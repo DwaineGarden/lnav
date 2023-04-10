@@ -1,0 +1,179 @@
+CSI Don't Send Mouse X & Y
+CSI Don’t Use Cell Motion Mouse Tracking
+CSI Don't ...
+CTRL Use alt charset
+CTRL save cursor
+CSI Use alternate screen buffer
+CSI set scrolling region 1-24
+S  -1 ┋                                                                                ┋
+A      └ normal
+CSI Reset Replace mode
+CSI Application cursor keys
+CTRL =
+OSC Set window title: LOG
+S  -1 ┋                                                                                ┋
+A      └ normal, normal, normal
+CSI Erase all
+S   1 ┋ 2013-06-06T12:13:20 PDT                                                        ┋
+A      └ bg(#008080)
+S  16 ┋ Files :: Text Filters ::                                       Press q to exit ┋
+A      └ bg(#000080), bold    │                                              ││
+A      ·└ fg(#008080), bg(#000080), underline                                ││
+A      ··└ normal, bg(#000080), bold                                         ││
+A      ·······└ normal, fg(#000000), bg(#000080)                             ││
+A      ········└ fg(#000080), bg(#c0c0c0)                                    ││
+A      ·········└ fg(#000000), bg(#c0c0c0), bold                             ││
+A      ··········└ fg(#800080), bg(#c0c0c0), underline                       ││
+A      ···········└ normal, fg(#000000), bg(#c0c0c0), bold                   ││
+A      ·······················└ normal, fg(#000000), bg(#c0c0c0)             ││
+A      ······································································└ bold
+A      ·······································································└ normal, fg(#000000), bg(#c0c0c0)
+S  17 ┋                                                                                ┋
+S  23 ┋ L0          0%                                         ?:View Help             ┋
+A      └ normal, bg(#008080)
+S  18 ┋                                                                                ┋
+A      └ normal, normal
+S   1 ┋                                     Press ENTER to focus on the breadcrumb bar ┋
+A      ·····································└ bg(#008080)                             │
+A      ···············································································└ carriage-return
+S   2 ┋ LOG ❭                                                                          ┋
+A      └ fg(#000000), bg(#000080), bold
+A      ·····└ normal, fg(#008080), bg(#c0c0c0)
+A      ······└ fg(#000000), bg(#c0c0c0)
+S   3 ┋                                                                               x┋
+A      ···············································································├ normal
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S   4 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S   5 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S   6 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S   7 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S   8 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S   9 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  10 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  11 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  12 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  13 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  14 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  15 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  18 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  19 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  20 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  21 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  22 ┋                                                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  22 ┋                                                                                ┋
+A      └ normal
+OSC Set window title: HELP
+S   2 ┋ HELP ❭⋯❭                                                                       ┋
+A      ·└ fg(#000000), bg(#000080), bold
+A      ······└ normal, fg(#008080), bg(#c0c0c0)
+A      ·······└ fg(#000000), bg(#c0c0c0)
+A      ········└ fg(#008080), bg(#c0c0c0)
+S   3 ┋                                                                               x┋
+A      ···············································································└ normal, fg(#000000)
+A      ················································································└ normal
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S   4 ┋lnav                                                                            ┋
+A      └ fg(#000000), normal, underline
+A      ····└ carriage-return
+S   6 ┋A fancy log file viewer for the terminal.                                       ┋
+A      └ normal                                 │
+A      ·········································└ carriage-return
+S   8 ┋Overview                                                                        ┋
+A      └ underline
+A      ········└ carriage-return
+S  10 ┋The Logfile Navigator, lnav, is an enhanced log file viewer that takes          ┋
+A      └ normal               │   │                                          │
+A      ·······················└ bold                                         │
+A      ···························└ normal                                   │
+A      ······································································└ carriage-return
+S  11 ┋advantage of any semantic information that can be gleaned from the              ┋
+A      ··································································└ carriage-return
+S  12 ┋files being viewed, such as timestamps and log levels. Using this               ┋
+A      ·································································└ carriage-return
+S  13 ┋extra semantic information, lnav can do things like interleaving                ┋
+A      ································································└ carriage-return
+S  14 ┋messages from different files, generate histograms of messages over             ┋
+A      ···································································└ carriage-return
+S  15 ┋time, and providing hotkeys for navigating through the file. It is              ┋
+A      ··································································└ carriage-return
+S  16 ┋hoped that these features will allow the user to quickly and                   x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  17 ┋efficiently zero in on problems.                                               x┋
+A                                                                                     └┛ alt
+A      ················································································└ normal
+S  19 ┋Opening Paths/URLs                                                              ┋
+A      └ underline       │
+A      ··················└ carriage-return
+S  21 ┋The main arguments to lnav are the local/remote files, directories,             ┋
+A      └ normal                                                           │
+A      ···································································└ carriage-return
+S  22 ┋glob patterns, or URLs to be viewed. If no arguments are given, the             ┋
+A      ···································································└ carriage-return
+S  23 ┋ L0          0%                                         ?:View Help             ┋
+A      └ fg(#000000), bg(#c0c0c0)
+S  24 ┋                       Press e/E to move forward/backward through error messags ┋
+A      ·······················└ normal││                                              │
+A      ·····························└ bold                                            │
+A      ······························└ normal                                         │
+A      ·······························└ bold                                          │
+A      ································└ normal                                       │
+A      ···············································································└ backspace, backspace
+CSI Set Replace mode
+S  24 ┋                                                                              e ┋
+CSI Reset Replace mode
+S  24 ┋                                                                                ┋
+A      ···············································································└ carriage-return
+A      └ normal
+K 71
+OSC Set window title: LOG
+S  24 ┋ⓘ info: executing SQL statement, press CTRL+] to cancel                         ┋
+A      ·······································└ fg(#800080), bold, underline
+A      ·············································└ normal
+CSI Erase to Right
+S  24 ┋                                                                                ┋
+A      ·······················································└ carriage-return
+A      └ normal
+CSI Erase all
+CSI Use normal screen buffer
+CTRL restore cursor
+S  24 ┋                                                                                ┋
+A      └ carriage-return
+CSI Normal cursor keys
+CTRL Normal keypad

@@ -1,19 +1,17 @@
 #! /bin/bash
 
-lnav_test="${top_builddir}/src/lnav-test"
+export YES_COLOR=1
 
+run_cap_test ${lnav_test} -W -C \
+    -I ${test_dir}/bad-config-json
 
-run_test ${lnav_test} -C \
-    -I ${test_dir}/bad-config
+if test x"$HAVE_SQLITE3_ERROR_OFFSET" != x""; then
+    run_cap_test env LC_ALL=C ${lnav_test} -W -C \
+        -I ${test_dir}/bad-config
+fi
 
-check_error_output "invalid format not detected?" <<EOF
-error:bad_regex_log.regex[std]:missing )
-error:bad_regex_log.level:missing )
-error:bad_regex_log:invalid sample -- 1428634687123; foo
-error:bad_sample_log:invalid sample -- 1428634687123; foo bar
-error:bad_sample_log:partial sample matched -- 1428634687123; foo
-error:  against pattern -- ^(?<timestamp>\d+); (?<body>\w+)$
-error:bad_sample_log:partial sample matched -- 1428634687123
-error:  against pattern -- ^(?<timestamp>\d+): (?<body>.*)$
-error:no_sample_log:no sample logs provided, all formats must have samples
-EOF
+run_cap_test ${lnav_test} -n \
+    -I ${test_dir} \
+    -c ";select * from leveltest_log" \
+    -c ':write-csv-to -' \
+    ${test_dir}/logfile_leveltest.0

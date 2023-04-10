@@ -21,20 +21,22 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * @file piper_proc.hh
  */
 
-#ifndef __piper_proc_hh
-#define __piper_proc_hh
+#ifndef piper_proc_hh
+#define piper_proc_hh
 
 #include <string>
+
 #include <sys/types.h>
-#include "auto_fd.hh"
+
+#include "base/auto_fd.hh"
 
 /**
  * Creates a subprocess that reads data from a pipe and writes it to a file so
@@ -44,11 +46,9 @@
  */
 class piper_proc {
 public:
-    class error
-        : public std::exception {
-public:
-        error(int err)
-            : e_err(err) { };
+    class error : public std::exception {
+    public:
+        error(int err) : e_err(err) {}
 
         int e_err;
     };
@@ -60,10 +60,9 @@ public:
      * @param pipefd The file descriptor to read the file contents from.
      * @param timestamp True if an ISO 8601 timestamp should be prepended onto
      *   the lines read from pipefd.
-     * @param filename The name of the file to save the input to, otherwise a
-     *   temporary file will be created.
+     * @param filefd The descriptor for the backing file.
      */
-    piper_proc(int pipefd, bool timestamp, const char *filename = NULL);
+    piper_proc(auto_fd pipefd, bool timestamp, auto_fd filefd);
 
     bool has_exited();
 
@@ -73,9 +72,9 @@ public:
     virtual ~piper_proc();
 
     /** @return The file descriptor for the temporary file. */
-    int get_fd() { return this->pp_fd.release(); };
+    auto_fd get_fd() { return this->pp_fd.dup(); }
 
-    pid_t get_child_pid() const { return this->pp_child; };
+    pid_t get_child_pid() const { return this->pp_child; }
 
 private:
     /** A file descriptor that refers to the temporary file. */

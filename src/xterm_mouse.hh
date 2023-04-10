@@ -21,45 +21,39 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * @file xterm_mouse.hh
  */
 
-#ifndef __xterm_mouse_hh
-#define __xterm_mouse_hh
+#ifndef xterm_mouse_hh
+#define xterm_mouse_hh
 
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-#include <string>
+#include "config.h"
 
 #if defined HAVE_NCURSESW_CURSES_H
-#  include <ncursesw/curses.h>
+#    include <ncursesw/curses.h>
 #elif defined HAVE_NCURSESW_H
-#  include <ncursesw.h>
+#    include <ncursesw.h>
 #elif defined HAVE_NCURSES_CURSES_H
-#  include <ncurses/curses.h>
+#    include <ncurses/curses.h>
 #elif defined HAVE_NCURSES_H
-#  include <ncurses.h>
+#    include <ncurses.h>
 #elif defined HAVE_CURSES_H
-#  include <curses.h>
+#    include <curses.h>
 #else
-#  error "SysV or X/Open-compatible Curses header file required"
+#    error "SysV or X/Open-compatible Curses header file required"
 #endif
-
-#include "lnav_log.hh"
 
 /**
  * Base class for delegates of the xterm_mouse class.
  */
 class mouse_behavior {
 public:
-    virtual ~mouse_behavior() { };
+    virtual ~mouse_behavior() = default;
 
     /**
      * Callback used to process mouse events.
@@ -78,127 +72,60 @@ public:
  */
 class xterm_mouse {
 public:
-    static const int XT_BUTTON1        = 0;
-    static const int XT_BUTTON2        = 1;
-    static const int XT_BUTTON3        = 2;
+    static const int XT_BUTTON1 = 0;
+    static const int XT_BUTTON2 = 1;
+    static const int XT_BUTTON3 = 2;
 
     static const int XT_DRAG_FLAG = 32;
     static const int XT_SCROLL_WHEEL_FLAG = 64;
-    static const int XT_SCROLL_UP         =
-        XT_SCROLL_WHEEL_FLAG | XT_BUTTON1;
-    static const int XT_SCROLL_DOWN =
-        XT_SCROLL_WHEEL_FLAG | XT_BUTTON2;
+    static const int XT_SCROLL_UP = XT_SCROLL_WHEEL_FLAG | XT_BUTTON1;
+    static const int XT_SCROLL_DOWN = XT_SCROLL_WHEEL_FLAG | XT_BUTTON2;
 
-    static const int XT_BUTTON__MASK =
-        XT_SCROLL_WHEEL_FLAG |
-        XT_BUTTON1 |
-        XT_BUTTON2 |
-        XT_BUTTON3;
+    static const int XT_BUTTON__MASK
+        = XT_SCROLL_WHEEL_FLAG | XT_BUTTON1 | XT_BUTTON2 | XT_BUTTON3;
 
-    static const char *XT_TERMCAP;
-    static const char *XT_TERMCAP_TRACKING;
-    static const char *XT_TERMCAP_SGR;
+    static const char* XT_TERMCAP;
+    static const char* XT_TERMCAP_TRACKING;
+    static const char* XT_TERMCAP_SGR;
 
     /**
      * @return True if the user's terminal supports xterm-mouse events.
      */
-    static bool is_available()
-    {
-        const char *termname = getenv("TERM");
-        bool retval = false;
-
-        if (termname and strstr(termname, "xterm") != NULL) {
-            retval = isatty(STDOUT_FILENO);
-        }
-        return retval;
-    };
-
-    xterm_mouse() : xm_enabled(false), xm_behavior(NULL) {};
+    static bool is_available();
 
     ~xterm_mouse()
     {
-        if (this->is_enabled())
+        if (this->is_enabled()) {
             set_enabled(false);
-    };
+        }
+    }
 
     /**
      * @param enabled True if xterm mouse support should be enabled in the
      *   terminal.
      */
-    void set_enabled(bool enabled)
-    {
-        if (is_available()) {
-            putp(tparm((char *)XT_TERMCAP, enabled ? 1 : 0));
-            putp(tparm((char *)XT_TERMCAP_TRACKING, enabled ? 1 : 0));
-            putp(tparm((char *)XT_TERMCAP_SGR, enabled ? 1 : 0));
-            fflush(stdout);
-            this->xm_enabled = enabled;
-        }
-    };
+    void set_enabled(bool enabled);
 
     /**
      * @return True if xterm mouse support is enabled, false otherwise.
      */
-    bool is_enabled() const
-    {
-        return this->xm_enabled;
-    };
+    bool is_enabled() const { return this->xm_enabled; }
 
     /**
      * @param mb The delegate to send mouse events to.
      */
-    void set_behavior(mouse_behavior *mb)
-    {
-        this->xm_behavior = mb;
-    };
+    void set_behavior(mouse_behavior* mb) { this->xm_behavior = mb; }
 
-    mouse_behavior *get_behavior() { return this->xm_behavior; };
+    mouse_behavior* get_behavior() { return this->xm_behavior; }
 
     /**
      * Handle a KEY_MOUSE character from ncurses.
      * @param ch unused
      */
-    void handle_mouse(int ch_unused)
-    {
-        bool release = false;
-        int ch;
-        size_t index = 0;
-        int bstate, x, y;
-        char buffer[64];
-        bool done = false;
-
-        while (!done) {
-            if (index >= sizeof(buffer) - 1) {
-                break;
-            }
-            ch = getch();
-            switch (ch) {
-            case 'm':
-                release = true;
-                done = true;
-                break;
-            case 'M':
-                done = true;
-                break;
-            default:
-                buffer[index++] = (char)ch;
-                break;
-            }
-        }
-        buffer[index] = '\0';
-
-        if (sscanf(buffer, "<%d;%d;%d", &bstate, &x, &y) == 3) {
-            if (this->xm_behavior) {
-                this->xm_behavior->mouse_event(bstate, release, x, y);
-            }
-        }
-        else {
-            log_error("bad mouse escape sequence: %s", buffer);
-        }
-    };
+    void handle_mouse();
 
 private:
-    bool            xm_enabled;
-    mouse_behavior *xm_behavior;
+    bool xm_enabled{false};
+    mouse_behavior* xm_behavior{nullptr};
 };
 #endif

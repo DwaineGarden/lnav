@@ -1,17 +1,25 @@
 {
+    "$schema": "https://lnav.org/schemas/format-v1.schema.json",
     "epoch_log": {
         "title": "epoch timestamp test",
         "regex": {
             "std": {
                 "pattern": "^(?<timestamp>\\d+) (?<body>.*)$"
+            },
+            "non_epoch": {
+                "pattern": "^(?<timestamp>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d+) (?<body>.*)$"
             }
         },
-        "timestamp-format" : [
-            "%i"
+        "timestamp-format": [
+            "%i",
+            "%Y-%m-%d %H:%M:%S.%f"
         ],
         "sample": [
             {
                 "line": "1428634687123 Hello, World!"
+            },
+            {
+                "line": "2022-09-10 19:57:36.123456 Hello, World"
             }
         ]
     }

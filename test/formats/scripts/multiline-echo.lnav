@@ -1,0 +1,3 @@
+;SELECT 'World' as name
+:echo Hello, ${name}!
+Goodbye, ${name}!

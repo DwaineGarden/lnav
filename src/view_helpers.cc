@@ -1,0 +1,1233 @@
+/**
+ * Copyright (c) 2018, Timothy Stack
+ *
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * * Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ * * Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ * * Neither the name of Timothy Stack nor the names of its contributors
+ * may be used to endorse or promote products derived from this software
+ * without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ''AS IS'' AND ANY
+ * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include "view_helpers.hh"
+
+#include "base/humanize.hh"
+#include "base/itertools.hh"
+#include "config.h"
+#include "document.sections.hh"
+#include "environ_vtab.hh"
+#include "filter_sub_source.hh"
+#include "help-md.h"
+#include "intervaltree/IntervalTree.h"
+#include "lnav.hh"
+#include "lnav.indexing.hh"
+#include "md2attr_line.hh"
+#include "md4cpp.hh"
+#include "pretty_printer.hh"
+#include "shlex.hh"
+#include "sql_help.hh"
+#include "sql_util.hh"
+#include "static_file_vtab.hh"
+#include "view_helpers.crumbs.hh"
+#include "view_helpers.examples.hh"
+#include "view_helpers.hist.hh"
+#include "vtab_module.hh"
+
+using namespace std::chrono_literals;
+using namespace lnav::roles::literals;
+
+const char* lnav_view_strings[LNV__MAX + 1] = {
+    "log",
+    "text",
+    "help",
+    "histogram",
+    "db",
+    "schema",
+    "pretty",
+    "spectro",
+
+    nullptr,
+};
+
+const char* lnav_view_titles[LNV__MAX] = {
+    "LOG",
+    "TEXT",
+    "HELP",
+    "HIST",
+    "DB",
+    "SCHEMA",
+    "PRETTY",
+    "SPECTRO",
+};
+
+nonstd::optional<lnav_view_t>
+view_from_string(const char* name)
+{
+    if (name == nullptr) {
+        return nonstd::nullopt;
+    }
+
+    auto* view_name_iter
+        = std::find_if(std::begin(lnav_view_strings),
+                       std::end(lnav_view_strings),
+                       [&](const char* v) {
+                           return v != nullptr && strcasecmp(v, name) == 0;
+                       });
+
+    if (view_name_iter == std::end(lnav_view_strings)) {
+        return nonstd::nullopt;
+    }
+
+    return lnav_view_t(view_name_iter - lnav_view_strings);
+}
+
+static void
+open_schema_view()
+{
+    textview_curses* schema_tc = &lnav_data.ld_views[LNV_SCHEMA];
+    std::string schema;
+
+    dump_sqlite_schema(lnav_data.ld_db, schema);
+
+    schema += "\n\n-- Virtual Table Definitions --\n\n";
+    schema += ENVIRON_CREATE_STMT;
+    schema += STATIC_FILE_CREATE_STMT;
+    schema += vtab_module_schemas;
+    for (const auto& vtab_iter : *lnav_data.ld_vtab_manager) {
+        schema += "\n" + vtab_iter.second->get_table_statement();
+    }
+
+    delete schema_tc->get_sub_source();
+
+    auto* pts = new plain_text_source(schema);
+    pts->set_text_format(text_format_t::TF_SQL);
+
+    schema_tc->set_sub_source(pts);
+    schema_tc->redo_search();
+}
+
+class pretty_sub_source : public plain_text_source {
+public:
+    void text_crumbs_for_line(int line,
+                              std::vector<breadcrumb::crumb>& crumbs) override
+    {
+        text_sub_source::text_crumbs_for_line(line, crumbs);
+
+        if (line < 0 || static_cast<size_t>(line) > this->tds_lines.size()) {
+            return;
+        }
+
+        const auto& tl = this->tds_lines[line];
+        const auto initial_size = crumbs.size();
+        lnav::document::hier_node* root_node{nullptr};
+
+        this->pss_hier_tree->template visit_overlapping(
+            tl.tl_offset,
+            [&root_node](const auto& hier_iv) { root_node = hier_iv.value; });
+        this->pss_interval_tree->visit_overlapping(
+            tl.tl_offset,
+            tl.tl_offset + tl.tl_value.length(),
+            [&crumbs, root_node, this, initial_size](const auto& iv) {
+                auto path = crumbs | lnav::itertools::skip(initial_size)
+                    | lnav::itertools::map(&breadcrumb::crumb::c_key)
+                    | lnav::itertools::append(iv.value);
+                auto poss_provider = [root_node, path]() {
+                    std::vector<breadcrumb::possibility> retval;
+                    auto curr_node = lnav::document::hier_node::lookup_path(
+                        root_node, path);
+                    if (curr_node) {
+                        auto* parent_node = curr_node.value()->hn_parent;
+
+                        if (parent_node != nullptr) {
+                            for (const auto& sibling :
+                                 parent_node->hn_named_children)
+                            {
+                                retval.template emplace_back(sibling.first);
+                            }
+                        }
+                    }
+                    return retval;
+                };
+                auto path_performer =
+                    [this, root_node, path](
+                        const breadcrumb::crumb::key_t& value) {
+                        auto curr_node = lnav::document::hier_node::lookup_path(
+                            root_node, path);
+                        if (!curr_node) {
+                            return;
+                        }
+                        auto* parent_node = curr_node.value()->hn_parent;
+
+                        if (parent_node == nullptr) {
+                            return;
+                        }
+                        value.template match(
+                            [this, parent_node](const std::string& str) {
+                                auto sib_iter
+                                    = parent_node->hn_named_children.find(str);
+                                if (sib_iter
+                                    != parent_node->hn_named_children.end()) {
+                                    this->line_for_offset(
+                                        sib_iter->second->hn_start)
+                                        | [](const auto new_top) {
+                                              lnav_data.ld_views[LNV_PRETTY]
+                                                  .set_top(new_top);
+                                          };
+                                }
+                            },
+                            [this, parent_node](size_t index) {
+                                if (index >= parent_node->hn_children.size()) {
+                                    return;
+                                }
+                                auto sib
+                                    = parent_node->hn_children[index].get();
+                                this->line_for_offset(sib->hn_start) |
+                                    [](const auto new_top) {
+                                        lnav_data.ld_views[LNV_PRETTY].set_top(
+                                            new_top);
+                                    };
+                            });
+                    };
+                crumbs.template emplace_back(iv.value,
+                                             std::move(poss_provider),
+                                             std::move(path_performer));
+                auto curr_node
+                    = lnav::document::hier_node::lookup_path(root_node, path);
+                if (curr_node
+                    && curr_node.value()->hn_parent->hn_children.size()
+                        != curr_node.value()
+                               ->hn_parent->hn_named_children.size())
+                {
+                    auto node = lnav::document::hier_node::lookup_path(
+                        root_node, path);
+
+                    crumbs.back().c_expected_input
+                        = curr_node.value()
+                              ->hn_parent->hn_named_children.empty()
+                        ? breadcrumb::crumb::expected_input_t::index
+                        : breadcrumb::crumb::expected_input_t::index_or_exact;
+                    crumbs.back().with_possible_range(
+                        node | lnav::itertools::map([](const auto hn) {
+                            return hn->hn_parent->hn_children.size();
+                        })
+                        | lnav::itertools::unwrap_or(size_t{0}));
+                }
+            });
+
+        auto path = crumbs | lnav::itertools::skip(initial_size)
+            | lnav::itertools::map(&breadcrumb::crumb::c_key);
+        auto node = lnav::document::hier_node::lookup_path(root_node, path);
+
+        if (node && !node.value()->hn_children.empty()) {
+            auto poss_provider = [curr_node = node.value()]() {
+                std::vector<breadcrumb::possibility> retval;
+                for (const auto& child : curr_node->hn_named_children) {
+                    retval.template emplace_back(child.first);
+                }
+                return retval;
+            };
+            auto path_performer = [this, curr_node = node.value()](
+                                      const breadcrumb::crumb::key_t& value) {
+                value.template match(
+                    [this, curr_node](const std::string& str) {
+                        auto child_iter
+                            = curr_node->hn_named_children.find(str);
+                        if (child_iter != curr_node->hn_named_children.end()) {
+                            this->line_for_offset(child_iter->second->hn_start)
+                                | [](const auto new_top) {
+                                      lnav_data.ld_views[LNV_PRETTY].set_top(
+                                          new_top);
+                                  };
+                        }
+                    },
+                    [this, curr_node](size_t index) {
+                        auto* child = curr_node->hn_children[index].get();
+                        this->line_for_offset(child->hn_start) |
+                            [](const auto new_top) {
+                                lnav_data.ld_views[LNV_PRETTY].set_top(new_top);
+                            };
+                    });
+            };
+            crumbs.emplace_back("", "\u22ef", poss_provider, path_performer);
+            crumbs.back().c_expected_input
+                = node.value()->hn_named_children.empty()
+                ? breadcrumb::crumb::expected_input_t::index
+                : breadcrumb::crumb::expected_input_t::index_or_exact;
+        }
+    }
+
+    using hier_tree_t
+        = interval_tree::IntervalTree<file_off_t, lnav::document::hier_node*>;
+    using hier_interval_t
+        = interval_tree::Interval<file_off_t, lnav::document::hier_node*>;
+
+    std::shared_ptr<lnav::document::sections_tree_t> pss_interval_tree;
+    std::vector<std::unique_ptr<lnav::document::hier_node>> pss_hier_nods;
+    std::shared_ptr<hier_tree_t> pss_hier_tree;
+};
+
+static void
+open_pretty_view()
+{
+    static const char* NOTHING_MSG = "Nothing to pretty-print";
+
+    auto* top_tc = *lnav_data.ld_view_stack.top();
+    auto* pretty_tc = &lnav_data.ld_views[LNV_PRETTY];
+    auto* log_tc = &lnav_data.ld_views[LNV_LOG];
+    auto* text_tc = &lnav_data.ld_views[LNV_TEXT];
+    attr_line_t full_text;
+
+    delete pretty_tc->get_sub_source();
+    pretty_tc->set_sub_source(nullptr);
+    if (top_tc->get_inner_height() == 0) {
+        pretty_tc->set_sub_source(new plain_text_source(NOTHING_MSG));
+        return;
+    }
+
+    std::vector<lnav::document::section_interval_t> all_intervals;
+    std::vector<std::unique_ptr<lnav::document::hier_node>> hier_nodes;
+    std::vector<pretty_sub_source::hier_interval_t> hier_tree_vec;
+    if (top_tc == log_tc) {
+        auto& lss = lnav_data.ld_log_source;
+        bool first_line = true;
+
+        for (auto vl = log_tc->get_top(); vl <= log_tc->get_bottom(); ++vl) {
+            content_line_t cl = lss.at(vl);
+            auto lf = lss.find(cl);
+            auto ll = lf->begin() + cl;
+            shared_buffer_ref sbr;
+
+            if (!first_line && !ll->is_message()) {
+                continue;
+            }
+            auto ll_start = lf->message_start(ll);
+            attr_line_t al;
+
+            vl -= vis_line_t(std::distance(ll_start, ll));
+            lss.text_value_for_line(
+                *log_tc,
+                vl,
+                al.get_string(),
+                text_sub_source::RF_FULL | text_sub_source::RF_REWRITE);
+            lss.text_attrs_for_line(*log_tc, vl, al.get_attrs());
+            scrub_ansi_string(al.get_string(), &al.get_attrs());
+            if (log_tc->get_hide_fields()) {
+                al.apply_hide();
+            }
+
+            const auto orig_lr
+                = find_string_attr_range(al.get_attrs(), &SA_ORIGINAL_LINE);
+            const auto body_lr
+                = find_string_attr_range(al.get_attrs(), &SA_BODY);
+            auto orig_al = al.subline(orig_lr.lr_start, orig_lr.length());
+            auto prefix_al = al.subline(0, orig_lr.lr_start);
+            attr_line_t pretty_al;
+            std::vector<attr_line_t> pretty_lines;
+            data_scanner ds(orig_al.get_string(),
+                            body_lr.is_valid()
+                                ? body_lr.lr_start - orig_lr.lr_start
+                                : orig_lr.lr_start);
+            pretty_printer pp(&ds, orig_al.get_attrs());
+            auto start_off = full_text.length();
+
+            if (body_lr.is_valid()) {
+                // TODO: dump more details of the line in the output.
+                pp.append_to(pretty_al);
+            } else {
+                pretty_al = orig_al;
+            }
+
+            pretty_al.split_lines(pretty_lines);
+
+            auto curr_intervals = pp.take_intervals();
+            auto line_hier_root = pp.take_hier_root();
+            auto line_off = 0;
+            for (auto& pretty_line : pretty_lines) {
+                if (pretty_line.empty() && &pretty_line == &pretty_lines.back())
+                {
+                    break;
+                }
+                pretty_line.insert(0, prefix_al);
+                pretty_line.append("\n");
+                for (auto& interval : curr_intervals) {
+                    if (line_off <= interval.start) {
+                        interval.start += prefix_al.length();
+                        interval.stop += prefix_al.length();
+                    } else if (line_off < interval.stop) {
+                        interval.stop += prefix_al.length();
+                    }
+                }
+                lnav::document::hier_node::depth_first(
+                    line_hier_root.get(),
+                    [line_off, prefix_len = prefix_al.length()](auto* hn) {
+                        if (line_off <= hn->hn_start) {
+                            hn->hn_start += prefix_len;
+                        }
+                    });
+                line_off += pretty_line.length();
+                full_text.append(pretty_line);
+            }
+
+            first_line = false;
+            for (auto& interval : curr_intervals) {
+                interval.start += start_off;
+                interval.stop += start_off;
+            }
+            lnav::document::hier_node::depth_first(
+                line_hier_root.get(),
+                [start_off](auto* hn) { hn->hn_start += start_off; });
+            hier_nodes.emplace_back(std::move(line_hier_root));
+            hier_tree_vec.emplace_back(
+                start_off, full_text.length(), hier_nodes.back().get());
+            all_intervals.insert(
+                all_intervals.end(),
+                std::make_move_iterator(curr_intervals.begin()),
+                std::make_move_iterator(curr_intervals.end()));
+        }
+
+        if (!full_text.empty()) {
+            full_text.erase(full_text.length() - 1, 1);
+        }
+    } else if (top_tc == text_tc) {
+        if (text_tc->listview_rows(*text_tc)) {
+            std::vector<attr_line_t> rows;
+            rows.resize(text_tc->get_bottom() - text_tc->get_top() + 1);
+            text_tc->listview_value_for_rows(
+                *text_tc, text_tc->get_top(), rows);
+            attr_line_t orig_al;
+
+            for (const auto& row : rows) {
+                orig_al.append(row);
+            }
+
+            data_scanner ds(orig_al.get_string());
+            string_attrs_t sa;
+            pretty_printer pp(&ds, orig_al.get_attrs());
+
+            pp.append_to(full_text);
+            all_intervals = pp.take_intervals();
+            hier_nodes.emplace_back(pp.take_hier_root());
+            hier_tree_vec.emplace_back(
+                0, full_text.length(), hier_nodes.back().get());
+        }
+    }
+    auto* pts = new pretty_sub_source();
+    pts->pss_interval_tree = std::make_shared<lnav::document::sections_tree_t>(
+        std::move(all_intervals));
+    pts->pss_hier_nods = std::move(hier_nodes);
+    pts->pss_hier_tree = std::make_shared<pretty_sub_source::hier_tree_t>(
+        std::move(hier_tree_vec));
+    pts->replace_with(full_text);
+    pretty_tc->set_sub_source(pts);
+    if (lnav_data.ld_last_pretty_print_top != log_tc->get_top()) {
+        pretty_tc->set_top(0_vl);
+    }
+    lnav_data.ld_last_pretty_print_top = log_tc->get_top();
+    pretty_tc->redo_search();
+}
+
+template<typename T>
+static void
+ignore_case(const T&)
+{
+}
+
+static void
+build_all_help_text()
+{
+    if (!lnav_data.ld_help_source.empty()) {
+        return;
+    }
+
+    shlex lexer(help_md.to_string_fragment());
+    std::string sub_help_text;
+
+    lexer.with_ignore_quotes(true).eval(
+        sub_help_text, lnav_data.ld_exec_context.ec_global_vars);
+
+    md2attr_line mdal;
+    auto parse_res = md4cpp::parse(sub_help_text, mdal);
+    attr_line_t all_help_text = parse_res.unwrap();
+
+    std::map<std::string, help_text*> sql_funcs;
+    std::map<std::string, help_text*> sql_keywords;
+
+    for (const auto& iter : sqlite_function_help) {
+        switch (iter.second->ht_context) {
+            case help_context_t::HC_SQL_FUNCTION:
+            case help_context_t::HC_SQL_TABLE_VALUED_FUNCTION:
+                sql_funcs[iter.second->ht_name] = iter.second;
+                break;
+            case help_context_t::HC_SQL_KEYWORD:
+                sql_keywords[iter.second->ht_name] = iter.second;
+                break;
+            default:
+                break;
+        }
+    }
+
+    all_help_text.append("\n").append("Command Reference"_h2);
+
+    for (const auto& cmd : lnav_commands) {
+        if (cmd.second->c_help.ht_summary == nullptr) {
+            continue;
+        }
+        all_help_text.append(2, '\n');
+        format_help_text_for_term(cmd.second->c_help, 70, all_help_text);
+        if (!cmd.second->c_help.ht_example.empty()) {
+            all_help_text.append("\n");
+            format_example_text_for_term(
+                cmd.second->c_help, eval_example, 90, all_help_text);
+        }
+    }
+
+    all_help_text.append("\n").append("SQL Reference"_h2);
+
+    for (const auto& iter : sql_funcs) {
+        all_help_text.append(2, '\n');
+        format_help_text_for_term(*iter.second, 70, all_help_text);
+        if (!iter.second->ht_example.empty()) {
+            all_help_text.append(1, '\n');
+            format_example_text_for_term(
+                *iter.second, eval_example, 90, all_help_text);
+        }
+    }
+
+    for (const auto& iter : sql_keywords) {
+        all_help_text.append(2, '\n');
+        format_help_text_for_term(*iter.second, 70, all_help_text);
+        if (!iter.second->ht_example.empty()) {
+            all_help_text.append(1, '\n');
+            format_example_text_for_term(
+                *iter.second, eval_example, 79, all_help_text);
+        }
+    }
+
+    lnav_data.ld_help_source.replace_with(all_help_text);
+    lnav_data.ld_views[LNV_HELP].redo_search();
+}
+
+bool
+handle_winch()
+{
+    static auto* filter_source = injector::get<filter_sub_source*>();
+
+    if (!lnav_data.ld_winched) {
+        return false;
+    }
+
+    struct winsize size;
+
+    lnav_data.ld_winched = false;
+
+    if (ioctl(fileno(stdout), TIOCGWINSZ, &size) == 0) {
+        resizeterm(size.ws_row, size.ws_col);
+    }
+    if (lnav_data.ld_rl_view != nullptr) {
+        lnav_data.ld_rl_view->do_update();
+        lnav_data.ld_rl_view->window_change();
+    }
+    filter_source->fss_editor->window_change();
+    for (auto& sc : lnav_data.ld_status) {
+        sc.window_change();
+    }
+    lnav_data.ld_view_stack.set_needs_update();
+    lnav_data.ld_doc_view.set_needs_update();
+    lnav_data.ld_example_view.set_needs_update();
+    lnav_data.ld_match_view.set_needs_update();
+    lnav_data.ld_filter_view.set_needs_update();
+    lnav_data.ld_files_view.set_needs_update();
+    lnav_data.ld_spectro_details_view.set_needs_update();
+    lnav_data.ld_user_message_view.set_needs_update();
+
+    return true;
+}
+
+void
+layout_views()
+{
+    unsigned long width, height;
+
+    getmaxyx(lnav_data.ld_window, height, width);
+    int doc_height;
+    bool doc_side_by_side = width > (90 + 60);
+    bool preview_status_open
+        = !lnav_data.ld_preview_status_source.get_description().empty();
+    bool filter_status_open = false;
+    auto is_spectro = false;
+
+    lnav_data.ld_view_stack.top() | [&](auto tc) {
+        is_spectro = (tc == &lnav_data.ld_views[LNV_SPECTRO]);
+
+        text_sub_source* tss = tc->get_sub_source();
+
+        if (tss == nullptr) {
+            return;
+        }
+
+        if (tss->tss_supports_filtering) {
+            filter_status_open = true;
+        }
+    };
+
+    if (doc_side_by_side) {
+        doc_height = std::max(lnav_data.ld_doc_source.text_line_count(),
+                              lnav_data.ld_example_source.text_line_count());
+    } else {
+        doc_height = lnav_data.ld_doc_source.text_line_count()
+            + lnav_data.ld_example_source.text_line_count();
+    }
+
+    int preview_height = lnav_data.ld_preview_hidden
+        ? 0
+        : lnav_data.ld_preview_source.text_line_count();
+    int match_rows = lnav_data.ld_match_source.text_line_count();
+    int match_height = std::min((unsigned long) match_rows, (height - 4) / 2);
+
+    lnav_data.ld_match_view.set_height(vis_line_t(match_height));
+
+    int um_rows = lnav_data.ld_user_message_source.text_line_count();
+    if (um_rows > 0
+        && std::chrono::steady_clock::now()
+            > lnav_data.ld_user_message_expiration)
+    {
+        lnav_data.ld_user_message_source.clear();
+        um_rows = 0;
+    }
+    int um_height = std::min((unsigned long) um_rows, (height - 4) / 2);
+
+    lnav_data.ld_user_message_view.set_height(vis_line_t(um_height));
+
+    if (doc_height + 14
+        > ((int) height - match_height - um_height - preview_height - 2))
+    {
+        preview_height = 0;
+        preview_status_open = false;
+    }
+
+    if (doc_height + 14 > ((int) height - match_height - um_height - 2)) {
+        doc_height = lnav_data.ld_doc_source.text_line_count();
+        if (doc_height + 14 > ((int) height - match_height - um_height - 2)) {
+            doc_height = 0;
+        }
+    }
+
+    bool doc_open = doc_height > 0;
+    bool filters_open = (lnav_data.ld_mode == ln_mode_t::FILTER
+                         || lnav_data.ld_mode == ln_mode_t::FILES
+                         || lnav_data.ld_mode == ln_mode_t::SEARCH_FILTERS
+                         || lnav_data.ld_mode == ln_mode_t::SEARCH_FILES)
+        && !preview_status_open && !doc_open;
+    bool breadcrumb_open = (lnav_data.ld_mode == ln_mode_t::BREADCRUMBS);
+    int filter_height = filters_open ? 5 : 0;
+
+    int bottom_height = (doc_open ? 1 : 0) + doc_height
+        + (preview_status_open ? 1 : 0) + preview_height + 1  // bottom status
+        + match_height + um_height + lnav_data.ld_rl_view->get_height()
+        + (is_spectro && !doc_open ? 5 : 0);
+
+    for (auto& tc : lnav_data.ld_views) {
+        tc.set_height(vis_line_t(-(bottom_height + (filter_status_open ? 1 : 0)
+                                   + (filters_open ? 1 : 0) + filter_height)));
+    }
+    lnav_data.ld_status[LNS_FILTER].set_visible(filter_status_open);
+    lnav_data.ld_status[LNS_FILTER].set_enabled(filters_open);
+    lnav_data.ld_status[LNS_FILTER].set_top(
+        -(bottom_height + filter_height + 1 + (filters_open ? 1 : 0)));
+    lnav_data.ld_status[LNS_FILTER_HELP].set_visible(filters_open);
+    lnav_data.ld_status[LNS_FILTER_HELP].set_top(
+        -(bottom_height + filter_height + 1));
+    lnav_data.ld_status[LNS_BOTTOM].set_top(-(match_height + um_height + 2));
+    lnav_data.ld_status[LNS_BOTTOM].set_enabled(!filters_open
+                                                && !breadcrumb_open);
+    lnav_data.ld_status[LNS_DOC].set_top(height - bottom_height);
+    lnav_data.ld_status[LNS_DOC].set_visible(doc_open);
+    lnav_data.ld_status[LNS_PREVIEW].set_top(height - bottom_height
+                                             + (doc_open ? 1 : 0) + doc_height);
+    lnav_data.ld_status[LNS_PREVIEW].set_visible(preview_status_open);
+    lnav_data.ld_status[LNS_SPECTRO].set_top(height - bottom_height - 1);
+    lnav_data.ld_status[LNS_SPECTRO].set_visible(is_spectro);
+    lnav_data.ld_status[LNS_SPECTRO].set_enabled(lnav_data.ld_mode
+                                                 == ln_mode_t::SPECTRO_DETAILS);
+
+    if (!doc_open || doc_side_by_side) {
+        lnav_data.ld_doc_view.set_height(vis_line_t(doc_height));
+    } else {
+        lnav_data.ld_doc_view.set_height(
+            vis_line_t(lnav_data.ld_doc_source.text_line_count()));
+    }
+    lnav_data.ld_doc_view.set_y(height - bottom_height + 1);
+
+    if (!doc_open || doc_side_by_side) {
+        lnav_data.ld_example_view.set_height(vis_line_t(doc_height));
+        lnav_data.ld_example_view.set_x(doc_open ? 90 : 0);
+        lnav_data.ld_example_view.set_y(height - bottom_height + 1);
+    } else {
+        lnav_data.ld_example_view.set_height(
+            vis_line_t(lnav_data.ld_example_source.text_line_count()));
+        lnav_data.ld_example_view.set_x(0);
+        lnav_data.ld_example_view.set_y(
+            height - bottom_height + lnav_data.ld_doc_view.get_height() + 1);
+    }
+
+    lnav_data.ld_filter_view.set_height(vis_line_t(filter_height));
+    lnav_data.ld_filter_view.set_y(height - bottom_height - filter_height);
+    lnav_data.ld_filter_view.set_width(width);
+
+    lnav_data.ld_files_view.set_height(vis_line_t(filter_height));
+    lnav_data.ld_files_view.set_y(height - bottom_height - filter_height);
+    lnav_data.ld_files_view.set_width(width);
+
+    lnav_data.ld_preview_view.set_height(vis_line_t(preview_height));
+    lnav_data.ld_preview_view.set_y(height - bottom_height + 1
+                                    + (doc_open ? 1 : 0) + doc_height);
+    lnav_data.ld_user_message_view.set_y(
+        height - lnav_data.ld_rl_view->get_height() - match_height - um_height);
+
+    lnav_data.ld_spectro_details_view.set_y(height - bottom_height);
+    lnav_data.ld_spectro_details_view.set_height(
+        is_spectro && !doc_open ? 5_vl : 0_vl);
+    lnav_data.ld_spectro_details_view.set_width(width);
+    lnav_data.ld_spectro_details_view.set_title("spectro-details");
+
+    lnav_data.ld_match_view.set_y(height - lnav_data.ld_rl_view->get_height()
+                                  - match_height);
+    lnav_data.ld_rl_view->set_width(width);
+}
+
+void
+update_hits(textview_curses* tc)
+{
+    if (isendwin()) {
+        return;
+    }
+
+    auto top_tc = lnav_data.ld_view_stack.top();
+
+    if (top_tc && tc == *top_tc) {
+        lnav_data.ld_bottom_source.update_hits(tc);
+
+        if (lnav_data.ld_mode == ln_mode_t::SEARCH) {
+            const auto MAX_MATCH_COUNT = 10_vl;
+            const auto PREVIEW_SIZE = MAX_MATCH_COUNT + 1_vl;
+
+            int preview_count = 0;
+
+            vis_bookmarks& bm = tc->get_bookmarks();
+            const auto& bv = bm[&textview_curses::BM_SEARCH];
+            auto vl = tc->get_top();
+            unsigned long width;
+            vis_line_t height;
+            attr_line_t all_matches;
+            char linebuf[64];
+            int last_line = tc->get_inner_height();
+            int max_line_width;
+
+            snprintf(linebuf, sizeof(linebuf), "%d", last_line);
+            max_line_width = strlen(linebuf);
+
+            tc->get_dimensions(height, width);
+            vl += height;
+            if (vl > PREVIEW_SIZE) {
+                vl -= PREVIEW_SIZE;
+            }
+
+            auto prev_vl = bv.prev(tc->get_top());
+
+            if (prev_vl) {
+                attr_line_t al;
+
+                tc->textview_value_for_row(prev_vl.value(), al);
+                if (preview_count > 0) {
+                    all_matches.append("\n");
+                }
+                snprintf(linebuf,
+                         sizeof(linebuf),
+                         "L%*d: ",
+                         max_line_width,
+                         (int) prev_vl.value());
+                all_matches.append(linebuf).append(al);
+                preview_count += 1;
+            }
+
+            nonstd::optional<vis_line_t> next_vl;
+            while ((next_vl = bv.next(vl)) && preview_count < MAX_MATCH_COUNT) {
+                attr_line_t al;
+
+                vl = next_vl.value();
+                tc->textview_value_for_row(vl, al);
+                if (preview_count > 0) {
+                    all_matches.append("\n");
+                }
+                snprintf(linebuf,
+                         sizeof(linebuf),
+                         "L%*d: ",
+                         max_line_width,
+                         (int) vl);
+                all_matches.append(linebuf).append(al);
+                preview_count += 1;
+            }
+
+            if (preview_count > 0) {
+                lnav_data.ld_preview_status_source.get_description().set_value(
+                    "Matching lines for search");
+                lnav_data.ld_preview_source.replace_with(all_matches)
+                    .set_text_format(text_format_t::TF_UNKNOWN);
+                lnav_data.ld_preview_view.set_needs_update();
+            }
+        }
+    }
+}
+
+static std::unordered_map<std::string, attr_line_t> EXAMPLE_RESULTS;
+
+void
+execute_examples()
+{
+    db_label_source& dls = lnav_data.ld_db_row_source;
+    db_overlay_source& dos = lnav_data.ld_db_overlay;
+    textview_curses& db_tc = lnav_data.ld_views[LNV_DB];
+
+    for (auto& help_iter : sqlite_function_help) {
+        struct help_text& ht = *(help_iter.second);
+
+        for (auto& ex : ht.ht_example) {
+            std::string alt_msg;
+            attr_line_t result;
+
+            if (!ex.he_cmd) {
+                continue;
+            }
+
+            switch (ht.ht_context) {
+                case help_context_t::HC_SQL_KEYWORD:
+                case help_context_t::HC_SQL_INFIX:
+                case help_context_t::HC_SQL_FUNCTION:
+                case help_context_t::HC_SQL_TABLE_VALUED_FUNCTION: {
+                    exec_context ec;
+
+                    execute_sql(ec, ex.he_cmd, alt_msg);
+
+                    if (dls.dls_rows.size() == 1 && dls.dls_rows[0].size() == 1)
+                    {
+                        result.append(dls.dls_rows[0][0]);
+                    } else {
+                        attr_line_t al;
+                        dos.list_value_for_overlay(db_tc, 0, 1, 0_vl, al);
+                        result.append(al);
+                        for (int lpc = 0; lpc < (int) dls.text_line_count();
+                             lpc++)
+                        {
+                            al.clear();
+                            dls.text_value_for_line(
+                                db_tc, lpc, al.get_string(), false);
+                            dls.text_attrs_for_line(db_tc, lpc, al.get_attrs());
+                            std::replace(al.get_string().begin(),
+                                         al.get_string().end(),
+                                         '\n',
+                                         ' ');
+                            result.append("\n").append(al);
+                        }
+                    }
+
+                    EXAMPLE_RESULTS[ex.he_cmd] = result;
+
+                    log_debug("example: %s", ex.he_cmd);
+                    log_debug("example result: %s",
+                              result.get_string().c_str());
+                    break;
+                }
+                default:
+                    log_warning("Not executing example: %s", ex.he_cmd);
+                    break;
+            }
+        }
+    }
+
+    dls.clear();
+}
+
+attr_line_t
+eval_example(const help_text& ht, const help_example& ex)
+{
+    auto iter = EXAMPLE_RESULTS.find(ex.he_cmd);
+
+    if (iter != EXAMPLE_RESULTS.end()) {
+        return iter->second;
+    }
+
+    return "";
+}
+
+bool
+toggle_view(textview_curses* toggle_tc)
+{
+    textview_curses* tc = lnav_data.ld_view_stack.top().value_or(nullptr);
+    bool retval = false;
+
+    require(toggle_tc != nullptr);
+    require(toggle_tc >= &lnav_data.ld_views[0]);
+    require(toggle_tc < &lnav_data.ld_views[LNV__MAX]);
+
+    if (tc == toggle_tc) {
+        if (lnav_data.ld_view_stack.size() == 1) {
+            return false;
+        }
+        lnav_data.ld_last_view = tc;
+        lnav_data.ld_view_stack.pop_back();
+    } else {
+        if (toggle_tc == &lnav_data.ld_views[LNV_LOG]
+            || toggle_tc == &lnav_data.ld_views[LNV_TEXT])
+        {
+            rescan_files(true);
+            rebuild_indexes_repeatedly();
+        } else if (toggle_tc == &lnav_data.ld_views[LNV_SCHEMA]) {
+            open_schema_view();
+        } else if (toggle_tc == &lnav_data.ld_views[LNV_PRETTY]) {
+            open_pretty_view();
+        } else if (toggle_tc == &lnav_data.ld_views[LNV_HISTOGRAM]) {
+            // Rebuild to reflect changes in marks.
+            rebuild_hist();
+        } else if (toggle_tc == &lnav_data.ld_views[LNV_HELP]) {
+            build_all_help_text();
+            if (lnav_data.ld_rl_view != nullptr) {
+                lnav_data.ld_rl_view->set_alt_value(
+                    HELP_MSG_1(q, "to return to the previous view"));
+            }
+        }
+        lnav_data.ld_last_view = nullptr;
+        lnav_data.ld_view_stack.push_back(toggle_tc);
+        retval = true;
+    }
+
+    return retval;
+}
+
+/**
+ * Ensure that the view is on the top of the view stack.
+ *
+ * @param expected_tc The text view that should be on top.
+ * @return True if the view was already on the top of the stack.
+ */
+bool
+ensure_view(textview_curses* expected_tc)
+{
+    textview_curses* tc = lnav_data.ld_view_stack.top().value_or(nullptr);
+    bool retval = true;
+
+    if (tc != expected_tc) {
+        toggle_view(expected_tc);
+        retval = false;
+    }
+    return retval;
+}
+
+bool
+ensure_view(lnav_view_t expected)
+{
+    require(expected >= 0);
+    require(expected < LNV__MAX);
+
+    return ensure_view(&lnav_data.ld_views[expected]);
+}
+
+nonstd::optional<vis_line_t>
+next_cluster(nonstd::optional<vis_line_t> (bookmark_vector<vis_line_t>::*f)(
+                 vis_line_t) const,
+             const bookmark_type_t* bt,
+             const vis_line_t top)
+{
+    auto* tc = get_textview_for_mode(lnav_data.ld_mode);
+    auto& bm = tc->get_bookmarks();
+    auto& bv = bm[bt];
+    bool top_is_marked = binary_search(bv.begin(), bv.end(), top);
+    vis_line_t last_top(top), tc_height;
+    nonstd::optional<vis_line_t> new_top = top;
+    unsigned long tc_width;
+    int hit_count = 0;
+
+    tc->get_dimensions(tc_height, tc_width);
+
+    while ((new_top = (bv.*f)(new_top.value()))) {
+        int diff = new_top.value() - last_top;
+
+        hit_count += 1;
+        if (!top_is_marked || diff > 1) {
+            return new_top;
+        }
+        if (hit_count > 1 && std::abs(new_top.value() - top) >= tc_height) {
+            return vis_line_t(new_top.value() - diff);
+        }
+        if (diff < -1) {
+            last_top = new_top.value();
+            while ((new_top = (bv.*f)(new_top.value()))) {
+                if ((std::abs(last_top - new_top.value()) > 1)
+                    || (hit_count > 1
+                        && (std::abs(top - new_top.value()) >= tc_height)))
+                {
+                    break;
+                }
+                last_top = new_top.value();
+            }
+            return last_top;
+        }
+        last_top = new_top.value();
+    }
+
+    if (last_top != top) {
+        return last_top;
+    }
+
+    return nonstd::nullopt;
+}
+
+bool
+moveto_cluster(nonstd::optional<vis_line_t> (bookmark_vector<vis_line_t>::*f)(
+                   vis_line_t) const,
+               const bookmark_type_t* bt,
+               vis_line_t top)
+{
+    textview_curses* tc = get_textview_for_mode(lnav_data.ld_mode);
+    auto new_top = next_cluster(f, bt, top);
+
+    if (!new_top) {
+        new_top = next_cluster(
+            f, bt, tc->is_selectable() ? tc->get_selection() : tc->get_top());
+    }
+    if (new_top != -1) {
+        tc->get_sub_source()->get_location_history() |
+            [new_top](auto lh) { lh->loc_history_append(new_top.value()); };
+
+        if (tc->is_selectable()) {
+            tc->set_selection(new_top.value());
+        } else {
+            tc->set_top(new_top.value());
+        }
+        return true;
+    }
+
+    alerter::singleton().chime("unable to find next bookmark");
+
+    return false;
+}
+
+void
+previous_cluster(const bookmark_type_t* bt, textview_curses* tc)
+{
+    key_repeat_history& krh = lnav_data.ld_key_repeat_history;
+    vis_line_t height, initial_top;
+    unsigned long width;
+
+    if (tc->is_selectable()) {
+        initial_top = tc->get_selection();
+    } else {
+        initial_top = tc->get_top();
+    }
+    auto new_top
+        = next_cluster(&bookmark_vector<vis_line_t>::prev, bt, initial_top);
+
+    tc->get_dimensions(height, width);
+    if (krh.krh_count > 1 && initial_top < (krh.krh_start_line - (1.5 * height))
+        && (!new_top || ((initial_top - new_top.value()) < height)))
+    {
+        bookmark_vector<vis_line_t>& bv = tc->get_bookmarks()[bt];
+        new_top = bv.next(std::max(0_vl, initial_top - height));
+    }
+
+    if (new_top) {
+        tc->get_sub_source()->get_location_history() |
+            [new_top](auto lh) { lh->loc_history_append(new_top.value()); };
+
+        if (tc->is_selectable()) {
+            tc->set_selection(new_top.value());
+        } else {
+            tc->set_top(new_top.value());
+        }
+    } else {
+        alerter::singleton().chime("no previous bookmark");
+    }
+}
+
+vis_line_t
+search_forward_from(textview_curses* tc)
+{
+    vis_line_t height,
+        retval = tc->is_selectable() ? tc->get_selection() : tc->get_top();
+    auto& krh = lnav_data.ld_key_repeat_history;
+    unsigned long width;
+
+    tc->get_dimensions(height, width);
+
+    if (krh.krh_count > 1 && retval > (krh.krh_start_line + (1.5 * height))) {
+        retval += vis_line_t(0.90 * height);
+    }
+
+    return retval;
+}
+
+textview_curses*
+get_textview_for_mode(ln_mode_t mode)
+{
+    switch (mode) {
+        case ln_mode_t::SEARCH_FILTERS:
+        case ln_mode_t::FILTER:
+            return &lnav_data.ld_filter_view;
+        case ln_mode_t::SEARCH_FILES:
+        case ln_mode_t::FILES:
+            return &lnav_data.ld_files_view;
+        case ln_mode_t::SPECTRO_DETAILS:
+        case ln_mode_t::SEARCH_SPECTRO_DETAILS:
+            return &lnav_data.ld_spectro_details_view;
+        default:
+            return *lnav_data.ld_view_stack.top();
+    }
+}
+
+hist_index_delegate::hist_index_delegate(hist_source2& hs, textview_curses& tc)
+    : hid_source(hs), hid_view(tc)
+{
+}
+
+void
+hist_index_delegate::index_start(logfile_sub_source& lss)
+{
+    this->hid_source.clear();
+}
+
+void
+hist_index_delegate::index_line(logfile_sub_source& lss,
+                                logfile* lf,
+                                logfile::iterator ll)
+{
+    if (ll->is_continued() || ll->get_time() == 0) {
+        return;
+    }
+
+    hist_source2::hist_type_t ht;
+
+    switch (ll->get_msg_level()) {
+        case LEVEL_FATAL:
+        case LEVEL_CRITICAL:
+        case LEVEL_ERROR:
+            ht = hist_source2::HT_ERROR;
+            break;
+        case LEVEL_WARNING:
+            ht = hist_source2::HT_WARNING;
+            break;
+        default:
+            ht = hist_source2::HT_NORMAL;
+            break;
+    }
+
+    this->hid_source.add_value(ll->get_time(), ht);
+    if (ll->is_marked() || ll->is_expr_marked()) {
+        this->hid_source.add_value(ll->get_time(), hist_source2::HT_MARK);
+    }
+}
+
+void
+hist_index_delegate::index_complete(logfile_sub_source& lss)
+{
+    this->hid_view.reload_data();
+    lnav_data.ld_views[LNV_SPECTRO].reload_data();
+}
+
+static std::vector<breadcrumb::possibility>
+view_title_poss()
+{
+    std::vector<breadcrumb::possibility> retval;
+
+    for (int view_index = 0; view_index < LNV__MAX; view_index++) {
+        attr_line_t display_value{lnav_view_titles[view_index]};
+        nonstd::optional<size_t> quantity;
+        std::string units;
+
+        switch (view_index) {
+            case LNV_LOG:
+                quantity = lnav_data.ld_log_source.file_count();
+                units = "file";
+                break;
+            case LNV_TEXT:
+                quantity = lnav_data.ld_text_source.size();
+                units = "file";
+                break;
+            case LNV_DB:
+                quantity = lnav_data.ld_db_row_source.dls_rows.size();
+                units = "row";
+                break;
+        }
+
+        if (quantity) {
+            display_value.pad_to(8)
+                .append(" (")
+                .append(lnav::roles::number(
+                    quantity.value() == 0 ? "no"
+                                          : fmt::to_string(quantity.value())))
+                .appendf(FMT_STRING(" {}{})"),
+                         units,
+                         quantity.value() == 1 ? "" : "s");
+        }
+        retval.emplace_back(lnav_view_titles[view_index], display_value);
+    }
+    return retval;
+}
+
+static void
+view_performer(const breadcrumb::crumb::key_t& view_name)
+{
+    auto* view_title_iter = std::find_if(
+        std::begin(lnav_view_titles),
+        std::end(lnav_view_titles),
+        [&](const char* v) {
+            return strcasecmp(v, view_name.get<std::string>().c_str()) == 0;
+        });
+
+    if (view_title_iter != std::end(lnav_view_titles)) {
+        ensure_view(lnav_view_t(view_title_iter - lnav_view_titles));
+    }
+}
+
+std::vector<breadcrumb::crumb>
+lnav_crumb_source()
+{
+    std::vector<breadcrumb::crumb> retval;
+
+    auto top_view_opt = lnav_data.ld_view_stack.top();
+    if (!top_view_opt) {
+        return retval;
+    }
+
+    auto* top_view = top_view_opt.value();
+    auto view_index = top_view - lnav_data.ld_views;
+    retval.emplace_back(
+        lnav_view_titles[view_index],
+        attr_line_t().append(lnav::roles::status_title(
+            fmt::format(FMT_STRING(" {} "), lnav_view_titles[view_index]))),
+        view_title_poss,
+        view_performer);
+
+    auto* tss = top_view->get_sub_source();
+    if (tss != nullptr) {
+        tss->text_crumbs_for_line(top_view->get_top(), retval);
+    }
+
+    return retval;
+}

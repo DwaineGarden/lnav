@@ -1,0 +1,84 @@
+name: lnav
+adopt-info: lnav
+summary: Log File Navigator
+description: |
+  The Log File Navigator, **lnav** for short, is an advanced log file viewer
+  for the small-scale.
+icon: docs/assets/images/favicon.png
+
+base: core20
+grade: stable
+confinement: strict
+
+environment:
+  LOCPATH: $SNAP/usr/lib/locale
+  GIT_TEMPLATE_DIR: $SNAP/usr/share/git-core/templates
+  GIT_EXEC_PATH: $SNAP/usr/lib/git-core
+
+apps:
+  lnav:
+    command: usr/bin/lnav
+    plugs:
+      - home            # optional, allows to read log files from home directory
+      - log-observe     # required, provide access to system logs in /var/log
+      - network         # required, lnav uses sendto() with UNIX domain socket
+      - removable-media
+      - ssh-keys
+      - x11
+
+parts:
+  selective-checkout:
+    source: https://github.com/Lin-Buo-Ren/selective-checkout.git
+    source-tag: v2.0.2
+    plugin: dump
+    build-packages:
+    # Uncomment the VCS your main part is using
+    - git
+    - curl
+    - jq
+    - sed
+
+    #- mercurial
+    #- subversion
+    stage:
+      - scriptlets/selective-checkout
+    prime:
+      - -*
+  lnav:
+    after:
+      - selective-checkout
+    plugin: autotools
+    autotools-configure-parameters:
+      - CFLAGS="-O2"
+      - CXXFLAGS="-O2"
+    source: https://github.com/tstack/lnav.git
+    source-depth: 500
+    override-pull: |
+      snapcraftctl pull
+
+      "$SNAPCRAFT_STAGE"/scriptlets/selective-checkout --debug --force-snapshot
+    build-packages:
+      - build-essential
+      - libarchive-dev
+      - libcurl4-gnutls-dev
+      - libpcre2-dev
+      - libsqlite3-dev
+      - libncursesw6
+      - libreadline-dev
+      - zlib1g-dev
+      - libbz2-dev
+      - libgpm-dev
+    stage-packages:
+      - zlib1g
+      - git-core
+      - libcurl4
+      - libncursesw6
+      - libpcre2-8-0
+      - libgpm2
+      - libarchive13
+      - libicu66
+      - libxml2
+      - locales-all
+      - ssh
+      - tshark
+      - xclip

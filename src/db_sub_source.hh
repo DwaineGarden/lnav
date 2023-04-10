@@ -21,217 +21,124 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef __db_sub_source_hh
-#define __db_sub_source_hh
+#ifndef db_sub_source_hh
+#define db_sub_source_hh
 
+#include <iterator>
 #include <string>
 #include <vector>
-#include <algorithm>
 
-#include "listview_curses.hh"
+#include <sqlite3.h>
+
+#include "ArenaAlloc/arenaalloc.h"
 #include "hist_source.hh"
-#include "log_vtab_impl.hh"
+#include "shlex.resolver.hh"
+#include "textview_curses.hh"
 
-class db_label_source : public hist_source::label_source {
+class db_label_source
+    : public text_sub_source
+    , public text_time_translator {
 public:
-    db_label_source() { };
+    ~db_label_source() override { this->clear(); }
 
-    ~db_label_source() { };
+    bool has_log_time_column() const { return !this->dls_time_column.empty(); }
 
-    size_t hist_label_width() {
+    size_t text_line_count() override { return this->dls_rows.size(); }
+
+    size_t text_size_for_line(textview_curses& tc,
+                              int line,
+                              line_flags_t flags) override
+    {
+        return this->text_line_width(tc);
+    }
+
+    size_t text_line_width(textview_curses& curses) override
+    {
         size_t retval = 0;
 
-        for (std::vector<size_t>::iterator iter = this->dls_column_sizes.begin();
-             iter != this->dls_column_sizes.end();
-             ++iter) {
-            retval += *iter;
+        for (auto& dls_header : this->dls_headers) {
+            retval += dls_header.hm_column_size + 1;
         }
         return retval;
-    };
-
-    void hist_label_for_group(int group, std::string &label_out)
-    {
-        label_out.clear();
-    };
-
-    void hist_label_for_bucket(int bucket_start_value,
-                               const hist_source::bucket_t &bucket,
-                               std::string &label_out)
-    {
-        /*
-         * start_value is the result rowid, each bucket type is a column value
-         * label_out should be the raw text output.
-         */
-
-        label_out.clear();
-        if (bucket_start_value >= (int)this->dls_rows.size()) {
-            return;
-        }
-        for (int lpc = 0; lpc < (int)this->dls_rows[bucket_start_value].size();
-             lpc++) {
-            int padding = (this->dls_column_sizes[lpc] -
-                           strlen(this->dls_rows[bucket_start_value][lpc]) -
-                           1);
-
-            if (this->dls_column_types[lpc] != SQLITE3_TEXT) {
-                label_out.append(padding, ' ');
-            }
-            label_out.append(this->dls_rows[bucket_start_value][lpc]);
-            if (this->dls_column_types[lpc] == SQLITE3_TEXT) {
-                label_out.append(padding, ' ');
-            }
-            label_out.append(1, ' ');
-        }
-    };
-
-    void hist_attrs_for_bucket(int bucket_start_value,
-                               const hist_source::bucket_t &bucket,
-                               string_attrs_t &sa)
-    {
-        struct line_range lr(0, 0);
-        struct line_range lr2(0, -1);
-
-        if (bucket_start_value >= (int)this->dls_rows.size()) {
-            return;
-        }
-        for (size_t lpc = 0; lpc < this->dls_column_sizes.size() - 1; lpc++) {
-            if (bucket_start_value % 2 == 0) {
-                sa.push_back(string_attr(lr2, &view_curses::VC_STYLE, A_BOLD));
-            }
-            lr.lr_start += this->dls_column_sizes[lpc] - 1;
-            lr.lr_end    = lr.lr_start + 1;
-            sa.push_back(string_attr(lr, &view_curses::VC_GRAPHIC, ACS_VLINE));
-            lr.lr_start += 1;
-        }
     }
 
-    /* TODO: add support for left and right justification... numbers should */
-    /* be right justified and strings should be left. */
-    void push_column(const char *colstr)
+    void text_value_for_line(textview_curses& tc,
+                             int row,
+                             std::string& label_out,
+                             line_flags_t flags) override;
+
+    void text_attrs_for_line(textview_curses& tc,
+                             int row,
+                             string_attrs_t& sa) override;
+
+    void push_header(const std::string& colstr, int type, bool graphable);
+
+    void push_column(const scoped_value_t& sv);
+
+    void clear();
+
+    nonstd::optional<size_t> column_name_to_index(
+        const std::string& name) const;
+
+    nonstd::optional<vis_line_t> row_for_time(
+        struct timeval time_bucket) override;
+
+    nonstd::optional<struct timeval> time_for_row(vis_line_t row) override
     {
-        int index = this->dls_rows.back().size();
-
-        if (colstr == NULL) {
-            colstr = NULL_STR;
-        }
-        else {
-            colstr = strdup(colstr);
-            if (colstr == NULL) {
-                throw "out of memory";
-            }
+        if ((row < 0_vl) || (((size_t) row) >= this->dls_time_column.size())) {
+            return nonstd::nullopt;
         }
 
-        this->dls_rows.back().push_back(colstr);
-        if (this->dls_rows.back().size() > this->dls_column_sizes.size()) {
-            this->dls_column_sizes.push_back(1);
+        return this->dls_time_column[row];
+    }
+
+    struct header_meta {
+        explicit header_meta(std::string name) : hm_name(std::move(name)) {}
+
+        bool operator==(const std::string& name) const
+        {
+            return this->hm_name == name;
         }
-        this->dls_column_sizes[index] =
-            std::max(this->dls_column_sizes[index], strlen(colstr) + 1);
+
+        std::string hm_name;
+        int hm_column_type{SQLITE3_TEXT};
+        unsigned int hm_sub_type{0};
+        bool hm_graphable{false};
+        size_t hm_column_size{0};
+        text_attrs hm_title_attrs;
     };
 
-    void push_header(const std::string &colstr, int type, bool graphable)
-    {
-        int index = this->dls_headers.size();
+    stacked_bar_chart<std::string> dls_chart;
+    std::vector<header_meta> dls_headers;
+    std::vector<std::vector<const char*>> dls_rows;
+    std::vector<struct timeval> dls_time_column;
+    std::vector<size_t> dls_cell_width;
+    int dls_time_column_index{-1};
+    nonstd::optional<size_t> dls_time_column_invalidated_at;
+    std::unique_ptr<ArenaAlloc::Alloc<char>> dls_allocator{
+        std::make_unique<ArenaAlloc::Alloc<char>>(64 * 1024)};
 
-        this->dls_headers.push_back(colstr);
-        if (this->dls_headers.size() > this->dls_column_sizes.size()) {
-            this->dls_column_sizes.push_back(1);
-        }
-        this->dls_column_sizes[index] =
-            std::max(this->dls_column_sizes[index], colstr.length() + 1);
-        this->dls_column_types.push_back(type);
-        this->dls_headers_to_graph.push_back(graphable);
-    }
-
-    void clear(void)
-    {
-        this->dls_headers.clear();
-        this->dls_headers_to_graph.clear();
-        this->dls_column_types.clear();
-        for (size_t row = 0; row < this->dls_rows.size(); row++) {
-            for (size_t col = 0; col < this->dls_rows[row].size(); col++) {
-                if (this->dls_rows[row][col] != NULL_STR) {
-                    free((void *)this->dls_rows[row][col]);
-                }
-            }
-        }
-        this->dls_rows.clear();
-        this->dls_column_sizes.clear();
-    }
-
-    std::string dls_stmt_str;
-    std::vector<std::string> dls_headers;
-    std::vector<int>         dls_headers_to_graph;
-    std::vector<int>         dls_column_types;
-    std::vector<std::vector<const char *> > dls_rows;
-    std::vector<size_t> dls_column_sizes;
-
-    static const char *NULL_STR;
+    static const char NULL_STR[];
 };
 
 class db_overlay_source : public list_overlay_source {
 public:
-    db_overlay_source() : dos_labels(NULL), dos_hist_source(NULL) { };
+    size_t list_overlay_count(const listview_curses& lv);
 
-    size_t list_overlay_count(const listview_curses &lv)
-    {
-        return 1;
-    };
+    bool list_value_for_overlay(const listview_curses& lv,
+                                int y,
+                                int bottom,
+                                vis_line_t row,
+                                attr_line_t& value_out) override;
 
-    bool list_value_for_overlay(const listview_curses &lv,
-                                vis_line_t y,
-                                attr_line_t &value_out)
-    {
-        view_colors &vc = view_colors::singleton();
-
-        if (y != 0) {
-            return false;
-        }
-
-        std::string &    line = value_out.get_string();
-        db_label_source *dls  = this->dos_labels;
-        string_attrs_t &sa = value_out.get_attrs();
-
-        for (size_t lpc = 0;
-             lpc < this->dos_labels->dls_column_sizes.size();
-             lpc++) {
-            int before, total_fill =
-                dls->dls_column_sizes[lpc] - dls->dls_headers[lpc].length();
-
-            struct line_range header_range(line.length(),
-                                           line.length() + dls->dls_column_sizes[lpc]);
-
-            int attrs =
-                vc.attrs_for_role(this->dos_hist_source->get_role_for_type(
-                                      bucket_type_t(
-                                          lpc)))
-                | A_UNDERLINE;
-            if (!this->dos_labels->dls_headers_to_graph[lpc]) {
-                attrs = A_UNDERLINE;
-            }
-            sa.push_back(string_attr(header_range, &view_curses::VC_STYLE, attrs));
-
-            before      = total_fill / 2;
-            total_fill -= before;
-            line.append(before, ' ');
-            line.append(dls->dls_headers[lpc]);
-            line.append(total_fill, ' ');
-        }
-
-        struct line_range lr(0);
-
-        sa.push_back(string_attr(lr, &view_curses::VC_STYLE, A_BOLD | A_UNDERLINE));
-
-        return true;
-    };
-
-    db_label_source *dos_labels;
-    hist_source *    dos_hist_source;
+    bool dos_active{false};
+    db_label_source* dos_labels{nullptr};
+    std::vector<attr_line_t> dos_lines;
 };
 #endif

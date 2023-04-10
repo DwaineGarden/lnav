@@ -21,60 +21,220 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * @file statusview_curses.cc
  */
 
-#include "config.h"
+#include <algorithm>
+#include <vector>
 
 #include "statusview_curses.hh"
 
-using namespace std;
+#include "base/ansi_scrubber.hh"
+#include "config.h"
 
-void statusview_curses::do_update(void)
+void
+status_field::set_value(std::string value)
 {
-    int           top, attrs, field, field_count, left = 1, right;
-    view_colors & vc = view_colors::singleton();
+    auto& sa = this->sf_value.get_attrs();
+
+    sa.clear();
+
+    scrub_ansi_string(value, &sa);
+    this->sf_value.with_string(value);
+}
+
+void
+status_field::do_cylon()
+{
+    auto& sa = this->sf_value.get_attrs();
+
+    remove_string_attr(sa, &VC_STYLE);
+
+    auto cycle_pos = (this->sf_cylon_pos % (4 + this->sf_width * 2)) - 2;
+    auto start = cycle_pos < this->sf_width
+        ? cycle_pos
+        : (this->sf_width - (cycle_pos - this->sf_width) - 1);
+    auto stop = std::min(start + 3, this->sf_width);
+    struct line_range lr(std::max<long>(start, 0L), stop);
+    auto& vc = view_colors::singleton();
+
+    auto attrs = vc.attrs_for_role(role_t::VCR_ACTIVE_STATUS);
+    attrs.ta_attrs |= A_REVERSE;
+    sa.emplace_back(lr, VC_STYLE.value(attrs));
+
+    this->sf_cylon_pos += 1;
+}
+
+void
+status_field::set_stitch_value(role_t left, role_t right)
+{
+    auto& sa = this->sf_value.get_attrs();
+    struct line_range lr(0, 1);
+
+    this->sf_value.get_string() = "::";
+    sa.clear();
+    sa.emplace_back(lr, VC_ROLE.value(left));
+    lr.lr_start = 1;
+    lr.lr_end = 2;
+    sa.emplace_back(lr, VC_ROLE.value(right));
+}
+
+void
+statusview_curses::do_update()
+{
+    int top, field, field_count, left = 0, right;
+    auto& vc = view_colors::singleton();
     unsigned long width, height;
 
-    getmaxyx(this->sc_window, height, width);
-    top   = this->sc_top < 0 ? height + this->sc_top : this->sc_top;
-    right = width;
-    attrs = vc.attrs_for_role(view_colors::VCR_STATUS);
+    if (!this->vc_visible || this->sc_window == nullptr) {
+        return;
+    }
 
-    wattron(this->sc_window, attrs);
+    getmaxyx(this->sc_window, height, width);
+    this->window_change();
+
+    top = this->sc_top < 0 ? height + this->sc_top : this->sc_top;
+    right = width;
+    auto attrs = vc.attrs_for_role(
+        this->sc_enabled ? this->sc_default_role : role_t::VCR_INACTIVE_STATUS);
+
+    auto pair = vc.ensure_color_pair(attrs.ta_fg_color, attrs.ta_bg_color);
+    wattr_set(this->sc_window, attrs.ta_attrs, pair, nullptr);
     wmove(this->sc_window, top, 0);
     wclrtoeol(this->sc_window);
     whline(this->sc_window, ' ', width);
-    wattroff(this->sc_window, attrs);
 
-    field_count = this->sc_source->statusview_fields();
-    for (field = 0; field < field_count; field++) {
-        status_field &sf = this->sc_source->statusview_value_for_field(
-            field);
-        struct line_range lr(0, sf.get_width());
-        attr_line_t       val;
-        int x;
+    if (this->sc_source != nullptr) {
+        field_count = this->sc_source->statusview_fields();
+        for (field = 0; field < field_count; field++) {
+            auto& sf = this->sc_source->statusview_value_for_field(field);
+            struct line_range lr(0, sf.get_width());
+            int x;
 
-        val = sf.get_value();
+            if (sf.is_cylon()) {
+                sf.do_cylon();
+            }
+            auto val = sf.get_value();
+            if (!this->sc_enabled) {
+                for (auto& sa : val.get_attrs()) {
+                    if (sa.sa_type == &VC_STYLE) {
+                        auto sa_attrs = sa.sa_value.get<text_attrs>();
+                        sa_attrs.ta_attrs &= ~(A_REVERSE | A_COLOR);
+                        sa_attrs.ta_fg_color = nonstd::nullopt;
+                        sa_attrs.ta_bg_color = nonstd::nullopt;
+                        sa.sa_value = sa_attrs;
+                    } else if (sa.sa_type == &VC_ROLE) {
+                        if (sa.sa_value.get<role_t>()
+                            == role_t::VCR_ALERT_STATUS)
+                        {
+                            sa.sa_value.get<role_t>()
+                                = role_t::VCR_INACTIVE_ALERT_STATUS;
+                        } else {
+                            sa.sa_value = role_t::VCR_NONE;
+                        }
+                    }
+                }
+            }
+            if (sf.get_left_pad() > 0) {
+                val.insert(0, sf.get_left_pad(), ' ');
+            }
 
-        if (sf.is_right_justified()) {
-            right -= sf.get_width();
-            x      = right;
+            if (sf.is_right_justified()) {
+                val.right_justify(sf.get_width());
+
+                right -= sf.get_width();
+                x = right;
+            } else {
+                x = left;
+                left += sf.get_width();
+            }
+
+            if (val.length() > sf.get_width()) {
+                static const std::string ELLIPSIS = "\xE2\x8B\xAF";
+
+                if (sf.get_width() > 11) {
+                    size_t half_width = sf.get_width() / 2 - 1;
+
+                    val.erase(half_width, val.length() - (half_width * 2));
+                    val.insert(half_width, ELLIPSIS);
+                } else {
+                    val = val.subline(0, sf.get_width() - 1);
+                    val.append(ELLIPSIS);
+                }
+            }
+
+            auto default_role = sf.get_role();
+            if (!this->sc_enabled) {
+                if (default_role == role_t::VCR_ALERT_STATUS) {
+                    default_role = role_t::VCR_INACTIVE_ALERT_STATUS;
+                } else if (default_role != role_t::VCR_STATUS_INFO) {
+                    default_role = role_t::VCR_INACTIVE_STATUS;
+                }
+            }
+
+            mvwattrline(this->sc_window, top, x, val, lr, default_role);
         }
-        else {
-            x     = left;
-            left += sf.get_width() + 1;
-        }
-        this->mvwattrline(this->sc_window,
-                          top, x,
-                          val,
-                          lr,
-                          sf.get_role());
     }
     wmove(this->sc_window, top + 1, 0);
+}
+
+void
+statusview_curses::window_change()
+{
+    if (this->sc_source == nullptr) {
+        return;
+    }
+
+    int field_count = this->sc_source->statusview_fields();
+    int total_shares = 0;
+    unsigned long width, height;
+    double remaining = 0;
+    std::vector<status_field*> resizable;
+
+    getmaxyx(this->sc_window, height, width);
+    // Silence the compiler. Remove this if height is used at a later stage.
+    (void) height;
+    remaining = width - 2;
+
+    for (int field = 0; field < field_count; field++) {
+        auto& sf = this->sc_source->statusview_value_for_field(field);
+
+        remaining -= sf.get_share() ? sf.get_min_width() : sf.get_width();
+        total_shares += sf.get_share();
+        if (sf.get_share()) {
+            resizable.emplace_back(&sf);
+        }
+    }
+
+    if (remaining < 2) {
+        remaining = 0;
+    }
+
+    std::stable_sort(begin(resizable), end(resizable), [](auto l, auto r) {
+        return r->get_share() < l->get_share();
+    });
+    for (auto* sf : resizable) {
+        double divisor = total_shares / sf->get_share();
+        int available = remaining / divisor;
+        int actual_width;
+
+        if ((sf->get_left_pad() + sf->get_value().length())
+            < (sf->get_min_width() + available))
+        {
+            actual_width = std::max(
+                (int) sf->get_min_width(),
+                (int) (sf->get_left_pad() + sf->get_value().length()));
+        } else {
+            actual_width = sf->get_min_width() + available;
+        }
+        remaining -= (actual_width - sf->get_min_width());
+        total_shares -= sf->get_share();
+
+        sf->set_width(actual_width);
+    }
 }

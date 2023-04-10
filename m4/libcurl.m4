@@ -5,11 +5,11 @@
 #                            | (__| |_| |  _ <| |___
 #                             \___|\___/|_| \_\_____|
 #
-# Copyright (C) 2006, David Shaw <dshaw@jabberwocky.com>
+# Copyright (C) 2006 - 2020, David Shaw <dshaw@jabberwocky.com>
 #
 # This software is licensed as described in the file COPYING, which
 # you should have received as part of this distribution. The terms
-# are also available at http://curl.haxx.se/docs/copyright.html.
+# are also available at https://curl.se/docs/copyright.html.
 #
 # You may opt to use, copy, modify, merge, publish, distribute and/or sell
 # copies of the Software, and permit persons to whom the Software is
@@ -82,7 +82,7 @@ AC_DEFUN([LIBCURL_CHECK_CONFIG],
   AH_TEMPLATE([LIBCURL_PROTOCOL_SMTP],[Defined if libcurl supports SMTP])
 
   AC_ARG_WITH(libcurl,
-     AC_HELP_STRING([--with-libcurl=PREFIX],[look for the curl library in PREFIX/lib and headers in PREFIX/include]),
+     AS_HELP_STRING([--with-libcurl=PREFIX],[look for the curl library in PREFIX/lib and headers in PREFIX/include]),
      [_libcurl_with=$withval],[_libcurl_with=ifelse([$1],,[yes],[$1])])
 
   if test "$_libcurl_with" != "no" ; then
@@ -128,7 +128,14 @@ AC_DEFUN([LIBCURL_CHECK_CONFIG],
            fi
            if test x"$LIBCURL" = "x" ; then
               if $5; then
-                 LIBCURL=`$_libcurl_config --static-libs`
+                 case "$host_os" in
+                 darwin*)
+                    LIBCURL=`$_libcurl_config --libs`
+                    ;;
+                 *)
+                    LIBCURL=`$_libcurl_config --static-libs`
+                    ;;
+                 esac
               else
                  LIBCURL=`$_libcurl_config --libs`
               fi
@@ -178,7 +185,7 @@ AC_DEFUN([LIBCURL_CHECK_CONFIG],
 
         # we didn't find curl-config, so let's see if the user-supplied
         # link line (or failing that, "-lcurl") is enough.
-        LIBCURL=${LIBCURL-"$_libcurl_ldflags -lcurl"}
+        # LIBCURL=${LIBCURL-"$_libcurl_ldflags -lcurl"}
 
         AC_CACHE_CHECK([whether libcurl is usable],
            [libcurl_cv_lib_curl_usable],
@@ -186,7 +193,7 @@ AC_DEFUN([LIBCURL_CHECK_CONFIG],
            _libcurl_save_cppflags=$CPPFLAGS
            CPPFLAGS="$LIBCURL_CPPFLAGS $CPPFLAGS"
            _libcurl_save_libs=$LIBS
-           LIBS="$LIBCURL $LIBS"
+           LIBS="$_libcurl_ldflags $LIBCURL $LIBS"
 
            AC_LINK_IFELSE([AC_LANG_PROGRAM([[#include <curl/curl.h>]],[[
 /* Try and use a few common options to force a failure if we are
@@ -199,7 +206,7 @@ x=CURLOPT_WRITEDATA;
 x=CURLOPT_ERRORBUFFER;
 x=CURLOPT_STDERR;
 x=CURLOPT_VERBOSE;
-if (x) ;
+if (x) {;}
 ]])],libcurl_cv_lib_curl_usable=yes,libcurl_cv_lib_curl_usable=no)
 
            CPPFLAGS=$_libcurl_save_cppflags
@@ -217,6 +224,7 @@ if (x) ;
            CPPFLAGS="$CPPFLAGS $LIBCURL_CPPFLAGS"
            _libcurl_save_libs=$LIBS
            LIBS="$LIBS $LIBCURL"
+           LDFLAGS="$_libcurl_ldflags $LDFLAGS"
 
            AC_CHECK_FUNC(curl_free,,
               AC_DEFINE(curl_free,free,

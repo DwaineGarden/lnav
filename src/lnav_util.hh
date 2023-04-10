@@ -21,8 +21,8 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
@@ -31,280 +31,211 @@
  * Dumping ground for useful functions with no other home.
  */
 
-#ifndef __lnav_util_hh
-#define __lnav_util_hh
+#ifndef lnav_util_hh
+#define lnav_util_hh
 
-#include <math.h>
-#include <time.h>
-#include <sys/time.h>
-#include <poll.h>
-#include <sys/types.h>
-
-#include "spookyhash/SpookyV2.h"
-
+#include <future>
+#include <iterator>
+#include <numeric>
 #include <string>
+#include <type_traits>
 #include <vector>
 
-#include "ptimec.hh"
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <time.h>
+
+#include "base/auto_mem.hh"
+#include "base/intern_string.hh"
+#include "base/lnav.console.hh"
+#include "base/result.h"
 #include "byte_array.hh"
-
-inline std::string trim(const std::string &str)
-{
-    std::string::size_type start, end;
-
-    for (start = 0; start < str.size() && isspace(str[start]); start++);
-    for (end = str.size(); end > 0 && isspace(str[end - 1]); end--);
-
-    return str.substr(start, end - start);
-}
-
-size_t unquote(char *dst, const char *str, size_t len);
-
-#undef rounddown
-
-/**
- * Round down a number based on a given granularity.
- *
- * @param
- * @param step The granularity.
- */
-inline int rounddown(size_t size, int step)
-{
-    return size - (size % step);
-}
-
-inline int rounddown_offset(size_t size, int step, int offset)
-{
-    return size - ((size - offset) % step);
-}
-
-inline int roundup_size(size_t size, int step)
-{
-    int retval = size + step;
-
-    retval -= (retval % step);
-
-    return retval;
-}
-
-inline int32_t read_le32(const unsigned char *data)
-{
-    return (
-        (data[0] <<  0) |
-        (data[1] <<  8) |
-        (data[2] << 16) |
-        (data[3] << 24));
-}
-
-inline time_t day_num(time_t ti)
-{
-    return ti / (24 * 60 * 60);
-}
-
-inline time_t hour_num(time_t ti)
-{
-    return ti / (60 * 60);
-}
-
-std::string time_ago(time_t last_time);
-
-typedef int64_t mstime_t;
-
-inline mstime_t getmstime() {
-    struct timeval tv;
-
-    gettimeofday(&tv, NULL);
-
-    return tv.tv_sec * 1000ULL + tv.tv_usec / 1000ULL;
-}
+#include "config.h"
+#include "fmt/format.h"
+#include "optional.hpp"
+#include "ptimec.hh"
+#include "spookyhash/SpookyV2.h"
 
 #if SIZEOF_OFF_T == 8
-#define FORMAT_OFF_T    "%qd"
+#    define FORMAT_OFF_T "%lld"
 #elif SIZEOF_OFF_T == 4
-#define FORMAT_OFF_T    "%ld"
+#    define FORMAT_OFF_T "%ld"
 #else
-#error "off_t has unhandled size..."
+#    error "off_t has unhandled size..."
 #endif
 
-struct hash_updater {
-    hash_updater(SpookyHash *context) : su_context(context) { };
+class hasher {
+public:
+    using array_t = byte_array<2, uint64_t>;
+    static constexpr size_t STRING_SIZE = array_t::STRING_SIZE;
 
-    void operator()(const std::string &str)
+    hasher() { this->h_context.Init(0, 0); }
+
+    hasher& update(const std::string& str)
     {
-        this->su_context->Update(str.c_str(), str.length());
+        this->h_context.Update(str.data(), str.length());
+
+        return *this;
     }
 
-    SpookyHash *su_context;
-};
-
-std::string hash_string(const std::string &str);
-
-template<typename UnaryFunction, typename Member>
-struct object_field_t {
-    object_field_t(UnaryFunction &func, Member &mem)
-        : of_func(func), of_mem(mem) {};
-
-    template<typename Object>
-    void operator()(Object obj)
+    hasher& update(const string_fragment& str)
     {
-        this->of_func(obj.*(this->of_mem));
-    };
+        this->h_context.Update(str.data(), str.length());
 
-    UnaryFunction &of_func;
-    Member         of_mem;
-};
-
-template<typename UnaryFunction, typename Member>
-object_field_t<UnaryFunction, Member> object_field(UnaryFunction &func,
-                                                   Member mem)
-{
-    return object_field_t<UnaryFunction, Member>(func, mem);
-}
-
-/* XXX figure out how to do this with the template */
-void sqlite_close_wrapper(void *mem);
-
-std::string get_current_dir(void);
-
-bool change_to_parent_dir(void);
-
-enum file_format_t {
-    FF_UNKNOWN,
-    FF_SQLITE_DB,
-};
-
-file_format_t detect_file_format(const std::string &filename);
-
-bool next_format(const char * const fmt[], int &index, int &locked_index);
-
-inline bool is_glob(const char *fn)
-{
-    return (strchr(fn, '*') != NULL ||
-            strchr(fn, '?') != NULL ||
-            strchr(fn, '[') != NULL);
-};
-
-bool is_url(const char *fn);
-
-inline bool startswith(const char *str, const char *prefix)
-{
-    return strncmp(str, prefix, strlen(prefix)) == 0;
-}
-
-inline bool startswith(std::string str, const char *prefix)
-{
-    return startswith(str.c_str(), prefix);
-}
-
-inline bool endswith(const char *str, const char *suffix)
-{
-    size_t len = strlen(str), suffix_len = strlen(suffix);
-
-    if (suffix_len > len) {
-        return false;
+        return *this;
     }
 
-    return strcmp(&str[len - suffix_len], suffix) == 0;
+    hasher& update(const char* bits, size_t len)
+    {
+        this->h_context.Update(bits, len);
+
+        return *this;
+    }
+
+    hasher& update(int64_t value)
+    {
+        value = SPOOKYHASH_LITTLE_ENDIAN_64(value);
+        this->h_context.Update(&value, sizeof(value));
+
+        return *this;
+    }
+
+    array_t to_array()
+    {
+        uint64_t h1;
+        uint64_t h2;
+        array_t retval;
+
+        this->h_context.Final(&h1, &h2);
+        *retval.out(0) = SPOOKYHASH_LITTLE_ENDIAN_64(h1);
+        *retval.out(1) = SPOOKYHASH_LITTLE_ENDIAN_64(h2);
+        return retval;
+    }
+
+    void to_string(auto_buffer& buf)
+    {
+        array_t bits = this->to_array();
+
+        bits.to_string(std::back_inserter(buf));
+    }
+
+    std::string to_string()
+    {
+        array_t bits = this->to_array();
+        return bits.to_string();
+    }
+
+    std::string to_uuid_string()
+    {
+        array_t bits = this->to_array();
+        return bits.to_uuid_string();
+    }
+
+private:
+    SpookyHash h_context;
+};
+
+bool change_to_parent_dir();
+
+bool next_format(const char* const fmt[], int& index, int& locked_index);
+
+namespace std {
+inline string
+to_string(const string& s)
+{
+    return s;
+}
+inline string
+to_string(const char* s)
+{
+    return s;
+}
+}  // namespace std
+
+inline bool
+is_glob(const std::string& fn)
+{
+    return (fn.find('*') != std::string::npos
+            || fn.find('?') != std::string::npos
+            || fn.find('[') != std::string::npos);
 }
 
-std::string build_path(const std::vector<std::string> &paths);
+inline void
+rusagesub(const struct rusage& left,
+          const struct rusage& right,
+          struct rusage& diff_out)
+{
+    timersub(&left.ru_utime, &right.ru_utime, &diff_out.ru_utime);
+    timersub(&left.ru_stime, &right.ru_stime, &diff_out.ru_stime);
+    diff_out.ru_maxrss = left.ru_maxrss - right.ru_maxrss;
+    diff_out.ru_ixrss = left.ru_ixrss - right.ru_ixrss;
+    diff_out.ru_idrss = left.ru_idrss - right.ru_idrss;
+    diff_out.ru_isrss = left.ru_isrss - right.ru_isrss;
+    diff_out.ru_minflt = left.ru_minflt - right.ru_minflt;
+    diff_out.ru_majflt = left.ru_majflt - right.ru_majflt;
+    diff_out.ru_nswap = left.ru_nswap - right.ru_nswap;
+    diff_out.ru_inblock = left.ru_inblock - right.ru_inblock;
+    diff_out.ru_oublock = left.ru_oublock - right.ru_oublock;
+    diff_out.ru_msgsnd = left.ru_msgsnd - right.ru_msgsnd;
+    diff_out.ru_msgrcv = left.ru_msgrcv - right.ru_msgrcv;
+    diff_out.ru_nvcsw = left.ru_nvcsw - right.ru_nvcsw;
+    diff_out.ru_nivcsw = left.ru_nivcsw - right.ru_nivcsw;
+}
 
-/**
- * Convert the time stored in a 'tm' struct into epoch time.
- *
- * @param t The 'tm' structure to convert to epoch time.
- * @return The given time in seconds since the epoch.
- */
-time_t tm2sec(const struct tm *t);
+inline void
+rusageadd(const struct rusage& left,
+          const struct rusage& right,
+          struct rusage& diff_out)
+{
+    timeradd(&left.ru_utime, &right.ru_utime, &diff_out.ru_utime);
+    timeradd(&left.ru_stime, &right.ru_stime, &diff_out.ru_stime);
+    diff_out.ru_maxrss = left.ru_maxrss + right.ru_maxrss;
+    diff_out.ru_ixrss = left.ru_ixrss + right.ru_ixrss;
+    diff_out.ru_idrss = left.ru_idrss + right.ru_idrss;
+    diff_out.ru_isrss = left.ru_isrss + right.ru_isrss;
+    diff_out.ru_minflt = left.ru_minflt + right.ru_minflt;
+    diff_out.ru_majflt = left.ru_majflt + right.ru_majflt;
+    diff_out.ru_nswap = left.ru_nswap + right.ru_nswap;
+    diff_out.ru_inblock = left.ru_inblock + right.ru_inblock;
+    diff_out.ru_oublock = left.ru_oublock + right.ru_oublock;
+    diff_out.ru_msgsnd = left.ru_msgsnd + right.ru_msgsnd;
+    diff_out.ru_msgrcv = left.ru_msgrcv + right.ru_msgrcv;
+    diff_out.ru_nvcsw = left.ru_nvcsw + right.ru_nvcsw;
+    diff_out.ru_nivcsw = left.ru_nivcsw + right.ru_nivcsw;
+}
 
-struct tm *secs2tm(time_t *tim_p, struct tm *res);
+bool is_dev_null(const struct stat& st);
+bool is_dev_null(int fd);
 
-extern const char *std_time_fmt[];
-
-struct date_time_scanner {
-    date_time_scanner() : dts_keep_base_tz(false),
-                          dts_local_time(false),
-                          dts_local_offset_cache(0),
-                          dts_local_offset_valid(0),
-                          dts_local_offset_expiry(0) {
-        this->clear();
-    };
-
-    void clear(void) {
-        this->dts_base_time = 0;
-        memset(&this->dts_base_tm, 0, sizeof(this->dts_base_tm));
-        this->dts_fmt_lock = -1;
-        this->dts_fmt_len = -1;
-    };
-
-    void set_base_time(time_t base_time) {
-        this->dts_base_time = base_time;
-        localtime_r(&base_time, &this->dts_base_tm.et_tm);
-    };
-
-    /**
-     * Convert a timestamp to local time.
-     *
-     * Calling localtime_r is slow since it wants to lookup the timezone on
-     * every call, so we cache the result and only call it again if the
-     * requested time falls outside of a fifteen minute range.
-     */
-    void to_localtime(time_t t, struct exttm &tm_out) {
-        if (t < this->dts_local_offset_valid ||
-                t >= this->dts_local_offset_expiry) {
-            time_t new_gmt;
-
-            localtime_r(&t, &tm_out.et_tm);
-#ifdef HAVE_STRUCT_TM_TM_ZONE
-            tm_out.et_tm.tm_zone = NULL;
-#endif
-            tm_out.et_tm.tm_isdst = 0;
-
-            new_gmt = tm2sec(&tm_out.et_tm);
-            this->dts_local_offset_cache = t - new_gmt;
-            this->dts_local_offset_valid = t;
-            this->dts_local_offset_expiry = t + (EXPIRE_TIME - 1);
-            this->dts_local_offset_expiry -=
-                    this->dts_local_offset_expiry % EXPIRE_TIME;
-        }
-        else {
-            time_t adjust_gmt = t - this->dts_local_offset_cache;
-            gmtime_r(&adjust_gmt, &tm_out.et_tm);
-        }
-    };
-
-    bool dts_keep_base_tz;
-    bool dts_local_time;
-    time_t dts_base_time;
-    struct exttm dts_base_tm;
-    int dts_fmt_lock;
-    int dts_fmt_len;
-    time_t dts_local_offset_cache;
-    time_t dts_local_offset_valid;
-    time_t dts_local_offset_expiry;
-
-    static const int EXPIRE_TIME = 15 * 60;
-
-    const char *scan(const char *time_src,
-                     size_t time_len,
-                     const char * const time_fmt[],
-                     struct exttm *tm_out,
-                     struct timeval &tv_out);
+template<typename A>
+struct final_action {  // slightly simplified
+    A act;
+    final_action(A a) : act{a} {}
+    ~final_action() { act(); }
 };
+
+template<typename A>
+final_action<A>
+finally(A act)  // deduce action type
+{
+    return final_action<A>{act};
+}
+
+void write_line_to(FILE* outfile, const attr_line_t& al);
+
+namespace lnav {
+
+std::string to_json(const std::string& str);
+std::string to_json(const lnav::console::user_message& um);
+std::string to_json(const attr_line_t& al);
 
 template<typename T>
-size_t strtonum(T &num_out, const char *data, size_t len);
+Result<T, std::vector<lnav::console::user_message>> from_json(
+    const std::string& json);
 
-inline bool pollfd_ready(const std::vector<struct pollfd> &pollfds, int fd, short events = POLLIN|POLLHUP) {
-    for (std::vector<struct pollfd>::const_iterator iter = pollfds.begin();
-            iter != pollfds.end();
-            ++iter) {
-        if (iter->fd == fd && iter->revents & events) {
-            return true;
-        }
-    }
-
-    return false;
-};
+}  // namespace lnav
 
 #endif

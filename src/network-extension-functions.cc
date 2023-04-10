@@ -21,139 +21,146 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * @file nextwork-extension-functions.cc
  */
 
-#include "config.h"
-
-#include <stdio.h>
-
-#include <assert.h>
-#include <errno.h>
-#include <string.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netdb.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <string.h>
+#include <sys/socket.h>
 
+#include "base/auto_mem.hh"
+#include "config.h"
+#include "sqlite-extension-func.hh"
 #include "sqlite3.h"
+#include "vtab_module.hh"
 
-#include "auto_mem.hh"
-#include "sqlite-extension-func.h"
-
-static void sql_gethostbyname(sqlite3_context *context,
-                              int argc, sqlite3_value **argv)
+static std::string
+sql_gethostbyname(const char* name_in)
 {
-    char             buffer[INET6_ADDRSTRLEN];
-    const char *     name_in;
+    char buffer[INET6_ADDRSTRLEN];
     auto_mem<struct addrinfo> ai(freeaddrinfo);
-    void *           addr_ptr = NULL;
+    void* addr_ptr = nullptr;
+    struct addrinfo hints;
     int rc;
 
-    assert(argc >= 1 && argc <= 2);
+    memset(&hints, 0, sizeof(hints));
+    for (auto family : {AF_INET, AF_INET6}) {
+        hints.ai_family = family;
+        while ((rc = getaddrinfo(name_in, nullptr, &hints, ai.out()))
+               == EAI_AGAIN)
+        {
+            sqlite3_sleep(10);
+        }
+        if (rc != 0) {
+            return name_in;
+        }
 
-    if (sqlite3_value_type(argv[0]) == SQLITE_NULL) {
-        sqlite3_result_null(context);
-        return;
-    }
+        switch (ai.in()->ai_family) {
+            case AF_INET:
+                addr_ptr = &((struct sockaddr_in*) ai.in()->ai_addr)->sin_addr;
+                break;
 
-    name_in = (const char *)sqlite3_value_text(argv[0]);
-    while ((rc = getaddrinfo(name_in, NULL, NULL, ai.out())) == EAI_AGAIN) {
-        sqlite3_sleep(10);
-    }
-    if (rc != 0) {
-        sqlite3_result_text(context, name_in, -1, SQLITE_TRANSIENT);
-        return;
-    }
+            case AF_INET6:
+                addr_ptr
+                    = &((struct sockaddr_in6*) ai.in()->ai_addr)->sin6_addr;
+                break;
 
-    switch (ai.in()->ai_family) {
-    case AF_INET:
-        addr_ptr = &((struct sockaddr_in *)ai.in()->ai_addr)->sin_addr;
+            default:
+                return name_in;
+        }
+
+        inet_ntop(ai.in()->ai_family, addr_ptr, buffer, sizeof(buffer));
         break;
-
-    case AF_INET6:
-        addr_ptr = &((struct sockaddr_in6 *)ai.in()->ai_addr)->sin6_addr;
-        break;
-
-    default:
-        sqlite3_result_error(context, "unknown address family", -1);
-        return;
     }
 
-    inet_ntop(ai.in()->ai_family, addr_ptr, buffer, sizeof(buffer));
-
-    sqlite3_result_text(context, buffer, -1, SQLITE_TRANSIENT);
+    return buffer;
 }
 
-static void sql_gethostbyaddr(sqlite3_context *context,
-                              int argc, sqlite3_value **argv)
+static std::string
+sql_gethostbyaddr(const char* addr_str)
 {
     union {
-        struct sockaddr_in  sin;
+        struct sockaddr_in sin;
         struct sockaddr_in6 sin6;
-    }           sa;
-    const char *addr_str;
-    char        buffer[NI_MAXHOST];
-    int         family, socklen;
-    char *      addr_raw;
-    int         rc;
-
-    assert(argc == 1);
-
-    if (sqlite3_value_type(argv[0]) == SQLITE_NULL) {
-        sqlite3_result_null(context);
-        return;
-    }
-
-    addr_str = (const char *)sqlite3_value_text(argv[0]);
+    } sa;
+    char buffer[NI_MAXHOST];
+    int family, socklen;
+    char* addr_raw;
+    int rc;
 
     memset(&sa, 0, sizeof(sa));
     if (strchr(addr_str, ':')) {
-        family              = AF_INET6;
-        socklen             = sizeof(struct sockaddr_in6);
+        family = AF_INET6;
+        socklen = sizeof(struct sockaddr_in6);
         sa.sin6.sin6_family = family;
-        addr_raw            = (char *)&sa.sin6.sin6_addr;
-    }
-    else {
-        family            = AF_INET;
-        socklen           = sizeof(struct sockaddr_in);
+        addr_raw = (char*) &sa.sin6.sin6_addr;
+    } else {
+        family = AF_INET;
+        socklen = sizeof(struct sockaddr_in);
         sa.sin.sin_family = family;
-        addr_raw          = (char *)&sa.sin.sin_addr;
+        addr_raw = (char*) &sa.sin.sin_addr;
     }
 
     if (inet_pton(family, addr_str, addr_raw) != 1) {
-        sqlite3_result_text(context, addr_str, -1, SQLITE_TRANSIENT);
-        return;
+        return addr_str;
     }
 
-    while ((rc = getnameinfo((struct sockaddr *)&sa, socklen,
-                             buffer, sizeof(buffer), NULL, 0,
-                             0)) == EAI_AGAIN) {
+    while ((rc = getnameinfo((struct sockaddr*) &sa,
+                             socklen,
+                             buffer,
+                             sizeof(buffer),
+                             NULL,
+                             0,
+                             0))
+           == EAI_AGAIN)
+    {
         sqlite3_sleep(10);
     }
 
     if (rc != 0) {
-        sqlite3_result_text(context, addr_str, -1, SQLITE_TRANSIENT);
-        return;
+        return addr_str;
     }
 
-    sqlite3_result_text(context, buffer, -1, SQLITE_TRANSIENT);
+    return buffer;
 }
 
-int network_extension_functions(const struct FuncDef **basic_funcs,
-                                const struct FuncDefAgg **agg_funcs)
+int
+network_extension_functions(struct FuncDef** basic_funcs,
+                            struct FuncDefAgg** agg_funcs)
 {
-    static const struct FuncDef network_funcs[] = {
-        { "gethostbyname", 1, 0, SQLITE_UTF8, 0, sql_gethostbyname },
-        { "gethostbyaddr", 1, 0, SQLITE_UTF8, 0, sql_gethostbyaddr },
+    static struct FuncDef network_funcs[] = {
+        sqlite_func_adapter<decltype(&sql_gethostbyname), sql_gethostbyname>::
+            builder(
+                help_text("gethostbyname",
+                          "Get the IP address for the given hostname")
+                    .sql_function()
+                    .with_parameter({"hostname", "The DNS hostname to lookup."})
+                    .with_tags({"net"})
+                    .with_example({
+                        "To get the IP address for 'localhost'",
+                        "SELECT gethostbyname('localhost')",
+                    })),
 
-        { NULL }
+        sqlite_func_adapter<decltype(&sql_gethostbyaddr), sql_gethostbyaddr>::
+            builder(
+                help_text("gethostbyaddr",
+                          "Get the hostname for the given IP address")
+                    .sql_function()
+                    .with_parameter({"hostname", "The IP address to lookup."})
+                    .with_tags({"net"})
+                    .with_example({
+                        "To get the hostname for the IP '127.0.0.1'",
+                        "SELECT gethostbyaddr('127.0.0.1')",
+                    })),
+
+        {nullptr},
     };
 
     *basic_funcs = network_funcs;

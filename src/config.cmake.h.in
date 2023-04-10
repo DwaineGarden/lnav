@@ -1,0 +1,31 @@
+
+#define HAVE_PCRE_H
+#define HAVE_NCURSESW_CURSES_H
+#define HAVE_ARCHIVE_H 1
+#define HAVE_BZLIB_H   1
+
+#define HAVE_LIBCURL
+
+#cmakedefine SIZEOF_OFF_T @SIZEOF_OFF_T@
+
+#cmakedefine VCS_PACKAGE_STRING "@VCS_PACKAGE_STRING@"
+
+#cmakedefine PACKAGE_VERSION "@PACKAGE_VERSION@"
+
+#cmakedefine HAVE_PTY_H
+
+#cmakedefine HAVE_UTIL_H
+
+#cmakedefine HAVE_EXECINFO_H
+
+#define HAVE_SQLITE3_STMT_READONLY
+
+#define HAVE_SQLITE3_VALUE_SUBTYPE
+
+#define HAVE_SQLITE3_ERROR_OFFSET
+
+#define HAVE_SQLITE3_DROP_MODULES
+
+#define _XOPEN_SOURCE_EXTENDED 1
+
+#define PACKAGE_BUGREPORT "lnav@googlegroups.com"

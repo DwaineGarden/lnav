@@ -21,8 +21,8 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
@@ -35,10 +35,8 @@
 #include "logfile_sub_source.hh"
 #include "statusview_curses.hh"
 
-class top_sys_status_source
-    : public status_data_source {
+class top_sys_status_source : public status_data_source {
 public:
-
     typedef enum {
         TSF_CPU,
         TSF_MEM,
@@ -61,14 +59,17 @@ public:
             this->tss_fields[lpc].set_width(5);
             this->tss_fields[lpc].set_value(names[lpc]);
         }
-        this->tss_fields[TSF_CPU].set_role(view_colors::VCR_WARN_STATUS);
-        this->tss_fields[TSF_MEM].set_role(view_colors::VCR_ALERT_STATUS);
-        this->tss_fields[TSF_TRAF].set_role(view_colors::VCR_ACTIVE_STATUS);
+        this->tss_fields[TSF_CPU].set_role(role_t::VCR_WARN_STATUS);
+        this->tss_fields[TSF_MEM].set_role(role_t::VCR_ALERT_STATUS);
+        this->tss_fields[TSF_TRAF].set_role(role_t::VCR_ACTIVE_STATUS);
     };
 
-    size_t statusview_fields(void) { return TSF__MAX; };
+    size_t statusview_fields()
+    {
+        return TSF__MAX;
+    };
 
-    status_field &statusview_value_for_field(int field)
+    status_field& statusview_value_for_field(int field)
     {
         return this->tss_fields[field];
     };

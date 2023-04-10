@@ -21,270 +21,266 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * @file lnav.hh
  */
 
-#ifndef __lnav_hh
-#define __lnav_hh
+#ifndef lnav_hh
+#define lnav_hh
 
-#include "config.h"
+#include <list>
+#include <map>
+#include <memory>
+#include <set>
+#include <stack>
+#include <unordered_map>
 
 #include <signal.h>
+#include <sys/time.h>
 
-#include <map>
-#include <set>
-#include <list>
-#include <stack>
-#include <memory>
-
-#include "byte_array.hh"
-#include "grapher.hh"
-#include "logfile.hh"
-#include "hist_source.hh"
-#include "statusview_curses.hh"
-#include "listview_curses.hh"
-#include "top_status_source.hh"
+#include "archive_manager.hh"
+#include "base/ansi_scrubber.hh"
+#include "base/future_util.hh"
+#include "base/isc.hh"
 #include "bottom_status_source.hh"
-#include "grep_highlighter.hh"
+#include "bound_tags.hh"
+#include "command_executor.hh"
+#include "config.h"
 #include "db_sub_source.hh"
-#include "textfile_sub_source.hh"
+#include "doc_status_source.hh"
+#include "file_collection.hh"
+#include "files_sub_source.hh"
+#include "filter_status_source.hh"
+#include "grep_highlighter.hh"
+#include "hist_source.hh"
+#include "input_dispatcher.hh"
+#include "listview_curses.hh"
+#include "log_format_loader.hh"
 #include "log_vtab_impl.hh"
-#include "readline_curses.hh"
-#include "xterm_mouse.hh"
+#include "logfile.hh"
 #include "piper_proc.hh"
-#include "term_extra.hh"
-#include "ansi_scrubber.hh"
-#include "curl_looper.hh"
-#include "papertrail_proc.hh"
+#include "plain_text_source.hh"
+#include "preview_status_source.hh"
+#include "readline_curses.hh"
 #include "relative_time.hh"
+#include "safe/safe.h"
+#include "sql_util.hh"
+#include "statusview_curses.hh"
+#include "textfile_sub_source.hh"
+#include "view_helpers.hh"
 
-/** The command modes that are available while viewing a file. */
-typedef enum {
-    LNM_PAGING,
-    LNM_COMMAND,
-    LNM_SEARCH,
-    LNM_CAPTURE,
-    LNM_SQL,
-} ln_mode_t;
+class spectrogram_source;
+class spectro_status_source;
 
-enum {
-    LNB_SYSLOG,
-    LNB__MAX,
-
-    LNB_TIMESTAMP,
-    LNB_HELP,
-    LNB_HEADLESS,
-    LNB_QUIET,
-    LNB_ROTATED,
-    LNB_CHECK_CONFIG,
-    LNB_INSTALL,
-    LNB_UPDATE_FORMATS,
-};
-
-/** Flags set on the lnav command-line. */
-typedef enum {
-    LNF_SYSLOG    = (1L << LNB_SYSLOG),
-
-    LNF_ROTATED   = (1L << LNB_ROTATED),
-
-    LNF_TIMESTAMP = (1L << LNB_TIMESTAMP),
-    LNF_HELP      = (1L << LNB_HELP),
-    LNF_HEADLESS  = (1L << LNB_HEADLESS),
-    LNF_QUIET     = (1L << LNB_QUIET),
-    LNF_CHECK_CONFIG = (1L << LNB_CHECK_CONFIG),
-    LNF_INSTALL   = (1L << LNB_INSTALL),
-    LNF_UPDATE_FORMATS = (1L << LNB_UPDATE_FORMATS),
-
-    LNF__ALL      = (LNF_SYSLOG|LNF_HELP)
-} lnav_flags_t;
-
-/** The different views available. */
-typedef enum {
-    LNV_LOG,
-    LNV_TEXT,
-    LNV_HELP,
-    LNV_HISTOGRAM,
-    LNV_GRAPH,
-    LNV_DB,
-    LNV_EXAMPLE,
-    LNV_SCHEMA,
-    LNV_PRETTY,
-
-    LNV__MAX
-} lnav_view_t;
-
-extern const char *lnav_view_strings[LNV__MAX + 1];
-
-extern const char *lnav_zoom_strings[];
+extern const std::vector<std::string> lnav_zoom_strings;
 
 /** The status bars. */
 typedef enum {
     LNS_TOP,
     LNS_BOTTOM,
+    LNS_FILTER,
+    LNS_FILTER_HELP,
+    LNS_DOC,
+    LNS_PREVIEW,
+    LNS_SPECTRO,
 
     LNS__MAX
 } lnav_status_t;
 
-typedef enum {
-    LG_GRAPH,
-    LG_CAPTURE,
-
-    LG__MAX
-} lnav_grep_t;
-
-void sqlite_close_wrapper(void *mem);
-
-typedef std::pair<int, int>                      ppid_time_pair_t;
-typedef std::pair<ppid_time_pair_t, std::string> session_pair_t;
+using ppid_time_pair_t = std::pair<int, int>;
+using session_pair_t = std::pair<ppid_time_pair_t, ghc::filesystem::path>;
 
 class input_state_tracker : public log_state_dumper {
 public:
-    input_state_tracker() : ist_index(0) {
-        memset(this->ist_recent_key_presses, 0, sizeof(this->ist_recent_key_presses));
-    };
+    input_state_tracker()
+    {
+        memset(this->ist_recent_key_presses,
+               0,
+               sizeof(this->ist_recent_key_presses));
+    }
 
-    void log_state() {
+    void log_state() override
+    {
         log_info("recent_key_presses: index=%d", this->ist_index);
         for (int lpc = 0; lpc < COUNT; lpc++) {
-            log_msg_extra(" 0x%x (%c)", this->ist_recent_key_presses[lpc],
-                    this->ist_recent_key_presses[lpc]);
+            log_msg_extra(" 0x%x (%c)",
+                          this->ist_recent_key_presses[lpc],
+                          this->ist_recent_key_presses[lpc]);
         }
         log_msg_extra_complete();
-    };
+    }
 
-    void push_back(int ch) {
+    void push_back(int ch)
+    {
         this->ist_recent_key_presses[this->ist_index % COUNT] = ch;
         this->ist_index = (this->ist_index + 1) % COUNT;
-    };
+    }
 
 private:
     static const int COUNT = 10;
 
     int ist_recent_key_presses[COUNT];
-    size_t ist_index;
+    size_t ist_index{0};
 };
 
-struct _lnav_data {
-    std::string                             ld_session_id;
-    time_t                                  ld_session_time;
-    time_t                                  ld_session_load_time;
-    time_t                                  ld_session_save_time;
-    std::list<session_pair_t>               ld_session_file_names;
-    int                                     ld_session_file_index;
-    const char *                            ld_program_name;
-    const char *                            ld_debug_log_name;
+struct key_repeat_history {
+    int krh_key{0};
+    int krh_count{0};
+    vis_line_t krh_start_line{0_vl};
+    struct timeval krh_last_press_time {
+        0, 0
+    };
 
-    std::list<std::string>                  ld_commands;
-    bool                                    ld_cmd_init_done;
-    std::vector<std::string>                ld_config_paths;
-    std::set<std::pair<std::string, int> >  ld_file_names;
-    std::list<logfile *>                    ld_files;
-    std::list<std::string>                  ld_other_files;
-    std::set<std::string>                   ld_closed_files;
-    std::list<std::pair<std::string, int> > ld_files_to_front;
-    std::string                             ld_pt_search;
-    time_t                                  ld_pt_min_time;
-    time_t                                  ld_pt_max_time;
-    bool                                    ld_stdout_used;
-    sig_atomic_t                            ld_looping;
-    sig_atomic_t                            ld_winched;
-    sig_atomic_t                            ld_child_terminated;
-    unsigned long                           ld_flags;
-    WINDOW *                                ld_window;
-    ln_mode_t                               ld_mode;
+    void update(int ch, vis_line_t top)
+    {
+        struct timeval now, diff;
 
-    statusview_curses                       ld_status[LNS__MAX];
-    top_status_source                       ld_top_source;
-    bottom_status_source                    ld_bottom_source;
-    listview_curses::action::broadcaster    ld_scroll_broadcaster;
+        gettimeofday(&now, nullptr);
+        timersub(&now, &this->krh_last_press_time, &diff);
+        if (diff.tv_sec >= 1 || diff.tv_usec > (750 * 1000)) {
+            this->krh_key = 0;
+            this->krh_count = 0;
+        }
+        this->krh_last_press_time = now;
 
-    time_t                                  ld_top_time;
-    int                                     ld_top_time_millis;
-    time_t                                  ld_bottom_time;
-    int                                     ld_bottom_time_millis;
+        if (this->krh_key == ch) {
+            this->krh_count += 1;
+        } else {
+            this->krh_key = ch;
+            this->krh_count = 1;
+            this->krh_start_line = top;
+        }
+    };
+};
 
-    textview_curses                         ld_match_view;
+using file_location_t = mapbox::util::variant<vis_line_t, std::string>;
 
-    std::stack<textview_curses *>           ld_view_stack;
-    textview_curses                         ld_views[LNV__MAX];
-    std::auto_ptr<grep_highlighter>         ld_search_child[LNV__MAX];
-    vis_line_t                              ld_search_start_line;
-    readline_curses *                       ld_rl_view;
+struct lnav_data_t {
+    std::map<std::string, std::list<session_pair_t>> ld_session_id;
+    time_t ld_session_time;
+    time_t ld_session_load_time;
+    const char* ld_program_name;
+    std::string ld_debug_log_name;
 
-    logfile_sub_source                      ld_log_source;
-    hist_source                             ld_hist_source;
-    int                                     ld_hist_zoom;
+    std::list<std::string> ld_commands;
+    bool ld_cmd_init_done;
+    bool ld_session_loaded;
+    std::vector<ghc::filesystem::path> ld_config_paths;
+    file_collection ld_active_files;
+    std::list<child_poller> ld_child_pollers;
+    std::list<std::pair<std::string, file_location_t>> ld_files_to_front;
+    bool ld_stdout_used;
+    sig_atomic_t ld_looping;
+    sig_atomic_t ld_winched;
+    sig_atomic_t ld_child_terminated;
+    unsigned long ld_flags;
+    WINDOW* ld_window;
+    ln_mode_t ld_mode;
+    ln_mode_t ld_last_config_mode{ln_mode_t::FILTER};
 
-    textfile_sub_source                     ld_text_source;
+    statusview_curses ld_status[LNS__MAX];
+    bottom_status_source ld_bottom_source;
+    filter_status_source ld_filter_status_source;
+    filter_help_status_source ld_filter_help_status_source;
+    doc_status_source ld_doc_status_source;
+    preview_status_source ld_preview_status_source;
+    std::unique_ptr<spectro_status_source> ld_spectro_status_source;
+    bool ld_preview_hidden;
+    int64_t ld_preview_generation{0};
+    action_broadcaster<listview_curses> ld_scroll_broadcaster;
+    action_broadcaster<listview_curses> ld_view_stack_broadcaster;
 
-    std::map<textview_curses *, int>        ld_last_user_mark;
-    std::map<textview_curses *, int>        ld_select_start;
+    plain_text_source ld_help_source;
 
-    grapher                                 ld_graph_source;
+    plain_text_source ld_doc_source;
+    textview_curses ld_doc_view;
+    textview_curses ld_filter_view;
+    files_sub_source ld_files_source;
+    files_overlay_source ld_files_overlay;
+    textview_curses ld_files_view;
+    plain_text_source ld_example_source;
+    textview_curses ld_example_view;
+    plain_text_source ld_match_source;
+    textview_curses ld_match_view;
+    plain_text_source ld_preview_source;
+    textview_curses ld_preview_view;
+    plain_text_source ld_user_message_source;
+    textview_curses ld_user_message_view;
+    std::chrono::time_point<std::chrono::steady_clock>
+        ld_user_message_expiration;
+    textview_curses ld_spectro_details_view;
+    plain_text_source ld_spectro_no_details_source;
 
-    hist_source                             ld_db_source;
-    db_label_source                         ld_db_rows;
-    db_overlay_source                       ld_db_overlay;
-    std::vector<std::string>                ld_db_key_names;
+    view_stack<textview_curses> ld_view_stack;
+    textview_curses* ld_last_view;
+    textview_curses ld_views[LNV__MAX];
+    vis_line_t ld_search_start_line;
+    readline_curses* ld_rl_view;
 
-    std::auto_ptr<grep_highlighter>         ld_grep_child[LG__MAX];
-    std::string                             ld_previous_search;
-    std::string                             ld_last_search[LNV__MAX];
+    logfile_sub_source ld_log_source;
+    hist_source2 ld_hist_source2;
+    int ld_zoom_level;
+    std::unique_ptr<spectrogram_source> ld_spectro_source;
 
-    vis_line_t                              ld_last_pretty_print_top;
+    textfile_sub_source ld_text_source;
 
-    log_vtab_manager *                      ld_vtab_manager;
-    auto_mem<sqlite3, sqlite_close_wrapper> ld_db;
+    std::map<textview_curses*, int> ld_last_user_mark;
+    std::map<textview_curses*, int> ld_select_start;
 
-    std::list<pid_t>                        ld_children;
-    std::list<piper_proc *>                 ld_pipers;
-    xterm_mouse ld_mouse;
-    term_extra ld_term_extra;
+    db_label_source ld_db_row_source;
+    db_overlay_source ld_db_overlay;
+    std::vector<std::string> ld_db_key_names;
+
+    vis_line_t ld_last_pretty_print_top;
+
+    std::unique_ptr<log_vtab_manager> ld_vtab_manager;
+    auto_sqlite3 ld_db;
+
+    std::unordered_map<std::string, std::string> ld_table_ddl;
+
+    std::list<pid_t> ld_children;
+    std::list<std::shared_ptr<piper_proc>> ld_pipers;
 
     input_state_tracker ld_input_state;
+    input_dispatcher ld_input_dispatcher;
 
-    curl_looper ld_curl_looper;
+    exec_context ld_exec_context;
 
-    relative_time ld_last_relative_time;
+    int ld_fifo_counter;
+
+    struct key_repeat_history ld_key_repeat_history;
+
+    bool ld_initial_build{false};
+    bool ld_show_help_view{false};
+
+    lnav::func::scoped_cb ld_status_refresher;
+
+    ghc::filesystem::file_time_type ld_last_dot_lnav_time;
 };
 
-extern struct _lnav_data lnav_data;
+struct static_service {};
+
+class main_looper
+    : public isc::service<main_looper>
+    , public static_service {
+public:
+};
+
+extern struct lnav_data_t lnav_data;
 
 extern readline_context::command_map_t lnav_commands;
-extern bookmark_type_t BM_QUERY;
-extern const int HIST_ZOOM_LEVELS;
+extern const int ZOOM_LEVELS[];
+extern const ssize_t ZOOM_COUNT;
 
-#define HELP_MSG_1(x, msg) \
-    "Press '" ANSI_BOLD(#x) "' " msg
+#define HELP_MSG_1(x, msg) "Press '" ANSI_BOLD(#x) "' " msg
 
-#define HELP_MSG_2(x, y, msg) \
-    "Press " ANSI_BOLD(#x) "/" ANSI_BOLD(#y) " " msg
+#define HELP_MSG_2(x, y, msg) "Press " ANSI_BOLD(#x) "/" ANSI_BOLD(#y) " " msg
 
-void rebuild_hist(size_t old_count, bool force);
-void rebuild_indexes(bool force);
-
-bool ensure_view(textview_curses *expected_tc);
-bool toggle_view(textview_curses *toggle_tc);
-
-bool setup_logline_table();
-
-void execute_search(lnav_view_t view, const std::string &regex);
-
-void redo_search(lnav_view_t view_index);
-
-bool rescan_files(bool required = false);
-
-vis_line_t next_cluster(
-        vis_line_t(bookmark_vector<vis_line_t>::*f) (vis_line_t),
-        bookmark_type_t *bt,
-        vis_line_t top);
-bool moveto_cluster(vis_line_t(bookmark_vector<vis_line_t>::*f) (vis_line_t),
-        bookmark_type_t *bt,
-        vis_line_t top);
+bool setup_logline_table(exec_context& ec);
+void wait_for_children();
 
 #endif

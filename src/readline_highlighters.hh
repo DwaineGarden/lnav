@@ -21,23 +21,28 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * @file readline_highlighters.hh
  */
 
-#ifndef __readline_highlighters_hh
-#define __readline_highlighters_hh
+#ifndef readline_highlighters_hh
+#define readline_highlighters_hh
 
-#include "view_curses.hh"
+#include "base/attr_line.hh"
 
-void readline_regex_highlighter(attr_line_t &line, int x);
+void readline_regex_highlighter(attr_line_t& line, int x);
 
-void readline_command_highlighter(attr_line_t &line, int x);
+void readline_command_highlighter(attr_line_t& line, int x);
 
-void readline_sqlite_highlighter(attr_line_t &line, int x);
+void readline_sqlite_highlighter(attr_line_t& line, int x);
+
+void readline_shlex_highlighter_int(attr_line_t& al, int x, line_range sub);
+void readline_shlex_highlighter(attr_line_t& line, int x);
+
+void readline_lnav_highlighter(attr_line_t& line, int x);
 
 #endif

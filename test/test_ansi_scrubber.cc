@@ -21,8 +21,8 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
@@ -34,38 +34,65 @@
  * color/style combinations.
  */
 
-#include "config.h"
-
 #include <assert.h>
 
-#include "ansi_scrubber.hh"
+#include "base/ansi_scrubber.hh"
+#include "config.h"
+#include "view_curses.hh"
 
 using namespace std;
 
-int main(int argc, char *argv[])
+int
+main(int argc, char* argv[])
 {
-    view_colors &vc = view_colors::singleton();
-    string_attrs_t::iterator iter;
+    {
+        char input[] = "Hello, \x1b[33;mWorld\x1b[0;m!";
+
+        auto new_len = erase_ansi_escapes(string_fragment::from_const(input));
+
+        printf("result '%s'\n", input);
+
+        assert(new_len == 13);
+    }
+
+    {
+        std::string boldish
+            = "\u2022\b\u2022\u2023\b\u2023 h\bhe\bel\blo\bo _\ba_\bb_\bc a\b_ "
+              "b";
+        auto boldish2 = boldish;
+        string_attrs_t sa;
+
+        sa.clear();
+        scrub_ansi_string(boldish, &sa);
+        printf("boldish %s\n", boldish.c_str());
+        assert(boldish == "\u2022\u2023 helo abc a b");
+
+        auto new_len = erase_ansi_escapes(boldish2);
+        boldish2.resize(new_len);
+        printf("boldish2 %s\n", boldish2.c_str());
+        assert(boldish2 == "\u2022\u2023 helo abc a b");
+
+        for (const auto& attr : sa) {
+            printf("attr %d:%d %s\n",
+                   attr.sa_range.lr_start,
+                   attr.sa_range.lr_end,
+                   attr.sa_type->sat_name);
+            if (attr.sa_type == &SA_ORIGIN_OFFSET) {
+                printf("  value: %d\n", attr.sa_value.get<int64_t>());
+            }
+        }
+    }
+
     string_attrs_t sa;
     string str_cp;
 
     str_cp = "Hello, World!";
-    scrub_ansi_string(str_cp, sa);
+    scrub_ansi_string(str_cp, &sa);
 
     assert(str_cp == "Hello, World!");
     assert(sa.empty());
 
     str_cp = "Hello\x1b[44;m, \x1b[33;mWorld\x1b[0;m!";
-    scrub_ansi_string(str_cp, sa);
+    scrub_ansi_string(str_cp, &sa);
     assert(str_cp == "Hello, World!");
-    
-    assert(sa[0].sa_range.lr_start == 5);
-    assert(sa[0].sa_range.lr_end == 7);
-    assert(sa[0].sa_type == &view_curses::VC_STYLE);
-    assert(sa[0].sa_value.sav_int == vc.ansi_color_pair(0, 4));
-
-    assert(sa[1].sa_range.lr_start == 7);
-    assert(sa[1].sa_range.lr_end == 12);
-    assert(sa[1].sa_type == &view_curses::VC_STYLE);
-    assert(sa[1].sa_value.sav_int == vc.ansi_color_pair(3, 0));
 }

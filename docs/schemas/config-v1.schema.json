@@ -1,0 +1,804 @@
+{
+    "$id": "https://lnav.org/schemas/config-v1.schema.json",
+    "title": "https://lnav.org/schemas/config-v1.schema.json",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "properties": {
+        "$schema": {
+            "title": "/$schema",
+            "description": "The URI that specifies the schema that describes this type of file",
+            "type": "string",
+            "examples": [
+                "https://lnav.org/schemas/config-v1.schema.json"
+            ]
+        },
+        "tuning": {
+            "description": "Internal settings",
+            "title": "/tuning",
+            "type": "object",
+            "properties": {
+                "archive-manager": {
+                    "description": "Settings related to opening archive files",
+                    "title": "/tuning/archive-manager",
+                    "type": "object",
+                    "properties": {
+                        "min-free-space": {
+                            "title": "/tuning/archive-manager/min-free-space",
+                            "description": "The minimum free space, in bytes, to maintain when unpacking archives",
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "cache-ttl": {
+                            "title": "/tuning/archive-manager/cache-ttl",
+                            "description": "The time-to-live for unpacked archives, expressed as a duration (e.g. '3d' for three days)",
+                            "type": "string",
+                            "examples": [
+                                "3d",
+                                "12h"
+                            ]
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "file-vtab": {
+                    "description": "Settings related to the lnav_file virtual-table",
+                    "title": "/tuning/file-vtab",
+                    "type": "object",
+                    "properties": {
+                        "max-content-size": {
+                            "title": "/tuning/file-vtab/max-content-size",
+                            "description": "The maximum allowed file size for the content column",
+                            "type": "integer",
+                            "minimum": 0
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "logfile": {
+                    "description": "Settings related to log files",
+                    "title": "/tuning/logfile",
+                    "type": "object",
+                    "properties": {
+                        "max-unrecognized-lines": {
+                            "title": "/tuning/logfile/max-unrecognized-lines",
+                            "description": "The maximum number of lines in a file to use when detecting the format",
+                            "type": "integer",
+                            "minimum": 1
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "remote": {
+                    "description": "Settings related to remote file support",
+                    "title": "/tuning/remote",
+                    "type": "object",
+                    "properties": {
+                        "cache-ttl": {
+                            "title": "/tuning/remote/cache-ttl",
+                            "description": "The time-to-live for files copied from remote hosts, expressed as a duration (e.g. '3d' for three days)",
+                            "type": "string",
+                            "examples": [
+                                "3d",
+                                "12h"
+                            ]
+                        },
+                        "ssh": {
+                            "description": "Settings related to the ssh command used to contact remote machines",
+                            "title": "/tuning/remote/ssh",
+                            "type": "object",
+                            "properties": {
+                                "command": {
+                                    "title": "/tuning/remote/ssh/command",
+                                    "description": "The SSH command to execute",
+                                    "type": "string"
+                                },
+                                "transfer-command": {
+                                    "title": "/tuning/remote/ssh/transfer-command",
+                                    "description": "Command executed on the remote host when transferring the file",
+                                    "type": "string"
+                                },
+                                "start-command": {
+                                    "title": "/tuning/remote/ssh/start-command",
+                                    "description": "Command executed on the remote host to start the tailer",
+                                    "type": "string"
+                                },
+                                "flags": {
+                                    "title": "/tuning/remote/ssh/flags",
+                                    "description": "The flags to pass to the SSH command",
+                                    "type": "string"
+                                },
+                                "options": {
+                                    "description": "The options to pass to the SSH command",
+                                    "title": "/tuning/remote/ssh/options",
+                                    "type": "object",
+                                    "patternProperties": {
+                                        "(\\w+)": {
+                                            "title": "/tuning/remote/ssh/options/<option_name>",
+                                            "description": "Set an option to be passed to the SSH command",
+                                            "type": "string"
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                },
+                                "config": {
+                                    "description": "The ssh_config options to pass to SSH with the -o option",
+                                    "title": "/tuning/remote/ssh/config",
+                                    "type": "object",
+                                    "patternProperties": {
+                                        "(\\w+)": {
+                                            "title": "/tuning/remote/ssh/config/<config_name>",
+                                            "description": "Set an SSH configuration value",
+                                            "type": "string"
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "clipboard": {
+                    "description": "Settings related to the clipboard",
+                    "title": "/tuning/clipboard",
+                    "type": "object",
+                    "properties": {
+                        "impls": {
+                            "description": "Clipboard implementations",
+                            "title": "/tuning/clipboard/impls",
+                            "type": "object",
+                            "patternProperties": {
+                                "([\\w\\-]+)": {
+                                    "description": "Clipboard implementation",
+                                    "title": "/tuning/clipboard/impls/<clipboard_impl_name>",
+                                    "type": "object",
+                                    "properties": {
+                                        "test": {
+                                            "title": "/tuning/clipboard/impls/<clipboard_impl_name>/test",
+                                            "description": "The command that checks",
+                                            "type": "string",
+                                            "examples": [
+                                                "command -v pbcopy"
+                                            ]
+                                        },
+                                        "general": {
+                                            "description": "Commands to work with the general clipboard",
+                                            "title": "/tuning/clipboard/impls/<clipboard_impl_name>/general",
+                                            "$ref": "#/definitions/clip-commands"
+                                        },
+                                        "find": {
+                                            "description": "Commands to work with the find clipboard",
+                                            "title": "/tuning/clipboard/impls/<clipboard_impl_name>/find",
+                                            "$ref": "#/definitions/clip-commands"
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        },
+        "ui": {
+            "description": "User-interface settings",
+            "title": "/ui",
+            "type": "object",
+            "properties": {
+                "clock-format": {
+                    "title": "/ui/clock-format",
+                    "description": "The format for the clock displayed in the top-left corner using strftime(3) conversions",
+                    "type": "string",
+                    "examples": [
+                        "%a %b %d %H:%M:%S %Z"
+                    ]
+                },
+                "dim-text": {
+                    "title": "/ui/dim-text",
+                    "description": "Reduce the brightness of text (useful for xterms). This setting can be useful when running in an xterm where the white color is very bright.",
+                    "type": "boolean"
+                },
+                "default-colors": {
+                    "title": "/ui/default-colors",
+                    "description": "Use default terminal background and foreground colors instead of black and white for all text coloring.  This setting can be useful when transparent background or alternate color theme terminal is used.",
+                    "type": "boolean"
+                },
+                "keymap": {
+                    "title": "/ui/keymap",
+                    "description": "The name of the keymap to use.",
+                    "type": "string"
+                },
+                "theme": {
+                    "title": "/ui/theme",
+                    "description": "The name of the theme to use.",
+                    "type": "string"
+                },
+                "theme-defs": {
+                    "description": "Theme definitions.",
+                    "title": "/ui/theme-defs",
+                    "type": "object",
+                    "patternProperties": {
+                        "([\\w\\-]+)": {
+                            "description": "Theme definitions",
+                            "title": "/ui/theme-defs/<theme_name>",
+                            "type": "object",
+                            "properties": {
+                                "vars": {
+                                    "description": "Variables definitions that are used in this theme.",
+                                    "title": "/ui/theme-defs/<theme_name>/vars",
+                                    "type": "object",
+                                    "patternProperties": {
+                                        "(\\w+)": {
+                                            "title": "/ui/theme-defs/<theme_name>/vars/<var_name>",
+                                            "description": "A theme variable definition",
+                                            "type": "string"
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                },
+                                "styles": {
+                                    "description": "Styles for log messages.",
+                                    "title": "/ui/theme-defs/<theme_name>/styles",
+                                    "type": "object",
+                                    "properties": {
+                                        "identifier": {
+                                            "description": "Styling for identifiers in logs",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/identifier",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "text": {
+                                            "description": "Styling for plain text",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/text",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "alt-text": {
+                                            "description": "Styling for plain text when alternating",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/alt-text",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "error": {
+                                            "description": "Styling for error messages",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/error",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "ok": {
+                                            "description": "Styling for success messages",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/ok",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "info": {
+                                            "description": "Styling for informational messages",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/info",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "warning": {
+                                            "description": "Styling for warning messages",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/warning",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "hidden": {
+                                            "description": "Styling for hidden fields in logs",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/hidden",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "cursor-line": {
+                                            "description": "Styling for the cursor line in the main view",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/cursor-line",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "adjusted-time": {
+                                            "description": "Styling for timestamps that have been adjusted",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/adjusted-time",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "skewed-time": {
+                                            "description": "Styling for timestamps that are different from the received time",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/skewed-time",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "offset-time": {
+                                            "description": "Styling for hidden fields",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/offset-time",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "invalid-msg": {
+                                            "description": "Styling for invalid log messages",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/invalid-msg",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "popup": {
+                                            "description": "Styling for popup windows",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/popup",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "focused": {
+                                            "description": "Styling for a focused row in a list view",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/focused",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "disabled-focused": {
+                                            "description": "Styling for a disabled focused row in a list view",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/disabled-focused",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "scrollbar": {
+                                            "description": "Styling for scrollbars",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/scrollbar",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "h1": {
+                                            "description": "Styling for top-level headers",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/h1",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "h2": {
+                                            "description": "Styling for 2nd-level headers",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/h2",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "h3": {
+                                            "description": "Styling for 3rd-level headers",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/h3",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "h4": {
+                                            "description": "Styling for 4th-level headers",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/h4",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "h5": {
+                                            "description": "Styling for 5th-level headers",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/h5",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "h6": {
+                                            "description": "Styling for 6th-level headers",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/h6",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "hr": {
+                                            "description": "Styling for horizontal rules",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/hr",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "hyperlink": {
+                                            "description": "Styling for hyperlinks",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/hyperlink",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "list-glyph": {
+                                            "description": "Styling for glyphs that prefix a list item",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/list-glyph",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "breadcrumb": {
+                                            "description": "Styling for the separator between breadcrumbs",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/breadcrumb",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "table-border": {
+                                            "description": "Styling for table borders",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/table-border",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "table-header": {
+                                            "description": "Styling for table headers",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/table-header",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "quote-border": {
+                                            "description": "Styling for quoted-block borders",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/quote-border",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "quoted-text": {
+                                            "description": "Styling for quoted text blocks",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/quoted-text",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "footnote-border": {
+                                            "description": "Styling for footnote borders",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/footnote-border",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "footnote-text": {
+                                            "description": "Styling for footnote text",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/footnote-text",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "snippet-border": {
+                                            "description": "Styling for snippet borders",
+                                            "title": "/ui/theme-defs/<theme_name>/styles/snippet-border",
+                                            "$ref": "#/definitions/style"
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                },
+                                "syntax-styles": {
+                                    "description": "Styles for syntax highlighting in text files.",
+                                    "title": "/ui/theme-defs/<theme_name>/syntax-styles",
+                                    "type": "object",
+                                    "properties": {
+                                        "quoted-code": {
+                                            "description": "Styling for quoted code blocks",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/quoted-code",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "code-border": {
+                                            "description": "Styling for quoted-code borders",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/code-border",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "keyword": {
+                                            "description": "Styling for keywords in source files",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/keyword",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "string": {
+                                            "description": "Styling for single/double-quoted strings in text",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/string",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "comment": {
+                                            "description": "Styling for comments in source files",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/comment",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "doc-directive": {
+                                            "description": "Styling for documentation directives in source files",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/doc-directive",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "variable": {
+                                            "description": "Styling for variables in text",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/variable",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "symbol": {
+                                            "description": "Styling for symbols in source files",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/symbol",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "number": {
+                                            "description": "Styling for numbers in source files",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/number",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "re-special": {
+                                            "description": "Styling for special characters in regular expressions",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/re-special",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "re-repeat": {
+                                            "description": "Styling for repeats in regular expressions",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/re-repeat",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "diff-delete": {
+                                            "description": "Styling for deleted lines in diffs",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/diff-delete",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "diff-add": {
+                                            "description": "Styling for added lines in diffs",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/diff-add",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "diff-section": {
+                                            "description": "Styling for diffs",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/diff-section",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "spectrogram-low": {
+                                            "description": "Styling for the lower threshold values in the spectrogram view",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/spectrogram-low",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "spectrogram-medium": {
+                                            "description": "Styling for the medium threshold values in the spectrogram view",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/spectrogram-medium",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "spectrogram-high": {
+                                            "description": "Styling for the high threshold values in the spectrogram view",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/spectrogram-high",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "file": {
+                                            "description": "Styling for file names in source files",
+                                            "title": "/ui/theme-defs/<theme_name>/syntax-styles/file",
+                                            "$ref": "#/definitions/style"
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                },
+                                "status-styles": {
+                                    "description": "Styles for the user-interface components.",
+                                    "title": "/ui/theme-defs/<theme_name>/status-styles",
+                                    "type": "object",
+                                    "properties": {
+                                        "text": {
+                                            "description": "Styling for status bars",
+                                            "title": "/ui/theme-defs/<theme_name>/status-styles/text",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "warn": {
+                                            "description": "Styling for warnings in status bars",
+                                            "title": "/ui/theme-defs/<theme_name>/status-styles/warn",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "alert": {
+                                            "description": "Styling for alerts in status bars",
+                                            "title": "/ui/theme-defs/<theme_name>/status-styles/alert",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "active": {
+                                            "description": "Styling for activity in status bars",
+                                            "title": "/ui/theme-defs/<theme_name>/status-styles/active",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "inactive-alert": {
+                                            "description": "Styling for inactive alert status bars",
+                                            "title": "/ui/theme-defs/<theme_name>/status-styles/inactive-alert",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "inactive": {
+                                            "description": "Styling for inactive status bars",
+                                            "title": "/ui/theme-defs/<theme_name>/status-styles/inactive",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "title-hotkey": {
+                                            "description": "Styling for hotkey highlights in titles",
+                                            "title": "/ui/theme-defs/<theme_name>/status-styles/title-hotkey",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "title": {
+                                            "description": "Styling for title sections of status bars",
+                                            "title": "/ui/theme-defs/<theme_name>/status-styles/title",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "disabled-title": {
+                                            "description": "Styling for title sections of status bars",
+                                            "title": "/ui/theme-defs/<theme_name>/status-styles/disabled-title",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "subtitle": {
+                                            "description": "Styling for subtitle sections of status bars",
+                                            "title": "/ui/theme-defs/<theme_name>/status-styles/subtitle",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "info": {
+                                            "description": "Styling for informational messages in status bars",
+                                            "title": "/ui/theme-defs/<theme_name>/status-styles/info",
+                                            "$ref": "#/definitions/style"
+                                        },
+                                        "hotkey": {
+                                            "description": "Styling for hotkey highlights of status bars",
+                                            "title": "/ui/theme-defs/<theme_name>/status-styles/hotkey",
+                                            "$ref": "#/definitions/style"
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                },
+                                "log-level-styles": {
+                                    "description": "Styles for each log message level.",
+                                    "title": "/ui/theme-defs/<theme_name>/log-level-styles",
+                                    "type": "object",
+                                    "patternProperties": {
+                                        "(trace|debug5|debug4|debug3|debug2|debug|info|stats|notice|warning|error|critical|fatal|invalid)": {
+                                            "title": "/ui/theme-defs/<theme_name>/log-level-styles/<level>",
+                                            "$ref": "#/definitions/style"
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                },
+                                "highlights": {
+                                    "description": "Styles for text highlights.",
+                                    "title": "/ui/theme-defs/<theme_name>/highlights",
+                                    "type": "object",
+                                    "patternProperties": {
+                                        "([\\w\\-]+)": {
+                                            "title": "/ui/theme-defs/<theme_name>/highlights/<highlight_name>",
+                                            "type": "object",
+                                            "properties": {
+                                                "pattern": {
+                                                    "title": "/ui/theme-defs/<theme_name>/highlights/<highlight_name>/pattern",
+                                                    "description": "The regular expression to highlight",
+                                                    "type": "string"
+                                                },
+                                                "style": {
+                                                    "description": "The styling for the text that matches the associated pattern",
+                                                    "title": "/ui/theme-defs/<theme_name>/highlights/<highlight_name>/style",
+                                                    "$ref": "#/definitions/style"
+                                                }
+                                            },
+                                            "additionalProperties": false
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "movement": {
+                    "description": "Log file cursor movement mode settings",
+                    "title": "/ui/movement",
+                    "type": "object",
+                    "properties": {
+                        "mode": {
+                            "title": "/ui/movement/mode",
+                            "description": "The mode of cursor movement to use.",
+                            "type": "string",
+                            "enum": [
+                                "top",
+                                "cursor"
+                            ],
+                            "examples": [
+                                "top",
+                                "cursor"
+                            ]
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "keymap-defs": {
+                    "description": "Keymap definitions.",
+                    "title": "/ui/keymap-defs",
+                    "type": "object",
+                    "patternProperties": {
+                        "([\\w\\-]+)": {
+                            "description": "The keymap definitions",
+                            "title": "/ui/keymap-defs/<keymap_name>",
+                            "type": "object",
+                            "patternProperties": {
+                                "((?:x[0-9a-f]{2})+)": {
+                                    "description": "Map of key codes to commands to execute.  The field names are the keys to be mapped using as a hexadecimal representation of the UTF-8 encoding.  Each byte of the UTF-8 should start with an 'x' followed by the hexadecimal representation of the byte.",
+                                    "title": "/ui/keymap-defs/<keymap_name>/<key_seq>",
+                                    "type": "object",
+                                    "properties": {
+                                        "command": {
+                                            "title": "/ui/keymap-defs/<keymap_name>/<key_seq>/command",
+                                            "description": "The command to execute for the given key sequence.  Use a script to execute more complicated operations.",
+                                            "type": "string",
+                                            "pattern": "^[:|;].*",
+                                            "examples": [
+                                                ":goto next hour"
+                                            ]
+                                        },
+                                        "alt-msg": {
+                                            "title": "/ui/keymap-defs/<keymap_name>/<key_seq>/alt-msg",
+                                            "description": "The help message to display after the key is pressed.",
+                                            "type": "string"
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        },
+        "log": {
+            "description": "Log message settings",
+            "title": "/log",
+            "type": "object",
+            "properties": {
+                "watch-expressions": {
+                    "description": "Log message watch expressions",
+                    "title": "/log/watch-expressions",
+                    "type": "object",
+                    "patternProperties": {
+                        "([\\w\\-]+)": {
+                            "description": "A log message watch expression",
+                            "title": "/log/watch-expressions/<watch_name>",
+                            "type": "object",
+                            "properties": {
+                                "expr": {
+                                    "title": "/log/watch-expressions/<watch_name>/expr",
+                                    "description": "The SQL expression to execute for each input line. If expression evaluates to true, a 'log message detected' event will be published.",
+                                    "type": "string"
+                                },
+                                "enabled": {
+                                    "title": "/log/watch-expressions/<watch_name>/enabled",
+                                    "description": "Indicates whether or not this expression should be evaluated during log processing.",
+                                    "type": "boolean"
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        },
+        "global": {
+            "description": "Global variable definitions",
+            "title": "/global",
+            "type": "object",
+            "patternProperties": {
+                "(\\w+)": {
+                    "title": "/global/<var_name>",
+                    "description": "A global variable definition.  Global variables can be referenced in scripts, SQL statements, or commands.",
+                    "type": "string"
+                }
+            },
+            "additionalProperties": false
+        }
+    },
+    "additionalProperties": false,
+    "definitions": {
+        "clip-commands": {
+            "title": "clip-commands",
+            "description": "Container for the commands used to read from and write to the system clipboard",
+            "type": "object",
+            "$$target": "#/definitions/clip-commands",
+            "properties": {
+                "write": {
+                    "title": "/write",
+                    "description": "The command used to write to the clipboard",
+                    "type": "string",
+                    "examples": [
+                        "pbcopy"
+                    ]
+                },
+                "read": {
+                    "title": "/read",
+                    "description": "The command used to read from the clipboard",
+                    "type": "string",
+                    "examples": [
+                        "pbpaste"
+                    ]
+                }
+            },
+            "additionalProperties": false
+        },
+        "style": {
+            "title": "style",
+            "type": "object",
+            "$$target": "#/definitions/style",
+            "properties": {
+                "color": {
+                    "title": "/color",
+                    "description": "The foreground color value for this style. The value can be the name of an xterm color, the hexadecimal value, or a theme variable reference.",
+                    "type": "string",
+                    "examples": [
+                        "#fff",
+                        "Green",
+                        "$black"
+                    ]
+                },
+                "background-color": {
+                    "title": "/background-color",
+                    "description": "The background color value for this style. The value can be the name of an xterm color, the hexadecimal value, or a theme variable reference.",
+                    "type": "string",
+                    "examples": [
+                        "#2d2a2e",
+                        "Green"
+                    ]
+                },
+                "underline": {
+                    "title": "/underline",
+                    "description": "Indicates that the text should be underlined.",
+                    "type": "boolean"
+                },
+                "bold": {
+                    "title": "/bold",
+                    "description": "Indicates that the text should be bolded.",
+                    "type": "boolean"
+                }
+            },
+            "additionalProperties": false
+        }
+    }
+}

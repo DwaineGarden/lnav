@@ -21,159 +21,168 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "config.h"
-
-#include <math.h>
-#include <limits.h>
-
-#include <numeric>
-
-#include "lnav_util.hh"
 #include "hist_source.hh"
 
-using namespace std;
+#include "base/math_util.hh"
+#include "config.h"
+#include "fmt/chrono.h"
 
-hist_source::hist_source()
-    : hs_bucket_size(1),
-      hs_group_size(100),
-      hs_label_source(NULL),
-      hs_token_bucket(NULL)
-{ }
-
-void hist_source::text_value_for_line(textview_curses &tc,
-                                      int row,
-                                      std::string &value_out,
-                                      bool no_scrub)
+nonstd::optional<vis_line_t>
+hist_source2::row_for_time(struct timeval tv_bucket)
 {
-    int grow = row / (this->buckets_per_group() + 1);
-    int brow = row % (this->buckets_per_group() + 1);
+    std::map<int64_t, struct bucket_block>::iterator iter;
+    int retval = 0;
+    time_t time_bucket = rounddown(tv_bucket.tv_sec, this->hs_time_slice);
 
-    if (brow == 0) {
-        unsigned long width;
-        vis_line_t    height;
+    for (iter = this->hs_blocks.begin(); iter != this->hs_blocks.end(); ++iter)
+    {
+        struct bucket_block& bb = iter->second;
 
-        tc.get_dimensions(height, width);
-        value_out.insert((unsigned int)0, width, '-');
-
-        if (this->hs_label_source != NULL) {
-            this->hs_label_source->hist_label_for_group(grow, value_out);
+        if (time_bucket < bb.bb_buckets[0].b_time) {
+            break;
         }
-        this->hs_token_bucket = NULL;
-    }
-    else {
-        std::map<bucket_group_t, bucket_array_t>::iterator group_iter;
-        bucket_t::iterator iter;
-        int bucket_index;
+        if (time_bucket > bb.bb_buckets[bb.bb_used].b_time) {
+            retval += bb.bb_used + 1;
+            continue;
+        }
 
-        bucket_index          = brow - 1;
-        group_iter = this->hs_groups.begin();
-        advance(group_iter, grow);
-        this->hs_token_bucket = &(group_iter->second[bucket_index]);
-        if (this->hs_label_source != NULL) {
-            this->hs_label_source->
-            hist_label_for_bucket((group_iter->first * this->hs_group_size) +
-                                  (bucket_index * this->hs_bucket_size),
-                                  *this->hs_token_bucket,
-                                  value_out);
+        for (unsigned int lpc = 0; lpc <= bb.bb_used; lpc++, retval++) {
+            if (time_bucket <= bb.bb_buckets[lpc].b_time) {
+                return vis_line_t(retval);
+            }
+        }
+    }
+    return vis_line_t(retval);
+}
+
+void
+hist_source2::text_value_for_line(textview_curses& tc,
+                                  int row,
+                                  std::string& value_out,
+                                  text_sub_source::line_flags_t flags)
+{
+    bucket_t& bucket = this->find_bucket(row);
+    struct tm bucket_tm;
+
+    value_out.clear();
+    if (gmtime_r(&bucket.b_time, &bucket_tm) != nullptr) {
+        fmt::format_to(std::back_inserter(value_out),
+                       FMT_STRING(" {:%a %b %d %H:%M:%S}  "),
+                       bucket_tm);
+    } else {
+        log_error("no time?");
+    }
+    fmt::format_to(
+        std::back_inserter(value_out),
+        FMT_STRING(" {:8L} normal  {:8L} errors  {:8L} warnings  {:8L} marks"),
+        rint(bucket.b_values[HT_NORMAL].hv_value),
+        rint(bucket.b_values[HT_ERROR].hv_value),
+        rint(bucket.b_values[HT_WARNING].hv_value),
+        rint(bucket.b_values[HT_MARK].hv_value));
+}
+
+void
+hist_source2::text_attrs_for_line(textview_curses& tc,
+                                  int row,
+                                  string_attrs_t& value_out)
+{
+    bucket_t& bucket = this->find_bucket(row);
+    int left = 0;
+
+    for (int lpc = 0; lpc < HT__MAX; lpc++) {
+        this->hs_chart.chart_attrs_for_value(tc,
+                                             left,
+                                             (const hist_type_t) lpc,
+                                             bucket.b_values[lpc].hv_value,
+                                             value_out);
+    }
+}
+
+void
+hist_source2::add_value(time_t row,
+                        hist_source2::hist_type_t htype,
+                        double value)
+{
+    if (row < this->hs_last_row) {
+        log_error("time mismatch %ld %ld", row, this->hs_last_row);
+    }
+
+    require(row >= this->hs_last_row);
+
+    row = rounddown(row, this->hs_time_slice);
+    if (row != this->hs_last_row) {
+        this->end_of_row();
+
+        this->hs_last_bucket += 1;
+        this->hs_last_row = row;
+    }
+
+    auto& bucket = this->find_bucket(this->hs_last_bucket);
+    bucket.b_time = row;
+    bucket.b_values[htype].hv_value += value;
+}
+
+void
+hist_source2::init()
+{
+    view_colors& vc = view_colors::singleton();
+
+    this->hs_chart
+        .with_attrs_for_ident(HT_NORMAL, vc.attrs_for_role(role_t::VCR_TEXT))
+        .with_attrs_for_ident(HT_WARNING,
+                              vc.attrs_for_role(role_t::VCR_WARNING))
+        .with_attrs_for_ident(HT_ERROR, vc.attrs_for_role(role_t::VCR_ERROR))
+        .with_attrs_for_ident(HT_MARK, vc.attrs_for_role(role_t::VCR_COMMENT));
+}
+
+void
+hist_source2::clear()
+{
+    this->hs_line_count = 0;
+    this->hs_last_bucket = -1;
+    this->hs_last_row = -1;
+    this->hs_blocks.clear();
+    this->hs_chart.clear();
+    this->init();
+}
+
+void
+hist_source2::end_of_row()
+{
+    if (this->hs_last_bucket >= 0) {
+        bucket_t& last_bucket = this->find_bucket(this->hs_last_bucket);
+
+        for (int lpc = 0; lpc < HT__MAX; lpc++) {
+            this->hs_chart.add_value((const hist_type_t) lpc,
+                                     last_bucket.b_values[lpc].hv_value);
         }
     }
 }
 
-void hist_source::text_attrs_for_line(textview_curses &tc,
-                                      int row,
-                                      string_attrs_t &value_out)
+nonstd::optional<struct timeval>
+hist_source2::time_for_row(vis_line_t row)
 {
-    int            grow         = row / (this->buckets_per_group() + 1);
-    int            brow         = row % (this->buckets_per_group() + 1);
-    int            bucket_index = brow - 1;
-
-    if (this->hs_token_bucket != NULL) {
-        std::map<bucket_group_t, bucket_array_t>::iterator group_iter;
-        view_colors &      vc = view_colors::singleton();
-        unsigned long      width, avail_width;
-        bucket_t::iterator iter;
-        vis_line_t         height;
-        struct line_range  lr;
-
-        group_iter = this->hs_groups.begin();
-        advance(group_iter, grow);
-
-        tc.get_dimensions(height, width);
-        avail_width = width - this->hs_token_bucket->size();
-
-        bucket_stats_t overall_stats;
-
-        for (std::map<bucket_type_t, bucket_stats_t>::iterator stats_iter =
-             this->hs_bucket_stats.begin();
-             stats_iter != this->hs_bucket_stats.end();
-             ++stats_iter) {
-            if (!this->is_bucket_graphed(stats_iter->first))
-                continue;
-            overall_stats.merge(stats_iter->second);
-        }
-
-        lr.lr_start = 0;
-        for (iter = this->hs_token_bucket->begin();
-             iter != this->hs_token_bucket->end();
-             iter++) {
-            double percent = (double)(iter->second - overall_stats.bs_min_count) /
-        overall_stats.width();
-            int amount, attrs;
-
-            if (!this->is_bucket_graphed(iter->first))
-                continue;
-            
-            attrs = vc.
-                    reverse_attrs_for_role(this->get_role_for_type(iter->first));
-            amount = (int)rint(percent * avail_width);
-            if (iter->second == 0.0) {
-                amount = 0;
-            }
-            else {
-                amount = max(1, amount);
-            }
-
-            lr.lr_end = lr.lr_start + amount;
-            value_out.push_back(string_attr(lr, &view_curses::VC_STYLE, attrs));
-
-            lr.lr_start = lr.lr_end;
-        }
-
-        this->hs_label_source->hist_attrs_for_bucket(
-            (group_iter->first * this->hs_group_size) +
-            (bucket_index * this->hs_bucket_size),
-            *this->hs_token_bucket,
-            value_out);
+    if (row < 0 || row > this->hs_line_count) {
+        return nonstd::nullopt;
     }
+
+    bucket_t& bucket = this->find_bucket(row);
+
+    return timeval{bucket.b_time, 0};
 }
 
-void hist_source::add_value(unsigned int value,
-                            bucket_type_t bt,
-                            bucket_count_t amount)
+hist_source2::bucket_t&
+hist_source2::find_bucket(int64_t index)
 {
-    bucket_group_t bg;
-
-    bg = bucket_group_t(value / this->hs_group_size);
-
-    bucket_array_t &ba = this->hs_groups[bg];
-
-    if (ba.empty()) {
-        ba.resize(this->buckets_per_group());
-    }
-
-    bucket_count_t &bc = ba[(value % this->hs_group_size) /
-                            this->hs_bucket_size][bt];
-
-    bc += amount;
-
-    bucket_stats_t &stats = this->hs_bucket_stats[bt];
-
-    stats.bs_max_count = max(stats.bs_max_count, bc);
-    stats.bs_min_count = min(stats.bs_min_count, bc);
+    struct bucket_block& bb = this->hs_blocks[index / BLOCK_SIZE];
+    unsigned int intra_block_index = index % BLOCK_SIZE;
+    bb.bb_used = std::max(intra_block_index, bb.bb_used);
+    this->hs_line_count = std::max(this->hs_line_count, index + 1);
+    return bb.bb_buckets[intra_block_index];
 }

@@ -1,4 +1,4 @@
-AC_INIT([lnav],[0.8.0],[lnav@googlegroups.com],[lnav],[http://lnav.org])
+AC_INIT([lnav],[0.11.1],[lnav@googlegroups.com],[lnav],[http://lnav.org])
 AC_CONFIG_SRCDIR([src/lnav.cc])
 AC_CONFIG_MACRO_DIR([m4])
 AM_INIT_AUTOMAKE([foreign subdir-objects])
@@ -7,68 +7,83 @@ AM_SILENT_RULES([yes])
 AC_PREFIX_DEFAULT(/usr)
 
 AC_CANONICAL_HOST
+AX_PROG_CC_FOR_BUILD
 
-for defdir in /opt/local /usr/local /usr /; do
-    if test -d "$defdir/include"; then
-        CPPFLAGS="$CPPFLAGS -I$defdir/include"
-    fi
+AX_PTHREAD()
+LIBS="$PTHREAD_LIBS $LIBS"
+CFLAGS="$CFLAGS $PTHREAD_CFLAGS"
+CC="$PTHREAD_CC"
 
-    if test -d "$defdir/lib"; then
-        LDFLAGS="$LDFLAGS -L$defdir/lib"
-    fi
-    if test -d "$defdir/lib64"; then
-        LDFLAGS="$LDFLAGS -L$defdir/lib64"
-    fi
+AC_LANG(C++)
+AX_CXX_COMPILE_STDCXX_14([noext], [mandatory])
 
-    if test -d "$defdir/lib/x86_64-linux-gnu"; then
-        LDFLAGS="$LDFLAGS -L$defdir/lib/x86_64-linux-gnu"
-    fi
-done
+AC_ARG_ENABLE(
+    [system-paths],
+    AS_HELP_STRING([--disable-system-paths],
+                   [Add extra system paths]),,[enable_system_paths=yes])
+
+if test x"${enable_system_paths}" != x"no"; then
+    for defdir in /opt/local /usr/local; do
+        if test -d "$defdir/include"; then
+            echo "Adding include path: $defdir/include"
+            CPPFLAGS="$CPPFLAGS -I$defdir/include"
+        fi
+    done
+
+    for defdir in /opt/local /usr/local /usr /; do
+
+        if test -d "$defdir/lib64"; then
+            LDFLAGS="$LDFLAGS -L$defdir/lib64"
+        fi
+        if test -d "$defdir/lib"; then
+            LDFLAGS="$LDFLAGS -L$defdir/lib"
+        fi
+
+        if test -d "$defdir/lib/x86_64-linux-gnu"; then
+            LDFLAGS="$LDFLAGS -L$defdir/lib/x86_64-linux-gnu"
+        fi
+    done
+else
+    echo "Not including extra system paths"
+fi
 
 dnl abssrcdir is the absolute path to the source base (regardless of where
 dnl you are building it)
 AS_CASE([x$srcdir],
     [x/*],
     AS_VAR_SET(abssrcdir, $srcdir),
-    AS_VAR_SET(abssrcdir, `pwd`/$srcdir)
+    AS_VAR_SET(abssrcdir, `cd $srcdir; pwd`)
 )
 
 AC_SUBST(abssrcdir)
 
 AC_PROG_CXX
 
-CPPFLAGS="$CPPFLAGS -D_ISOC99_SOURCE -D__STDC_LIMIT_MACROS"
+CPPFLAGS="$CPPFLAGS -D_ISOC99_SOURCE -D__STDC_LIMIT_MACROS -D_GNU_SOURCE"
 
-# CFLAGS=`echo $CFLAGS | sed 's/-O2//g'`
-# CXXFLAGS=`echo $CXXFLAGS | sed 's/-O2//g'`
+AC_ARG_ENABLE([debug],
+              AS_HELP_STRING([--enable-debug],
+                             [Compile with symbols]))
+
+AS_VAR_IF([enable_profiling], [yes],
+      [CFLAGS=`echo $CFLAGS | sed 's/-O2//g'`
+       CXXFLAGS=`echo $CXXFLAGS | sed 's/-O2//g'`],
+      [enable_debug=no]dnl
+)
 
 AC_ARG_VAR(SFTP_TEST_URL)
 
-AC_ARG_ENABLE([profiling],
-              AS_HELP_STRING([--enable-profiling],
-                             [Compile with gprof(1) profiling support]))
-
-AC_MSG_CHECKING(gprof(4) profiling support)
-
-AS_VAR_IF([enable_profiling], [yes],
-      [CFLAGS="$CFLAGS -pg -gstabs"
-       CXXFLAGS="$CXXFLAGS -pg -gstabs"
-       LDFLAGS="$LDFLAGS -pg"],
-      [enable_profiling=no]dnl
-)
-
-AC_MSG_RESULT($enable_profiling)
-
-AC_SUBST(CFLAGS_PG)
-
 AC_PROG_INSTALL
 AC_PROG_RANLIB
+AM_PROG_AR
 AC_PROG_LN_S
 AC_PROG_MAKE_SET
 
 AC_PATH_PROG(BZIP2_CMD, [bzip2])
 AC_PATH_PROG(RE2C_CMD, [re2c])
 AM_CONDITIONAL(HAVE_RE2C, test x"$RE2C_CMD" != x"")
+AC_PATH_PROG(XZ_CMD, [xz])
+AC_PATH_PROG(TSHARK_CMD, [tshark])
 
 AC_CHECK_SIZEOF(off_t)
 AC_CHECK_SIZEOF(size_t)
@@ -76,8 +91,8 @@ AC_CHECK_SIZEOF(size_t)
 AC_STRUCT_TIMEZONE
 
 AC_ARG_ENABLE([static],
-              AS_HELP_STRING([--disable-static],
-                             [Disable static linking]))
+              AS_HELP_STRING([--enable-static],
+                             [Enable static linking]))
 
 AC_SEARCH_LIBS(openpty, util)
 AC_SEARCH_LIBS(gzseek, z, [], [AC_MSG_ERROR([libz required to build])])
@@ -87,7 +102,7 @@ AC_SEARCH_LIBS(BZ2_bzopen, bz2,
 AC_SUBST(BZIP2_SUPPORT)
 AC_SEARCH_LIBS(dlopen, dl)
 AC_SEARCH_LIBS(backtrace, execinfo)
-LIBCURL_CHECK_CONFIG([], [7.23.0], [], [], [test x"${enable_static}" != x"no"])
+LIBCURL_CHECK_CONFIG([], [7.23.0], [], [AC_MSG_ERROR([libcurl required to build])], [test x"${enable_static}" = x"yes"])
 
 # Sometimes, curses depends on these libraries being linked in...
 AC_ARG_ENABLE([tinfo],
@@ -99,7 +114,7 @@ AC_ARG_ENABLE([tinfo],
 AS_IF([test "x${enable_tinfo}" != "xno"],
     [dnl
     AC_MSG_NOTICE([Trying to link with tinfo])
-    AC_SEARCH_LIBS(cur_term, tinfo,
+    AC_SEARCH_LIBS(cur_term, [tinfow tinfo],
         AC_MSG_NOTICE([Linking with tinfo]),
         AC_MSG_WARN([libtinfo not found])
     )
@@ -112,7 +127,7 @@ dnl and gpm libraries with interdependencies. This check is not required on OS X
 AS_CASE(["$host_os"],
     [darwin*],
     [],
-    AC_SEARCH_LIBS(Gpm_Open, gpm,
+    AC_SEARCH_LIBS(Gpm_Open, [gpm :libgpm.so.2],
        AS_VAR_SET(HAVE_GPM, "1"),
        AC_MSG_WARN(m4_join([ ],
                    [libgpm not found. If build fails later],
@@ -122,6 +137,41 @@ AS_CASE(["$host_os"],
 )
 
 AC_CHECK_HEADERS(execinfo.h pty.h util.h zlib.h bzlib.h libutil.h sys/ttydefaults.h)
+
+dnl Experimental SIMD features.
+AC_ARG_ENABLE([simd],
+    AS_HELP_STRING([--enable-simd], [Try and enable simd optimizations]),
+    [
+     AS_CASE(["$enable_simd"],
+             [no], [enable_simd="no"],
+             [yes | ""],[enable_simd="yes"])
+     ],
+     []
+)
+
+AS_IF([test "x$enable_simd" = "xyes"], [
+       AC_CHECK_HEADERS(x86intrin.h)
+])
+
+
+AC_ARG_WITH([system_doctest],
+    AS_HELP_STRING(
+        [--with-system-doctest],
+        [Use the system provided doctest library rather than the bundled one]
+    ),
+    [], []
+)
+
+AS_IF([test "x$with_system_doctest" = "xyes"], [
+    AC_CHECK_HEADERS(doctest/doctest.h)
+    AS_IF([test "x$ac_cv_header_doctest_doctest_h" != "xyes"], [
+        AC_MSG_ERROR([system doctest not found])dnl
+    ])
+])
+AS_IF([test "x$with_system_doctest" != "xyes"], [
+    CPPFLAGS="-I\$(top_srcdir)/src/third-party/doctest-root $CPPFLAGS"
+])
+
 
 LNAV_WITH_JEMALLOC
 
@@ -133,35 +183,51 @@ AS_VAR_IF([ax_cv_curses],[yes],[],
     AC_MSG_ERROR([requires an X/Open-compatible Curses library with color])dnl
 )
 
-AX_PATH_LIB_PCRE([], [AC_MSG_ERROR([pcre required to build])])
+AX_PATH_LIB_ARCHIVE
+AX_CHECK_PCRE2([8], [], [AC_MSG_ERROR([pcre2 is required to build])])
 AX_PATH_LIB_READLINE
 
-LNAV_WITH_SQLITE3("3.6.0")
+AX_CODE_COVERAGE
 
-case "$host_os" in
-    *)
-        # AC_DEFINE([_XOPEN_SOURCE], [500], [Need pread])
-        AC_DEFINE([_BSD_SOURCE], [1], [Need pread])
-        ;;
-esac
+LNAV_WITH_SQLITE3("3.9.0")
 
-AS_VAR_SET(ALL_LDFLAGS, "$SQLITE3_LDFLAGS $READLINE_LDFLAGS $LDFLAGS")
+dnl case "$host_os" in
+dnl     *)
+dnl         # AC_DEFINE([_XOPEN_SOURCE], [500], [Need pread])
+dnl         AC_DEFINE([_DEFAULT_SOURCE], [1], [Need pread])
+dnl         AC_DEFINE([_BSD_SOURCE], [1], [Need pread])
+dnl         ;;
+dnl esac
+
+AC_DEFINE([_XOPEN_SOURCE_EXTENDED], [1], [Wide character support for ncurses])
+
+AS_VAR_SET(ALL_LDFLAGS, "$SQLITE3_LDFLAGS $READLINE_LDFLAGS $LIBARCHIVE_LDFLAGS $LIBCURL $LDFLAGS")
 
 AS_VAR_SET(static_lib_list,
-           ["libncurses.a libreadline.a libsqlite3.a libz.a libtinfo.a"])
+           ["libncurses.a libncursesw.a libreadline.a libsqlite3.a libz.a libtinfo.a libtinfow.a"])
 AS_VAR_SET(static_lib_list,
-           ["$static_lib_list libpcre.a libpcrecpp.a libncursesw.a libbz2.a"])
+           ["$static_lib_list libpcre2-8.a libncursesw.a libbz2.a"])
 AS_VAR_SET(static_lib_list,
            ["$static_lib_list libgpm.a libcurl.a libcrypto.a libssl.a libssh2.a"])
+AS_VAR_SET(static_lib_list,
+           ["$static_lib_list libnghttp2.a liblzma.a libcrypto.a libzstd.a libldap.a"])
+AS_VAR_SET(static_lib_list,
+           ["$static_lib_list libarchive.a libidn2.a libgssapi_krb5.a libbrotlidec-static.a"])
+AS_VAR_SET(static_lib_list,
+           ["$static_lib_list librtmp.a libiconv.a liblz4.a liblber.a libunistring.a"])
 
-if test x"${enable_static}" != x"no"; then
+if test x"${enable_static}" = x"yes"; then
     case "$host_os" in
     darwin*)
         STATIC_LDFLAGS="$STATIC_LDFLAGS -Wl,-search_paths_first"
         ;;
     esac
 
+    AX_CHECK_LINK_FLAG([-static-libgcc], [STATIC_LDFLAGS="$STATIC_LDFLAGS -static-libgcc"])
+
     STATIC_LDFLAGS="$STATIC_LDFLAGS -L`pwd`/src/static-libs"
+    AX_CHECK_LINK_FLAG([-static-libstdc++],
+                       [STATIC_LDFLAGS="$STATIC_LDFLAGS -static-libstdc++"])
     # This is a hack to link against static libraries instead of shared
     # so that we can build a mostly statically link exe that can
     # be downloaded and used right away.  This is required for OS X and
@@ -176,12 +242,22 @@ if test x"${enable_static}" != x"no"; then
         -L*)
                 libdir=`echo $libflag | sed -e 's/-L//'`
                 for slib in $static_lib_list; do
-                    if test -e "$libdir/$slib"; then
+                    if test -e "$libdir/$slib" -a ! -e "src/static-libs/$slib"; then
                         ln -sf "$libdir/$slib" src/static-libs/.
                     fi
                 done
         ;;
         esac
+    done
+
+    for slib in $static_lib_list; do
+        AC_MSG_CHECKING(for static library $slib)
+        if test -e "src/static-libs/$slib"; then
+            found_slib=`readlink src/static-libs/$slib`
+            AC_MSG_RESULT($found_slib)
+        else
+            AC_MSG_RESULT(not found)
+        fi
     done
 fi
 AC_SUBST(STATIC_LDFLAGS)
@@ -230,11 +306,26 @@ AS_IF([test $? -eq 0],
 
 AM_CONDITIONAL(USE_INCLUDED_YAJL, test $HAVE_LOCAL_YAJL -eq 0)
 AM_CONDITIONAL(HAVE_LIBCURL, test x"$LIBCURL" != x"")
+AM_CONDITIONAL([DISABLE_DOCUMENTATION], [ test x"$cross_compiling" != x"no" ])
+
+USER_CXXFLAGS="${CXXFLAGS}"
+AC_SUBST(USER_CXXFLAGS)
 
 AC_CONFIG_HEADERS([src/config.h])
 AC_CONFIG_FILES([Makefile])
 AC_CONFIG_FILES([TESTS_ENVIRONMENT])
+AC_CONFIG_FILES([tools/Makefile])
 AC_CONFIG_FILES([src/Makefile])
+AC_CONFIG_FILES([src/base/Makefile])
+AC_CONFIG_FILES([src/formats/logfmt/Makefile])
+AC_CONFIG_FILES([src/fmtlib/Makefile])
+AC_CONFIG_FILES([src/pcrepp/Makefile])
+AC_CONFIG_FILES([src/pugixml/Makefile])
+AC_CONFIG_FILES([src/tailer/Makefile])
+AC_CONFIG_FILES([src/yajl/Makefile])
+AC_CONFIG_FILES([src/yajlpp/Makefile])
+AC_CONFIG_FILES([src/third-party/base64/lib/Makefile])
+AC_CONFIG_FILES([src/third-party/scnlib/src/Makefile])
 AC_CONFIG_FILES([test/Makefile])
 
 AC_OUTPUT

@@ -1,0 +1,83 @@
+add_library(
+        base STATIC
+        ../config.h.in
+        ansi_scrubber.cc
+        attr_line.cc
+        attr_line.builder.cc
+        auto_pid.cc
+        date_time_scanner.cc
+        fs_util.cc
+        humanize.cc
+        humanize.network.cc
+        humanize.time.cc
+        intern_string.cc
+        is_utf8.cc
+        isc.cc
+        lnav.console.cc
+        lnav.gzip.cc
+        lnav_log.cc
+        network.tcp.cc
+        paths.cc
+        snippet_highlighters.cc
+        string_attr_type.cc
+        string_util.cc
+        strnatcmp.c
+        time_util.cc
+
+        ansi_scrubber.hh
+        attr_line.hh
+        attr_line.builder.hh
+        auto_fd.hh
+        auto_mem.hh
+        auto_pid.hh
+        bus.hh
+        date_time_scanner.hh
+        enum_util.hh
+        fs_util.hh
+        func_util.hh
+        future_util.hh
+        humanize.hh
+        humanize.network.hh
+        humanize.time.hh
+        injector.hh
+        injector.bind.hh
+        intern_string.hh
+        is_utf8.hh
+        isc.hh
+        itertools.hh
+        lnav.console.hh
+        lnav.console.into.hh
+        log_level_enum.hh
+        lrucache.hpp
+        math_util.hh
+        network.tcp.hh
+        paths.hh
+        result.h
+        snippet_highlighters.hh
+        string_attr_type.hh
+        strnatcmp.h
+        time_util.hh
+
+        ../third-party/xxHash/xxhash.h
+        ../third-party/xxHash/xxhash.c
+)
+
+target_include_directories(base PUBLIC . .. ../third-party
+        ${CMAKE_CURRENT_BINARY_DIR}/..)
+target_link_libraries(base cppfmt cppscnlib pcrepp ncurses::libcurses pthread)
+
+add_executable(
+        test_base
+        attr_line.tests.cc
+        fs_util.tests.cc
+        humanize.file_size.tests.cc
+        humanize.network.tests.cc
+        humanize.time.tests.cc
+        intern_string.tests.cc
+        lnav.gzip.tests.cc
+        string_util.tests.cc
+        network.tcp.tests.cc
+        test_base.cc)
+target_include_directories(test_base PUBLIC ../third-party/doctest-root)
+target_link_libraries(test_base base pcrepp ZLIB::ZLIB)
+add_test(NAME test_base COMMAND test_base)

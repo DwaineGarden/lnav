@@ -21,14 +21,14 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef __filter_observer_hh
-#define __filter_observer_hh
+#ifndef filter_observer_hh
+#define filter_observer_hh
 
 #include <sys/types.h>
 
@@ -37,69 +37,41 @@
 
 class line_filter_observer : public logline_observer {
 public:
-    line_filter_observer(filter_stack &fs, logfile *lf)
-            : lfo_filter_stack(fs), lfo_filter_state(lf) {
+    line_filter_observer(filter_stack& fs, std::shared_ptr<logfile> lf)
+        : lfo_filter_stack(fs), lfo_filter_state(lf)
+    {
+    }
 
-    };
-
-    void logline_restart(const logfile &lf) {
-        for (filter_stack::iterator iter = this->lfo_filter_stack.begin();
-             iter != this->lfo_filter_stack.end();
-             ++iter) {
-            (*iter)->revert_to_last(this->lfo_filter_state);
+    void logline_restart(const logfile& lf, file_size_t rollback_size) override
+    {
+        for (auto& filter : this->lfo_filter_stack) {
+            filter->revert_to_last(this->lfo_filter_state, rollback_size);
         }
-    };
+    }
 
-    void logline_new_line(const logfile &lf, logfile::const_iterator ll, shared_buffer_ref &sbr) {
-        size_t offset = std::distance(lf.begin(), ll);
+    void logline_new_lines(const logfile& lf,
+                           logfile::const_iterator ll_begin,
+                           logfile::const_iterator ll_end,
+                           shared_buffer_ref& sbr) override;
 
-        require(&lf == this->lfo_filter_state.tfs_logfile);
+    void logline_eof(const logfile& lf) override;
 
-        this->lfo_filter_state.resize(lf.size());
-        if (!this->lfo_filter_stack.empty()) {
-            if (lf.get_format() != NULL) {
-                lf.get_format()->get_subline(*ll, sbr);
-            }
-            for (filter_stack::iterator iter = this->lfo_filter_stack.begin();
-                 iter != this->lfo_filter_stack.end();
-                 ++iter) {
-                if (offset >= this->lfo_filter_state.tfs_filter_count[(*iter)->get_index()]) {
-                    (*iter)->add_line(this->lfo_filter_state, ll, sbr);
-                }
-            }
-        }
-    };
-
-    void logline_eof(const logfile &lf) {
-        for (filter_stack::iterator iter = this->lfo_filter_stack.begin();
-             iter != this->lfo_filter_stack.end();
-             ++iter) {
-            (*iter)->end_of_message(this->lfo_filter_state);
-        }
-    };
-
-    bool excluded(uint32_t filter_in_mask, uint32_t filter_out_mask,
-            size_t offset) const {
-        bool filtered_in = (filter_in_mask == 0) || (
-                this->lfo_filter_state.tfs_mask[offset] & filter_in_mask) != 0;
-        bool filtered_out = (
-                this->lfo_filter_state.tfs_mask[offset] & filter_out_mask) != 0;
+    bool excluded(uint32_t filter_in_mask,
+                  uint32_t filter_out_mask,
+                  size_t offset) const
+    {
+        bool filtered_in = (filter_in_mask == 0)
+            || (this->lfo_filter_state.tfs_mask[offset] & filter_in_mask) != 0;
+        bool filtered_out
+            = (this->lfo_filter_state.tfs_mask[offset] & filter_out_mask) != 0;
         return !filtered_in || filtered_out;
-    };
+    }
 
-    size_t get_min_count(size_t max) const {
-        size_t retval = max;
+    size_t get_min_count(size_t max) const;
 
-        for (filter_stack::iterator iter = this->lfo_filter_stack.begin();
-             iter != this->lfo_filter_stack.end();
-             ++iter) {
-            retval = std::min(retval, this->lfo_filter_state.tfs_filter_count[(*iter)->get_index()]);
-        }
+    void clear_deleted_filter_state();
 
-        return retval;
-    };
-
-    filter_stack &lfo_filter_stack;
+    filter_stack& lfo_filter_stack;
     logfile_filter_state lfo_filter_state;
 };
 

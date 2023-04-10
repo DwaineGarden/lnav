@@ -15,10 +15,11 @@ efficiently zero in on problems.
 PREREQUISITES
 -------------
 
-Lnav requires the following software packages:
+The following software packages are required to build/run lnav:
 
-  libpcre   - The Perl Compatible Regular Expression (PCRE) library.
-  sqlite    - The SQLite database engine.
+  gcc/clang - A C++14-compatible compiler.
+  libpcre2  - The Perl Compatible Regular Expression v2 (PCRE2) library.
+  sqlite    - The SQLite database engine.  Version 3.9.0 or higher is required.
   ncurses   - The ncurses text UI library.
   readline  - The readline line editing library.
   zlib      - The zlib compression library.
@@ -26,12 +27,16 @@ Lnav requires the following software packages:
   re2c      - The re2c scanner generator.
   libcurl   - The cURL library for downloading files from URLs.  Version
               7.23.0 or higher is required.
+  libarchive - The libarchive library for opening archive files, like zip/tgz.
+  wireshark - The 'tshark' program is used to interpret pcap files.
 
 
 INSTALLATION
 ------------
 
 Lnav follows the usual GNU style for configuring and installing software:
+
+Run "./autogen.sh" if compiling from a cloned repository.
 
   $ ./configure
   $ make
@@ -51,9 +56,25 @@ You can view all the syslog messages by running:
   $ lnav /var/log/messages*
 
 
+SUPPORT
+-------
+
+The lnav mailing list can be reached at:
+
+  lnav@googlegroups.com
+
+
+ACKNOWLEDGEMENTS
+----------------
+
+The xterm color database was copied from:
+
+  https://jonasjacek.github.io/colors/
+
+
 SEE ALSO
 --------
 
-Lnav website:
+The lnav website:
 
-  http://lnav.org
+  https://lnav.org

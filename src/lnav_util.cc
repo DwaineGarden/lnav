@@ -21,8 +21,8 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
@@ -31,164 +31,35 @@
  * Dumping ground for useful functions with no other home.
  */
 
-#include "config.h"
+#include "lnav_util.hh"
 
 #include <stdio.h>
-#include <fcntl.h>
-#include <ctype.h>
+#include <sys/stat.h>
 
-#include <sqlite3.h>
+#include "base/ansi_scrubber.hh"
+#include "base/itertools.hh"
+#include "base/result.h"
+#include "bookmarks.hh"
+#include "config.h"
+#include "fmt/format.h"
+#include "log_format_fwd.hh"
+#include "view_curses.hh"
+#include "yajlpp/yajlpp.hh"
+#include "yajlpp/yajlpp_def.hh"
 
-#include "auto_fd.hh"
-#include "lnav_util.hh"
-#include "pcrepp.hh"
-#include "lnav_config.hh"
-
-using namespace std;
-
-bool is_url(const char *fn)
-{
-    static pcrepp url_re("^(file|https?|ftps?||scp|sftp):");
-
-    pcre_context_static<30> pc;
-    pcre_input pi(fn);
-
-    return url_re.match(pc, pi);
-}
-
-std::string hash_string(const std::string &str)
-{
-    byte_array<2, uint64> hash;
-    SpookyHash context;
-
-    context.Init(0, 0);
-    context.Update(str.c_str(), str.length());
-    context.Final(hash.out(0), hash.out(1));
-
-    return hash.to_string();
-}
-
-size_t unquote(char *dst, const char *str, size_t len)
-{
-    if (str[0] == 'r' || str[0] == 'u') {
-        str += 1;
-        len -= 1;
-    }
-    char quote_char = str[0];
-    size_t index = 0;
-
-    require(str[0] == '\'' || str[0] == '"');
-
-    for (size_t lpc = 1; lpc < (len - 1); lpc++, index++) {
-        dst[index] = str[lpc];
-        if (str[lpc] == quote_char) {
-            lpc += 1;
-        }
-        else if (str[lpc] == '\\' && (lpc + 1) < len) {
-            switch (str[lpc] + 1) {
-                case 'n':
-                    dst[index] = '\n';
-                    break;
-                case 'r':
-                    dst[index] = '\r';
-                    break;
-                case 't':
-                    dst[index] = '\t';
-                    break;
-                default:
-                    dst[index] = str[lpc + 1];
-                    break;
-            }
-            lpc += 1;
-        }
-    }
-    dst[index] = '\0';
-
-    return index;
-}
-
-std::string time_ago(time_t last_time)
-{
-    time_t      delta, current_time = time(NULL);
-    const char *fmt;
-    char        buffer[64];
-    int         amount;
-
-    delta = current_time - last_time;
-    if (delta < 0) {
-        return "in the future";
-    }
-    else if (delta < 60) {
-        return "just now";
-    }
-    else if (delta < (60 * 2)) {
-        return "one minute ago";
-    }
-    else if (delta < (60 * 60)) {
-        fmt    = "%d minutes ago";
-        amount = delta / 60;
-    }
-    else if (delta < (2 * 60 * 60)) {
-        return "one hour ago";
-    }
-    else if (delta < (24 * 60 * 60)) {
-        fmt    = "%d hours ago";
-        amount = delta / (60 * 60);
-    }
-    else if (delta < (2 * 24 * 60 * 60)) {
-        return "one day ago";
-    }
-    else if (delta < (365 * 24 * 60 * 60)) {
-        fmt    = "%d days ago";
-        amount = delta / (24 * 60 * 60);
-    }
-    else {
-        return "over a year ago";
-    }
-
-    snprintf(buffer, sizeof(buffer), fmt, amount);
-
-    return std::string(buffer);
-}
-
-/* XXX figure out how to do this with the template */
-void sqlite_close_wrapper(void *mem)
-{
-    sqlite3_close((sqlite3 *)mem);
-}
-
-std::string get_current_dir(void)
-{
-    char        cwd[FILENAME_MAX];
-    std::string retval = ".";
-
-    if (getcwd(cwd, sizeof(cwd)) == NULL) {
-        perror("getcwd");
-    }
-    else {
-        retval = std::string(cwd);
-    }
-
-    if (retval != "/") {
-        retval += "/";
-    }
-
-    return retval;
-}
-
-bool change_to_parent_dir(void)
+bool
+change_to_parent_dir()
 {
     bool retval = false;
     char cwd[3] = "";
 
-    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+    if (getcwd(cwd, sizeof(cwd)) == nullptr) {
         /* perror("getcwd"); */
     }
     if (strcmp(cwd, "/") != 0) {
         if (chdir("..") == -1) {
             perror("chdir('..')");
-        }
-        else {
+        } else {
             retval = true;
         }
     }
@@ -196,377 +67,268 @@ bool change_to_parent_dir(void)
     return retval;
 }
 
-file_format_t detect_file_format(const std::string &filename)
+bool
+is_dev_null(const struct stat& st)
 {
-    file_format_t retval = FF_UNKNOWN;
-    auto_fd       fd;
+    struct stat null_stat;
 
-    if ((fd = open(filename.c_str(), O_RDONLY)) != -1) {
-        char buffer[32];
-        int  rc;
+    stat("/dev/null", &null_stat);
 
-        if ((rc = read(fd, buffer, sizeof(buffer))) > 0) {
-            if (rc > 16 &&
-                strncmp(buffer, "SQLite format 3", 16) == 0) {
-                retval = FF_SQLITE_DB;
+    return st.st_dev == null_stat.st_dev && st.st_ino == null_stat.st_ino;
+}
+
+bool
+is_dev_null(int fd)
+{
+    struct stat fd_stat;
+
+    fstat(fd, &fd_stat);
+    return is_dev_null(fd_stat);
+}
+
+void
+write_line_to(FILE* outfile, const attr_line_t& al)
+{
+    const auto& al_attrs = al.get_attrs();
+    auto lr = find_string_attr_range(al_attrs, &SA_ORIGINAL_LINE);
+
+    if (!lr.is_valid() || lr.lr_start > 1) {
+        // If the line is prefixed with some extra information, include that
+        // in the output.  For example, the log file name or time offset.
+        lnav::console::println(outfile, al);
+    } else {
+        lnav::console::println(outfile, al.subline(lr.lr_start, lr.length()));
+    }
+}
+
+namespace lnav {
+
+std::string
+to_json(const std::string& str)
+{
+    yajlpp_gen gen;
+
+    yajl_gen_config(gen, yajl_gen_beautify, false);
+    yajl_gen_string(gen, str);
+
+    return gen.to_string_fragment().to_string();
+}
+
+static void
+to_json(yajlpp_gen& gen, const attr_line_t& al)
+{
+    {
+        yajlpp_map root_map(gen);
+
+        root_map.gen("str");
+        root_map.gen(al.get_string());
+
+        root_map.gen("attrs");
+        {
+            yajlpp_array attr_array(gen);
+
+            for (const auto& sa : al.get_attrs()) {
+                yajlpp_map elem_map(gen);
+
+                elem_map.gen("start");
+                elem_map.gen(sa.sa_range.lr_start);
+                elem_map.gen("end");
+                elem_map.gen(sa.sa_range.lr_end);
+                elem_map.gen("type");
+                elem_map.gen(sa.sa_type->sat_name);
+                elem_map.gen("value");
+                sa.sa_value.match(
+                    [&](int64_t i) { elem_map.gen(i); },
+                    [&](role_t r) {
+                        elem_map.gen(lnav::enums::to_underlying(r));
+                    },
+                    [&](const intern_string_t& str) { elem_map.gen(str); },
+                    [&](const std::string& str) { elem_map.gen(str); },
+                    [&](const text_attrs& ta) { elem_map.gen(ta.ta_attrs); },
+                    [&](const std::shared_ptr<logfile>& lf) {
+                        elem_map.gen("");
+                    },
+                    [&](const bookmark_metadata* bm) { elem_map.gen(""); },
+                    [&](const timespec& ts) { elem_map.gen(""); },
+                    [&](const string_fragment& sf) { elem_map.gen(sf); });
             }
         }
     }
-
-    return retval;
 }
 
-static time_t BAD_DATE = -1;
-
-time_t tm2sec(const struct tm *t)
+std::string
+to_json(const attr_line_t& al)
 {
-    int       year;
-    time_t    days;
-    const int dayoffset[12] =
-    { 306, 337, 0, 31, 61, 92, 122, 153, 184, 214, 245, 275 };
+    yajlpp_gen gen;
 
-    year = t->tm_year;
+    yajl_gen_config(gen, yajl_gen_beautify, false);
+    to_json(gen, al);
 
-    if (year < 70 || ((sizeof(time_t) <= 4) && (year >= 138))) {
-        return BAD_DATE;
-    }
-
-    /* shift new year to 1st March in order to make leap year calc easy */
-
-    if (t->tm_mon < 2) {
-        year--;
-    }
-
-    /* Find number of days since 1st March 1900 (in the Gregorian calendar). */
-
-    days  = year * 365 + year / 4 - year / 100 + (year / 100 + 3) / 4;
-    days += dayoffset[t->tm_mon] + t->tm_mday - 1;
-    days -= 25508; /* 1 jan 1970 is 25508 days since 1 mar 1900 */
-
-    days = ((days * 24 + t->tm_hour) * 60 + t->tm_min) * 60 + t->tm_sec;
-
-    if (days < 0) {
-        return BAD_DATE;
-    }                          /* must have overflowed */
-    else {
-#ifdef HAVE_STRUCT_TM_TM_ZONE
-        if (t->tm_zone) {
-            days -= t->tm_gmtoff;
-        }
-#endif
-        return days;
-    }                          /* must be a valid time */
+    return gen.to_string_fragment().to_string();
 }
 
-static const int MONSPERYEAR = 12;
-static const int SECSPERMIN = 60;
-static const int SECSPERHOUR = 60 * SECSPERMIN;
-static const int SECSPERDAY = 24 * SECSPERHOUR;
-static const int YEAR_BASE = 1900;
-static const int EPOCH_WDAY = 4;
-static const int DAYSPERWEEK = 7;
-static const int EPOCH_YEAR = 1970;
-
-#define isleap(y) ((((y) % 4) == 0 && ((y) % 100) != 0) || ((y) % 400) == 0)
-
-static const int mon_lengths[2][MONSPERYEAR] = {
-        {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},
-        {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
-} ;
-
-static const int year_lengths[2] = {
-        365,
-        366
-} ;
-
-struct tm *secs2tm(time_t *tim_p, struct tm *res)
+std::string
+to_json(const lnav::console::user_message& um)
 {
-    long days, rem;
-    time_t lcltime;
-    int y;
-    int yleap;
-    const int *ip;
+    yajlpp_gen gen;
 
-    /* base decision about std/dst time on current time */
-    lcltime = *tim_p;
+    yajl_gen_config(gen, yajl_gen_beautify, false);
 
-    days = ((long)lcltime) / SECSPERDAY;
-    rem = ((long)lcltime) % SECSPERDAY;
-    while (rem < 0)
     {
-        rem += SECSPERDAY;
-        --days;
-    }
+        yajlpp_map root_map(gen);
 
-    /* compute hour, min, and sec */
-    res->tm_hour = (int) (rem / SECSPERHOUR);
-    rem %= SECSPERHOUR;
-    res->tm_min = (int) (rem / SECSPERMIN);
-    res->tm_sec = (int) (rem % SECSPERMIN);
-
-    /* compute day of week */
-    if ((res->tm_wday = ((EPOCH_WDAY + days) % DAYSPERWEEK)) < 0)
-        res->tm_wday += DAYSPERWEEK;
-
-    /* compute year & day of year */
-    y = EPOCH_YEAR;
-    if (days >= 0)
-    {
-        for (;;)
-        {
-            yleap = isleap(y);
-            if (days < year_lengths[yleap])
+        root_map.gen("level");
+        switch (um.um_level) {
+            case console::user_message::level::raw:
+                root_map.gen("raw");
                 break;
-            y++;
-            days -= year_lengths[yleap];
+            case console::user_message::level::ok:
+                root_map.gen("ok");
+                break;
+            case console::user_message::level::info:
+                root_map.gen("info");
+                break;
+            case console::user_message::level::warning:
+                root_map.gen("warning");
+                break;
+            case console::user_message::level::error:
+                root_map.gen("error");
+                break;
         }
-    }
-    else
-    {
-        do
+
+        root_map.gen("message");
+        to_json(gen, um.um_message);
+        root_map.gen("reason");
+        to_json(gen, um.um_reason);
+        root_map.gen("snippets");
         {
-            --y;
-            yleap = isleap(y);
-            days += year_lengths[yleap];
-        } while (days < 0);
-    }
+            yajlpp_array snippet_array(gen);
 
-    res->tm_year = y - YEAR_BASE;
-    res->tm_yday = days;
-    ip = mon_lengths[yleap];
-    for (res->tm_mon = 0; days >= ip[res->tm_mon]; ++res->tm_mon)
-        days -= ip[res->tm_mon];
-    res->tm_mday = days + 1;
+            for (const auto& snip : um.um_snippets) {
+                yajlpp_map snip_map(gen);
 
-    res->tm_isdst = 0;
-
-    return (res);
-}
-
-bool next_format(const char * const fmt[], int &index, int &locked_index)
-{
-    bool retval = true;
-
-    if (locked_index == -1) {
-        index += 1;
-        if (fmt[index] == NULL) {
-            retval = false;
+                snip_map.gen("source");
+                snip_map.gen(snip.s_location.sl_source);
+                snip_map.gen("line");
+                snip_map.gen(snip.s_location.sl_line_number);
+                snip_map.gen("content");
+                to_json(gen, snip.s_content);
+            }
         }
-    }
-    else if (index == locked_index) {
-        retval = false;
-    }
-    else {
-        index = locked_index;
+        root_map.gen("help");
+        to_json(gen, um.um_help);
     }
 
-    return retval;
+    return gen.to_string_fragment().to_string();
 }
 
-static const char *time_fmt_with_zone = "%a %b %d %H:%M:%S ";
+static int
+read_string_attr_type(yajlpp_parse_context* ypc,
+                      const unsigned char* str,
+                      size_t len)
+{
+    auto* sa = (string_attr*) ypc->ypc_obj_stack.top();
+    auto type = std::string((const char*) str, len);
 
-const char *std_time_fmt[] = {
-    "%Y-%m-%d %H:%M:%S",
-    "%Y-%m-%d %H:%M",
-    "%Y-%m-%dT%H:%M:%S",
-    "%Y-%m-%dT%H:%M:%SZ",
-    "%Y/%m/%d %H:%M:%S",
-    "%Y/%m/%d %H:%M",
+    if (type == "role") {
+        sa->sa_type = &VC_ROLE;
+    } else if (type == "preformatted") {
+        sa->sa_type = &SA_PREFORMATTED;
+    } else if (type == "style") {
+        sa->sa_type = &VC_STYLE;
+    } else {
+        log_error("unhandled string_attr type: %s", type.c_str());
+        ensure(false);
+    }
+    return 1;
+}
 
-    "%a %b %d %H:%M:%S %Y",
-    "%a %b %d %H:%M:%S %Z %Y",
-    time_fmt_with_zone,
+static int
+read_string_attr_int_value(yajlpp_parse_context* ypc, long long in)
+{
+    auto* sa = (string_attr*) ypc->ypc_obj_stack.top();
 
-    "%d/%b/%Y:%H:%M:%S +0000",
-    "%d/%b/%Y:%H:%M:%S %z",
+    if (sa->sa_type == &VC_ROLE) {
+        sa->sa_value = static_cast<role_t>(in);
+    } else if (sa->sa_type == &VC_STYLE) {
+        sa->sa_value = text_attrs{
+            static_cast<int32_t>(in),
+        };
+    }
+    return 1;
+}
 
-    "%b %d %H:%M:%S",
-
-    "%m/%d/%y %H:%M:%S",
-
-    "%m%d %H:%M:%S",
-
-    "+%s",
-
-    NULL,
+static const struct json_path_container string_attr_handlers = {
+    yajlpp::property_handler("start").for_field(&string_attr::sa_range,
+                                                &line_range::lr_start),
+    yajlpp::property_handler("end").for_field(&string_attr::sa_range,
+                                              &line_range::lr_end),
+    yajlpp::property_handler("type").add_cb(read_string_attr_type),
+    yajlpp::property_handler("value").add_cb(read_string_attr_int_value),
 };
 
-const char *date_time_scanner::scan(const char *time_dest,
-                                    size_t time_len,
-                                    const char * const time_fmt[],
-                                    struct exttm *tm_out,
-                                    struct timeval &tv_out)
+static const typed_json_path_container<attr_line_t> attr_line_handlers = {
+    yajlpp::property_handler("str").for_field(&attr_line_t::al_string),
+    yajlpp::property_handler("attrs#")
+        .for_field(&attr_line_t::al_attrs)
+        .with_children(string_attr_handlers),
+};
+
+template<>
+Result<attr_line_t, std::vector<console::user_message>>
+from_json(const std::string& json)
 {
-    int  curr_time_fmt = -1;
-    bool found         = false;
-    const char *retval = NULL;
+    static const auto STRING_SRC = intern_string::lookup("string");
 
-    if (!time_fmt) {
-        time_fmt = PTIMEC_FORMAT_STR;
-    }
-
-    while (next_format(time_fmt,
-                       curr_time_fmt,
-                       this->dts_fmt_lock)) {
-        *tm_out = this->dts_base_tm;
-        tm_out->et_flags = 0;
-        if (time_dest[0] == '+') {
-            char time_cp[time_len + 1];
-            int gmt_int, off;
-
-            retval = NULL;
-            memcpy(time_cp, time_dest, time_len);
-            time_cp[time_len] = '\0';
-            if (sscanf(time_cp, "+%d%n", &gmt_int, &off) == 1) {
-                time_t gmt = gmt_int;
-
-                if (this->dts_local_time) {
-                    localtime_r(&gmt, &tm_out->et_tm);
-#ifdef HAVE_STRUCT_TM_TM_ZONE
-                    tm_out->et_tm.tm_zone = NULL;
-#endif
-                    tm_out->et_tm.tm_isdst = 0;
-                    gmt = tm2sec(&tm_out->et_tm);
-                }
-                tv_out.tv_sec = gmt;
-                tv_out.tv_usec = 0;
-                tm_out->et_flags = ETF_DAY_SET|ETF_MONTH_SET|ETF_YEAR_SET;
-
-                this->dts_fmt_lock = curr_time_fmt;
-                this->dts_fmt_len = off;
-                retval = time_dest + off;
-                found = true;
-                break;
-            }
-        }
-        else if (time_fmt == PTIMEC_FORMAT_STR) {
-            ptime_func func = PTIMEC_FORMATS[curr_time_fmt].pf_func;
-            off_t off = 0;
-
-#ifdef HAVE_STRUCT_TM_TM_ZONE
-            if (!this->dts_keep_base_tz) {
-                tm_out->et_tm.tm_zone = NULL;
-            }
-#endif
-            if (func(tm_out, time_dest, off, time_len)) {
-                retval = &time_dest[off];
-
-                if (tm_out->et_tm.tm_year < 70) {
-                    tm_out->et_tm.tm_year = 80;
-                }
-                if (this->dts_local_time) {
-                    time_t gmt = tm2sec(&tm_out->et_tm);
-
-                    this->to_localtime(gmt, *tm_out);
-                }
-                tv_out.tv_sec = tm2sec(&tm_out->et_tm);
-                tv_out.tv_usec = tm_out->et_nsec / 1000;
-
-                this->dts_fmt_lock = curr_time_fmt;
-                this->dts_fmt_len  = retval - time_dest;
-
-                found = true;
-                break;
-            }
-        }
-        else {
-            off_t off = 0;
-
-            if (ptime_fmt(time_fmt[curr_time_fmt], tm_out, time_dest, off, time_len)) {
-                retval = &time_dest[off];
-                if (tm_out->et_tm.tm_year < 70) {
-                    tm_out->et_tm.tm_year = 80;
-                }
-                if (this->dts_local_time) {
-                    time_t gmt = tm2sec(&tm_out->et_tm);
-
-                    this->to_localtime(gmt, *tm_out);
-#ifdef HAVE_STRUCT_TM_TM_ZONE
-                    tm_out->et_tm.tm_zone = NULL;
-#endif
-                    tm_out->et_tm.tm_isdst = 0;
-                }
-
-                tv_out.tv_sec = tm2sec(&tm_out->et_tm);
-                tv_out.tv_usec = tm_out->et_nsec / 1000;
-
-                this->dts_fmt_lock = curr_time_fmt;
-                this->dts_fmt_len  = retval - time_dest;
-
-                found = true;
-                break;
-            }
-        }
-    }
-
-    if (!found) {
-        retval = NULL;
-    }
-
-    if (retval != NULL) {
-        /* Try to pull out the milli/micro-second value. */
-        if (retval[0] == '.' || retval[0] == ',') {
-            off_t off = (retval - time_dest) + 1;
-
-            if (ptime_f(tm_out, time_dest, off, time_len)) {
-                tv_out.tv_usec = tm_out->et_nsec / 1000;
-                this->dts_fmt_len += 7;
-            }
-            else if (ptime_F(tm_out, time_dest, off, time_len)) {
-                tv_out.tv_usec = tm_out->et_nsec / 1000;
-                this->dts_fmt_len += 4;
-            }
-        }
-    }
-
-    return retval;
+    return attr_line_handlers.parser_for(STRING_SRC).of(json);
 }
 
-template<typename T>
-size_t strtonum(T &num_out, const char *string, size_t len)
+static const json_path_container snippet_handlers = {
+    yajlpp::property_handler("source").for_field(&console::snippet::s_location,
+                                                 &source_location::sl_source),
+    yajlpp::property_handler("line").for_field(
+        &console::snippet::s_location, &source_location::sl_line_number),
+    yajlpp::property_handler("content")
+        .for_child(&console::snippet::s_content)
+        .with_children(attr_line_handlers),
+};
+
+static const json_path_handler_base::enum_value_t LEVEL_ENUM[] = {
+    {"raw", lnav::console::user_message::level::raw},
+    {"ok", lnav::console::user_message::level::ok},
+    {"info", lnav::console::user_message::level::info},
+    {"warning", lnav::console::user_message::level::warning},
+    {"error", lnav::console::user_message::level::error},
+
+    json_path_handler_base::ENUM_TERMINATOR,
+};
+
+static const typed_json_path_container<console::user_message>
+    user_message_handlers = {
+        yajlpp::property_handler("level")
+            .with_enum_values(LEVEL_ENUM)
+            .for_field(&console::user_message::um_level),
+        yajlpp::property_handler("message")
+            .for_child(&console::user_message::um_message)
+            .with_children(attr_line_handlers),
+        yajlpp::property_handler("reason")
+            .for_child(&console::user_message::um_reason)
+            .with_children(attr_line_handlers),
+        yajlpp::property_handler("snippets#")
+            .for_field(&console::user_message::um_snippets)
+            .with_children(snippet_handlers),
+        yajlpp::property_handler("help")
+            .for_child(&console::user_message::um_help)
+            .with_children(attr_line_handlers),
+};
+
+template<>
+Result<lnav::console::user_message, std::vector<console::user_message>>
+from_json(const std::string& json)
 {
-    size_t retval = 0;
-    T sign = 1;
+    static const auto STRING_SRC = intern_string::lookup("string");
 
-    num_out = 0;
-    
-    for (; retval < len && isspace(string[retval]); retval++);
-    for (; retval < len && string[retval] == '-'; retval++) {
-        sign *= -1;
-    }
-    for (; retval < len && string[retval] == '+'; retval++);
-    for (; retval < len && isdigit(string[retval]); retval++) {
-        num_out *= 10;
-        num_out += string[retval] - '0';
-    }
-
-    return retval;
+    return user_message_handlers.parser_for(STRING_SRC).of(json);
 }
 
-template
-size_t strtonum<long long>(long long &num_out, const char *string, size_t len);
-
-template
-size_t strtonum<long>(long &num_out, const char *string, size_t len);
-
-template
-size_t strtonum<int>(int &num_out, const char *string, size_t len);
-
-string build_path(const vector<string> &paths)
-{
-    string retval;
-
-    for (vector<string>::const_iterator path_iter = paths.begin();
-         path_iter != paths.end();
-         ++path_iter) {
-        if (path_iter->empty()) {
-            continue;
-        }
-        if (!retval.empty()) {
-            retval += ":";
-        }
-        retval += *path_iter;
-    }
-    retval += ":" + string(getenv("PATH"));
-    return retval;
-}
+}  // namespace lnav

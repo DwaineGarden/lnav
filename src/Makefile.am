@@ -1,9 +1,26 @@
 
+include $(top_srcdir)/aminclude_static.am
+
+CXXFLAGS =
+
+SUBDIRS = \
+    fmtlib \
+    third-party/base64/lib \
+    third-party/scnlib/src \
+    pcrepp \
+    base \
+    tailer \
+    pugixml \
+    yajl \
+    yajlpp \
+    formats/logfmt \
+    .
+
 bin_PROGRAMS = lnav
 
-noinst_PROGRAMS = bin2c ptimec lnav-test
+noinst_PROGRAMS = lnav-test
 
-noinst_LIBRARIES = libdiag.a
+noinst_LIBRARIES = libdiag.a libdatascanner.a
 
 PTIME_V = $(PTIME_V_@AM_V@)
 PTIME_V_ = $(PTIME_V_@AM_DEFAULT_V@)
@@ -17,298 +34,515 @@ RE2C_V = $(RE2C_V_@AM_V@)
 RE2C_V_ = $(RE2C_V_@AM_DEFAULT_V@)
 RE2C_V_0 = @echo "  RE2C   " $@;
 
-help.c: $(srcdir)/help.txt bin2c
-	$(BIN2C_V)./bin2c -z -c $(srcdir)/help.txt $@
+BIN2C_PATH = ../tools/bin2c$(BUILD_EXEEXT)
 
-dump-pid-sh.c: $(srcdir)/dump-pid.sh bin2c
-	$(BIN2C_V)./bin2c -z -c $(srcdir)/dump-pid.sh $@
+include formats/formats.am
 
-default-log-formats-json.c: $(srcdir)/default-log-formats.json bin2c
-	$(BIN2C_V)./bin2c -z -c $(srcdir)/default-log-formats.json $@
+default-formats.cc: $(BIN2C_PATH) $(FORMAT_FILES)
+	$(BIN2C_V)$(BIN2C_PATH) -n lnav_format_json default-formats $(FORMAT_FILES)
 
-init-sql.c: bin2c
-	$(BIN2C_V)./bin2c -z -c $(srcdir)/init.sql $@
+include keymaps/keymaps.am
+include themes/themes.am
 
-TIME_FORMATS = \
-    "%Y-%m-%d %H:%M:%S" \
-    "%Y-%m-%d %H:%M" \
-    "%Y-%m-%dT%H:%M:%S.%f%z" \
-    "%y-%m-%dT%H:%M:%S.%f%z" \
-    "%Y-%m-%dT%H:%M:%SZ" \
-    "%Y-%m-%dT%H:%M:%S" \
-    "%Y/%m/%d %H:%M:%S" \
-    "%Y/%m/%d %H:%M" \
-    "%a %b %d %H:%M:%S %Y" \
-    "%a %b %d %H:%M:%S %Z %Y" \
-    "%a %b %d %H:%M:%S " \
-    "%a %b %d %H:%M:%S.%L " \
-    "%d/%b/%Y:%H:%M:%S +0000" \
-    "%d/%b/%Y:%H:%M:%S %z" \
-    "%b %d %H:%M:%S" \
-    "%m/%d/%y %H:%M:%S" \
-    "%m/%d/%Y %I:%M:%S:%L %p %Z" \
-    "%m/%e/%Y %l:%M:%S %p" \
-    "%m%d %H:%M:%S" \
-    "%H:%M:%S" \
-    "%M:%S" \
-    "%m/%d %H:%M:%S" \
+CONFIG_FILES = \
+    $(srcdir)/root-config.json \
+    $(KEYMAP_FILES) \
+    $(THEME_FILES) \
     $()
 
-time_fmts.cc: ptimec
-	$(PTIME_V)./ptimec $(TIME_FORMATS) > $@
+default-config.cc: $(BIN2C_PATH) $(CONFIG_FILES)
+	$(BIN2C_V)$(BIN2C_PATH) -n lnav_config_json default-config $(CONFIG_FILES)
+
+include scripts/scripts.am
+
+builtin-scripts.cc: $(BIN2C_PATH) $(BUILTIN_LNAVSCRIPTS)
+	$(BIN2C_V)$(BIN2C_PATH) -n lnav_scripts builtin-scripts $(BUILTIN_LNAVSCRIPTS)
+
+builtin-sh-scripts.cc: $(BIN2C_PATH) $(BUILTIN_SHSCRIPTS)
+	$(BIN2C_V)$(BIN2C_PATH) -n lnav_sh_scripts builtin-sh-scripts $(BUILTIN_SHSCRIPTS)
+
+%-sh.cc: $(srcdir)/%.sh $(BIN2C_PATH)
+	$(BIN2C_V)$(BIN2C_PATH) $(*)-sh $<
+
+%-txt.cc: $(srcdir)/%.txt $(BIN2C_PATH)
+	$(BIN2C_V)$(BIN2C_PATH) $(*)-txt $<
+
+%-md.cc: $(srcdir)/%.md $(BIN2C_PATH)
+	$(BIN2C_V)$(BIN2C_PATH) $(*)-md $<
+
+%-sql.cc: $(srcdir)/%.sql $(BIN2C_PATH)
+	$(BIN2C_V)$(BIN2C_PATH) $(*)-sql $<
+
+%-lnav.cc: $(srcdir)/%.lnav $(BIN2C_PATH)
+	$(BIN2C_V)$(BIN2C_PATH) $(*)-lnav $<
+
+%-json.cc: $(srcdir)/%.json $(BIN2C_PATH)
+	$(BIN2C_V)$(BIN2C_PATH) $(*)-json $<
+
+include time_formats.am
+
+time_fmts.cc: ptimec$(BUILD_EXEEXT)
+	$(PTIME_V)./ptimec$(BUILD_EXEEXT) $(TIME_FORMATS) > $@
 
 if HAVE_RE2C
 %.cc: %.re
-	$(RE2C_V)$(RE2C_CMD) -o $@ $<
+	$(RE2C_V)$(RE2C_CMD) --bit-vectors -W --tags -8 -o $@ $<
 	$(REC2_V)test $@ -ef $(srcdir)/$*.cc || cp $@ $(srcdir)/$*.cc
 endif
 
+LNAV_BUILT_FILES = \
+    animals-json.cc \
+    ansi-palette-json.cc \
+    builtin-scripts.cc \
+    builtin-sh-scripts.cc \
+    default-config.cc \
+    default-formats.cc \
+    diseases-json.cc \
+    emojis-json.cc \
+    words-json.cc \
+    help-md.cc \
+    init-sql.cc \
+    time_fmts.cc \
+    xml-entities-json.cc \
+    xterm-palette-json.cc
+
+BUILT_SOURCES = $(LNAV_BUILT_FILES)
+
+AM_LIBS = $(CODE_COVERAGE_LIBS)
+AM_CFLAGS = $(CODE_COVERAGE_CFLAGS)
+AM_CXXFLAGS = $(CODE_COVERAGE_CXXFLAGS) $(USER_CXXFLAGS)
+
 AM_LDFLAGS = \
 	$(STATIC_LDFLAGS) \
+	$(LIBARCHIVE_LDFLAGS) \
 	$(READLINE_LDFLAGS) \
 	$(SQLITE3_LDFLAGS) \
-	$(PCRE_LDFLAGS) \
-	-pthread
+	$(PCRE_LDFLAGS)
 
 AM_CPPFLAGS = \
 	-DSYSCONFDIR='"$(sysconfdir)"' \
+	-DSQLITE_OMIT_LOAD_EXTENSION \
+	-I$(srcdir)/fmtlib \
+	-I$(srcdir)/third-party \
+	-I$(srcdir)/third-party/base64/include \
+	-I$(srcdir)/third-party/rapidyaml \
+	-I$(top_srcdir)/src/third-party/scnlib/include \
 	-Wall \
+	$(CODE_COVERAGE_CPPFLAGS) \
+	$(LIBARCHIVE_CFLAGS) \
 	$(READLINE_CFLAGS) \
 	$(SQLITE3_CFLAGS) \
+	$(PCRE_CFLAGS) \
 	$(LIBCURL_CPPFLAGS)
 
 LDADD = \
 	libdiag.a \
+	libdatascanner.a \
+	base/libbase.a \
+	formats/logfmt/liblogfmt.a \
+	fmtlib/libcppfmt.a \
+	third-party/scnlib/src/libscnlib.a \
+	pcrepp/libpcrepp.a \
+	pugixml/libpugixml.a \
+	tailer/libtailerservice.a \
+	tailer/libtailercommon.a \
+	tailer/libtailerpp.a \
+	yajl/libyajl.a \
+	yajlpp/libyajlpp.a \
+	third-party/base64/lib/libbase64.a \
 	$(READLINE_LIBS) \
 	$(CURSES_LIB) \
 	$(SQLITE3_LIBS) \
-	$(LIBCURL) \
-	-lpcrecpp
+	$(LIBARCHIVE_LIBS) \
+	$(LIBCURL)
+
+# emojis.json is from https://gist.github.com/oliveratgithub/0bf11a9aff0d6da7b46f1490f86a71eb/
+# xml-entities.json is from https://html.spec.whatwg.org/entities.json
 
 dist_noinst_DATA = \
-	default-log-formats.json \
-	dump-pid.sh
+	alpha-release.sh \
+	animals.json \
+	ansi-palette.json \
+	diseases.json \
+	emojis.json \
+	$(BUILTIN_LNAVSCRIPTS) \
+	$(BUILTIN_SHSCRIPTS) \
+	$(CONFIG_FILES) \
+	$(FORMAT_FILES) \
+	words.json \
+	xml-entities.json \
+	xterm-palette.json
 
 noinst_HEADERS = \
+    third-party/md4c/md4c.h \
+    third-party/rapidyaml/ryml_all.hpp \
 	all_logs_vtab.hh \
-	ansi_scrubber.hh \
-	auto_fd.hh \
-	auto_mem.hh \
-	auto_pid.hh \
+	archive_manager.hh \
+	archive_manager.cfg.hh \
+	big_array.hh \
+	bin2c.hh \
 	bookmarks.hh \
 	bottom_status_source.hh \
+	bound_tags.hh \
+	breadcrumb.hh \
+	breadcrumb_curses.hh \
 	byte_array.hh \
-	chunky_index.hh \
 	column_namer.hh \
 	command_executor.hh \
-	concise_index.hh \
 	curl_looper.hh \
 	data_scanner.hh \
 	data_scanner_re.re \
 	data_parser.hh \
-	default-log-formats-json.hh \
 	db_sub_source.hh \
+	doc_status_source.hh \
+	document.sections.hh \
+	dump_internals.hh \
+	elem_to_json.hh \
 	environ_vtab.hh \
 	field_overlay_source.hh \
+	file_collection.hh \
+	file_format.hh \
+	file_vtab.cfg.hh \
+	files_sub_source.hh \
 	filter_observer.hh \
-	format-text-files.hh \
-	grapher.hh \
+	filter_status_source.hh \
+	filter_sub_source.hh \
+	fstat_vtab.hh \
+	fts_fuzzy_match.hh \
 	grep_highlighter.hh \
 	grep_proc.hh \
-	help.hh \
+	help.md \
 	help.txt \
+	help_text.hh \
+	help_text_formatter.hh \
+	highlighter.hh \
 	hist_source.hh \
 	hotkeys.hh \
 	init.sql \
-	init-sql.hh \
-	intern_string.hh \
-	json_op.hh \
-	json_ptr.hh \
+	input_dispatcher.hh \
+	itertools.similar.hh \
 	k_merge_tree.h \
 	line_buffer.hh \
 	listview_curses.hh \
 	lnav.hh \
+	lnav.events.hh \
+	lnav.indexing.hh \
+	lnav.management_cli.hh \
 	lnav_commands.hh \
 	lnav_config.hh \
-	lnav_log.hh \
+	lnav_config_fwd.hh \
 	lnav_util.hh \
+	log.watch.hh \
 	log_accel.hh \
+	log_actions.hh \
     log_data_helper.hh \
     log_data_table.hh \
 	log_format.hh \
+	log_format_ext.hh \
+	log_format_fwd.hh \
 	log_format_loader.hh \
+	log_gutter_source.hh \
+	log_level.hh \
+	log_level_re.re \
 	log_search_table.hh \
+	log_search_table_fwd.hh \
 	logfile.hh \
+	logfile.cfg.hh \
+	logfile_fwd.hh \
 	logfile_sub_source.hh \
-	papertrail_proc.hh \
-	pcrepp.hh \
+	logfile_sub_source.cfg.hh \
+	mapbox/recursive_wrapper.hpp \
+	mapbox/variant.hpp \
+	mapbox/variant_io.hpp \
+	mapbox/variant_visitor.hpp \
+	md2attr_line.hh \
+	md4cpp.hh \
+	optional.hpp \
+	pcap_manager.hh \
 	piper_proc.hh \
 	plain_text_source.hh \
+	pollable.hh \
 	pretty_printer.hh \
-	pthreadpp.hh \
+	preview_status_source.hh \
 	ptimec.hh \
 	readline_callbacks.hh \
+	readline_context.hh \
 	readline_curses.hh \
 	readline_highlighters.hh \
 	readline_possibilities.hh \
+	regex101.client.hh \
+	regex101.import.hh \
+	regexp_vtab.hh \
 	relative_time.hh \
-	sequence_matcher.hh \
-	sequence_sink.hh \
+	ring_span.hh \
+	safe/accessmode.h \
+	safe/defaulttypes.h \
+	safe/mutableref.h \
+	safe/safe.h \
+	service_tags.hh \
+	session.export.hh \
 	session_data.hh \
 	shared_buffer.hh \
+	shlex.hh \
+	shlex.resolver.hh \
+	simdutf8check.h \
+	spectro_impls.hh \
+	spectro_source.hh \
+	sqlitepp.hh \
+	sqlitepp.client.hh \
+	sql_help.hh \
 	sql_util.hh \
-	sqlite-extension-func.h \
-    status_controllers.hh \
+	sqlite-extension-func.hh \
+	static_file_vtab.hh \
+	styling.hh \
 	statusview_curses.hh \
-	strnatcmp.h \
 	strong_int.hh \
 	sysclip.hh \
+	sysclip.cfg.hh \
 	termios_guard.hh \
 	term_extra.hh \
+	text_anonymizer.hh \
+	text_format.hh \
+	textfile_highlighters.hh \
 	textfile_sub_source.hh \
 	textview_curses.hh \
+	textview_curses_fwd.hh \
 	time_T.hh \
 	timer.hh \
 	top_status_source.hh \
+	top_status_source.cfg.hh \
+	unique_path.hh \
 	url_loader.hh \
 	view_curses.hh \
+	view_helpers.hh \
+	view_helpers.crumbs.hh \
+	view_helpers.examples.hh \
+	view_helpers.hist.hh \
 	views_vtab.hh \
+	vis_line.hh \
 	vt52_curses.hh \
+	vtab_module.hh \
+	vtab_module_json.hh \
 	log_vtab_impl.hh \
 	log_format_impls.cc \
+	xml_util.hh \
+	xpath_vtab.hh \
 	xterm_mouse.hh \
-	yajlpp.hh \
-	spookyhash/SpookyV2.h
+	spookyhash/SpookyV2.h \
+	ghc/filesystem.hpp \
+	ghc/fs_fwd.hpp \
+	ghc/fs_impl.hpp \
+	ghc/fs_std.hpp \
+	ghc/fs_std_fwd.hpp \
+	ghc/fs_std_impl.hpp \
+    ww898/cp_utf8.hpp
 
-if USE_INCLUDED_YAJL
-noinst_HEADERS += yajl/api/yajl_common.h \
-	yajl/api/yajl_gen.h \
-	yajl/api/yajl_parse.h \
-	yajl/api/yajl_tree.h \
-	yajl/yajl_alloc.h \
-	yajl/yajl_buf.h \
-	yajl/yajl_bytestack.h \
-	yajl/yajl_common.h \
-	yajl/yajl_encode.h \
-	yajl/yajl_lex.h \
-	yajl/yajl_parser.h \
-	yajl/yajl_version.h
-endif
+nodist_libdiag_a_SOURCES = \
+	$(LNAV_BUILT_FILES)
 
+THIRD_PARTY_SRCS = \
+    third-party/ArenaAlloc/arenaalloc.h \
+    third-party/ArenaAlloc/arenaallocimpl.h \
+    third-party/ArenaAlloc/recyclealloc.h \
+    third-party/backward-cpp/backward.hpp \
+    third-party/CLI/StringTools.hpp \
+    third-party/CLI/App.hpp \
+    third-party/CLI/Macros.hpp \
+    third-party/CLI/Option.hpp \
+    third-party/CLI/Config.hpp \
+    third-party/CLI/CLI.hpp \
+    third-party/CLI/Formatter.hpp \
+    third-party/CLI/Error.hpp \
+    third-party/CLI/Version.hpp \
+    third-party/CLI/Timer.hpp \
+    third-party/CLI/FormatterFwd.hpp \
+    third-party/CLI/Validators.hpp \
+    third-party/CLI/Split.hpp \
+    third-party/CLI/TypeTools.hpp \
+    third-party/CLI/ConfigFwd.hpp \
+    third-party/doctest-root/doctest/doctest.h \
+    third-party/intervaltree/IntervalTree.h \
+    third-party/md4c/md4c.c \
+    third-party/robin_hood/robin_hood.h \
+	third-party/sqlite/ext/dbdump.c \
+	third-party/sqlite/ext/series.c
+
+libdatascanner_a_SOURCES = \
+	data_scanner.cc \
+	data_scanner_re.cc
 
 libdiag_a_SOURCES = \
-	ansi_scrubber.cc \
+	$(THIRD_PARTY_SRCS) \
+	all_logs_vtab.cc \
+	archive_manager.cc \
 	bookmarks.cc \
+	bottom_status_source.cc \
+	breadcrumb_curses.cc \
 	collation-functions.cc \
+	column_namer.cc \
 	command_executor.cc \
 	curl_looper.cc \
 	db_sub_source.cc \
+	document.sections.cc \
+	dump_internals.cc \
+	elem_to_json.cc \
 	environ_vtab.cc \
-	extension-functions.c \
+	extension-functions.cc \
 	field_overlay_source.cc \
+	file_collection.cc \
+	file_format.cc \
+	files_sub_source.cc \
+	filter_observer.cc \
+	filter_status_source.cc \
+	filter_sub_source.cc \
+	fstat_vtab.cc \
     fs-extension-functions.cc \
+    fts_fuzzy_match.cc \
 	grep_proc.cc \
+	help_text.cc \
+	help_text_formatter.cc \
+	highlighter.cc \
 	hist_source.cc \
 	hotkeys.cc \
-	intern_string.cc \
+	input_dispatcher.cc \
 	json-extension-functions.cc \
-	json_op.cc \
-	json_ptr.cc \
 	line_buffer.cc \
 	listview_curses.cc \
 	lnav_commands.cc \
 	lnav_config.cc \
-	lnav_log.cc \
 	lnav_util.cc \
+	log.watch.cc \
 	log_accel.cc \
+	log_actions.cc \
+	log_data_helper.cc \
+	log_data_table.cc \
 	log_format.cc \
 	log_format_loader.cc \
+	log_level.cc \
+	log_level_re.cc \
+	log_search_table.cc \
 	logfile.cc \
 	logfile_sub_source.cc \
+	md2attr_line.cc \
+	md4cpp.cc \
 	network-extension-functions.cc \
-	data_scanner.cc \
-	data_scanner_re.cc \
 	data_parser.cc \
-	papertrail_proc.cc \
+	pcap_manager.cc \
+	plain_text_source.cc \
+	pollable.cc \
 	pretty_printer.cc \
 	ptimec_rt.cc \
 	readline_callbacks.cc \
 	readline_curses.cc \
 	readline_highlighters.cc \
 	readline_possibilities.cc \
+	regex101.client.cc \
+	regex101.import.cc \
+	regexp_vtab.cc \
 	relative_time.cc \
+	session.export.cc \
 	session_data.cc \
-	sequence_matcher.cc \
 	shared_buffer.cc \
-	sqlite-extension-func.c \
+	shlex.cc \
+	spectro_impls.cc \
+	spectro_source.cc \
+	sqlitepp.cc \
+	sqlite-extension-func.cc \
+	static_file_vtab.cc \
 	statusview_curses.cc \
 	string-extension-functions.cc \
+	styling.cc \
+	text_anonymizer.cc \
+	text_format.cc \
+	textfile_sub_source.cc \
 	timer.cc \
-	pcrepp.cc \
 	piper_proc.cc \
+	sql_commands.cc \
 	sql_util.cc \
 	state-extension-functions.cc \
-	strnatcmp.c \
 	sysclip.cc \
+	textfile_highlighters.cc \
 	textview_curses.cc \
 	time-extension-functions.cc \
-	time_fmts.cc \
+	top_status_source.cc \
+	unique_path.cc \
 	view_curses.cc \
+	view_helpers.cc \
 	views_vtab.cc \
 	vt52_curses.cc \
+	vtab_module.cc \
 	log_vtab_impl.cc \
+	xml_util.cc \
+	xpath_vtab.cc \
 	xterm_mouse.cc \
-	yajlpp.cc \
+	yaml-extension-functions.cc \
 	spookyhash/SpookyV2.cpp
 
-if USE_INCLUDED_YAJL
-libdiag_a_SOURCES += yajl/yajl.c \
-	yajl/yajl_alloc.c \
-	yajl/yajl_alloc.h \
-	yajl/yajl_buf.c \
-	yajl/yajl_buf.h \
-	yajl/yajl_bytestack.h \
-	yajl/yajl_encode.c \
-	yajl/yajl_encode.h \
-	yajl/yajl_gen.c \
-	yajl/yajl_lex.c \
-	yajl/yajl_lex.h \
-	yajl/yajl_parser.c \
-	yajl/yajl_parser.h \
-	yajl/yajl_tree.c \
-	yajl/yajl_version.c
+PLUGIN_SRCS = \
+	file_vtab.cc
+
+lnav_SOURCES = \
+    lnav.cc \
+    lnav.events.cc \
+    lnav.indexing.cc \
+    lnav.management_cli.cc \
+    $(PLUGIN_SRCS)
+
+lnav_test_SOURCES = \
+    lnav.cc \
+    lnav.events.cc \
+    lnav.indexing.cc \
+    lnav.management_cli.cc \
+    test_override.c \
+    $(PLUGIN_SRCS)
+
+ptimec$(BUILD_EXEEXT): ptimec.c
+	$(AM_V_CC) $(CC_FOR_BUILD) $(CPPFLAGS_FOR_BUILD) $(LDFLAGS_FOR_BUILD) -g3 -o $@ $?
+
+if HAVE_RE2C
+RE2C_FILES = data_scanner_re.cc log_level_re.cc
 endif
 
-TEXT2C_FILES = \
-	dump-pid-sh.o \
-	help.o \
-	init-sql.o \
-	default-log-formats-json.o
+EXTRA_DIST = \
+	ptimec.c
 
-lnav_SOURCES = lnav.cc $(HELP_SRC)
-lnav_LDADD = \
-	$(TEXT2C_FILES) \
-	$(LDADD)
-
-lnav_test_SOURCES = lnav.cc $(HELP_SRC) test_override.c
-lnav_test_LDADD = \
-	$(TEXT2C_FILES) \
-	$(LDADD)
-
-bin2c_SOURCES = bin2c.c
-bin2c_LDADD =
-
-ptimec_SOURCES = ptimec.cc
-ptimec_LDADD =
+CLEANFILES = \
+	ptimec$(BUILD_EXEEXT)
 
 DISTCLEANFILES = \
-	data_scanner_re.cc \
-	dump-pid-sh.c \
-	help.c \
-	init-sql.c \
-	default-log-formats-json.c \
-    time_fmts.cc
+    $(LNAV_BUILT_FILES) \
+    animals-json.h \
+    ansi-palette-json.h \
+    builtin-scripts.h \
+    builtin-sh-scripts.h \
+    default-config.h \
+    default-formats.h \
+    diseases-json.h \
+    emojis-json.h \
+    words-json.h \
+    help-md.h \
+    init-sql.h \
+    time_fmts.h \
+    xml-entities-json.h \
+    xterm-palette-json.h \
+	$(RE2C_FILES)
+
+distclean-local:
+	$(RM_V)rm -rf *.dSYM
 
 uncrusty:
 	(cd $(srcdir) && uncrustify -c ../lnav.cfg --replace $(SOURCES) \
 		$(HEADERS))
+
+if !DISABLE_DOCUMENTATION
+all-local: $(LNAV_BUILT_FILES) lnav
+	if test -w $(srcdir)/internals; then \
+		env DUMP_INTERNALS_DIR=$(srcdir)/internals DUMP_CRASH=1 ./lnav Makefile; \
+		mv $(srcdir)/internals/*.schema.json $(top_srcdir)/docs/schemas; \
+	fi
+else
+all-local: $(LNAV_BUILT_FILES)
+endif
+
+install-exec-hook:
+	bash $(srcdir)/alpha-release.sh

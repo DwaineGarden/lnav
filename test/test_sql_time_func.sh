@@ -1,54 +1,71 @@
 #! /bin/bash
 
-run_test ./drive_sql "select timeslice()"
+# timeslice('blah')
+run_cap_test ./drive_sql "select timeslice('2015-08-07 12:01:00', 'blah')"
 
-check_error_output "timeslice()" <<EOF
-error: sqlite3_exec failed -- wrong number of arguments to function timeslice()
-EOF
+# before 12pm
+run_cap_test ./drive_sql "select timeslice('2015-08-07 12:01:00', 'before fri')"
 
-run_test ./drive_sql "select timeslice(1)"
+# not before 12pm
+run_cap_test ./drive_sql "select timeslice('2015-08-07 11:59:00', 'after fri')"
 
-check_error_output "timeslice(1)" <<EOF
-error: sqlite3_exec failed -- wrong number of arguments to function timeslice()
-EOF
+# not before 12pm
+run_cap_test ./drive_sql "select timeslice('2015-08-07 11:59:00', 'fri')"
 
-run_test ./drive_sql "select timeslice('', '')"
+# before 12pm
+run_cap_test ./drive_sql "select timeslice('2015-08-07 12:01:00', 'before 12pm')"
 
-check_error_output "timeslice empty" <<EOF
-error: sqlite3_exec failed -- no time slice value given
-EOF
+# not before 12pm
+run_cap_test ./drive_sql "select timeslice('2015-08-07 11:59:00', 'before 12pm')"
 
-run_test ./drive_sql "select timeslice('2015-08-07 12:01:00', '8 am')"
+# after 12pm
+run_cap_test ./drive_sql "select timeslice('2015-08-07 12:01:00', 'after 12pm')"
 
-check_error_output "timeslice abs" <<EOF
-error: sqlite3_exec failed -- absolute time slices are not valid
-EOF
+# not after 12pm
+run_cap_test ./drive_sql "select timeslice('2015-08-07 11:59:00', 'after 12pm')"
 
-run_test ./drive_sql "select timeslice(null, null)"
+# timeslice()
+run_cap_test ./drive_sql "select timeslice()"
 
-check_output "timeslice(null, null)" <<EOF
-Row 0:
-  Column timeslice(null, null): (null)
-EOF
+# timeslice('2015-02-01T05:10:00')
+run_cap_test ./drive_sql "select timeslice('2015-02-01T05:10:00')"
 
-run_test ./drive_sql "select timeslice('2015-08-07 12:01:00', '5m')"
+# timeslice empty
+run_cap_test ./drive_sql "select timeslice('', '')"
 
-check_output "timeslice 5m" <<EOF
-Row 0:
-  Column timeslice('2015-08-07 12:01:00', '5m'): 2015-08-07 12:00:00.000
-EOF
+# timeslice abs
+run_cap_test ./drive_sql "select timeslice('2015-08-07 12:01:00', '8 am')"
 
-run_test ./drive_sql "select timeslice('2015-08-07 12:01:00', '1d')"
+# timeslice abs
+run_cap_test ./drive_sql "select timeslice('2015-08-07 08:00:33', '8 am')"
 
-check_output "timeslice 1d" <<EOF
-Row 0:
-  Column timeslice('2015-08-07 12:01:00', '1d'): 2015-08-07 00:00:00.000
-EOF
+# timeslice abs
+run_cap_test ./drive_sql "select timeslice('2015-08-07 08:01:33', '8 am')"
 
-run_test ./drive_sql "select timeslice('2015-08-07 12:01:00', '1 month')"
+# timeslice(null, null)
+run_cap_test ./drive_sql "select timeslice(null, null)"
+
+# timeslice(null)
+run_cap_test ./drive_sql "select timeslice(null)"
+
+# 100ms slice
+run_cap_test ./drive_sql "select timeslice(1616300753.333, '100ms')"
+
+# timeslice 5m
+run_cap_test ./drive_sql "select timeslice('2015-08-07 12:01:00', '5m')"
+
+# timeslice 1d
+run_cap_test ./drive_sql "select timeslice('2015-08-07 12:01:00', '1d')"
 
 # XXX This is wrong...
-check_output "timeslice 1 month" <<EOF
-Row 0:
-  Column timeslice('2015-08-07 12:01:00', '1 month'): 2015-08-03 00:00:00.000
-EOF
+# timeslice 1 month
+run_cap_test ./drive_sql "select timeslice('2015-08-07 12:01:00', '1 month')"
+
+# timeslice ms
+run_cap_test ./drive_sql "select timediff('2017-01-02T05:00:00.100', '2017-01-02T05:00:00.000')"
+
+# timeslice day
+run_cap_test ./drive_sql "select timediff('today', 'yesterday')"
+
+# timeslice day
+run_cap_test ./drive_sql "select timediff('foo', 'yesterday')"

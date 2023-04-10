@@ -21,46 +21,39 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * @file logfile_sub_source.hh
  */
 
-#include "config.h"
-
-#include <stdio.h>
-#include <string.h>
-#include <sqlite3.h>
-
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sqlite3.h>
+#include <string.h>
 #include <sys/socket.h>
 
-#include <algorithm>
+#include "base/strnatcmp.h"
+#include "config.h"
+#include "log_level.hh"
 
-#include "log_format.hh"
+constexpr int MAX_ADDR_LEN = 128;
 
-extern "C" {
-        #include "strnatcmp.h"
-}
-
-#define MAX_ADDR_LEN    128
-
-static int try_inet_pton(int p_len, const char *p, char *n)
+static int
+try_inet_pton(int p_len, const char* p, char* n)
 {
-    static int family[] = { AF_INET6, AF_INET, AF_MAX };
+    static int ADDR_FAMILIES[] = {AF_INET, AF_INET6};
 
     char buf[MAX_ADDR_LEN + 1];
-    int  retval = AF_MAX;
+    int retval = AF_MAX;
 
     strncpy(buf, p, p_len);
     buf[p_len] = '\0';
-    for (int lpc = 0; family[lpc] != AF_MAX; lpc++) {
-        if (inet_pton(family[lpc], buf, n) == 1) {
-            retval = family[lpc];
+    for (int family : ADDR_FAMILIES) {
+        if (inet_pton(family, buf, n) == 1) {
+            retval = family;
             break;
         }
     }
@@ -68,13 +61,14 @@ static int try_inet_pton(int p_len, const char *p, char *n)
     return retval;
 }
 
-static int convert_v6_to_v4(int family, char *n)
+static int
+convert_v6_to_v4(int family, char* n)
 {
-    struct in6_addr *ia = (struct in6_addr *)n;
+    struct in6_addr* ia = (struct in6_addr*) n;
 
-    if (family == AF_INET6 &&
-        (IN6_IS_ADDR_V4COMPAT(ia) ||
-         IN6_IS_ADDR_V4MAPPED(ia))) {
+    if (family == AF_INET6
+        && (IN6_IS_ADDR_V4COMPAT(ia) || IN6_IS_ADDR_V4MAPPED(ia)))
+    {
         family = AF_INET;
         memmove(n, n + 12, sizeof(struct in_addr));
     }
@@ -82,18 +76,20 @@ static int convert_v6_to_v4(int family, char *n)
     return family;
 }
 
-static
-int ipaddress(void *ptr,
-              int a_len, const void *a_in,
-              int b_len, const void *b_in)
+static int
+ipaddress(void* ptr, int a_len, const void* a_in, int b_len, const void* b_in)
 {
-    char a_addr[sizeof(struct in6_addr)],
-         b_addr[sizeof(struct in6_addr)];
-    const char *a_str = (const char *)a_in, *b_str = (const char *)b_in;
-    int         a_family, b_family, retval;
+    char a_addr[sizeof(struct in6_addr)], b_addr[sizeof(struct in6_addr)];
+    const char *a_str = (const char*) a_in, *b_str = (const char*) b_in;
+    int a_family, b_family, retval;
 
-    if (a_len > MAX_ADDR_LEN || b_len > MAX_ADDR_LEN) {
+    if ((a_len > MAX_ADDR_LEN) || (b_len > MAX_ADDR_LEN)) {
         return strnatcasecmp(a_len, a_str, b_len, b_str);
+    }
+
+    int v4res = 0;
+    if (ipv4cmp(a_len, a_str, b_len, b_str, &v4res)) {
+        return v4res;
     }
 
     a_family = try_inet_pton(a_len, a_str, a_addr);
@@ -101,26 +97,21 @@ int ipaddress(void *ptr,
 
     if (a_family == AF_MAX && b_family == AF_MAX) {
         return strnatcasecmp(a_len, a_str, b_len, b_str);
-    }
-    else if (a_family == AF_MAX && b_family != AF_MAX) {
+    } else if (a_family == AF_MAX && b_family != AF_MAX) {
         retval = -1;
-    }
-    else if (a_family != AF_MAX && b_family == AF_MAX) {
+    } else if (a_family != AF_MAX && b_family == AF_MAX) {
         retval = 1;
-    }
-    else {
+    } else {
         a_family = convert_v6_to_v4(a_family, a_addr);
         b_family = convert_v6_to_v4(b_family, b_addr);
         if (a_family == b_family) {
-            retval = memcmp(a_addr, b_addr,
-                            a_family == AF_INET ?
-                            sizeof(struct in_addr) :
-                            sizeof(struct in6_addr));
-        }
-        else if (a_family == AF_INET) {
+            retval = memcmp(a_addr,
+                            b_addr,
+                            a_family == AF_INET ? sizeof(struct in_addr)
+                                                : sizeof(struct in6_addr));
+        } else if (a_family == AF_INET) {
             retval = -1;
-        }
-        else {
+        } else {
             retval = 1;
         }
     }
@@ -128,40 +119,37 @@ int ipaddress(void *ptr,
     return retval;
 }
 
-static
-int sql_strnatcmp(void *ptr,
-                  int a_len, const void *a_in,
-                  int b_len, const void *b_in)
+static int
+sql_strnatcmp(
+    void* ptr, int a_len, const void* a_in, int b_len, const void* b_in)
 {
-    return strnatcmp(a_len, (char *)a_in, b_len, (char *)b_in);
+    return strnatcmp(a_len, (char*) a_in, b_len, (char*) b_in);
 }
 
-static
-int sql_strnatcasecmp(void *ptr,
-                      int a_len, const void *a_in,
-                      int b_len, const void *b_in)
+static int
+sql_strnatcasecmp(
+    void* ptr, int a_len, const void* a_in, int b_len, const void* b_in)
 {
-    return strnatcasecmp(a_len, (char *)a_in, b_len, (char *)b_in);
+    return strnatcasecmp(a_len, (char*) a_in, b_len, (char*) b_in);
 }
 
-static
-int sql_loglevelcmp(void *ptr,
-    int a_len, const void *a_in,
-    int b_len, const void *b_in)
+static int
+sql_loglevelcmp(
+    void* ptr, int a_len, const void* a_in, int b_len, const void* b_in)
 {
-    return logline::levelcmp((const char *)a_in, a_len,
-        (const char *)b_in, b_len);
+    return levelcmp((const char*) a_in, a_len, (const char*) b_in, b_len);
 }
 
-int register_collation_functions(sqlite3 *db)
+int
+register_collation_functions(sqlite3* db)
 {
-    sqlite3_create_collation(db, "ipaddress", SQLITE_UTF8, NULL, ipaddress);
-    sqlite3_create_collation(db, "naturalcase", SQLITE_UTF8, NULL,
-                             sql_strnatcmp);
-    sqlite3_create_collation(db, "naturalnocase", SQLITE_UTF8, NULL,
-                             sql_strnatcasecmp);
-    sqlite3_create_collation(db, "loglevel", SQLITE_UTF8, NULL,
-                             sql_loglevelcmp);
+    sqlite3_create_collation(db, "ipaddress", SQLITE_UTF8, nullptr, ipaddress);
+    sqlite3_create_collation(
+        db, "naturalcase", SQLITE_UTF8, nullptr, sql_strnatcmp);
+    sqlite3_create_collation(
+        db, "naturalnocase", SQLITE_UTF8, nullptr, sql_strnatcasecmp);
+    sqlite3_create_collation(
+        db, "loglevel", SQLITE_UTF8, nullptr, sql_loglevelcmp);
 
     return 0;
 }

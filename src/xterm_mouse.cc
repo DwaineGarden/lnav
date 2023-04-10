@@ -21,16 +21,78 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "config.h"
-
 #include "xterm_mouse.hh"
 
-const char *xterm_mouse::XT_TERMCAP          = "\033[?1000%?%p1%{1}%=%th%el%;";
-const char *xterm_mouse::XT_TERMCAP_TRACKING = "\033[?1002%?%p1%{1}%=%th%el%;";
-const char *xterm_mouse::XT_TERMCAP_SGR      = "\033[?1006%?%p1%{1}%=%th%el%;";
+#include <unistd.h>
+
+#include "base/lnav_log.hh"
+#include "config.h"
+
+const char* xterm_mouse::XT_TERMCAP = "\033[?1000%?%p1%{1}%=%th%el%;";
+const char* xterm_mouse::XT_TERMCAP_TRACKING = "\033[?1002%?%p1%{1}%=%th%el%;";
+const char* xterm_mouse::XT_TERMCAP_SGR = "\033[?1006%?%p1%{1}%=%th%el%;";
+
+void
+xterm_mouse::handle_mouse()
+{
+    bool release = false;
+    int ch;
+    size_t index = 0;
+    int bstate, x, y;
+    char buffer[64];
+    bool done = false;
+
+    while (!done) {
+        if (index >= sizeof(buffer) - 1) {
+            break;
+        }
+        ch = getch();
+        switch (ch) {
+            case 'm':
+                release = true;
+                done = true;
+                break;
+            case 'M':
+                done = true;
+                break;
+            default:
+                buffer[index++] = (char) ch;
+                break;
+        }
+    }
+    buffer[index] = '\0';
+
+    if (sscanf(buffer, "%d;%d;%d", &bstate, &x, &y) == 3) {
+        if (this->xm_behavior) {
+            this->xm_behavior->mouse_event(bstate, release, x, y);
+        }
+    } else {
+        log_error("bad mouse escape sequence: %s", buffer);
+    }
+}
+
+void
+xterm_mouse::set_enabled(bool enabled)
+{
+    if (is_available()) {
+        putp(tparm((char*) XT_TERMCAP, enabled ? 1 : 0));
+        putp(tparm((char*) XT_TERMCAP_TRACKING, enabled ? 1 : 0));
+        putp(tparm((char*) XT_TERMCAP_SGR, enabled ? 1 : 0));
+        fflush(stdout);
+        this->xm_enabled = enabled;
+    } else {
+        log_warning("mouse support is not available");
+    }
+}
+
+bool
+xterm_mouse::is_available()
+{
+    return isatty(STDOUT_FILENO);
+}

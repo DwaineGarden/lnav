@@ -21,57 +21,69 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * @file bookmarks.cc
  */
 
-#include "config.h"
-
 #include "bookmarks.hh"
 
-using namespace std;
+#include "base/itertools.hh"
+#include "config.h"
 
-template<typename LineType>
-LineType bookmark_vector<LineType>::next(LineType start)
+std::unordered_set<std::string> bookmark_metadata::KNOWN_TAGS;
+
+void
+bookmark_metadata::add_tag(const std::string& tag)
 {
-    typename bookmark_vector::iterator ub;
-
-    LineType retval(-1);
-
-    require(start >= -1);
-
-    ub = upper_bound(this->begin(), this->end(), start);
-    if (ub != this->end()) {
-        retval = *ub;
+    if (!(this->bm_tags | lnav::itertools::find(tag))) {
+        this->bm_tags.emplace_back(tag);
     }
+}
 
-    ensure(retval == -1 || start < retval);
+bool
+bookmark_metadata::remove_tag(const std::string& tag)
+{
+    auto iter = std::find(this->bm_tags.begin(), this->bm_tags.end(), tag);
+    bool retval = false;
 
+    if (iter != this->bm_tags.end()) {
+        this->bm_tags.erase(iter);
+        retval = true;
+    }
     return retval;
 }
 
-template<typename LineType>
-LineType bookmark_vector<LineType>::prev(LineType start)
+bool
+bookmark_metadata::empty() const
 {
-    typename bookmark_vector::iterator lb;
-
-    LineType retval(-1);
-
-    require(start >= 0);
-
-    lb = lower_bound(this->begin(), this->end(), start);
-    if (lb != this->begin()) {
-        lb    -= 1;
-        retval = *lb;
-    }
-
-    ensure(retval < start);
-
-    return retval;
+    return this->bm_name.empty() && this->bm_comment.empty()
+        && this->bm_tags.empty();
 }
 
-template class bookmark_vector<vis_line_t>;
+void
+bookmark_metadata::clear()
+{
+    this->bm_comment.clear();
+    this->bm_tags.clear();
+}
+
+nonstd::optional<bookmark_type_t*>
+bookmark_type_t::find_type(const std::string& name)
+{
+    return get_all_types()
+        | lnav::itertools::find_if(
+               [&name](const auto& elem) { return elem->bt_name == name; })
+        | lnav::itertools::deref();
+}
+
+std::vector<bookmark_type_t*>&
+bookmark_type_t::get_all_types()
+{
+    static std::vector<bookmark_type_t*> all_types;
+
+    return all_types;
+}

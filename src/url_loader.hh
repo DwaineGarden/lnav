@@ -21,8 +21,8 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
@@ -30,42 +30,42 @@
 #ifndef url_loader_hh
 #define url_loader_hh
 
+#include "config.h"
+
 #ifdef HAVE_LIBCURL
-#include <curl/curl.h>
+#    include <curl/curl.h>
+#    include <paths.h>
+
+#    include "base/fs_util.hh"
+#    include "curl_looper.hh"
 
 class url_loader : public curl_request {
 public:
-    url_loader(const std::string &url) : curl_request(url), ul_resume_offset(0) {
-        char piper_tmpname[PATH_MAX];
-        const char *tmpdir;
-
-        if ((tmpdir = getenv("TMPDIR")) == NULL) {
-            tmpdir = _PATH_VARTMP;
-        }
-        snprintf(piper_tmpname, sizeof(piper_tmpname),
-                 "%s/lnav.url.XXXXXX",
-                 tmpdir);
-        if ((this->ul_fd = mkstemp(piper_tmpname)) == -1) {
+    url_loader(const std::string& url) : curl_request(url)
+    {
+        auto tmp_res = lnav::filesystem::open_temp_file(
+            ghc::filesystem::temp_directory_path() / "lnav.url.XXXXXX");
+        if (tmp_res.isErr()) {
             return;
         }
 
-        unlink(piper_tmpname);
+        auto tmp_pair = tmp_res.unwrap();
+        ghc::filesystem::remove(tmp_pair.first);
+        this->ul_fd = std::move(tmp_pair.second);
 
         curl_easy_setopt(this->cr_handle, CURLOPT_URL, this->cr_name.c_str());
         curl_easy_setopt(this->cr_handle, CURLOPT_WRITEFUNCTION, write_cb);
         curl_easy_setopt(this->cr_handle, CURLOPT_WRITEDATA, this);
         curl_easy_setopt(this->cr_handle, CURLOPT_FILETIME, 1);
-    };
+        curl_easy_setopt(this->cr_handle, CURLOPT_BUFFERSIZE, 128L * 1024L);
+    }
 
-    int get_fd() const {
-        return this->ul_fd.get();
-    };
+    int get_fd() const { return this->ul_fd.get(); }
 
-    auto_fd copy_fd() const {
-        return this->ul_fd;
-    };
+    auto_fd copy_fd() const { return this->ul_fd.dup(); }
 
-    long complete(CURLcode result) {
+    long complete(CURLcode result)
+    {
         curl_request::complete(result);
 
         switch (result) {
@@ -75,8 +75,12 @@ public:
                 break;
             default:
                 log_error("%s:curl failure -- %ld %s",
-                          this->cr_name.c_str(), result, curl_easy_strerror(result));
-                write(this->ul_fd, this->cr_error_buffer, strlen(this->cr_error_buffer));
+                          this->cr_name.c_str(),
+                          result,
+                          curl_easy_strerror(result));
+                log_perror(write(this->ul_fd,
+                                 this->cr_error_buffer,
+                                 strlen(this->cr_error_buffer)));
                 return -1;
         }
 
@@ -88,8 +92,8 @@ public:
             time_t current_time;
 
             time(&current_time);
-            if (file_time == -1 ||
-                (current_time - file_time) < FOLLOW_IF_MODIFIED_SINCE) {
+            if (file_time == -1
+                || (current_time - file_time) < FOLLOW_IF_MODIFIED_SINCE) {
                 char range[64];
                 struct stat st;
                 off_t start;
@@ -98,45 +102,48 @@ public:
                 if (st.st_size > 0) {
                     start = st.st_size - 1;
                     this->ul_resume_offset = 1;
-                }
-                else {
+                } else {
                     start = 0;
                     this->ul_resume_offset = 0;
                 }
                 snprintf(range, sizeof(range), "%ld-", (long) start);
                 curl_easy_setopt(this->cr_handle, CURLOPT_RANGE, range);
                 return 2000;
-            }
-            else {
+            } else {
                 log_debug("URL was not recently modified, not tailing: %s",
                           this->cr_name.c_str());
             }
-        }
-        else {
+        } else {
             log_error("Could not get file time for URL: %s -- %s",
-                      this->cr_name.c_str(), curl_easy_strerror(rc));
+                      this->cr_name.c_str(),
+                      curl_easy_strerror(rc));
         }
 
         return -1;
-    };
+    }
 
 private:
     static const long FOLLOW_IF_MODIFIED_SINCE = 60 * 60;
 
-    static ssize_t write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
-        url_loader *ul = (url_loader *) userp;
-        char *c_contents = (char *) contents;
+    static ssize_t write_cb(void* contents,
+                            size_t size,
+                            size_t nmemb,
+                            void* userp)
+    {
+        url_loader* ul = (url_loader*) userp;
+        char* c_contents = (char*) contents;
         ssize_t retval;
 
         c_contents += ul->ul_resume_offset;
-        retval = write(ul->ul_fd, c_contents, (size * nmemb) - ul->ul_resume_offset);
+        retval = write(
+            ul->ul_fd, c_contents, (size * nmemb) - ul->ul_resume_offset);
         retval += ul->ul_resume_offset;
         ul->ul_resume_offset = 0;
         return retval;
     }
 
     auto_fd ul_fd;
-    off_t ul_resume_offset;
+    off_t ul_resume_offset{0};
 };
 #endif
 

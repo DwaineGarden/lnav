@@ -21,8 +21,8 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
@@ -30,16 +30,233 @@
 #ifndef LNAV_COMMAND_EXECUTOR_H
 #define LNAV_COMMAND_EXECUTOR_H
 
-#include <sqlite3.h>
-
+#include <future>
+#include <stack>
 #include <string>
 
-std::string execute_command(std::string cmdline);
+#include <sqlite3.h>
 
-std::string execute_sql(std::string sql, std::string &alt_msg);
-void execute_file(std::string path, bool multiline = true);
-void execute_init_commands(std::vector<std::pair<std::string, std::string> > &msgs);
+#include "base/auto_fd.hh"
+#include "base/lnav.console.hh"
+#include "bookmarks.hh"
+#include "fmt/format.h"
+#include "ghc/filesystem.hpp"
+#include "help_text.hh"
+#include "optional.hpp"
+#include "shlex.resolver.hh"
+#include "vis_line.hh"
 
-int sql_callback(sqlite3_stmt *stmt);
+struct exec_context;
+class attr_line_t;
+class logline_value;
+struct logline_value_vector;
 
-#endif //LNAV_COMMAND_EXECUTOR_H
+using sql_callback_t = int (*)(exec_context&, sqlite3_stmt*);
+int sql_callback(exec_context& ec, sqlite3_stmt* stmt);
+
+using pipe_callback_t
+    = std::future<std::string> (*)(exec_context&, const std::string&, auto_fd&);
+
+using error_callback_t
+    = std::function<void(const lnav::console::user_message&)>;
+
+struct exec_context {
+    enum class perm_t {
+        READ_WRITE,
+        READ_ONLY,
+    };
+
+    using output_t = std::pair<FILE*, int (*)(FILE*)>;
+
+    exec_context(logline_value_vector* line_values = nullptr,
+                 sql_callback_t sql_callback = ::sql_callback,
+                 pipe_callback_t pipe_callback = nullptr);
+
+    bool is_read_write() const
+    {
+        return this->ec_perms == perm_t::READ_WRITE;
+    }
+
+    bool is_read_only() const
+    {
+        return this->ec_perms == perm_t::READ_ONLY;
+    }
+
+    exec_context& with_perms(perm_t perms)
+    {
+        this->ec_perms = perms;
+        return *this;
+    }
+
+    void add_error_context(lnav::console::user_message& um);
+
+    template<typename... Args>
+    Result<std::string, lnav::console::user_message> make_error(
+        fmt::string_view format_str, const Args&... args)
+    {
+        auto retval = lnav::console::user_message::error(
+            fmt::vformat(format_str, fmt::make_format_args(args...)));
+
+        this->add_error_context(retval);
+
+        return Err(retval);
+    }
+
+    nonstd::optional<FILE*> get_output()
+    {
+        for (auto iter = this->ec_output_stack.rbegin();
+             iter != this->ec_output_stack.rend();
+             ++iter)
+        {
+            if (iter->second && (*iter->second).first) {
+                return (*iter->second).first;
+            }
+        }
+
+        return nonstd::nullopt;
+    }
+
+    void set_output(const std::string& name, FILE* file, int (*closer)(FILE*));
+
+    void clear_output();
+
+    struct source_guard {
+        source_guard(exec_context* context) : sg_context(context) {}
+
+        source_guard(const source_guard&) = delete;
+
+        source_guard(source_guard&& other) : sg_context(other.sg_context)
+        {
+            other.sg_context = nullptr;
+        }
+
+        ~source_guard()
+        {
+            if (this->sg_context != nullptr) {
+                this->sg_context->ec_source.pop_back();
+            }
+        }
+
+        exec_context* sg_context;
+    };
+
+    struct output_guard {
+        explicit output_guard(exec_context& context,
+                              std::string name = "default",
+                              const nonstd::optional<output_t>& file
+                              = nonstd::nullopt);
+
+        ~output_guard();
+
+        exec_context& sg_context;
+    };
+
+    source_guard enter_source(intern_string_t path,
+                              int line_number,
+                              const std::string& content);
+
+    struct error_cb_guard {
+        error_cb_guard(exec_context* context) : sg_context(context) {}
+
+        error_cb_guard(const error_cb_guard&) = delete;
+        error_cb_guard(error_cb_guard&& other) : sg_context(other.sg_context)
+        {
+            other.sg_context = nullptr;
+        }
+
+        ~error_cb_guard()
+        {
+            if (this->sg_context != nullptr) {
+                this->sg_context->ec_error_callback_stack.pop_back();
+            }
+        }
+
+        exec_context* sg_context;
+    };
+
+    error_cb_guard add_error_callback(error_callback_t cb)
+    {
+        this->ec_error_callback_stack.emplace_back(std::move(cb));
+        return {this};
+    }
+
+    scoped_resolver create_resolver()
+    {
+        return {
+            &this->ec_local_vars.top(),
+            &this->ec_global_vars,
+        };
+    }
+
+    void execute(const std::string& cmdline);
+
+    using kv_pair_t = std::pair<std::string, std::string>;
+
+    void execute_with_int(const std::string& cmdline)
+    {
+        this->execute(cmdline);
+    }
+
+    template<typename... Args>
+    void execute_with_int(const std::string& cmdline,
+                          kv_pair_t pair,
+                          Args... args)
+    {
+        this->ec_local_vars.top().template emplace(pair);
+        this->execute(cmdline, args...);
+    }
+
+    template<typename... Args>
+    void execute_with(const std::string& cmdline, Args... args)
+    {
+        this->ec_local_vars.push({});
+        this->execute_with_int(cmdline, args...);
+        this->ec_local_vars.pop();
+    }
+
+    vis_line_t ec_top_line{0_vl};
+    bool ec_dry_run{false};
+    perm_t ec_perms{perm_t::READ_WRITE};
+
+    std::map<std::string, std::string> ec_override;
+    logline_value_vector* ec_line_values;
+    std::stack<std::map<std::string, scoped_value_t>> ec_local_vars;
+    std::map<std::string, scoped_value_t> ec_global_vars;
+    std::vector<ghc::filesystem::path> ec_path_stack;
+    std::vector<lnav::console::snippet> ec_source;
+    help_text* ec_current_help{nullptr};
+
+    std::vector<std::pair<std::string, nonstd::optional<output_t>>>
+        ec_output_stack;
+
+    std::unique_ptr<attr_line_t> ec_accumulator;
+
+    sql_callback_t ec_sql_callback;
+    pipe_callback_t ec_pipe_callback;
+    std::vector<error_callback_t> ec_error_callback_stack;
+};
+
+Result<std::string, lnav::console::user_message> execute_command(
+    exec_context& ec, const std::string& cmdline);
+
+Result<std::string, lnav::console::user_message> execute_sql(
+    exec_context& ec, const std::string& sql, std::string& alt_msg);
+Result<std::string, lnav::console::user_message> execute_file(
+    exec_context& ec, const std::string& path_and_args, bool multiline = true);
+Result<std::string, lnav::console::user_message> execute_any(
+    exec_context& ec, const std::string& cmdline);
+void execute_init_commands(
+    exec_context& ec,
+    std::vector<std::pair<Result<std::string, lnav::console::user_message>,
+                          std::string>>& msgs);
+
+std::future<std::string> pipe_callback(exec_context& ec,
+                                       const std::string& cmdline,
+                                       auto_fd& fd);
+
+int sql_progress(const struct log_cursor& lc);
+void sql_progress_finished();
+
+void add_global_vars(exec_context& ec);
+
+#endif  // LNAV_COMMAND_EXECUTOR_H

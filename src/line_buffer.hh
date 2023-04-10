@@ -21,37 +21,40 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * @file line_buffer.hh
  */
 
-#ifndef __line_buffer_hh
-#define __line_buffer_hh
+#ifndef line_buffer_hh
+#define line_buffer_hh
+
+#include <array>
+#include <exception>
+#include <future>
+#include <vector>
 
 #include <errno.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <zlib.h>
 
-#include <exception>
-
-#include "lnav_log.hh"
-#include "auto_fd.hh"
-#include "auto_mem.hh"
+#include "base/auto_fd.hh"
+#include "base/auto_mem.hh"
+#include "base/file_range.hh"
+#include "base/lnav_log.hh"
+#include "base/result.h"
+#include "safe/safe.h"
 #include "shared_buffer.hh"
 
-struct line_value {
-    char *lv_start;
-    size_t lv_len;
-    bool lv_partial;
-
-    void terminate() {
-        this->lv_start[this->lv_len] = '\0';
-    };
+struct line_info {
+    file_range li_file_range;
+    bool li_partial{false};
+    bool li_valid_utf{true};
+    bool li_has_ansi{false};
 };
 
 /**
@@ -65,129 +68,212 @@ struct line_value {
  */
 class line_buffer {
 public:
-    static const size_t DEFAULT_LINE_BUFFER_SIZE   = 256 * 1024;
-    static const size_t MAX_LINE_BUFFER_SIZE       = 4 * DEFAULT_LINE_BUFFER_SIZE;
-    class error
-        : public std::exception {
-public:
-        error(int err)
-            : e_err(err) { };
+    static const ssize_t DEFAULT_LINE_BUFFER_SIZE;
+    static const ssize_t MAX_LINE_BUFFER_SIZE;
+    class error : public std::exception {
+    public:
+        explicit error(int err) : e_err(err) {}
 
         int e_err;
+    };
+
+    struct header_data {
+        timeval hd_mtime{};
+        auto_buffer hd_extra{auto_buffer::alloc(0)};
+        std::string hd_name;
+        std::string hd_comment;
+
+        bool empty() const
+        {
+            return this->hd_mtime.tv_sec == 0 && this->hd_extra.empty()
+                && this->hd_name.empty() && this->hd_comment.empty();
+        }
+    };
+
+#define GZ_WINSIZE           32768U /*> gzip's max supported dictionary is 15-bits */
+#define GZ_RAW_MODE          (-15) /*> Raw inflate data mode */
+#define GZ_HEADER_MODE       (15 + 32) /*> Automatic zstd or gzip decoding */
+#define GZ_BORROW_BITS_MASK  7 /*> Bits (0-7) consumed in previous block */
+#define GZ_END_OF_BLOCK_MASK 128 /*> Stopped because reached end-of-block */
+#define GZ_END_OF_FILE_MASK  64 /*> Stopped because reached end-of-file */
+
+    /**
+     * A memoized gzip file reader that can do random file access faster than
+     * gzseek/gzread alone.
+     */
+    class gz_indexed {
+    public:
+        gz_indexed();
+        gz_indexed(gz_indexed&& other) = default;
+        ~gz_indexed() { this->close(); }
+
+        inline operator bool() const { return this->gz_fd != -1; }
+
+        uLong get_source_offset() const
+        {
+            return !!*this ? this->strm.total_in + this->strm.avail_in : 0;
+        }
+
+        void close();
+        void init_stream();
+        void continue_stream();
+        void open(int fd, header_data& hd);
+        int stream_data(void* buf, size_t size);
+        void seek(off_t offset);
+
+        /**
+         * Decompress bytes from the gz file returning at most `size` bytes.
+         * offset is the byte-offset in the decompressed data stream.
+         */
+        int read(void* buf, size_t offset, size_t size);
+
+        struct indexDict {
+            off_t in = 0;
+            off_t out = 0;
+            unsigned char bits = 0;
+            unsigned char in_bits = 0;
+            Bytef index[GZ_WINSIZE];
+            indexDict(z_stream const& s, const file_size_t size);
+
+            int apply(z_streamp s);
+        };
+
+    private:
+        z_stream strm; /*< gzip streams structure */
+        std::vector<indexDict>
+            syncpoints; /*< indexed dictionaries as discovered */
+        auto_mem<Bytef> inbuf; /*< Compressed data buffer */
+        int gz_fd = -1; /*< The file to read data from. */
     };
 
     /** Construct an empty line_buffer. */
     line_buffer();
 
+    line_buffer(line_buffer&& other) = delete;
+
     virtual ~line_buffer();
 
     /** @param fd The file descriptor that data should be pulled from. */
-    void set_fd(auto_fd &fd) throw (error);
+    void set_fd(auto_fd& fd);
 
     /** @return The file descriptor that data should be pulled from. */
-    int get_fd() const { return this->lb_fd; };
+    int get_fd() const { return this->lb_fd; }
 
-    time_t get_file_time() const { return this->lb_file_time; };
+    time_t get_file_time() const { return this->lb_file_time; }
 
     /**
      * @return The size of the file or the amount of data pulled from a pipe.
      */
-    ssize_t get_file_size() const { return this->lb_file_size; };
+    file_ssize_t get_file_size() const { return this->lb_file_size; }
 
-    bool is_pipe() const {
-        return !this->lb_seekable;
-    };
+    bool is_pipe() const { return !this->lb_seekable; }
 
-    bool is_pipe_closed() const {
+    bool is_pipe_closed() const
+    {
         return !this->lb_seekable && (this->lb_file_size != -1);
-    };
+    }
 
-    bool is_compressed() const {
-        return this->lb_gz_file != NULL || this->lb_bz_file;
-    };
+    bool is_compressed() const { return this->lb_compressed; }
 
-    off_t get_read_offset(off_t off) const
+    file_off_t get_read_offset(file_off_t off) const
     {
-        if (this->lb_gz_file) {
-            return this->lb_gz_offset;
+        if (this->is_compressed()) {
+            return this->lb_compressed_offset;
         }
-        else{
-            return off;
+        return off;
+    }
+
+    bool is_data_available(file_off_t off, file_off_t stat_size) const
+    {
+        if (this->is_compressed()) {
+            return (this->lb_file_size == -1 || off < this->lb_file_size);
         }
-    };
+        return off < stat_size;
+    }
 
     /**
-     * Read up to the end of file or a given delimiter.
+     * Attempt to load the next line into the buffer.
      *
-     * @param offset_inout The offset in the file to start reading from.  On
-     * return, it contains the offset where the next line should start or one
-     * past the size of the file.
-     * @param len_out On return, contains the length of the line, not including
-     * the delimiter.
-     * @param delim The character that splits lines in the input, defaults to a
-     * line feed.
-     * @return The address in the internal buffer where the line starts.  The
-     * line is not NULL-terminated, but this method ensures there is room to NULL
-     * terminate the line.  If any modifications are made to the line, such as
-     * NULL termination, the invalidate() must be called before re-reading the
-     * line to refresh the buffer.
+     * @param prev_line The range of the previous line.
+     * @return If the read was successful, information about the line.
+     *   Otherwise, an error message.
      */
-    bool read_line(off_t &offset_inout, line_value &lv,
-        bool include_delim = false)
-        throw (error);
+    Result<line_info, std::string> load_next_line(file_range prev_line = {});
 
-    bool read_line(off_t &offset_inout, shared_buffer_ref &sbr, line_value *lv = NULL)
-        throw (error);
+    Result<shared_buffer_ref, std::string> read_range(file_range fr);
 
-    bool read_range(off_t offset, size_t len, shared_buffer_ref &sbr)
-        throw (error);
+    file_range get_available();
 
-    /**
-     * Signal that the contents of the internal buffer have been modified and
-     * any attempts to re-read the currently cached line(s) should trigger
-     * another read from the file.
-     */
-    void invalidate()
+    bool is_likely_to_flush(file_range prev_line);
+
+    void flush_at(file_off_t off)
     {
-        this->lb_file_offset += this->lb_buffer_size;
-        this->lb_buffer_size  = 0;
-        this->lb_file_size    = -1;
-        log_info("invalidate %p", this);
-    };
+        if (this->in_range(off)) {
+            this->lb_buffer.resize(off - this->lb_file_offset);
+        } else {
+            this->lb_buffer.clear();
+        }
+    }
 
     /** Release any resources held by this object. */
     void reset()
     {
         this->lb_fd.reset();
 
-        this->lb_file_offset      = 0;
-        this->lb_file_size        = (size_t)-1;
-        this->lb_buffer_size      = 0;
+        this->lb_file_offset = 0;
+        this->lb_file_size = (ssize_t) -1;
+        this->lb_buffer.resize(0);
         this->lb_last_line_offset = -1;
-    };
+    }
 
     /** Check the invariants for this object. */
-    bool invariant(void)
+    bool invariant() const
     {
-        require(this->lb_buffer != NULL);
-        require(this->lb_buffer_size <= this->lb_buffer_max);
+        require(this->lb_buffer.size() <= this->lb_buffer.capacity());
 
         return true;
+    }
+
+    void quiesce();
+
+    struct stats {
+        bool empty() const
+        {
+            return this->s_decompressions == 0 && this->s_preads == 0
+                && this->s_requested_preloads == 0
+                && this->s_used_preloads == 0;
+        }
+
+        uint32_t s_decompressions{0};
+        uint32_t s_preads{0};
+        uint32_t s_requested_preloads{0};
+        uint32_t s_used_preloads{0};
+        std::array<uint32_t, 10> s_hist{};
     };
 
-private:
+    struct stats consume_stats() { return std::exchange(this->lb_stats, {}); }
 
+    size_t get_buffer_size() const { return this->lb_buffer.size(); }
+
+    const header_data& get_header_data() const { return this->lb_header; }
+
+    void enable_cache();
+
+    static void cleanup_cache();
+
+private:
     /**
      * @param off The file offset to check for in the buffer.
      * @return True if the given offset is cached in the buffer.
      */
-    bool in_range(off_t off) const
+    bool in_range(file_off_t off) const
     {
-        return this->lb_file_offset <= off &&
-               off < (int)(this->lb_file_offset + this->lb_buffer_size);
-    };
+        return this->lb_file_offset <= off
+            && off
+            < (this->lb_file_offset + (file_ssize_t) this->lb_buffer.size());
+    }
 
-    void resize_buffer(size_t new_max) throw (error);
+    void resize_buffer(size_t new_max);
 
     /**
      * Ensure there is enough room in the buffer to cache a range of data from
@@ -201,7 +287,7 @@ private:
      * @param start The file offset of the start of the line.
      * @param max_length The amount of data to be cached in the buffer.
      */
-    void ensure_available(off_t start, size_t max_length) throw (error);
+    void ensure_available(file_off_t start, ssize_t max_length);
 
     /**
      * Fill the buffer with the given range of data from the file.
@@ -211,7 +297,7 @@ private:
      * @param max_length The maximum amount of data to read from the file.
      * @return True if any data was read from the file.
      */
-    bool fill_range(off_t start, size_t max_length) throw (error);
+    bool fill_range(file_off_t start, ssize_t max_length);
 
     /**
      * After a successful fill, the cached data can be retrieved with this
@@ -223,41 +309,62 @@ private:
      * @return A pointer to the start of the cached data in the internal
      * buffer.
      */
-    char *get_range(off_t start, size_t &avail_out)
+    const char* get_range(file_off_t start, file_ssize_t& avail_out) const
     {
-        off_t buffer_offset = start - this->lb_file_offset;
-        char *retval;
+        size_t buffer_offset = start - this->lb_file_offset;
 
         require(buffer_offset >= 0);
+        require(this->lb_buffer.size() >= buffer_offset);
 
-        retval    = &this->lb_buffer[buffer_offset];
-        avail_out = this->lb_buffer_size - buffer_offset;
+        const auto* retval = this->lb_buffer.at(buffer_offset);
+        avail_out = this->lb_buffer.size() - buffer_offset;
 
         return retval;
-    };
+    }
+
+    bool load_next_buffer();
+
+    using safe_gz_indexed = safe::Safe<gz_indexed>;
 
     shared_buffer lb_share_manager;
 
-    auto_fd lb_fd;              /*< The file to read data from. */
-    gzFile  lb_gz_file;         /*< File handle for gzipped files. */
-    bool    lb_bz_file;         /*< Flag set for bzip2 compressed files. */
-    off_t   lb_gz_offset;       /*< The offset into the compressed file. */
+    auto_fd lb_fd; /*< The file to read data from. */
+    safe_gz_indexed lb_gz_file; /*< File reader for gzipped files. */
+    bool lb_bz_file{false}; /*< Flag set for bzip2 compressed files. */
 
-    auto_mem<char> lb_buffer;   /*< The internal buffer where data is cached */
+    auto_buffer lb_buffer{auto_buffer::alloc(DEFAULT_LINE_BUFFER_SIZE)};
+    nonstd::optional<auto_buffer> lb_alt_buffer;
+    std::vector<uint32_t> lb_alt_line_starts;
+    std::vector<bool> lb_alt_line_is_utf;
+    std::vector<bool> lb_alt_line_has_ansi;
+    std::future<bool> lb_loader_future;
+    nonstd::optional<file_off_t> lb_loader_file_offset;
 
-    ssize_t lb_file_size;       /*<
-                                 * The size of the file.  When lb_fd refers to
-                                 * a pipe, this is set to the amount of data
-                                 * read from the pipe when EOF is reached.
-                                 */
-    off_t lb_file_offset;       /*<
-                                 * Data cached in the buffer comes from this
-                                 * offset in the file.
-                                 */
-    time_t lb_file_time;
-    ssize_t lb_buffer_size;     /*< The amount of cached data in the buffer. */
-    ssize_t lb_buffer_max;      /*< The size of the buffer memory. */
-    bool   lb_seekable;         /*< Flag set for seekable file descriptors. */
-    off_t  lb_last_line_offset; /*< */
+    file_off_t lb_compressed_offset{
+        0}; /*< The offset into the compressed file. */
+    file_ssize_t lb_file_size{
+        -1}; /*<
+              * The size of the file.  When lb_fd refers to
+              * a pipe, this is set to the amount of data
+              * read from the pipe when EOF is reached.
+              */
+    file_off_t lb_file_offset{0}; /*<
+                                   * Data cached in the buffer comes from this
+                                   * offset in the file.
+                                   */
+    time_t lb_file_time{0};
+    bool lb_seekable{false}; /*< Flag set for seekable file descriptors. */
+    bool lb_compressed{false};
+    file_off_t lb_last_line_offset{-1}; /*< */
+
+    std::vector<uint32_t> lb_line_starts;
+    std::vector<bool> lb_line_is_utf;
+    std::vector<bool> lb_line_has_ansi;
+    stats lb_stats;
+
+    nonstd::optional<auto_fd> lb_cached_fd;
+
+    header_data lb_header;
 };
+
 #endif

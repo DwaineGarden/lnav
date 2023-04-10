@@ -3,12 +3,18 @@
 top_srcdir="@abssrcdir@"
 export top_srcdir
 
+top_srcdir_parent=`dirname ${top_srcdir}`
+export top_srcdir_parent
+
 srcdir="@abssrcdir@/test"
 export srcdir
 
 # The top build directory, derived from the path to this script.
 top_builddir=`dirname $0`
 export top_builddir
+
+builddir=`pwd -P`
+export builddir
 
 test_dir="@abssrcdir@/test"
 export test_dir
@@ -20,6 +26,15 @@ export BZIP2_SUPPORT
 BZIP2_CMD="@BZIP2_CMD@"
 export BZIP2_CMD
 
+XZ_CMD="@XZ_CMD@"
+export XZ_CMD
+
+TSHARK_CMD="@TSHARK_CMD@"
+export TSHARK_CMD
+
+LIBARCHIVE_LIBS="@LIBARCHIVE_LIBS@"
+export LIBARCHIVE_LIBS
+
 HOME="${top_builddir}/test"
 export HOME
 
@@ -29,6 +44,8 @@ test_file=$1
 test_file_base=`basename $1`
 # The current test number for shell based tests.
 test_num=0
+
+test_hash=""
 
 lnav_test="${top_builddir}/src/lnav-test"
 export lnav_test
@@ -42,9 +59,19 @@ export LNAV_LOG_PATH
 SFTP_TEST_URL="@SFTP_TEST_URL@"
 export SFTP_TEST_URL
 
+HAVE_SQLITE3_VALUE_SUBTYPE="@HAVE_SQLITE3_VALUE_SUBTYPE@"
+export HAVE_SQLITE3_VALUE_SUBTYPE
+
+HAVE_SQLITE3_ERROR_OFFSET="@HAVE_SQLITE3_ERROR_OFFSET@"
+export HAVE_SQLITE3_ERROR_OFFSET
+
 ## BEGIN Functions
 
 LAST_TEST=""
+
+LAST_CAP_TEST=()
+
+has_errors=""
 
 #
 # Run a test case and capture its standard out and standard err.
@@ -58,8 +85,71 @@ LAST_TEST=""
 #     run_test rktimes -V
 #
 run_test() {
-    LAST_TEST="test: $@"
+    printf "%s \033[0;35m=============================================================\033[0m\n" $(date -Iseconds)
+    LAST_TEST=("test: $@")
+    echo "${LAST_TEST[@]}"
+    export test_num=`expr ${test_num} \+ 1`
     "$@" > ${test_file_base}_${test_num}.tmp 2> ${test_file_base}_${test_num}.err
+}
+
+run_cap_test() {
+    LAST_CAP_TEST=("test: $@")
+    local full_cmd=$(echo "${LAST_CAP_TEST[@]}" | sed -e "s;${test_dir};{test_dir};g" -e "s;${top_srcdir};{top_srcdir};g")
+    export test_hash=$(echo "${full_cmd}" | shasum | cut -f 1 -d ' ')
+    echo "${full_cmd}" > ${test_file_base}_${test_hash}.cmd
+    "$@" > ${test_file_base}_${test_hash}.out 2> ${test_file_base}_${test_hash}.err
+
+    sed -ibak \
+        -e "s;${test_dir};{test_dir};g" \
+        -e "s;${builddir};{test_dir};g" \
+        -e "s;${top_srcdir};{top_srcdir};g" \
+        -e "s;${top_srcdir_parent};{top_srcdir_parent};g" \
+        ${test_file_base}_${test_hash}.out
+    echo
+    printf "%s \033[0;35m=============================================================\033[0m\n" $(date -Iseconds)
+    printf '\033[0;35mCommand\033[0m: %s\n' "${full_cmd}"
+    printf '\033[0;32mBEGIN\033[0m %s\n' "${test_file_base}_${test_hash}.out"
+    cat "${test_file_base}_${test_hash}.out"
+    printf '\033[0;32mEND\033[0m   %s\n' "${test_file_base}_${test_hash}.out"
+    if test -f ${srcdir}/expected/${test_file_base}_${test_hash}.out; then
+       diff -w -u \
+           ${srcdir}/expected/${test_file_base}_${test_hash}.out \
+           ${test_file_base}_${test_hash}.out \
+           > ${test_file_base}_${test_hash}.diff
+       if test $? -ne 0; then
+           echo OUT: "${full_cmd}"
+           cat ${test_file_base}_${test_hash}.diff
+           echo "FAIL! EXPECTED OUT DIFF"
+           export has_errors="yes"
+       fi
+    else
+       echo "FAIL! EXPECTED OUT MISSING -- ${srcdir}/expected/${test_file_base}_${test_hash}.out"
+       export has_errors="yes"
+    fi
+
+    sed -ibak -E \
+        -e "s;${test_dir};{test_dir};g" \
+        -e "s;${builddir};{builddir};g" \
+        -e "s;${top_srcdir};{top_srcdir};g" \
+        -e 's;"errorId":".+";;g' \
+        ${test_file_base}_${test_hash}.err
+    printf '\033[0;31mBEGIN\033[0m %s\n' "${test_file_base}_${test_hash}.err"
+    cat "${test_file_base}_${test_hash}.err"
+    printf '\033[0;31mEND\033[0m   %s\n' "${test_file_base}_${test_hash}.err"
+    if test -f ${srcdir}/expected/${test_file_base}_${test_hash}.err; then
+       diff -w -u ${srcdir}/expected/${test_file_base}_${test_hash}.err \
+           ${test_file_base}_${test_hash}.err \
+           > ${test_file_base}_${test_hash}.err.diff
+       if test $? -ne 0; then
+           echo ERR: "${full_cmd}"
+           cat ${test_file_base}_${test_hash}.err.diff
+           echo "FAIL! EXPECTED ERR DIFF"
+           export has_errors="yes"
+       fi
+    else
+       echo "FAIL! EXPECTED ERR MISSING"
+       export has_errors="yes"
+    fi
 }
 
 #
@@ -78,14 +168,31 @@ run_test() {
 #     EOF
 #
 check_output() {
+    sed -ibak \
+        -e "s;${test_dir};{test_dir};g" \
+        -e "s;${top_srcdir};{top_srcdir};g" \
+        ${test_file_base}_${test_num}.tmp
     diff -w -u - ${test_file_base}_${test_num}.tmp > ${test_file_base}_${test_num}.diff
     if test $? -ne 0; then
-        echo $LAST_TEST
+        echo "${LAST_TEST[@]}"
         echo $1
         cat ${test_file_base}_${test_num}.diff
 	    exit 1
     fi
-    test_num=`expr ${test_num} \+ 1`
+}
+
+check_output_ws() {
+    diff -u - ${test_file_base}_${test_num}.tmp > ${test_file_base}_${test_num}.diff
+    if test $? -ne 0; then
+        echo "${LAST_TEST[@]}"
+        echo $1
+        cat ${test_file_base}_${test_num}.diff
+	    exit 1
+    fi
+}
+
+test_filename() {
+    echo ${test_file_base}_${test_num}.tmp
 }
 
 test_err_filename() {
@@ -93,10 +200,14 @@ test_err_filename() {
 }
 
 check_error_output() {
+    sed -ibak \
+        -e "s;${test_dir};{test_dir};g" \
+        -e "s;${top_srcdir};{top_srcdir};g" \
+        ${test_file_base}_${test_num}.err
     diff -w -u - ${test_file_base}_${test_num}.err \
         > ${test_file_base}_${test_num}.err.diff
     if test $? -ne 0; then
-        echo $LAST_TEST
+        echo "${LAST_TEST[@]}"
         echo $1
         cat ${test_file_base}_${test_num}.err.diff
         exit 1
@@ -106,7 +217,7 @@ check_error_output() {
 #
 # Grep for a string in the output generated by a run_test() call.
 #
-# Usage: grep_output_for <string> <fail maessage>
+# Usage: grep_output_for <string> <fail message>
 #
 # Example:
 #
@@ -123,12 +234,21 @@ grep_output_for() {
 	echo "${test_file_base}_${test_num}.tmp: $2"
 	exit 1
     fi
-    test_num=`expr ${test_num} \+ 1`
+}
+
+on_error_log() {
+  if test $? -ne 0; then
+    echo $1 > /dev/stderr
+    cat ${test_file_base}_${test_num}.tmp
+    cat ${test_file_base}_${test_num}.err
+  fi
 }
 
 on_error_fail_with() {
     if test $? -ne 0; then
 	echo $1 > /dev/stderr
+	cat ${test_file_base}_${test_num}.tmp
+	cat ${test_file_base}_${test_num}.err
 	exit 1
     fi
 }
@@ -145,3 +265,11 @@ else
     shift
     . ${test_file}
 fi
+
+cleanup() {
+  if test "${has_errors}"x = "yes"x; then
+    exit 1
+  fi
+}
+
+trap "cleanup" EXIT

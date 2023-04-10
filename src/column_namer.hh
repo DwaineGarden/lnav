@@ -21,70 +21,50 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * @file column_namer.hh
  */
 
-#ifndef _column_namer_hh
-#define _column_namer_hh
+#ifndef lnav_column_namer_hh
+#define lnav_column_namer_hh
 
-#include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
-#include <algorithm>
+
+#include "ArenaAlloc/arenaalloc.h"
+#include "base/intern_string.hh"
 
 class column_namer {
 public:
-    column_namer()
-    {
-        this->cn_builtin_names.push_back("col");
+    enum class language {
+        SQL,
+        JSON,
     };
 
-    bool existing_name(const std::string &in_name) const
-    {
-        if (find(this->cn_builtin_names.begin(),
-                 this->cn_builtin_names.end(),
-                 in_name) != this->cn_builtin_names.end()) {
-            return true;
-        }
-        else if (find(this->cn_names.begin(),
-                      this->cn_names.end(),
-                      in_name) != this->cn_names.end()) {
-            return true;
-        }
+    column_namer(language lang);
 
-        return false;
-    };
+    bool existing_name(const string_fragment& in_name) const;
 
-    std::string add_column(const std::string &in_name)
-    {
-        std::string base_name = in_name, retval;
-        size_t      buf_size;
-        int         num = 0;
+    string_fragment add_column(const string_fragment& in_name);
 
-        buf_size = in_name.length() + 64;
-        char buffer[buf_size];
-        if (in_name == "") {
-            base_name = "col";
-        }
+    static const char BUILTIN_COL[];
 
-        retval = base_name;
-        while (this->existing_name(retval)) {
-            snprintf(buffer, buf_size, "%s_%d", base_name.c_str(), num);
-            retval = buffer;
-            num   += 1;
-        }
-
-        this->cn_names.push_back(retval);
-
-        return retval;
-    };
-
-    std::vector<std::string> cn_builtin_names;
-    std::vector<std::string> cn_names;
+    ArenaAlloc::Alloc<char> cn_alloc;
+    language cn_language;
+    std::vector<string_fragment> cn_builtin_names{string_fragment(BUILTIN_COL)};
+    std::vector<string_fragment> cn_names;
+    std::unordered_map<
+        string_fragment,
+        size_t,
+        frag_hasher,
+        std::equal_to<string_fragment>,
+        ArenaAlloc::Alloc<std::pair<const string_fragment, size_t>>>
+        cn_name_counters;
 };
+
 #endif

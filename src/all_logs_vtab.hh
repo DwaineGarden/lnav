@@ -21,97 +21,40 @@
  * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
  * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
  * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef LNAV_ALL_LOGS_VTAB_HH
-#define LNAV_ALL_LOGS_VTAB_HH
+#ifndef lnav_all_logs_vtab_hh
+#define lnav_all_logs_vtab_hh
 
-#include "byte_array.hh"
-#include "log_vtab_impl.hh"
+#include <array>
+
 #include "data_parser.hh"
+#include "log_vtab_impl.hh"
 
+/**
+ * A virtual table that provides access to all log messages from all formats.
+ *
+ * @feature f0:sql.tables.all_logs
+ */
 class all_logs_vtab : public log_vtab_impl {
 public:
+    all_logs_vtab();
 
-    all_logs_vtab() : log_vtab_impl(intern_string::lookup("all_logs")) {
-        this->alv_value_name = intern_string::lookup("log_format");
-        this->alv_msg_name = intern_string::lookup("log_msg_format");
-        this->alv_schema_name = intern_string::lookup("log_msg_schema");
-    }
+    void get_columns(std::vector<vtab_column>& cols) const override;
 
-    void get_columns(std::vector<vtab_column> &cols) {
-        cols.push_back(vtab_column(this->alv_value_name.get()));
-        cols.push_back(vtab_column(this->alv_msg_name.get()));
-        cols.push_back(vtab_column(this->alv_schema_name.get(), SQLITE3_TEXT, NULL, true));
-    };
+    void extract(logfile* lf,
+                 uint64_t line_number,
+                 logline_value_vector& values) override;
 
-    void extract(logfile *lf, shared_buffer_ref &line,
-                 std::vector<logline_value> &values) {
-        log_format *format = lf->get_format();
-        values.push_back(logline_value(this->alv_value_name,
-                                       format->get_name(), 0));
-
-        std::vector<logline_value> sub_values;
-        struct line_range body;
-        string_attrs_t sa;
-
-        format->annotate(line, sa, sub_values);
-
-        body = find_string_attr_range(sa, &textview_curses::SA_BODY);
-        if (body.lr_start == -1) {
-            body.lr_start = 0;
-            body.lr_end = line.length();
-        }
-
-        data_scanner ds(line, body.lr_start, body.lr_end);
-        data_parser dp(&ds);
-
-        std::string str;
-        dp.dp_msg_format = &str;
-        dp.parse();
-
-        tmp_shared_buffer tsb(str.c_str());
-
-        values.push_back(logline_value(this->alv_msg_name, tsb.tsb_ref, 1));
-
-        this->alv_schema_manager.invalidate_refs();
-        dp.dp_schema_id.to_string(this->alv_schema_buffer);
-        shared_buffer_ref schema_ref;
-        schema_ref.share(this->alv_schema_manager,
-                         this->alv_schema_buffer,
-                         data_parser::schema_id_t::STRING_SIZE - 1);
-        values.push_back(logline_value(this->alv_schema_name, schema_ref, 2));
-    }
-
-    bool next(log_cursor &lc, logfile_sub_source &lss) {
-        lc.lc_curr_line = lc.lc_curr_line + vis_line_t(1);
-        lc.lc_sub_index = 0;
-
-        if (lc.is_eof()) {
-            return true;
-        }
-
-        content_line_t    cl(lss.at(lc.lc_curr_line));
-        logfile *         lf      = lss.find(cl);
-        logfile::iterator lf_iter = lf->begin() + cl;
-
-        if (lf_iter->get_level() & logline::LEVEL_CONTINUED) {
-            return false;
-        }
-
-        return true;
-    };
+    bool next(log_cursor& lc, logfile_sub_source& lss) override;
 
 private:
-    intern_string_t alv_value_name;
-    intern_string_t alv_msg_name;
-    intern_string_t alv_schema_name;
-    shared_buffer alv_schema_manager;
-    char alv_schema_buffer[data_parser::schema_id_t::STRING_SIZE];
+    logline_value_meta alv_msg_meta;
+    logline_value_meta alv_schema_meta;
 };
 
-#endif //LNAV_ALL_LOGS_VTAB_HH
+#endif  // LNAV_ALL_LOGS_VTAB_HH
