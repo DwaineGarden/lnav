@@ -138,7 +138,7 @@ object with the following fields:
   converted from the raw JSON encoding into this format.  Each element
   is either an object that defines which fields should be inserted into
   the final message string and or a string constant that should be
-  inserted.  For example, the following configuration will tranform each
+  inserted.  For example, the following configuration will transform each
   log message object into a string that contains the timestamp, followed
   by a space, and then the message body:
 
@@ -164,6 +164,8 @@ object with the following fields:
   :max-width: The maximum width for the field.  If the value for the field
     in a given log message is longer, the overflow algorithm will be applied
     to try and shorten the field. (v0.8.2+)
+  :auto-width: Flag that indicates that the width of the field should
+    automatically be set to the widest value seen. (v0.11.2)
   :align: Specifies the alignment for the field, either "left" or "right".
     If "left", padding to meet the minimum-width will be added on the right.
     If "right", padding will be added on the left. (v0.8.2+)
@@ -255,6 +257,11 @@ object with the following fields:
   level can be supplied.  If the JSON log format uses numeric ranges instead
   of exact numbers, you can supply a pattern and the number found in the log
   will be converted to a string for pattern-matching.
+
+  .. note:: The regular expression is not anchored to the start of the
+     string by default, so an expression like :code:`1` will match
+     :code:`-1`.  If you want to exactly match :code:`1`, you would
+     use :code:`^1$` as the expression.
 
 :multiline: If false, **lnav** will consider any log lines that do not
   match one of the message patterns to be in error when checking files with

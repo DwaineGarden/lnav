@@ -300,6 +300,7 @@ read_levels(yajlpp_parse_context* ypc, const unsigned char* str, size_t len)
     log_level_t level = string2level(level_name_or_number.c_str());
     auto value_frag = string_fragment::from_bytes(str, len);
 
+    elf->elf_level_patterns[level].lp_pcre.pp_path = ypc->get_full_path();
     auto compile_res = lnav::pcre2pp::code::from(value_frag);
     if (compile_res.isErr()) {
         static const intern_string_t PATTERN_SRC
@@ -479,6 +480,11 @@ static const struct json_path_container line_format_handlers = {
         .with_synopsis("<size>")
         .with_description("The minimum width of the field")
         .for_field(&external_log_format::json_format_element::jfe_min_width),
+
+    yajlpp::property_handler("auto-width")
+        .with_description("Automatically detect the necessary width of the "
+                          "field based on the observed values")
+        .for_field(&external_log_format::json_format_element::jfe_auto_width),
 
     yajlpp::property_handler("max-width")
         .with_min_value(0)
