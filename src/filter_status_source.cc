@@ -36,17 +36,28 @@
 #include "filter_sub_source.hh"
 #include "lnav.hh"
 
-static auto TOGGLE_MSG = "Press " ANSI_BOLD("TAB") " to edit ";
-static auto EXIT_MSG = "Press " ANSI_BOLD("q") " to exit ";
+using namespace lnav::roles::literals;
 
-static auto CREATE_HELP = ANSI_BOLD("i") "/" ANSI_BOLD("o") ": Create in/out";
-static auto ENABLE_HELP = ANSI_BOLD("SPC") ": ";
-static auto EDIT_HELP = ANSI_BOLD("ENTER") ": Edit";
-static auto TOGGLE_HELP = ANSI_BOLD("t") ": To ";
-static auto DELETE_HELP = ANSI_BOLD("D") ": Delete";
-static auto FILTERING_HELP = ANSI_BOLD("f") ": ";
-static auto JUMP_HELP = ANSI_BOLD("ENTER") ": Jump To";
-static auto CLOSE_HELP = ANSI_BOLD("X") ": Close";
+static constexpr auto TOGGLE_MSG = "Press " ANSI_HOTKEY("TAB") " to edit "_frag;
+static constexpr auto EXIT_MSG = "Press " ANSI_HOTKEY("ESC") " to exit "_frag;
+
+static constexpr auto CREATE_HELP
+    = "Create: " ANSI_HOTKEY("i") "n/" ANSI_HOTKEY("o") "ut";
+static constexpr auto CREATE_EXPR_HELP = "  SQL " ANSI_HOTKEY("e") "xpr";
+static constexpr auto CREATE_SEARCH_HELP = "  " ANSI_HOTKEY("s") "earch";
+static constexpr auto CREATE_LEVEL_HELP = "  " ANSI_HOTKEY("l") "evel";
+static constexpr auto MIN_MAX_TIME_HELP
+    = "  " ANSI_HOTKEY("m") "in/" ANSI_HOTKEY("M") "ax time";
+static constexpr auto ENABLE_HELP = ANSI_HOTKEY("SPC") ": ";
+static constexpr auto EDIT_HELP = ANSI_HOTKEY("ENTER") ": Edit";
+static constexpr auto TOGGLE_HELP = ANSI_HOTKEY("t") ": To ";
+static constexpr auto DELETE_HELP = ANSI_HOTKEY("D") ": Delete";
+static constexpr auto FOCUS_SEARCH_HELP = ANSI_HOTKEY(".") ": ";
+static constexpr auto FILTERING_HELP = ANSI_HOTKEY("f") ": ";
+static constexpr auto JUMP_HELP = ANSI_HOTKEY("ENTER") ": Jump To";
+static constexpr auto CLOSE_HELP = ANSI_HOTKEY("X") ": Close";
+static constexpr auto FOCUS_DETAILS_HELP
+    = ANSI_BOLD("CTRL-]") ": Focus on details view";
 
 filter_status_source::filter_status_source()
 {
@@ -54,6 +65,8 @@ filter_status_source::filter_status_source()
     this->tss_fields[TSF_TITLE].set_role(role_t::VCR_STATUS_TITLE);
     this->tss_fields[TSF_TITLE].set_value(" " ANSI_ROLE("T") "ext Filters ",
                                           role_t::VCR_STATUS_TITLE_HOTKEY);
+    this->tss_fields[TSF_TITLE].on_click
+        = [](status_field&) { set_view_mode(ln_mode_t::FILTER); };
 
     this->tss_fields[TSF_STITCH_TITLE].set_width(2);
     this->tss_fields[TSF_STITCH_TITLE].set_stitch_value(
@@ -73,6 +86,8 @@ filter_status_source::filter_status_source()
         role_t::VCR_STATUS_DISABLED_TITLE);
     this->tss_fields[TSF_FILES_TITLE].set_value(" " ANSI_ROLE("F") "iles ",
                                                 role_t::VCR_STATUS_HOTKEY);
+    this->tss_fields[TSF_FILES_TITLE].on_click
+        = [](status_field&) { set_view_mode(ln_mode_t::FILES); };
 
     this->tss_fields[TSF_FILES_RIGHT_STITCH].set_width(2);
     this->tss_fields[TSF_FILES_RIGHT_STITCH].set_stitch_value(
@@ -98,6 +113,7 @@ filter_status_source::statusview_fields()
             break;
         case ln_mode_t::FILTER:
         case ln_mode_t::FILES:
+        case ln_mode_t::FILE_DETAILS:
             this->tss_fields[TSF_HELP].set_value(EXIT_MSG);
             break;
         default:
@@ -105,15 +121,55 @@ filter_status_source::statusview_fields()
             break;
     }
 
+    size_t error_count = 0;
+
+    auto& fc = lnav_data.ld_active_files;
+    {
+        auto stub_map = fc.fc_name_to_stubs->readAccess();
+
+        for (const auto& stub : *stub_map) {
+            switch (stub.second.fsi_description.um_level) {
+                case lnav::console::user_message::level::raw:
+                case lnav::console::user_message::level::ok:
+                case lnav::console::user_message::level::info:
+                case lnav::console::user_message::level::warning:
+                    break;
+                case lnav::console::user_message::level::error:
+                case lnav::console::user_message::level::fatal:
+                    error_count += 1;
+                    break;
+            }
+        }
+    }
+
+    if (error_count == 0) {
+        this->tss_error.clear();
+    } else if (error_count == 1) {
+        this->tss_error.set_value(" error: a file cannot be opened "_frag);
+    } else if (error_count > 1) {
+        this->tss_error.set_value(" error: %zu files cannot be opened ",
+                                  error_count);
+    }
+
     if (lnav_data.ld_mode == ln_mode_t::FILES
+        || lnav_data.ld_mode == ln_mode_t::FILE_DETAILS
         || lnav_data.ld_mode == ln_mode_t::SEARCH_FILES)
     {
         this->tss_fields[TSF_FILES_TITLE].set_value(
             " " ANSI_ROLE("F") "iles ", role_t::VCR_STATUS_TITLE_HOTKEY);
-        this->tss_fields[TSF_FILES_TITLE].set_role(role_t::VCR_STATUS_TITLE);
-        this->tss_fields[TSF_FILES_RIGHT_STITCH].set_stitch_value(
-            role_t::VCR_STATUS_STITCH_TITLE_TO_NORMAL,
-            role_t::VCR_STATUS_STITCH_NORMAL_TO_TITLE);
+        if (error_count > 0) {
+            this->tss_fields[TSF_FILES_TITLE].set_role(
+                role_t::VCR_ALERT_STATUS_TITLE);
+            this->tss_fields[TSF_FILES_RIGHT_STITCH].set_stitch_value(
+                role_t::VCR_STATUS_STITCH_ALERT_TITLE_TO_NORMAL,
+                role_t::VCR_STATUS_STITCH_NORMAL_TO_ALERT_TITLE);
+        } else {
+            this->tss_fields[TSF_FILES_TITLE].set_role(
+                role_t::VCR_STATUS_TITLE);
+            this->tss_fields[TSF_FILES_RIGHT_STITCH].set_stitch_value(
+                role_t::VCR_STATUS_STITCH_TITLE_TO_NORMAL,
+                role_t::VCR_STATUS_STITCH_NORMAL_TO_TITLE);
+        }
         this->tss_fields[TSF_TITLE].set_value(" " ANSI_ROLE("T") "ext Filters ",
                                               role_t::VCR_STATUS_HOTKEY);
         this->tss_fields[TSF_TITLE].set_role(role_t::VCR_STATUS_DISABLED_TITLE);
@@ -122,21 +178,12 @@ filter_status_source::statusview_fields()
     } else {
         this->tss_fields[TSF_FILES_TITLE].set_value(" " ANSI_ROLE("F") "iles ",
                                                     role_t::VCR_STATUS_HOTKEY);
-        if (lnav_data.ld_active_files.fc_name_to_errors.empty()) {
-            this->tss_fields[TSF_FILES_TITLE].set_role(
-                role_t::VCR_STATUS_DISABLED_TITLE);
-        } else {
+        if (error_count > 0) {
             this->tss_fields[TSF_FILES_TITLE].set_role(
                 role_t::VCR_ALERT_STATUS);
-
-            auto& fc = lnav_data.ld_active_files;
-            if (fc.fc_name_to_errors.size() == 1) {
-                this->tss_error.set_value(" error: a file cannot be opened ");
-            } else {
-                this->tss_error.set_value(
-                    " error: %u files cannot be opened ",
-                    lnav_data.ld_active_files.fc_name_to_errors.size());
-            }
+        } else {
+            this->tss_fields[TSF_FILES_TITLE].set_role(
+                role_t::VCR_STATUS_DISABLED_TITLE);
         }
         this->tss_fields[TSF_FILES_RIGHT_STITCH].set_stitch_value(
             role_t::VCR_STATUS_STITCH_NORMAL_TO_TITLE,
@@ -165,7 +212,7 @@ filter_status_source::statusview_fields()
             filter_count += 1;
         }
         if (filter_count == 0) {
-            this->tss_fields[TSF_COUNT].set_value("");
+            this->tss_fields[TSF_COUNT].set_value(""_frag);
         } else {
             this->tss_fields[TSF_COUNT].set_value(
                 " " ANSI_BOLD("%d") " of " ANSI_BOLD("%d") " enabled ",
@@ -181,7 +228,7 @@ status_field&
 filter_status_source::statusview_value_for_field(int field)
 {
     if (field == TSF_FILTERED
-        && !lnav_data.ld_active_files.fc_name_to_errors.empty())
+        && !lnav_data.ld_active_files.fc_name_to_stubs->readAccess()->empty())
     {
         return this->tss_error;
     }
@@ -189,40 +236,56 @@ filter_status_source::statusview_value_for_field(int field)
     return this->tss_fields[field];
 }
 
-void
+bool
 filter_status_source::update_filtered(text_sub_source* tss)
 {
     if (tss == nullptr) {
-        return;
+        return false;
     }
 
     auto& sf = this->tss_fields[TSF_FILTERED];
+    auto retval = false;
 
-    if (tss->get_filtered_count() == 0) {
+    auto curr_filtered_count = tss->get_filtered_count();
+    if (curr_filtered_count == 0) {
         if (tss->tss_apply_filters) {
-            sf.clear();
+            if (!sf.empty()) {
+                sf.clear();
+                retval = true;
+            }
         } else {
-            sf.set_value(
-                " \u2718 Filtering disabled, re-enable with " ANSI_BOLD_START
-                ":toggle-filtering" ANSI_NORM);
+            auto al = attr_line_t(" ")
+                          .append("  ", VC_ICON.value(ui_icon_t::warning))
+                          .append(" Filtering disabled, re-enable with ")
+                          .append(":toggle-filtering"_symbol);
+            retval = sf.set_value(al);
         }
+        this->bss_last_filtered_count = curr_filtered_count;
     } else {
         auto& timer = ui_periodic_timer::singleton();
         auto& al = sf.get_value();
 
-        if (tss->get_filtered_count() == this->bss_last_filtered_count) {
-            if (timer.fade_diff(this->bss_filter_counter) == 0) {
+        if (curr_filtered_count == this->bss_last_filtered_count) {
+            if (timer.fade_diff(this->bss_filter_counter) == 0
+                && this->tss_fields[TSF_FILTERED].get_role()
+                    != role_t::VCR_STATUS)
+            {
                 this->tss_fields[TSF_FILTERED].set_role(role_t::VCR_STATUS);
-                al.with_attr(string_attr(line_range{0, -1},
-                                         VC_STYLE.value(text_attrs{A_BOLD})));
+                al.with_attr(
+                    string_attr(line_range{0, -1},
+                                VC_STYLE.value(text_attrs::with_bold())));
+                retval = true;
             }
         } else {
             this->tss_fields[TSF_FILTERED].set_role(role_t::VCR_ALERT_STATUS);
             this->bss_last_filtered_count = tss->get_filtered_count();
             timer.start_fade(this->bss_filter_counter, 3);
+            retval = sf.set_value("%'9d Lines not shown ",
+                                  tss->get_filtered_count());
         }
-        sf.set_value("%'9d Lines not shown ", tss->get_filtered_count());
     }
+
+    return retval;
 }
 
 filter_help_status_source::filter_help_status_source()
@@ -241,60 +304,132 @@ size_t
 filter_help_status_source::statusview_fields()
 {
     lnav_data.ld_view_stack.top() | [this](auto tc) {
-        text_sub_source* tss = tc->get_sub_source();
+        auto* tss = tc->get_sub_source();
         if (tss == nullptr) {
             return;
         }
 
+        auto* lss = dynamic_cast<logfile_sub_source*>(tss);
+        auto* ttt = dynamic_cast<text_time_translator*>(tss);
+
         if (lnav_data.ld_mode == ln_mode_t::FILTER) {
             static auto* editor = injector::get<filter_sub_source*>();
             auto& lv = lnav_data.ld_filter_view;
-            auto& fs = tss->get_filters();
+            auto sel = lv.get_selection();
+            auto* fss = dynamic_cast<filter_sub_source*>(lv.get_sub_source());
+            auto rows = fss->rows_for(tc);
+            if (rows.empty()) {
+                this->fss_help.set_value(
+                    "  %s%s%s%s%s",
+                    CREATE_HELP,
+                    lss != nullptr ? CREATE_EXPR_HELP : "",
+                    lss != nullptr ? CREATE_LEVEL_HELP : "",
+                    ttt != nullptr ? MIN_MAX_TIME_HELP : "",
+                    CREATE_SEARCH_HELP);
+            } else {
+                auto& row = rows[sel.value()];
+                auto* tfr = dynamic_cast<filter_sub_source::text_filter_row*>(
+                    row.get());
+                auto* tir = dynamic_cast<filter_sub_source::time_filter_row*>(
+                    row.get());
+                auto* nsr = dynamic_cast<filter_sub_source::named_search_row*>(
+                    row.get());
+                if (editor->fss_editing) {
+                    if (nsr != nullptr) {
+                        this->fss_help.set_value(
+                            "                           "
+                            "Enter a name and pattern, or just a name to "
+                            "adopt the current search:");
+                    } else if (tfr != nullptr) {
+                        auto& tf = tfr->tfr_filter;
+                        auto lang = tf->get_lang() == filter_lang_t::SQL
+                            ? "an SQL"
+                            : "a regular";
 
-            if (editor->fss_editing) {
-                auto tf = *(fs.begin() + lv.get_selection());
-                auto lang = tf->get_lang() == filter_lang_t::SQL ? "an SQL"
-                                                                 : "a regular";
-
-                if (tf->get_type() == text_filter::type_t::INCLUDE) {
+                        if (tf->get_type() == text_filter::type_t::INCLUDE) {
+                            this->fss_help.set_value(
+                                "                           "
+                                "Enter %s expression to match lines to filter "
+                                "in:",
+                                lang);
+                        } else {
+                            this->fss_help.set_value(
+                                "                           "
+                                "Enter %s expression to match lines to filter "
+                                "out:",
+                                lang);
+                        }
+                    } else if (tir != nullptr) {
+                        this->fss_help.set_value(
+                            "                           "
+                            "Enter timestamp:");
+                    } else {
+                        this->fss_help.set_value(
+                            "                           "
+                            "Enter level:");
+                    }
+                } else if (tfr != nullptr) {
+                    auto& tf = tfr->tfr_filter;
                     this->fss_help.set_value(
-                        "                        "
-                        "Enter %s expression to match lines to filter in:",
-                        lang);
+                        "  %s%s%s%s%s  %s%s  %s  %s%s  %s  %s%s",
+                        CREATE_HELP,
+                        lss != nullptr ? CREATE_EXPR_HELP : "",
+                        lss != nullptr ? CREATE_LEVEL_HELP : "",
+                        ttt != nullptr ? MIN_MAX_TIME_HELP : "",
+                        CREATE_SEARCH_HELP,
+                        ENABLE_HELP,
+                        tf->is_enabled() ? "Disable" : "Enable ",
+                        EDIT_HELP,
+                        TOGGLE_HELP,
+                        tf->get_type() == text_filter::type_t::INCLUDE ? "OUT"
+                                                                       : "IN ",
+                        DELETE_HELP,
+                        FILTERING_HELP,
+                        tss->tss_apply_filters ? "Disable Filtering"
+                                               : "Enable Filtering");
+                } else if (nsr != nullptr) {
+                    const auto* ns = tc->find_named_search(nsr->nsr_name);
+                    this->fss_help.set_value(
+                        "  %s%s%s%s%s  %s%s  %s%s  %s  %s",
+                        CREATE_HELP,
+                        lss != nullptr ? CREATE_EXPR_HELP : "",
+                        lss != nullptr ? CREATE_LEVEL_HELP : "",
+                        ttt != nullptr ? MIN_MAX_TIME_HELP : "",
+                        CREATE_SEARCH_HELP,
+                        ENABLE_HELP,
+                        ns != nullptr && ns->ns_enabled ? "Disable" : "Enable ",
+                        FOCUS_SEARCH_HELP,
+                        ns != nullptr
+                                && tc->get_focused_search_slot() == ns->ns_slot
+                            ? "Unfocus"
+                            : "Focus  ",
+                        EDIT_HELP,
+                        DELETE_HELP);
                 } else {
                     this->fss_help.set_value(
-                        "                        "
-                        "Enter %s expression to match lines to filter out:",
-                        lang);
+                        "  %s%s%s%s%s  %s  %s  %s%s",
+                        CREATE_HELP,
+                        lss != nullptr ? CREATE_EXPR_HELP : "",
+                        lss != nullptr ? CREATE_LEVEL_HELP : "",
+                        ttt != nullptr ? MIN_MAX_TIME_HELP : "",
+                        CREATE_SEARCH_HELP,
+                        EDIT_HELP,
+                        DELETE_HELP,
+                        FILTERING_HELP,
+                        tss->tss_apply_filters ? "Disable Filtering"
+                                               : "Enable Filtering");
                 }
-            } else if (fs.empty()) {
-                this->fss_help.set_value("  %s", CREATE_HELP);
-            } else {
-                auto tf = *(fs.begin() + lv.get_selection());
-
-                this->fss_help.set_value(
-                    "  %s  %s%s  %s  %s%s  %s  %s%s",
-                    CREATE_HELP,
-                    ENABLE_HELP,
-                    tf->is_enabled() ? "Disable" : "Enable ",
-                    EDIT_HELP,
-                    TOGGLE_HELP,
-                    tf->get_type() == text_filter::type_t::INCLUDE ? "OUT"
-                                                                   : "IN ",
-                    DELETE_HELP,
-                    FILTERING_HELP,
-                    tss->tss_apply_filters ? "Disable Filtering"
-                                           : "Enable Filtering");
             }
-        } else if (lnav_data.ld_mode == ln_mode_t::FILES
+        } else if ((lnav_data.ld_mode == ln_mode_t::FILES
+                    || lnav_data.ld_mode == ln_mode_t::FILE_DETAILS)
                    && lnav_data.ld_session_loaded)
         {
-            auto& lv = lnav_data.ld_files_view;
+            const auto& lv = lnav_data.ld_files_view;
             auto sel = files_model::from_selection(lv.get_selection());
 
             sel.match(
                 [this](files_model::no_selection) { this->fss_help.clear(); },
-                [this](files_model::error_selection) {
+                [this](files_model::stub_selection) {
                     this->fss_help.set_value("  %s", CLOSE_HELP);
                 },
                 [this](files_model::other_selection) {
@@ -307,9 +442,16 @@ filter_help_status_source::statusview_fields()
                     if (ld_opt && !ld_opt.value()->ld_visible) {
                         vis_help = "Show";
                     }
+                    const auto* focus_details_help
+                        = lnav_data.ld_mode == ln_mode_t::FILES
+                        ? FOCUS_DETAILS_HELP
+                        : "";
 
-                    this->fss_help.set_value(
-                        "  %s%s  %s", ENABLE_HELP, vis_help, JUMP_HELP);
+                    this->fss_help.set_value("  %s%s  %s  %s",
+                                             ENABLE_HELP,
+                                             vis_help,
+                                             JUMP_HELP,
+                                             focus_details_help);
                 });
         }
     };

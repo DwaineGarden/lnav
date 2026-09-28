@@ -30,8 +30,10 @@
 #include "session.export.hh"
 
 #include "base/injector.hh"
+#include "base/itertools.hh"
 #include "bound_tags.hh"
 #include "lnav.hh"
+#include "log_vtab_impl.hh"
 #include "sqlitepp.client.hh"
 #include "sqlitepp.hh"
 #include "textview_curses.hh"
@@ -40,24 +42,26 @@ struct log_message_session_state {
     int64_t lmss_time_msecs;
     std::string lmss_format;
     bool lmss_mark;
-    nonstd::optional<std::string> lmss_comment;
-    nonstd::optional<std::string> lmss_tags;
+    std::optional<std::string> lmss_comment;
+    std::optional<std::string> lmss_tags;
+    std::optional<std::string> lmss_annotations;
+    std::optional<std::string> lmss_opid;
     std::string lmss_hash;
 };
 
 template<>
-struct from_sqlite<log_message_session_state> {
-    inline log_message_session_state operator()(int argc,
-                                                sqlite3_value** argv,
-                                                int argi)
+struct from_column<log_message_session_state> {
+    log_message_session_state operator()(sqlite3_stmt* stmt, int argi) const
     {
         return {
-            from_sqlite<int64_t>()(argc, argv, argi + 0),
-            from_sqlite<std::string>()(argc, argv, argi + 1),
-            from_sqlite<bool>()(argc, argv, argi + 2),
-            from_sqlite<nonstd::optional<std::string>>()(argc, argv, argi + 3),
-            from_sqlite<nonstd::optional<std::string>>()(argc, argv, argi + 4),
-            from_sqlite<std::string>()(argc, argv, argi + 5),
+            from_column<int64_t>()(stmt, argi + 0),
+            from_column<std::string>()(stmt, argi + 1),
+            from_column<bool>()(stmt, argi + 2),
+            from_column<std::optional<std::string>>()(stmt, argi + 3),
+            from_column<std::optional<std::string>>()(stmt, argi + 4),
+            from_column<std::optional<std::string>>()(stmt, argi + 5),
+            from_column<std::optional<std::string>>()(stmt, argi + 6),
+            from_column<std::string>()(stmt, argi + 7),
         };
     }
 };
@@ -71,17 +75,35 @@ struct log_filter_session_state {
 };
 
 template<>
-struct from_sqlite<log_filter_session_state> {
-    inline log_filter_session_state operator()(int argc,
-                                               sqlite3_value** argv,
-                                               int argi)
+struct from_column<log_filter_session_state> {
+    log_filter_session_state operator()(sqlite3_stmt* stmt, int argi) const
     {
         return {
-            from_sqlite<std::string>()(argc, argv, argi + 0),
-            from_sqlite<bool>()(argc, argv, argi + 1),
-            from_sqlite<std::string>()(argc, argv, argi + 2),
-            from_sqlite<std::string>()(argc, argv, argi + 3),
-            from_sqlite<std::string>()(argc, argv, argi + 4),
+            from_column<std::string>()(stmt, argi + 0),
+            from_column<bool>()(stmt, argi + 1),
+            from_column<std::string>()(stmt, argi + 2),
+            from_column<std::string>()(stmt, argi + 3),
+            from_column<std::string>()(stmt, argi + 4),
+        };
+    }
+};
+
+struct named_search_session_state {
+    std::string nsss_view_name;
+    bool nsss_enabled;
+    std::string nsss_name;
+    std::string nsss_pattern;
+};
+
+template<>
+struct from_column<named_search_session_state> {
+    named_search_session_state operator()(sqlite3_stmt* stmt, int argi) const
+    {
+        return {
+            from_column<std::string>()(stmt, argi + 0),
+            from_column<bool>()(stmt, argi + 1),
+            from_column<std::string>()(stmt, argi + 2),
+            from_column<std::string>()(stmt, argi + 3),
         };
     }
 };
@@ -93,30 +115,27 @@ struct log_file_session_state {
 };
 
 template<>
-struct from_sqlite<log_file_session_state> {
-    inline log_file_session_state operator()(int argc,
-                                             sqlite3_value** argv,
-                                             int argi)
+struct from_column<log_file_session_state> {
+    log_file_session_state operator()(sqlite3_stmt* stmt, int argi) const
     {
         return {
-            from_sqlite<std::string>()(argc, argv, argi + 0),
-            from_sqlite<std::string>()(argc, argv, argi + 1),
-            from_sqlite<int64_t>()(argc, argv, argi + 2),
+            from_column<std::string>()(stmt, argi + 0),
+            from_column<std::string>()(stmt, argi + 1),
+            from_column<int64_t>()(stmt, argi + 2),
         };
     }
 };
 
-namespace lnav {
-namespace session {
+namespace lnav::session {
 
-static nonstd::optional<ghc::filesystem::path>
-find_container_dir(ghc::filesystem::path file_path)
+static std::optional<std::filesystem::path>
+find_container_dir(std::filesystem::path file_path)
 {
-    if (!ghc::filesystem::exists(file_path)) {
-        return nonstd::nullopt;
+    if (!std::filesystem::exists(file_path)) {
+        return std::nullopt;
     }
 
-    nonstd::optional<ghc::filesystem::path> dir_with_last_readme;
+    std::optional<std::filesystem::path> dir_with_last_readme;
 
     while (file_path.has_parent_path()
            && file_path != file_path.root_directory())
@@ -126,7 +145,7 @@ find_container_dir(ghc::filesystem::path file_path)
         std::error_code ec;
 
         for (const auto& entry :
-             ghc::filesystem::directory_iterator(parent, ec))
+             std::filesystem::directory_iterator(parent, ec))
         {
             if (!entry.is_regular_file()) {
                 continue;
@@ -145,13 +164,13 @@ find_container_dir(ghc::filesystem::path file_path)
         file_path = parent;
     }
 
-    return nonstd::nullopt;
+    return std::nullopt;
 }
 
 static std::string
 replace_home_dir(std::string path)
 {
-    auto home_dir_opt = getenv_opt("HOME");
+    const auto home_dir_opt = getenv_opt("HOME");
 
     if (!home_dir_opt) {
         return path;
@@ -175,16 +194,25 @@ replace_home_dir(std::string path)
 Result<void, lnav::console::user_message>
 export_to(FILE* file)
 {
+    auto* vtab_manager = injector::get<log_vtab_manager*>();
     static auto& lnav_db = injector::get<auto_sqlite3&>();
 
     static const char* BOOKMARK_QUERY = R"(
-SELECT log_time_msecs, log_format, log_mark, log_comment, log_tags, log_line_hash
+SELECT log_time_msecs, log_format, log_mark, log_comment, log_tags, log_annotations, log_user_opid, log_line_hash
    FROM all_logs
-   WHERE log_mark = 1 OR log_comment IS NOT NULL OR log_tags IS NOT NULL
+   WHERE log_mark = 1 OR
+         log_comment IS NOT NULL OR
+         log_tags IS NOT NULL OR
+         log_annotations IS NOT NULL OR
+         (log_user_opid IS NOT NULL AND log_user_opid != '')
 )";
 
     static const char* FILTER_QUERY = R"(
 SELECT view_name, enabled, type, language, pattern FROM lnav_view_filters
+)";
+
+    static const char* SEARCH_QUERY = R"(
+SELECT view_name, enabled, name, pattern FROM lnav_view_searches
 )";
 
     static const char* FILE_QUERY = R"(
@@ -192,7 +220,7 @@ SELECT content_id, format, time_offset FROM lnav_file
   WHERE format IS NOT NULL AND time_offset != 0
 )";
 
-    static constexpr const char HEADER[] = R"(#!lnav -Nf
+    static constexpr char HEADER[] = R"(#!lnav -Nf
 # This file is an export of an lnav session.  You can type
 # '|/path/to/this/file' in lnav to execute this file and
 # restore the state of the session.
@@ -204,12 +232,12 @@ SELECT content_id, format, time_offset FROM lnav_file
 
 )";
 
-    static constexpr const char LOG_DIR_INSERT[] = R"(
+    static constexpr char LOG_DIR_INSERT[] = R"(
 # Set this environment variable to override this value or edit this script.
 ;INSERT OR IGNORE INTO environ (name, value) VALUES ('LOG_DIR_{}', {})
 )";
 
-    static constexpr const char MARK_HEADER[] = R"(
+    static constexpr char MARK_HEADER[] = R"(
 
 # The following SQL statements will restore the bookmarks,
 # comments, and tags that were added in the session.
@@ -217,7 +245,7 @@ SELECT content_id, format, time_offset FROM lnav_file
 ;SELECT total_changes() AS before_mark_changes
 )";
 
-    static constexpr const char MARK_FOOTER[] = R"(
+    static constexpr char MARK_FOOTER[] = R"(
 ;SELECT {} - (total_changes() - $before_mark_changes) AS failed_mark_changes
 ;SELECT echoln(printf('%sERROR%s: failed to restore %d bookmarks',
                       $ansi_red, $ansi_norm, $failed_mark_changes))
@@ -231,6 +259,13 @@ SELECT content_id, format, time_offset FROM lnav_file
 
 )";
 
+    static const char* SEARCH_HEADER = R"(
+
+# The following SQL statements will restore the named searches
+# that were created in the session.
+
+)";
+
     static const char* FILE_HEADER = R"(
 
 # The following SQL statements will restore the state of the
@@ -239,14 +274,26 @@ SELECT content_id, format, time_offset FROM lnav_file
 ;SELECT total_changes() AS before_file_changes
 )";
 
-    static constexpr const char FILE_FOOTER[] = R"(
+    static const char* FIELD_HEADER = R"(
+# The following field visibility commands were run by the
+# original user during this session.  Uncomment them if
+# desired.
+)";
+
+    static const char* HIGHLIGHT_HEADER = R"(
+# The following highlight commands were run by the
+# original user during this session.  Uncomment them if
+# desired.
+)";
+
+    static constexpr char FILE_FOOTER[] = R"(
 ;SELECT {} - (total_changes() - $before_file_changes) AS failed_file_changes
 ;SELECT echoln(printf('%sERROR%s: failed to restore the state of %d files',
                       $ansi_red, $ansi_norm, $failed_file_changes))
    WHERE $failed_file_changes != 0
 )";
 
-    static constexpr const char VIEW_HEADER[] = R"(
+    static constexpr char VIEW_HEADER[] = R"(
 
 # The following commands will restore the state of the {} view.
 
@@ -259,7 +306,7 @@ SELECT content_id, format, time_offset FROM lnav_file
                 .with_reason(prep_mark_res.unwrapErr()));
     }
 
-    fmt::print(file, FMT_STRING(HEADER), sqlitepp::quote(PACKAGE_VERSION));
+    fmt::print(file, FMT_STRING(HEADER), sqlitepp::quote(PACKAGE_VERSION).in());
 
     std::map<std::string, std::vector<std::string>> file_containers;
     std::set<std::string> raw_files;
@@ -267,24 +314,37 @@ SELECT content_id, format, time_offset FROM lnav_file
         const auto& open_opts = name_pair.second;
 
         if (!open_opts.loo_is_visible || !open_opts.loo_include_in_session
-            || open_opts.loo_temp_file
+            || !open_opts.loo_filename.empty()
             || open_opts.loo_source != logfile_name_source::USER)
         {
             continue;
         }
 
-        auto file_path_str = name_pair.first;
-        auto file_path = ghc::filesystem::path(file_path_str);
+        const auto& file_path_str = name_pair.first;
+        auto file_path = std::filesystem::path(file_path_str);
         auto container_path_opt = find_container_dir(file_path);
         if (container_path_opt) {
             auto container_parent = container_path_opt.value().parent_path();
             auto file_container_path
-                = ghc::filesystem::relative(file_path, container_parent)
+                = std::filesystem::relative(file_path, container_parent)
                       .string();
             file_containers[container_parent.string()].push_back(
                 file_container_path);
         } else {
             raw_files.insert(file_path_str);
+        }
+    }
+    for (const auto& lf : lnav_data.ld_active_files.fc_files) {
+        if (lf->is_valid_filename()) {
+            continue;
+        }
+        if (!lf->get_open_options().loo_include_in_session) {
+            continue;
+        }
+
+        const auto& open_options = lf->get_open_options();
+        if (open_options.loo_piper) {
+            raw_files.emplace(open_options.loo_piper->get_url());
         }
     }
     for (const auto& file_path_str : raw_files) {
@@ -296,7 +356,7 @@ SELECT content_id, format, time_offset FROM lnav_file
         fmt::print(file,
                    FMT_STRING(LOG_DIR_INSERT),
                    container_index,
-                   sqlitepp::quote(container_pair.first));
+                   sqlitepp::quote(container_pair.first).in());
         for (const auto& file_path_str : container_pair.second) {
             fmt::print(file,
                        FMT_STRING(":open $LOG_DIR_{}/{}\n"),
@@ -320,16 +380,20 @@ SELECT content_id, format, time_offset FROM lnav_file
                            FMT_STRING(";UPDATE all_logs "
                                       "SET log_mark = {}, "
                                       "log_comment = {}, "
-                                      "log_tags = {} "
+                                      "log_tags = {}, "
+                                      "log_annotations = {}, "
+                                      "log_opid = {} "
                                       "WHERE log_time_msecs = {} AND "
                                       "log_format = {} AND "
                                       "log_line_hash = {}\n"),
                            lmss.lmss_mark ? "1" : "0",
-                           sqlitepp::quote(lmss.lmss_comment),
-                           sqlitepp::quote(lmss.lmss_tags),
+                           sqlitepp::quote(lmss.lmss_comment).in(),
+                           sqlitepp::quote(lmss.lmss_tags).in(),
+                           sqlitepp::quote(lmss.lmss_annotations).in(),
+                           sqlitepp::quote(lmss.lmss_opid).in(),
                            lmss.lmss_time_msecs,
-                           sqlitepp::quote(lmss.lmss_format),
-                           sqlitepp::quote(lmss.lmss_hash));
+                           sqlitepp::quote(lmss.lmss_format).in(),
+                           sqlitepp::quote(lmss.lmss_hash).in());
                 return false;
             });
 
@@ -362,11 +426,11 @@ SELECT content_id, format, time_offset FROM lnav_file
                     FMT_STRING(";REPLACE INTO lnav_view_filters "
                                "(view_name, enabled, type, language, pattern) "
                                "VALUES ({}, {}, {}, {}, {})\n"),
-                    sqlitepp::quote(lfss.lfss_name),
+                    sqlitepp::quote(lfss.lfss_name).in(),
                     lfss.lfss_enabled ? 1 : 0,
-                    sqlitepp::quote(lfss.lfss_type),
-                    sqlitepp::quote(lfss.lfss_language),
-                    sqlitepp::quote(lfss.lfss_pattern));
+                    sqlitepp::quote(lfss.lfss_type).in(),
+                    sqlitepp::quote(lfss.lfss_language).in(),
+                    sqlitepp::quote(lfss.lfss_pattern).in());
                 return false;
             });
 
@@ -374,6 +438,39 @@ SELECT content_id, format, time_offset FROM lnav_file
         return Err(console::user_message::error(
                        "failed to fetch filter state for views")
                        .with_reason(each_filter_res.unwrapErr().fe_msg));
+    }
+
+    auto prep_search_res = prepare_stmt(lnav_db.in(), SEARCH_QUERY);
+    if (prep_search_res.isErr()) {
+        return Err(
+            console::user_message::error("unable to export named searches")
+                .with_reason(prep_search_res.unwrapErr()));
+    }
+
+    auto added_search_header = false;
+    auto each_search_res
+        = prep_search_res.unwrap().for_each_row<named_search_session_state>(
+            [file, &added_search_header](
+                const named_search_session_state& nsss) {
+                if (!added_search_header) {
+                    fmt::print(file, FMT_STRING("{}"), SEARCH_HEADER);
+                    added_search_header = true;
+                }
+                fmt::print(file,
+                           FMT_STRING(";INSERT INTO lnav_view_searches "
+                                      "(view_name, enabled, name, pattern) "
+                                      "VALUES ({}, {}, {}, {})\n"),
+                           sqlitepp::quote(nsss.nsss_view_name).in(),
+                           nsss.nsss_enabled ? 1 : 0,
+                           sqlitepp::quote(nsss.nsss_name).in(),
+                           sqlitepp::quote(nsss.nsss_pattern).in());
+                return false;
+            });
+
+    if (each_search_res.isErr()) {
+        return Err(console::user_message::error(
+                       "failed to fetch named searches for views")
+                       .with_reason(each_search_res.unwrapErr().fe_msg));
     }
 
     auto prep_file_res = prepare_stmt(lnav_db.in(), FILE_QUERY);
@@ -395,8 +492,8 @@ SELECT content_id, format, time_offset FROM lnav_file
                                   "SET time_offset = {} "
                                   "WHERE content_id = {} AND format = {}\n"),
                        lfss.lfss_time_offset,
-                       sqlitepp::quote(lfss.lfss_content_id),
-                       sqlitepp::quote(lfss.lfss_format));
+                       sqlitepp::quote(lfss.lfss_content_id).in(),
+                       sqlitepp::quote(lfss.lfss_format).in());
             return false;
         });
 
@@ -420,7 +517,78 @@ SELECT content_id, format, time_offset FROM lnav_file
                    FMT_STRING(":switch-to-view {}\n"),
                    lnav_view_strings[view_index]);
 
+        if (view_index == LNV_LOG) {
+            std::vector<std::string> field_cmds;
+            for (const auto& format : log_format::get_root_formats()) {
+                auto field_states = format->get_field_states();
+
+                for (const auto& fs_pair : field_states) {
+                    if (!fs_pair.second.lvm_user_hidden) {
+                        continue;
+                    }
+
+                    if (fs_pair.second.lvm_user_hidden.value()) {
+                        field_cmds.emplace_back(
+                            fmt::format(FMT_STRING("# :hide-fields {}.{}\n"),
+
+                                        format->get_name(),
+                                        fs_pair.first));
+                    } else if (fs_pair.second.lvm_hidden) {
+                        field_cmds.emplace_back(
+                            fmt::format(FMT_STRING("# :show-fields {}.{}\n"),
+                                        format->get_name().to_string(),
+                                        fs_pair.first));
+                    }
+                }
+            }
+
+            if (!field_cmds.empty()) {
+                fmt::print(file, FMT_STRING("{}"), FIELD_HEADER);
+                field_cmds
+                    | lnav::itertools::for_each([&file](const auto& cmd) {
+                          fmt::print(file, FMT_STRING("{}"), cmd);
+                      });
+            }
+        }
+
+        {
+            std::vector<std::string> hl_cmds;
+            const auto& hm = tc.get_highlights();
+            for (const auto& hl_pair : hm) {
+                if (hl_pair.first.first != highlight_source_t::INTERACTIVE) {
+                    continue;
+                }
+
+                auto cmd = fmt::format(FMT_STRING("# :highlight {}\n"),
+                                       hl_pair.second.h_regex->get_pattern());
+                hl_cmds.emplace_back(cmd);
+            }
+
+            if (!hl_cmds.empty()) {
+                fmt::print(file, FMT_STRING("{}"), HIGHLIGHT_HEADER);
+                hl_cmds | lnav::itertools::for_each([&file](const auto& cmd) {
+                    fmt::print(file, FMT_STRING("{}"), cmd);
+                });
+                fmt::println(file, FMT_STRING(""));
+            }
+        }
+
         auto* tss = tc.get_sub_source();
+        auto* ttt = dynamic_cast<text_time_translator*>(tss);
+        if (ttt != nullptr) {
+            char tsbuf[128];
+            auto min_time_opt = ttt->get_min_row_time();
+            if (min_time_opt) {
+                sql_strftime(tsbuf, sizeof(tsbuf), min_time_opt.value(), 'T');
+                fmt::print(file, FMT_STRING(":hide-lines-before {}\n"), tsbuf);
+            }
+            auto max_time_opt = ttt->get_max_row_time();
+            if (max_time_opt) {
+                sql_strftime(tsbuf, sizeof(tsbuf), max_time_opt.value(), 'T');
+                fmt::print(file, FMT_STRING(":hide-lines-after {}\n"), tsbuf);
+            }
+        }
+
         auto* lss = dynamic_cast<logfile_sub_source*>(tss);
         if (lss != nullptr) {
             auto min_level = lss->get_min_log_level();
@@ -431,16 +599,6 @@ SELECT content_id, format, time_offset FROM lnav_file
                            level_names[min_level]);
             }
 
-            struct timeval min_time, max_time;
-            char tsbuf[128];
-            if (lss->get_min_log_time(min_time)) {
-                sql_strftime(tsbuf, sizeof(tsbuf), min_time, 'T');
-                fmt::print(file, FMT_STRING(":hide-lines-before {}\n"), tsbuf);
-            }
-            if (lss->get_max_log_time(max_time)) {
-                sql_strftime(tsbuf, sizeof(tsbuf), max_time, 'T');
-                fmt::print(file, FMT_STRING(":hide-lines-after {}\n"), tsbuf);
-            }
             for (const auto& ld : *lss) {
                 if (ld->is_visible()) {
                     continue;
@@ -462,7 +620,7 @@ SELECT content_id, format, time_offset FROM lnav_file
                 }
                 auto container_parent
                     = container_path_opt.value().parent_path();
-                auto file_container_path = ghc::filesystem::relative(
+                auto file_container_path = std::filesystem::relative(
                     ld->get_file_ptr()->get_path(), container_parent);
                 fmt::print(file,
                            FMT_STRING(":hide-file */{}\n"),
@@ -474,11 +632,25 @@ SELECT content_id, format, time_offset FROM lnav_file
             fmt::print(file, FMT_STRING("/{}\n"), tc.get_current_search());
         }
 
-        fmt::print(file, FMT_STRING(":goto {}\n"), (int) tc.get_top());
+        fmt::print(file,
+                   FMT_STRING(":goto {}\n"),
+                   (int) tc.get_selection().value_or(tc.get_top()));
+    }
+
+    for (const auto& [name, vi] : *vtab_manager) {
+        if (vi->vi_provenance != log_vtab_impl::provenance_t::user) {
+            continue;
+        }
+
+        auto cmd_opt = vi->get_command();
+        if (!cmd_opt) {
+            continue;
+        }
+
+        fmt::print(file, FMT_STRING("\n{}\n"), cmd_opt.value());
     }
 
     return Ok();
 }
 
-}  // namespace session
-}  // namespace lnav
+}  // namespace lnav::session

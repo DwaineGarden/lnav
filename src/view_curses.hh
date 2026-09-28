@@ -32,50 +32,27 @@
 #ifndef view_curses_hh
 #define view_curses_hh
 
-#include <limits.h>
-#include <signal.h>
-#include <stdint.h>
-#include <sys/time.h>
-#include <zlib.h>
-
-#include "config.h"
-
-#if defined HAVE_NCURSESW_CURSES_H
-#    include <ncursesw/curses.h>
-#elif defined HAVE_NCURSESW_H
-#    include <ncursesw.h>
-#elif defined HAVE_NCURSES_CURSES_H
-#    include <ncurses/curses.h>
-#elif defined HAVE_NCURSES_H
-#    include <ncurses.h>
-#elif defined HAVE_CURSES_H
-#    include <curses.h>
-#else
-#    error "SysV or X/Open-compatible Curses header file required"
-#endif
 #include <functional>
-#include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include <notcurses/notcurses.h>
+#include <signal.h>
+#include <stdint.h>
+#include <sys/time.h>
+#include <termios.h>
+
 #include "base/attr_line.hh"
 #include "base/enum_util.hh"
 #include "base/lnav_log.hh"
-#include "base/lrucache.hpp"
-#include "base/opt_util.hh"
+#include "base/log_level_enum.hh"
+#include "base/result.h"
+#include "base/string_attr_type.hh"
+#include "config.h"
 #include "lnav_config_fwd.hh"
-#include "log_level.hh"
-#include "optional.hpp"
 #include "styling.hh"
-
-#define KEY_CTRL_A 0x01
-#define KEY_CTRL_E 0x05
-#define KEY_CTRL_G 7
-#define KEY_CTRL_L 12
-#define KEY_CTRL_P 16
-#define KEY_CTRL_R 18
-#define KEY_CTRL_W 23
 
 class view_curses;
 
@@ -84,41 +61,48 @@ class view_curses;
  */
 class screen_curses : public log_crash_recoverer {
 public:
-    static Result<screen_curses, std::string> create();
-
     void log_crash_recover() override
     {
-        if (this->sc_main_window != nullptr) {
-            endwin();
+        if (this->sc_notcurses != nullptr) {
+            notcurses_stop(this->sc_notcurses);
+            this->sc_notcurses = nullptr;
         }
     }
 
-    virtual ~screen_curses()
+    static Result<screen_curses, std::string> create(
+        const notcurses_options& options);
+
+    ~screen_curses() override
     {
-        if (this->sc_main_window != nullptr) {
-            endwin();
+        if (this->sc_notcurses != nullptr) {
+            notcurses_stop(this->sc_notcurses);
+            this->sc_notcurses = nullptr;
         }
     }
 
-    screen_curses(screen_curses&& other)
-        : sc_main_window(std::exchange(other.sc_main_window, nullptr))
-    {
-    }
+    screen_curses(screen_curses&& other) noexcept;
 
     screen_curses(const screen_curses&) = delete;
 
-    screen_curses& operator=(screen_curses&& other)
+    screen_curses& operator=(screen_curses&& other) noexcept
     {
-        this->sc_main_window = std::exchange(other.sc_main_window, nullptr);
+        this->sc_notcurses = std::exchange(other.sc_notcurses, nullptr);
         return *this;
     }
 
-    WINDOW* get_window() { return this->sc_main_window; }
+    notcurses* get_notcurses() const { return this->sc_notcurses; }
+
+    ncplane* get_std_plane() const
+    {
+        return notcurses_stdplane(this->sc_notcurses);
+    }
+
+    termios sc_termios;
 
 private:
-    screen_curses(WINDOW* win) : sc_main_window(win) {}
+    explicit screen_curses(notcurses* nc) : sc_notcurses(nc) {}
 
-    WINDOW* sc_main_window;
+    notcurses* sc_notcurses;
 };
 
 template<typename T>
@@ -134,7 +118,7 @@ public:
 
 class ui_periodic_timer {
 public:
-    static const struct itimerval INTERVAL;
+    static const itimerval INTERVAL;
 
     static ui_periodic_timer& singleton();
 
@@ -152,7 +136,7 @@ public:
         counter = this->upt_counter + decay;
     }
 
-    int fade_diff(sig_atomic_t& counter) const
+    int fade_diff(const sig_atomic_t& counter) const
     {
         if (this->upt_counter >= counter) {
             return 0;
@@ -165,7 +149,8 @@ private:
 
     static void sigalrm(int sig);
 
-    volatile sig_atomic_t upt_counter;
+    volatile sig_atomic_t upt_counter{0};
+    std::optional<std::chrono::steady_clock::time_point> upt_deadline;
 };
 
 class alerter {
@@ -176,18 +161,18 @@ public:
 
     bool chime(std::string msg);
 
-    void new_input(int ch)
+    void new_input(const ncinput& ch)
     {
-        if (this->a_last_input != ch) {
+        if (this->a_last_input != ch.id) {
             this->a_do_flash = true;
         }
-        this->a_last_input = ch;
+        this->a_last_input = ch.id;
     }
 
 private:
     bool a_enabled{true};
     bool a_do_flash{true};
-    int a_last_input{-1};
+    uint32_t a_last_input{0};
 };
 
 /**
@@ -195,10 +180,12 @@ private:
  */
 class view_colors {
 public:
-    static constexpr unsigned long HI_COLOR_COUNT = 6 * 3 * 3;
+    static constexpr size_t HI_COLOR_COUNT = 6 * 3 * 3;
 
     /** @return A reference to the singleton. */
     static view_colors& singleton();
+
+    static uint64_t to_channels(const text_attrs& ta);
 
     view_colors(const view_colors&) = delete;
     view_colors(view_colors&&) = delete;
@@ -210,7 +197,7 @@ public:
      * called before this method, but the returned attributes cannot be used
      * with curses code until this method is called.
      */
-    static void init(bool headless);
+    static void init(notcurses* nc);
 
     void init_roles(const lnav_theme& lt,
                     lnav_config_listener::error_reporter& reporter);
@@ -233,9 +220,9 @@ public:
             : this->vc_role_attrs[lnav::enums::to_underlying(role)].ra_normal;
     }
 
-    nonstd::optional<short> color_for_ident(const char* str, size_t len) const;
+    styling::color_unit color_for_ident(const char* str, size_t len) const;
 
-    nonstd::optional<short> color_for_ident(const string_fragment& sf) const
+    styling::color_unit color_for_ident(const string_fragment& sf) const
     {
         return this->color_for_ident(sf.data(), sf.length());
     }
@@ -257,37 +244,25 @@ public:
         return this->vc_level_attrs[level].ra_normal;
     }
 
-    int ensure_color_pair(short fg, short bg);
-
-    int ensure_color_pair(nonstd::optional<short> fg,
-                          nonstd::optional<short> bg);
-
-    int ensure_color_pair(const styling::color_unit& fg,
-                          const styling::color_unit& bg);
-
-    static constexpr short MATCH_COLOR_DEFAULT = -1;
-    static constexpr short MATCH_COLOR_SEMANTIC = -10;
-
-    nonstd::optional<short> match_color(const styling::color_unit& color) const;
-
-    short ansi_to_theme_color(short ansi_fg) const
-    {
-        return this->vc_ansi_to_theme[ansi_fg];
-    }
+    styling::color_unit ansi_to_theme_color(styling::color_unit ansi_fg) const;
 
     std::unordered_map<std::string, string_attr_pair> vc_class_to_role;
 
-    static bool initialized;
+    block_elem_t wchar_for_icon(ui_icon_t ic) const;
 
-private:
+    styling::color_unit match_color(styling::color_unit cu) const;
+
+    std::optional<lab_color> to_lab_color(const styling::color_unit& color);
+
+    text_attrs to_attrs(const style_config& sc,
+                        std::vector<lnav::console::user_message>& errors);
+
+    static bool initialized;
     static term_color_palette* vc_active_palette;
 
+private:
     /** Private constructor that initializes the member fields. */
     view_colors();
-
-    struct dyn_pair {
-        int dp_color_pair;
-    };
 
     struct role_attrs {
         text_attrs ra_normal;
@@ -299,14 +274,19 @@ private:
                         const positioned_property<style_config>& sc,
                         lnav_config_listener::error_reporter& reporter);
 
+    role_attrs& get_role_attrs(const role_t role)
+    {
+        return this->vc_role_attrs[lnav::enums::to_underlying(role)];
+    }
+
+    notcurses* vc_notcurses{nullptr};
     role_attrs vc_level_attrs[LEVEL__MAX];
 
     /** Map of role IDs to attribute values. */
     role_attrs vc_role_attrs[lnav::enums::to_underlying(role_t::VCR__MAX)];
-    short vc_ansi_to_theme[8];
+    styling::color_unit vc_ansi_to_theme[8];
     short vc_highlight_colors[HI_COLOR_COUNT];
-    int vc_color_pair_end{0};
-    cache::lru_cache<std::pair<short, short>, dyn_pair> vc_dyn_pairs;
+    block_elem_t vc_icons[ui_icon_count];
 };
 
 enum class mouse_button_t {
@@ -318,27 +298,60 @@ enum class mouse_button_t {
     BUTTON_SCROLL_DOWN,
 };
 
+string_fragment to_string_fragment(mouse_button_t mb);
+
 enum class mouse_button_state_t {
     BUTTON_STATE_PRESSED,
     BUTTON_STATE_DRAGGED,
     BUTTON_STATE_RELEASED,
+    BUTTON_STATE_DOUBLE_CLICK,
 };
 
 struct mouse_event {
     mouse_event(mouse_button_t button = mouse_button_t::BUTTON_LEFT,
                 mouse_button_state_t state
                 = mouse_button_state_t::BUTTON_STATE_PRESSED,
+                uint8_t mods = 0,
                 int x = -1,
                 int y = -1)
-        : me_button(button), me_state(state), me_x(x), me_y(y)
+        : me_button(button), me_state(state), me_modifiers(mods), me_x(x),
+          me_y(y)
     {
     }
 
+    enum class modifier_t : uint8_t {
+        shift = 4,
+        meta = 8,
+        ctrl = 16,
+    };
+
+    bool is_modifier_pressed(modifier_t mod) const
+    {
+        return this->me_modifiers & lnav::enums::to_underlying(mod);
+    }
+
+    bool is_click(mouse_button_t button) const;
+
+    bool is_click_in(mouse_button_t button, int x_start, int x_end) const;
+
+    bool is_click_in(mouse_button_t button, line_range lr) const
+    {
+        return this->is_click_in(button, lr.lr_start, lr.lr_end);
+    }
+
+    bool is_press_in(mouse_button_t button, line_range lr) const;
+
+    bool is_drag_in(mouse_button_t button, line_range lr) const;
+    bool is_double_click_in(mouse_button_t button, line_range lr) const;
+
     mouse_button_t me_button;
     mouse_button_state_t me_state;
-    struct timeval me_time {};
+    uint8_t me_modifiers;
+    timeval me_time{};
     int me_x;
     int me_y;
+    int me_press_x{-1};
+    int me_press_y{-1};
 };
 
 /**
@@ -348,67 +361,140 @@ class view_curses {
 public:
     virtual ~view_curses() = default;
 
+    /** @param win The curses window this view is attached to. */
+    virtual void set_window(ncplane* win) { this->vc_window = win; }
+
+    /** @return The curses window this view is attached to. */
+    ncplane* get_window() const { return this->vc_window; }
+
+    void set_title(const std::string& title) { this->vc_title = title; }
+
+    const std::string& get_title() const { return this->vc_title; }
+
     /**
      * Update the curses display.
      */
-    virtual void do_update()
-    {
-        this->vc_needs_update = false;
+    virtual bool do_update();
 
-        if (!this->vc_visible) {
-            return;
-        }
+    virtual bool handle_mouse(mouse_event& me);
 
-        for (auto* child : this->vc_children) {
-            child->do_update();
-        }
-    }
+    virtual std::optional<view_curses*> contains(int x, int y);
 
-    virtual bool handle_mouse(mouse_event& me) { return false; }
+    virtual void deinit() { this->set_window(nullptr); }
 
     void set_needs_update()
     {
-        this->vc_needs_update = true;
-        for (auto* child : this->vc_children) {
-            child->set_needs_update();
+        if (this->is_visible()) {
+            this->vc_needs_update = true;
+            for (auto* child : this->vc_children) {
+                child->set_needs_update();
+            }
         }
     }
+
+    void clear_needs_update() { this->vc_needs_update = false; }
 
     bool get_needs_update() const { return this->vc_needs_update; }
 
     view_curses& add_child_view(view_curses* child)
     {
         this->vc_children.push_back(child);
+        this->set_needs_update();
 
         return *this;
     }
 
     void set_default_role(role_t role) { this->vc_default_role = role; }
 
-    void set_visible(bool value) { this->vc_visible = value; }
+    void set_enabled(bool value)
+    {
+        if (value != this->vc_enabled) {
+            this->vc_enabled = value;
+            this->set_needs_update();
+        }
+    }
+
+    bool is_enabled() const { return this->vc_enabled; }
+
+    void set_visible(bool value)
+    {
+        if (this->vc_visible != value) {
+            this->vc_visible = value;
+            if (value) {
+                this->set_needs_update();
+            } else {
+                this->vc_needs_update = false;
+            }
+        }
+    }
 
     bool is_visible() const { return this->vc_visible; }
 
-    void set_width(long width) { this->vc_width = width; }
+    /**
+     * Set the Y position of this view on the display.  A value greater than
+     * zero is considered to be an absolute size.  A value less than zero makes
+     * the position relative to the bottom of the enclosing window.
+     *
+     * @param y The Y position of the cursor on the curses display.
+     */
+    void set_y(int y)
+    {
+        if (y != this->vc_y) {
+            this->vc_y = y;
+            this->set_needs_update();
+        }
+    }
+
+    int get_y() const { return this->vc_y; }
+
+    void set_x(int x)
+    {
+        if (x != this->vc_x) {
+            this->vc_x = x;
+            this->set_needs_update();
+        }
+    }
+
+    int get_x() const { return this->vc_x; }
+
+    void set_width(long width)
+    {
+        if (this->vc_width != width) {
+            this->vc_width = width;
+            this->set_needs_update();
+        }
+    }
 
     long get_width() const { return this->vc_width; }
 
     static void awaiting_user_input();
 
-    static size_t mvwattrline(WINDOW* window,
-                              int y,
-                              int x,
-                              attr_line_t& al,
-                              const struct line_range& lr,
-                              role_t base_role = role_t::VCR_TEXT);
+    struct mvwattrline_result {
+        size_t mr_chars_out{0};
+        size_t mr_bytes_remaining{0};
+        string_fragment mr_selected_text;
+    };
+
+    static mvwattrline_result mvwattrline(ncplane* window,
+                                          int y,
+                                          int x,
+                                          attr_line_t& al,
+                                          const struct line_range& lr,
+                                          role_t base_role = role_t::VCR_TEXT);
 
 protected:
+    ncplane* vc_window{nullptr}; /*< The window that contains this view. */
+    std::string vc_title;
+    bool vc_enabled{true};
     bool vc_visible{true};
     /** Flag to indicate if a display update is needed. */
     bool vc_needs_update{true};
-    long vc_width;
+    int vc_x{0};
+    int vc_y{0};
+    long vc_width{0};
     std::vector<view_curses*> vc_children;
     role_t vc_default_role{role_t::VCR_TEXT};
+    view_curses* vc_last_drag_child{nullptr};
 };
 
 template<class T>
@@ -416,30 +502,32 @@ class view_stack : public view_curses {
 public:
     using iterator = typename std::vector<T*>::iterator;
 
-    nonstd::optional<T*> top()
+    std::optional<T*> top()
     {
         if (this->vs_views.empty()) {
-            return nonstd::nullopt;
+            return std::nullopt;
         }
         return this->vs_views.back();
     }
 
-    void do_update() override
+    bool do_update() override
     {
         if (!this->vc_visible) {
-            return;
+            return false;
         }
 
-        this->top() | [this](T* vc) {
+        bool retval = false;
+        this->top() | [this, &retval](T* vc) {
             if (this->vc_needs_update) {
                 vc->set_needs_update();
             }
-            vc->do_update();
+            retval = vc->do_update();
         };
 
-        view_curses::do_update();
+        retval = view_curses::do_update() || retval;
 
         this->vc_needs_update = false;
+        return retval;
     }
 
     void push_back(T* view)

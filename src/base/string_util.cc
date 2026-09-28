@@ -31,28 +31,33 @@
 #include <iterator>
 #include <regex>
 #include <sstream>
+#include <string_view>
 
 #include "string_util.hh"
 
 #include "config.h"
 #include "is_utf8.hh"
 #include "lnav_log.hh"
+#include "scn/scan.h"
+#include "unistr.h"
+
+using namespace std::string_view_literals;
 
 void
 scrub_to_utf8(char* buffer, size_t length)
 {
-    const char* msg;
-    int faulty_bytes;
-
-    while (true) {
-        auto scan_res
-            = is_utf8((unsigned char*) buffer, length, &msg, &faulty_bytes);
-
-        if (msg == nullptr) {
-            break;
+    size_t index = 0;
+    while (index < length) {
+        if (buffer[index] > 0) {
+            index += 1;
+            continue;
         }
-        for (int lpc = 0; lpc < faulty_bytes; lpc++) {
-            buffer[scan_res.usr_end + lpc] = '?';
+
+        auto rc = u8_mblen((uint8_t*) &buffer[index], length - index);
+        if (rc <= 0) {
+            buffer[index] = '?';
+        } else {
+            index += rc;
         }
     }
 }
@@ -60,7 +65,7 @@ scrub_to_utf8(char* buffer, size_t length)
 void
 quote_content(auto_buffer& buf, const string_fragment& sf, char quote_char)
 {
-    for (char ch : sf) {
+    for (const char ch : sf) {
         if (ch == quote_char) {
             buf.push_back('\\').push_back(ch);
             continue;
@@ -126,7 +131,9 @@ unquote_content(char* dst, const char* str, size_t len, char quote_char)
 size_t
 unquote(char* dst, const char* str, size_t len)
 {
-    if (str[0] == 'r' || str[0] == 'u') {
+    if (str[0] == 'f' || str[0] == 'r' || str[0] == 'u' || str[0] == 'R'
+        || str[0] == 'x' || str[0] == 'X')
+    {
         str += 1;
         len -= 1;
     }
@@ -158,7 +165,7 @@ unquote_w3c(char* dst, const char* str, size_t len)
 void
 truncate_to(std::string& str, size_t max_char_len)
 {
-    static const std::string ELLIPSIS = "\u22ef";
+    static constexpr const char ELLIPSIS[] = "\u22ef";
 
     if (str.length() < max_char_len) {
         return;
@@ -193,12 +200,50 @@ truncate_to(std::string& str, size_t max_char_len)
     str.insert(bytes_to_keep_at_front, ELLIPSIS);
 }
 
-bool
-is_url(const std::string& fn)
+ssize_t
+utf8_char_to_byte_index(const std::string& str, ssize_t ch_index)
 {
-    static const auto url_re = std::regex("^(file|https?|ftps?|scp|sftp):.*");
+    ssize_t retval = 0;
 
-    return std::regex_match(fn, url_re);
+    while (ch_index > 0) {
+        auto ch_len
+            = ww898::utf::utf8::char_size([&str, retval]() {
+                  return std::make_pair(str[retval], str.length() - retval - 1);
+              }).unwrapOr(1);
+
+        retval += ch_len;
+        ch_index -= 1;
+    }
+
+    return retval;
+}
+
+size_t
+last_word_str(char* str, size_t len, size_t max_len)
+{
+    if (len < max_len) {
+        return len;
+    }
+
+    size_t last_start = 0;
+
+    for (size_t index = 0; index < len; index++) {
+        switch (str[index]) {
+            case '.':
+            case '-':
+            case '/':
+            case ':':
+                last_start = index + 1;
+                break;
+        }
+    }
+
+    if (last_start == 0) {
+        return len;
+    }
+
+    memmove(&str[0], &str[last_start], len - last_start);
+    return len - last_start;
 }
 
 size_t
@@ -234,11 +279,20 @@ abbreviate_str(char* str, size_t len, size_t max_len)
 void
 split_ws(const std::string& str, std::vector<std::string>& toks_out)
 {
-    std::stringstream ss(str);
-    std::string buf;
+    auto str_sf = string_fragment::from_str(str);
 
-    while (ss >> buf) {
-        toks_out.push_back(buf);
+    while (true) {
+        auto split_pair = str_sf.split_when(isspace);
+        if (split_pair.first.empty()) {
+            if (split_pair.second.empty()) {
+                break;
+            }
+            str_sf = split_pair.second;
+            continue;
+        }
+
+        toks_out.emplace_back(split_pair.first.to_string());
+        str_sf = split_pair.second;
     }
 }
 
@@ -275,16 +329,40 @@ is_blank(const std::string& str)
         str.begin(), str.end(), [](const auto ch) { return isspace(ch); });
 }
 
-std::string
-scrub_ws(const char* in)
+size_t
+compute_indent_size(const std::string& str)
 {
-    static const std::string TAB_SYMBOL = "\u21e5";
-    static const std::string LF_SYMBOL = "\u240a";
-    static const std::string CR_SYMBOL = "\u240d";
+    size_t retval = 0;
+    for (const auto& ch : str) {
+        if (ch == ' ') {
+            retval += 1;
+        } else if (ch == '\t') {
+            do {
+                retval += 1;
+            } while (retval % 8);
+        } else {
+            break;
+        }
+    }
+    return retval;
+}
+
+std::string
+scrub_ws(const char* in, ssize_t len)
+{
+    static constexpr auto TAB_SYMBOL = "\u21e5"sv;
+    static constexpr auto LF_SYMBOL = "\u240a"sv;
+    static constexpr auto CR_SYMBOL = "\u240d"sv;
 
     std::string retval;
 
-    for (size_t lpc = 0; in[lpc]; lpc++) {
+    if (len > 0) {
+        retval.reserve(len);
+    }
+
+    for (ssize_t lpc = 0; (len == -1 && in[lpc]) || (len >= 0 && lpc < len);
+         lpc++)
+    {
         auto ch = in[lpc];
 
         switch (ch) {
@@ -298,10 +376,128 @@ scrub_ws(const char* in)
                 retval.append(CR_SYMBOL);
                 break;
             default:
-                retval.append(1, ch);
+                retval.push_back(ch);
                 break;
         }
     }
 
     return retval;
 }
+
+static constexpr const char* const SUPERSCRIPT_NUMS[] = {
+    "⁰",
+    "¹",
+    "²",
+    "³",
+    "⁴",
+    "⁵",
+    "⁶",
+    "⁷",
+    "⁸",
+    "⁹",
+};
+
+std::string
+to_superscript(const std::string& in)
+{
+    std::string retval;
+    for (const auto ch : in) {
+        if (isdigit(ch)) {
+            auto index = ch - '0';
+
+            retval.append(SUPERSCRIPT_NUMS[index]);
+        } else {
+            retval.push_back(ch);
+        }
+    }
+
+    return retval;
+}
+
+namespace fmt {
+auto
+formatter<lnav::tainted_string>::format(const lnav::tainted_string& ts,
+                                        format_context& ctx)
+    -> decltype(ctx.out()) const
+{
+    auto esc_res = fmt::v10::detail::find_escape(
+        ts.ts_str.data(), ts.ts_str.data() + ts.ts_str.size());
+    if (esc_res.end == nullptr) {
+        return formatter<string_view>::format(ts.ts_str, ctx);
+    }
+
+    return format_to(ctx.out(), FMT_STRING("{:?}"), ts.ts_str);
+}
+}  // namespace fmt
+
+namespace lnav::pcre2pp {
+
+static bool
+is_meta(char ch)
+{
+    switch (ch) {
+        case '\\':
+        case '^':
+        case '$':
+        case '.':
+        case '[':
+        case ']':
+        case '(':
+        case ')':
+        case '*':
+        case '+':
+        case '?':
+        case '{':
+        case '}':
+            return true;
+        default:
+            return false;
+    }
+}
+
+static std::optional<const char*>
+char_escape_seq(char ch)
+{
+    switch (ch) {
+        case '\t':
+            return "\\t";
+        case '\n':
+            return "\\n";
+        default:
+            return std::nullopt;
+    }
+}
+
+std::string
+quote(string_fragment str)
+{
+    std::string retval;
+
+    while (true) {
+        auto cp_pair_opt = str.consume_codepoint();
+        if (!cp_pair_opt) {
+            break;
+        }
+
+        auto cp_pair = cp_pair_opt.value();
+        if ((cp_pair.first & ~0xff) == 0) {
+            if (is_meta(cp_pair.first)) {
+                retval.push_back('\\');
+            } else {
+                auto esc_seq = char_escape_seq(cp_pair.first);
+                if (esc_seq) {
+                    retval.append(esc_seq.value());
+                    str = cp_pair_opt->second;
+                    continue;
+                }
+            }
+        }
+        ww898::utf::utf8::write(cp_pair.first,
+                                [&retval](char ch) { retval.push_back(ch); });
+        str = cp_pair_opt->second;
+    }
+
+    return retval;
+}
+
+}  // namespace lnav::pcre2pp

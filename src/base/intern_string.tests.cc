@@ -43,6 +43,15 @@ TEST_CASE("string_fragment::startswith")
     CHECK_FALSE(sf.startswith("abc"));
 }
 
+TEST_CASE("string_fragment::lt")
+{
+    auto sf1 = string_fragment::from_const("abc");
+    auto sf2 = string_fragment::from_const("abcdef");
+
+    CHECK(sf1 < sf2);
+    CHECK_FALSE(sf2 < sf1);
+}
+
 TEST_CASE("split_lines")
 {
     std::string in1 = "Hello, World!";
@@ -54,6 +63,14 @@ TEST_CASE("split_lines")
 
         CHECK(1 == split.size());
         CHECK(in1 == split[0].to_string());
+    }
+
+    {
+        auto sf = string_fragment::from_str_range(in1, 7, -1);
+        auto split = sf.split_lines();
+
+        CHECK(1 == split.size());
+        CHECK("World!" == split[0].to_string());
     }
 
     {
@@ -121,24 +138,452 @@ TEST_CASE("find_left_boundary")
         auto world_sf = sf.find_left_boundary(
             in1.length() - 3, [](auto ch) { return ch == '\n'; });
         CHECK(world_sf.to_string() == "World!\n");
+        auto world_sf2 = sf.find_left_boundary(
+            in1.length() - 3, [](auto ch) { return ch == '\n'; }, 2);
+        CHECK(world_sf2.to_string() == "Hello,\nWorld!\n");
+        auto world_sf3 = sf.find_left_boundary(
+            in1.length() - 3, [](auto ch) { return ch == '\n'; }, 3);
+        CHECK(world_sf3.to_string() == "Hello,\nWorld!\n");
         auto full_sf
             = sf.find_left_boundary(3, [](auto ch) { return ch == '\n'; });
         CHECK(full_sf.to_string() == in1);
+    }
+
+    {
+        auto sf = string_fragment::from_const("\n    ");
+        auto last_line
+            = sf.find_left_boundary(sf.length(), string_fragment::tag1{'\n'});
+
+        CHECK(last_line.to_string() == "    ");
     }
 }
 
 TEST_CASE("find_right_boundary")
 {
-    std::string in1 = "Hello,\nWorld!\n";
-
     {
-        auto sf = string_fragment{in1};
+        const auto sf = string_fragment::from_const("Hello,\nWorld!\n");
 
-        auto world_sf = sf.find_right_boundary(
-            in1.length() - 3, [](auto ch) { return ch == '\n'; });
+        auto world_sf = sf.find_right_boundary(sf.length() - 3,
+                                               string_fragment::tag1{'\n'});
         CHECK(world_sf.to_string() == "Hello,\nWorld!");
         auto hello_sf
             = sf.find_right_boundary(3, [](auto ch) { return ch == '\n'; });
         CHECK(hello_sf.to_string() == "Hello,");
+        auto hello_sf2
+            = sf.find_right_boundary(3, string_fragment::tag1{'\n'}, 2);
+        CHECK(hello_sf2.to_string() == "Hello,\nWorld!");
+    }
+}
+
+TEST_CASE("find_boundaries_around")
+{
+    {
+        const auto sf = string_fragment::from_const(
+            R"(Hello,
+World!
+Goodbye,
+World!)");
+
+        auto all_sf1
+            = sf.find_boundaries_around(3, string_fragment::tag1{'\n'});
+        CHECK(all_sf1 == "Hello,");
+        auto all_sf2
+            = sf.find_boundaries_around(3, string_fragment::tag1{'\n'}, 2);
+        CHECK(all_sf2 == "Hello,\nWorld!");
+    }
+}
+
+TEST_CASE("string_fragment::column_width")
+{
+    {
+        const auto sf = string_fragment::from_const("Key(s)\n");
+
+        CHECK(7 == sf.column_width());
+    }
+    {
+        const auto sf = string_fragment::from_const("\u26a0");
+
+        CHECK(1 == sf.column_width());
+    }
+}
+
+TEST_CASE("string_fragment::next_word")
+{
+    {
+        const auto sf = string_fragment::from_const("hello world");
+
+        CHECK(sf.next_word(0) == std::optional<int>(6));
+        CHECK(sf.next_word(3) == std::optional<int>(6));
+        CHECK(sf.next_word(6) == std::nullopt);
+    }
+
+    {
+        const auto sf = string_fragment::from_const("SELECT * FROM");
+
+        CHECK(sf.next_word(0) == std::optional<int>(7));
+        CHECK(sf.next_word(7) == std::optional<int>(9));
+        CHECK(sf.next_word(9) == std::nullopt);
+    }
+
+    {
+        const auto sf = string_fragment::from_const("lnav_db.syslog_log");
+
+        CHECK(sf.next_word(0) == std::optional<int>(8));
+        CHECK(sf.next_word(3) == std::optional<int>(8));
+        CHECK(sf.next_word(8) == std::nullopt);
+    }
+
+    {
+        const auto sf = string_fragment::from_const("abc(def)");
+
+        CHECK(sf.next_word(0) == std::optional<int>(4));
+        CHECK(sf.next_word(4) == std::nullopt);
+    }
+
+    {
+        const auto sf = string_fragment::from_const("a..b");
+
+        CHECK(sf.next_word(0) == std::optional<int>(3));
+    }
+
+    {
+        const auto sf = string_fragment::from_const("a * b");
+
+        CHECK(sf.next_word(0) == std::optional<int>(2));
+        CHECK(sf.next_word(2) == std::optional<int>(4));
+    }
+
+    {
+        const auto sf = string_fragment::from_const("  hello");
+
+        CHECK(sf.next_word(0) == std::optional<int>(2));
+    }
+
+    {
+        const auto sf = string_fragment::from_const("a\tb");
+
+        CHECK(sf.next_word(0) == std::optional<int>(8));
+    }
+
+    {
+        const auto empty = string_fragment::from_const("");
+        const auto ws = string_fragment::from_const("   ");
+
+        CHECK(empty.next_word(0) == std::nullopt);
+        CHECK(ws.next_word(0) == std::nullopt);
+    }
+}
+
+TEST_CASE("string_fragment::prev_word")
+{
+    {
+        const auto sf = string_fragment::from_const("hello world");
+
+        CHECK(sf.prev_word(11) == std::optional<int>(6));
+        CHECK(sf.prev_word(6) == std::optional<int>(0));
+        CHECK(sf.prev_word(3) == std::optional<int>(0));
+        CHECK(sf.prev_word(0) == std::nullopt);
+    }
+
+    {
+        const auto sf = string_fragment::from_const("SELECT * FROM");
+
+        CHECK(sf.prev_word(13) == std::optional<int>(9));
+        CHECK(sf.prev_word(9) == std::optional<int>(7));
+        CHECK(sf.prev_word(7) == std::optional<int>(0));
+        CHECK(sf.prev_word(0) == std::nullopt);
+    }
+
+    {
+        const auto sf = string_fragment::from_const("lnav_db.syslog_log");
+
+        CHECK(sf.prev_word(18) == std::optional<int>(8));
+        CHECK(sf.prev_word(8) == std::optional<int>(0));
+        CHECK(sf.prev_word(0) == std::nullopt);
+    }
+
+    {
+        const auto sf = string_fragment::from_const("abc(def)");
+
+        CHECK(sf.prev_word(8) == std::optional<int>(4));
+        CHECK(sf.prev_word(4) == std::optional<int>(0));
+    }
+
+    {
+        const auto sf = string_fragment::from_const("a..b");
+
+        CHECK(sf.prev_word(4) == std::optional<int>(3));
+        CHECK(sf.prev_word(3) == std::optional<int>(0));
+    }
+
+    {
+        const auto sf = string_fragment::from_const("a * b");
+
+        CHECK(sf.prev_word(5) == std::optional<int>(4));
+        CHECK(sf.prev_word(4) == std::optional<int>(2));
+        CHECK(sf.prev_word(2) == std::optional<int>(0));
+    }
+
+    {
+        const auto sf = string_fragment::from_const("  hello");
+
+        CHECK(sf.prev_word(7) == std::optional<int>(2));
+        CHECK(sf.prev_word(2) == std::nullopt);
+    }
+
+    {
+        const auto sf = string_fragment::from_const("a\tb");
+
+        CHECK(sf.prev_word(9) == std::optional<int>(8));
+        CHECK(sf.prev_word(8) == std::optional<int>(0));
+    }
+
+    {
+        const auto empty = string_fragment::from_const("");
+        const auto ws = string_fragment::from_const("   ");
+
+        CHECK(empty.prev_word(0) == std::nullopt);
+        CHECK(ws.prev_word(3) == std::nullopt);
+    }
+}
+
+TEST_CASE("string_fragment::curr_word")
+{
+    {
+        const auto sf = string_fragment::from_const("hello world");
+
+        CHECK(sf.curr_word(0) == std::optional<int>(0));
+        CHECK(sf.curr_word(3) == std::optional<int>(0));
+        CHECK(sf.curr_word(4) == std::optional<int>(0));
+        CHECK(sf.curr_word(5) == std::nullopt);
+        CHECK(sf.curr_word(6) == std::optional<int>(6));
+        CHECK(sf.curr_word(8) == std::optional<int>(6));
+        CHECK(sf.curr_word(11) == std::nullopt);
+    }
+
+    {
+        const auto sf = string_fragment::from_const("SELECT * FROM");
+
+        CHECK(sf.curr_word(0) == std::optional<int>(0));
+        CHECK(sf.curr_word(3) == std::optional<int>(0));
+        CHECK(sf.curr_word(6) == std::nullopt);
+        CHECK(sf.curr_word(7) == std::optional<int>(7));
+        CHECK(sf.curr_word(8) == std::nullopt);
+        CHECK(sf.curr_word(9) == std::optional<int>(9));
+        CHECK(sf.curr_word(12) == std::optional<int>(9));
+    }
+
+    {
+        const auto sf = string_fragment::from_const("lnav_db.syslog_log");
+
+        CHECK(sf.curr_word(0) == std::optional<int>(0));
+        CHECK(sf.curr_word(3) == std::optional<int>(0));
+        CHECK(sf.curr_word(7) == std::optional<int>(0));
+        CHECK(sf.curr_word(8) == std::optional<int>(8));
+        CHECK(sf.curr_word(13) == std::optional<int>(8));
+    }
+
+    {
+        const auto sf = string_fragment::from_const("abc(def)");
+
+        CHECK(sf.curr_word(0) == std::optional<int>(0));
+        CHECK(sf.curr_word(2) == std::optional<int>(0));
+        CHECK(sf.curr_word(3) == std::optional<int>(0));
+        CHECK(sf.curr_word(4) == std::optional<int>(4));
+        CHECK(sf.curr_word(7) == std::optional<int>(4));
+    }
+
+    {
+        const auto sf = string_fragment::from_const("  hello");
+
+        CHECK(sf.curr_word(0) == std::nullopt);
+        CHECK(sf.curr_word(1) == std::nullopt);
+        CHECK(sf.curr_word(2) == std::optional<int>(2));
+        CHECK(sf.curr_word(5) == std::optional<int>(2));
+    }
+
+    {
+        const auto empty = string_fragment::from_const("");
+        const auto ws = string_fragment::from_const("   ");
+
+        CHECK(empty.curr_word(0) == std::nullopt);
+        CHECK(ws.curr_word(0) == std::nullopt);
+        CHECK(ws.curr_word(2) == std::nullopt);
+    }
+}
+
+TEST_CASE("string_fragment::word helpers with wide chars")
+{
+    {
+        const auto sf = string_fragment::from_const("中文");
+
+        REQUIRE(sf.column_width() == 4);
+        CHECK(sf.next_word(0) == std::nullopt);
+        CHECK(sf.prev_word(4) == std::optional<int>(0));
+        CHECK(sf.curr_word(0) == std::optional<int>(0));
+        CHECK(sf.curr_word(1) == std::optional<int>(0));
+        CHECK(sf.curr_word(2) == std::optional<int>(0));
+        CHECK(sf.curr_word(3) == std::optional<int>(0));
+    }
+
+    {
+        const auto sf = string_fragment::from_const("中 文");
+
+        REQUIRE(sf.column_width() == 5);
+        CHECK(sf.next_word(0) == std::optional<int>(3));
+        CHECK(sf.next_word(3) == std::nullopt);
+        CHECK(sf.prev_word(5) == std::optional<int>(3));
+        CHECK(sf.prev_word(3) == std::optional<int>(0));
+        CHECK(sf.curr_word(0) == std::optional<int>(0));
+        CHECK(sf.curr_word(1) == std::optional<int>(0));
+        CHECK(sf.curr_word(2) == std::nullopt);
+        CHECK(sf.curr_word(3) == std::optional<int>(3));
+        CHECK(sf.curr_word(4) == std::optional<int>(3));
+    }
+
+    {
+        const auto sf = string_fragment::from_const("ab中c");
+
+        REQUIRE(sf.column_width() == 5);
+        CHECK(sf.next_word(0) == std::nullopt);
+        CHECK(sf.prev_word(5) == std::optional<int>(0));
+        CHECK(sf.curr_word(0) == std::optional<int>(0));
+        CHECK(sf.curr_word(2) == std::optional<int>(0));
+        CHECK(sf.curr_word(3) == std::optional<int>(0));
+        CHECK(sf.curr_word(4) == std::optional<int>(0));
+    }
+}
+
+TEST_CASE("string_fragment::cursor")
+{
+    {
+        const auto input = ""_frag;
+        auto cursor = input.cursor();
+        CHECK_FALSE(cursor.lookbehind().has_value());
+        CHECK_FALSE(cursor.lookahead().has_value());
+        CHECK_FALSE(cursor.next().has_value());
+    }
+    {
+        const auto input = "hello"_frag;
+        auto cursor = input.cursor();
+        CHECK_FALSE(cursor.lookbehind().has_value());
+        CHECK('h' == cursor.lookahead());
+        CHECK('h' == cursor.lookahead());
+        CHECK('h' == cursor.next());
+        CHECK_FALSE(cursor.lookbehind().has_value());
+        CHECK('e' == cursor.lookahead());
+        CHECK('e' == cursor.next());
+        CHECK('h' == cursor.lookbehind());
+        CHECK('l' == cursor.next());
+        CHECK('l' == cursor.next());
+        CHECK('o' == cursor.next());
+        CHECK_FALSE(cursor.next().has_value());
+        CHECK('o' == cursor.lookbehind());
+        CHECK_FALSE(cursor.next().has_value());
+        CHECK('o' == cursor.lookbehind());
+        CHECK_FALSE(cursor.lookahead().has_value());
+    }
+}
+
+TEST_CASE("string_fragment::start_of_codepoint")
+{
+    // "“ab" -- bytes 1 and 2 are continuations of the quote at byte 0.
+    const auto sf = string_fragment::from_const("“ab");
+
+    CHECK(sf.length() == 5);
+
+    SUBCASE("an index already on a character is left alone")
+    {
+        CHECK(sf.start_of_codepoint(0) == 0);
+        CHECK(sf.start_of_codepoint(3) == 3);
+        CHECK(sf.start_of_codepoint(4) == 4);
+    }
+
+    SUBCASE("an index inside a character moves back to its start")
+    {
+        // Splitting here is what produced a doubled character followed by
+        // "\x80" "\x9c" escapes in a rendered line.
+        CHECK(sf.start_of_codepoint(1) == 0);
+        CHECK(sf.start_of_codepoint(2) == 0);
+    }
+
+    SUBCASE("the end of the fragment is left alone")
+    {
+        CHECK(sf.start_of_codepoint(sf.length()) == (size_t) sf.length());
+    }
+
+    SUBCASE("an ascii-only fragment never moves")
+    {
+        const auto ascii = string_fragment::from_const("hello");
+
+        for (size_t lpc = 0; lpc <= (size_t) ascii.length(); lpc++) {
+            CHECK(ascii.start_of_codepoint(lpc) == lpc);
+        }
+    }
+
+    SUBCASE("a run of continuation bytes is left where it is")
+    {
+        // Four continuation bytes in a row cannot be one character, so the
+        // index stays put rather than sliding an unbounded distance.
+        const auto junk = string_fragment::from_const("\x80\x80\x80\x80\x80");
+
+        CHECK(junk.start_of_codepoint(4) == 4);
+    }
+}
+
+TEST_CASE("string_fragment::byte_to_column_index")
+{
+    SUBCASE("ascii runs one column per byte")
+    {
+        const auto sf = string_fragment::from_const("abcdef");
+
+        CHECK(sf.byte_to_column_index(0) == 0);
+        CHECK(sf.byte_to_column_index(3) == 3);
+        CHECK(sf.byte_to_column_index(6) == 6);
+    }
+
+    SUBCASE("a tab advances to the next multiple of eight")
+    {
+        const auto sf = string_fragment::from_const("ab\tc");
+
+        CHECK(sf.byte_to_column_index(2) == 2);
+        CHECK(sf.byte_to_column_index(3) == 8);
+        CHECK(sf.byte_to_column_index(4) == 9);
+    }
+
+    SUBCASE("a wide character takes two columns")
+    {
+        const auto sf = string_fragment::from_const("a中b");
+
+        CHECK(sf.byte_to_column_index(1) == 1);
+        // the wide char is three bytes and two columns
+        CHECK(sf.byte_to_column_index(4) == 3);
+    }
+
+    SUBCASE("a line feed restarts the count")
+    {
+        // a column is relative to the row the byte is rendered on, so the
+        // width of the earlier rows must not leak into the result.
+        const auto sf = string_fragment::from_const("hello\nworld");
+
+        CHECK(sf.byte_to_column_index(5) == 5);
+        CHECK(sf.byte_to_column_index(6) == 0);
+        CHECK(sf.byte_to_column_index(9) == 3);
+    }
+
+    SUBCASE("every row of a multi-line fragment starts at zero")
+    {
+        const auto sf = string_fragment::from_const("#+1162490366\n./drive");
+
+        CHECK(sf.byte_to_column_index(13) == 0);
+        CHECK(sf.byte_to_column_index(sf.length()) == 7);
+    }
+
+    SUBCASE("a tab stop is measured from the start of its own row")
+    {
+        const auto sf = string_fragment::from_const("abcdefghij\na\tb");
+
+        CHECK(sf.byte_to_column_index(11) == 0);
+        CHECK(sf.byte_to_column_index(13) == 8);
     }
 }

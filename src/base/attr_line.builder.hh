@@ -40,6 +40,11 @@ public:
 
     class attr_guard {
     public:
+        explicit attr_guard(attr_line_t& al)
+            : ag_line(al), ag_start(std::nullopt)
+        {
+        }
+
         attr_guard(attr_line_t& al, string_attr_pair sap)
             : ag_line(al), ag_start(al.get_string().length()),
               ag_attr(std::move(sap))
@@ -51,10 +56,10 @@ public:
         attr_guard& operator=(const attr_guard&) = delete;
 
         attr_guard(attr_guard&& other) noexcept
-            : ag_line(other.ag_line), ag_start(other.ag_start),
+            : ag_line(other.ag_line), ag_start(std::move(other.ag_start)),
               ag_attr(std::move(other.ag_attr))
         {
-            other.ag_start = nonstd::nullopt;
+            other.ag_start = std::nullopt;
         }
 
         ~attr_guard()
@@ -71,9 +76,11 @@ public:
 
     private:
         attr_line_t& ag_line;
-        nonstd::optional<int> ag_start;
+        std::optional<int> ag_start;
         string_attr_pair ag_attr;
     };
+
+    attr_guard with_default() { return attr_guard{this->alb_line}; }
 
     attr_guard with_attr(string_attr_pair sap)
     {
@@ -83,15 +90,15 @@ public:
     template<typename... Args>
     attr_line_builder& overlay_attr(Args... args)
     {
-        this->alb_line.al_attrs.template emplace_back(args...);
+        this->alb_line.al_attrs.emplace_back(args...);
         return *this;
     }
 
     template<typename... Args>
     attr_line_builder& overlay_attr_for_char(int index, Args... args)
     {
-        this->alb_line.al_attrs.template emplace_back(
-            line_range{index, index + 1}, args...);
+        this->alb_line.al_attrs.emplace_back(line_range{index, index + 1},
+                                             args...);
         return *this;
     }
 
@@ -99,6 +106,14 @@ public:
     attr_line_builder& append(Args... args)
     {
         this->alb_line.append(args...);
+
+        return *this;
+    }
+
+    template<typename... Args>
+    attr_line_builder& appendf(Args... args)
+    {
+        this->alb_line.appendf(args...);
 
         return *this;
     }
@@ -111,6 +126,8 @@ public:
 
         return *this;
     }
+
+    attr_line_builder& append_as_hexdump(const string_fragment& sf);
 
 private:
     attr_line_t& alb_line;

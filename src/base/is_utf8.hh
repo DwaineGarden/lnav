@@ -28,21 +28,31 @@
 #ifndef _IS_UTF8_H
 #define _IS_UTF8_H
 
-#include <stdlib.h>
-#include <sys/types.h>
+#include <optional>
 
-#include "optional.hpp"
+#include "intern_string.hh"
 
 struct utf8_scan_result {
-    ssize_t usr_end{0};
+    const char* usr_message{nullptr};
+    size_t usr_faulty_bytes{0};
+    string_fragment usr_valid_frag{string_fragment::invalid()};
+    std::optional<string_fragment> usr_remaining;
     bool usr_has_ansi{false};
+    size_t usr_column_width_guess{0};
+
+    const char* remaining_ptr() const
+    {
+        if (this->usr_remaining) {
+            return this->usr_remaining->begin();
+        }
+        return nullptr;
+    }
+
+    bool is_valid() const { return this->usr_message == nullptr; }
 };
 
-utf8_scan_result is_utf8(const unsigned char* str,
-                         size_t len,
-                         const char** message,
-                         int* faulty_bytes,
-                         nonstd::optional<unsigned char> terminator
-                         = nonstd::nullopt);
+utf8_scan_result is_utf8(string_fragment frag,
+                         std::optional<unsigned char> terminator
+                         = std::nullopt);
 
 #endif /* _IS_UTF8_H */

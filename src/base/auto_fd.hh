@@ -32,16 +32,11 @@
 #ifndef auto_fd_hh
 #define auto_fd_hh
 
-#include <exception>
-#include <new>
 #include <string>
 
-#include <errno.h>
 #include <fcntl.h>
-#include <sys/select.h>
-#include <unistd.h>
 
-#include "base/lnav_log.hh"
+#include "base/intern_string.hh"
 #include "base/result.h"
 
 /**
@@ -59,19 +54,7 @@ public:
      * contains the reader end of the pipe and the second contains the writer.
      * @return The result of the pipe(2) function.
      */
-    static int pipe(auto_fd* af)
-    {
-        int retval, fd[2];
-
-        require(af != nullptr);
-
-        if ((retval = ::pipe(fd)) == 0) {
-            af[0] = fd[0];
-            af[1] = fd[1];
-        }
-
-        return retval;
-    }
+    static int pipe(auto_fd* af);
 
     /**
      * dup(2) the given file descriptor and wrap it in an auto_fd.
@@ -79,27 +62,16 @@ public:
      * @param fd The file descriptor to duplicate.
      * @return A new auto_fd that contains the duplicated file descriptor.
      */
-    static auto_fd dup_of(int fd)
-    {
-        if (fd == -1) {
-            return auto_fd{};
-        }
+    static auto_fd dup_of(int fd);
 
-        auto new_fd = ::dup(fd);
-
-        if (new_fd == -1) {
-            throw std::bad_alloc();
-        }
-
-        return auto_fd(new_fd);
-    }
+    static Result<auto_fd, std::string> openpt(int flags);
 
     /**
      * Construct an auto_fd to manage the given file descriptor.
      *
      * @param fd The file descriptor to be managed.
      */
-    explicit auto_fd(int fd = -1) : af_fd(fd) { require(fd >= -1); }
+    explicit auto_fd(int fd = -1);
 
     /**
      * Non-const copy constructor.  Management of the file descriptor will be
@@ -108,7 +80,7 @@ public:
      *
      * @param af The source of the file descriptor.
      */
-    auto_fd(auto_fd&& af) noexcept : af_fd(af.release()) {}
+    auto_fd(auto_fd&& af) noexcept;
 
     /**
      * Const copy constructor.  The file descriptor from the source will be
@@ -118,21 +90,12 @@ public:
      */
     auto_fd(const auto_fd& af) = delete;
 
-    auto_fd dup() const
-    {
-        int new_fd;
-
-        if (this->af_fd == -1 || (new_fd = ::dup(this->af_fd)) == -1) {
-            throw std::bad_alloc();
-        }
-
-        return auto_fd{new_fd};
-    }
+    auto_fd dup() const;
 
     /**
      * Destructor that will close the file descriptor managed by this object.
      */
-    ~auto_fd() { this->reset(); }
+    ~auto_fd();
 
     /** @return The file descriptor as a plain integer. */
     operator int() const { return this->af_fd; }
@@ -144,13 +107,7 @@ public:
      * @param fd The file descriptor to store in this object.
      * @return *this
      */
-    auto_fd& operator=(int fd)
-    {
-        require(fd >= -1);
-
-        this->reset(fd);
-        return *this;
-    }
+    auto_fd& operator=(int fd);
 
     /**
      * Transfer management of the given file descriptor to this object.
@@ -189,10 +146,14 @@ public:
         return retval;
     }
 
+    void copy_to(int fd) const;
+
     /**
      * @return The file descriptor.
      */
     int get() const { return this->af_fd; }
+
+    bool has_value() const { return this->af_fd != -1; }
 
     /**
      * Closes the current file descriptor and replaces its value with the given
@@ -200,33 +161,33 @@ public:
      *
      * @param fd The new file descriptor to be managed.
      */
-    void reset(int fd = -1)
-    {
-        require(fd >= -1);
+    void reset(int fd = -1);
 
-        if (this->af_fd != fd) {
-            if (this->af_fd != -1) {
-                switch (this->af_fd) {
-                    case STDIN_FILENO:
-                    case STDOUT_FILENO:
-                    case STDERR_FILENO:
-                        break;
-                    default:
-                        close(this->af_fd);
-                        break;
-                }
-            }
-            this->af_fd = fd;
-        }
+    Result<void, std::string> write_fully(const unsigned char* data,
+                                          size_t len);
+
+    Result<void, std::string> write_fully(string_fragment sf)
+    {
+        return this->write_fully(sf.udata(), sf.length());
     }
 
-    void close_on_exec() const
+    template<std::size_t N>
+    Result<void, std::string> write_fully(const unsigned char (&str)[N])
     {
-        if (this->af_fd == -1) {
-            return;
-        }
-        log_perror(fcntl(this->af_fd, F_SETFD, FD_CLOEXEC));
+        return this->write_fully(str, N);
     }
+
+    template<typename T,
+             std::enable_if_t<std::is_integral_v<T>, bool> = true>
+    Result<void, std::string> write_fully(const T& value)
+    {
+        return this->write_fully(
+            reinterpret_cast<const unsigned char*>(&value), sizeof(value));
+    }
+
+    void close_on_exec() const;
+
+    void non_blocking() const;
 
 private:
     int af_fd; /*< The managed file descriptor. */
@@ -234,32 +195,30 @@ private:
 
 class auto_pipe {
 public:
-    static Result<auto_pipe, std::string> for_child_fd(int child_fd)
-    {
-        auto_pipe retval(child_fd);
+    static Result<auto_pipe, std::string> for_child_fd(int child_fd);
 
-        if (retval.open() == -1) {
-            return Err(std::string(strerror(errno)));
+    template<typename... ARGS>
+    static Result<std::array<auto_pipe, sizeof...(ARGS)>, std::string>
+    for_child_fds(ARGS... args)
+    {
+        std::array<auto_pipe, sizeof...(ARGS)> retval;
+
+        size_t index = 0;
+        for (const auto child_fd : {args...}) {
+            auto open_res = for_child_fd(child_fd);
+            if (open_res.isErr()) {
+                return Err(open_res.unwrapErr());
+            }
+
+            retval[index++] = open_res.unwrap();
         }
 
         return Ok(std::move(retval));
     }
 
-    explicit auto_pipe(int child_fd = -1, int child_flags = O_RDONLY)
-        : ap_child_flags(child_flags), ap_child_fd(child_fd)
-    {
-        switch (child_fd) {
-            case STDIN_FILENO:
-                this->ap_child_flags = O_RDONLY;
-                break;
-            case STDOUT_FILENO:
-            case STDERR_FILENO:
-                this->ap_child_flags = O_WRONLY;
-                break;
-        }
-    }
+    explicit auto_pipe(int child_fd = -1, int child_flags = O_RDONLY);
 
-    int open() { return auto_fd::pipe(this->ap_fd); }
+    int open();
 
     void close()
     {
@@ -271,44 +230,7 @@ public:
 
     auto_fd& write_end() { return this->ap_fd[1]; }
 
-    void after_fork(pid_t child_pid)
-    {
-        int new_fd;
-
-        switch (child_pid) {
-            case -1:
-                this->close();
-                break;
-            case 0:
-                if (this->ap_child_flags == O_RDONLY) {
-                    this->write_end().reset();
-                    if (this->read_end().get() == -1) {
-                        this->read_end() = ::open("/dev/null", O_RDONLY);
-                    }
-                    new_fd = this->read_end().get();
-                } else {
-                    this->read_end().reset();
-                    if (this->write_end().get() == -1) {
-                        this->write_end() = ::open("/dev/null", O_WRONLY);
-                    }
-                    new_fd = this->write_end().get();
-                }
-                if (this->ap_child_fd != -1) {
-                    if (new_fd != this->ap_child_fd) {
-                        dup2(new_fd, this->ap_child_fd);
-                        this->close();
-                    }
-                }
-                break;
-            default:
-                if (this->ap_child_flags == O_RDONLY) {
-                    this->read_end().reset();
-                } else {
-                    this->write_end().reset();
-                }
-                break;
-        }
-    }
+    void after_fork(pid_t child_pid);
 
     int ap_child_flags;
     int ap_child_fd;

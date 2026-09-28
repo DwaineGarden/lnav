@@ -37,10 +37,8 @@
 #include <time.h>
 #define __STDC_FORMAT_MACROS
 #include <limits>
-#include <list>
 #include <memory>
 #include <set>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -51,13 +49,13 @@
 #include "base/date_time_scanner.hh"
 #include "base/intern_string.hh"
 #include "base/lnav_log.hh"
-#include "file_format.hh"
+#include "base/log_level_enum.hh"
 #include "highlighter.hh"
 #include "line_buffer.hh"
 #include "log_format_fwd.hh"
-#include "log_level.hh"
-#include "optional.hpp"
+#include "logfile.hh"
 #include "pcrepp/pcre2pp.hh"
+#include "robin_hood/robin_hood.h"
 #include "shared_buffer.hh"
 
 struct sqlite3;
@@ -65,241 +63,37 @@ class logfile;
 class log_vtab_manager;
 struct exec_context;
 
-enum class scale_op_t {
-    SO_IDENTITY,
-    SO_MULTIPLY,
-    SO_DIVIDE
-};
-
-struct scaling_factor {
-    template<typename T>
-    void scale(T& val) const
-    {
-        switch (this->sf_op) {
-            case scale_op_t::SO_IDENTITY:
-                break;
-            case scale_op_t::SO_DIVIDE:
-                val = val / (T) this->sf_value;
-                break;
-            case scale_op_t::SO_MULTIPLY:
-                val = val * (T) this->sf_value;
-                break;
-        }
-    }
-
-    scale_op_t sf_op{scale_op_t::SO_IDENTITY};
-    double sf_value{1};
-};
-
-enum class value_kind_t : int {
-    VALUE_UNKNOWN = -1,
-    VALUE_NULL,
-    VALUE_TEXT,
-    VALUE_INTEGER,
-    VALUE_FLOAT,
-    VALUE_BOOLEAN,
-    VALUE_JSON,
-    VALUE_STRUCT,
-    VALUE_QUOTED,
-    VALUE_W3C_QUOTED,
-    VALUE_TIMESTAMP,
-    VALUE_XML,
-
-    VALUE__MAX
-};
-
-struct logline_value_meta {
-    logline_value_meta(intern_string_t name,
-                       value_kind_t kind,
-                       int col = -1,
-                       const nonstd::optional<log_format*>& format
-                       = nonstd::nullopt)
-        : lvm_name(name), lvm_kind(kind), lvm_column(col), lvm_format(format)
-    {
-    }
-
-    bool is_hidden() const { return this->lvm_hidden || this->lvm_user_hidden; }
-
-    logline_value_meta& with_struct_name(intern_string_t name)
-    {
-        this->lvm_struct_name = name;
-        return *this;
-    }
-
-    intern_string_t lvm_name;
-    value_kind_t lvm_kind;
-    int lvm_column{-1};
-    nonstd::optional<size_t> lvm_values_index;
-    bool lvm_identifier{false};
-    bool lvm_hidden{false};
-    bool lvm_user_hidden{false};
-    bool lvm_from_module{false};
-    intern_string_t lvm_struct_name;
-    nonstd::optional<log_format*> lvm_format;
-};
-
-class logline_value {
-public:
-    logline_value(logline_value_meta lvm) : lv_meta(std::move(lvm))
-    {
-        this->lv_meta.lvm_kind = value_kind_t::VALUE_NULL;
-    }
-
-    logline_value(logline_value_meta lvm, bool b)
-        : lv_meta(std::move(lvm)), lv_value((int64_t) (b ? 1 : 0))
-    {
-        this->lv_meta.lvm_kind = value_kind_t::VALUE_BOOLEAN;
-    }
-
-    logline_value(logline_value_meta lvm, int64_t i)
-        : lv_meta(std::move(lvm)), lv_value(i)
-    {
-        this->lv_meta.lvm_kind = value_kind_t::VALUE_INTEGER;
-    }
-
-    logline_value(logline_value_meta lvm, double i)
-        : lv_meta(std::move(lvm)), lv_value(i)
-    {
-        this->lv_meta.lvm_kind = value_kind_t::VALUE_FLOAT;
-    }
-
-    logline_value(logline_value_meta lvm, string_fragment frag)
-        : lv_meta(std::move(lvm)), lv_frag(frag)
-    {
-    }
-
-    logline_value(logline_value_meta lvm, const intern_string_t val)
-        : lv_meta(std::move(lvm)), lv_intern_string(val)
-    {
-    }
-
-    logline_value(logline_value_meta lvm, std::string val)
-        : lv_meta(std::move(lvm)), lv_str(std::move(val))
-    {
-    }
-
-    logline_value(logline_value_meta lvm,
-                  shared_buffer_ref& sbr,
-                  struct line_range origin);
-
-    void apply_scaling(const scaling_factor* sf)
-    {
-        if (sf != nullptr) {
-            switch (this->lv_meta.lvm_kind) {
-                case value_kind_t::VALUE_INTEGER:
-                    sf->scale(this->lv_value.i);
-                    break;
-                case value_kind_t::VALUE_FLOAT:
-                    sf->scale(this->lv_value.d);
-                    break;
-                default:
-                    break;
-            }
-        }
-    }
-
-    std::string to_string() const;
-
-    const char* text_value() const
-    {
-        if (this->lv_str) {
-            return this->lv_str->c_str();
-        }
-        if (this->lv_frag.empty()) {
-            if (this->lv_intern_string.empty()) {
-                return "";
-            }
-            return this->lv_intern_string.get();
-        }
-        return this->lv_frag.data();
-    }
-
-    size_t text_length() const
-    {
-        if (this->lv_str) {
-            return this->lv_str->size();
-        }
-        if (this->lv_frag.empty()) {
-            return this->lv_intern_string.size();
-        }
-        return this->lv_frag.length();
-    }
-
-    struct line_range origin_in_full_msg(const char* msg, ssize_t len) const;
-
-    logline_value_meta lv_meta;
-    union value_u {
-        int64_t i;
-        double d;
-
-        value_u() : i(0) {}
-        value_u(int64_t i) : i(i) {}
-        value_u(double d) : d(d) {}
-    } lv_value;
-    nonstd::optional<std::string> lv_str;
-    string_fragment lv_frag;
-    int lv_sub_offset{0};
-    intern_string_t lv_intern_string;
-    struct line_range lv_origin;
-};
-
-struct logline_value_vector {
-    void clear()
-    {
-        this->lvv_values.clear();
-        this->lvv_sbr.disown();
-    }
-
-    shared_buffer_ref lvv_sbr;
-    std::vector<logline_value> lvv_values;
-};
-
-struct logline_value_stats {
-    logline_value_stats() { this->clear(); }
-
-    void clear()
-    {
-        this->lvs_width = 0;
-        this->lvs_count = 0;
-        this->lvs_total = 0;
-        this->lvs_min_value = std::numeric_limits<double>::max();
-        this->lvs_max_value = -std::numeric_limits<double>::max();
-    }
-
-    void merge(const logline_value_stats& other);
-
-    void add_value(double value);
-
-    int64_t lvs_width;
-    int64_t lvs_count;
-    double lvs_total;
-    double lvs_min_value;
-    double lvs_max_value;
-};
-
-struct logline_value_cmp {
-    explicit logline_value_cmp(const intern_string_t* name = nullptr,
-                               int col = -1)
-        : lvc_name(name), lvc_column(col)
+struct logline_value_name_cmp {
+    explicit logline_value_name_cmp(const intern_string_t* name)
+        : lvc_name(name)
     {
     }
 
     bool operator()(const logline_value& lv) const
     {
-        bool retval = true;
-
-        if (this->lvc_name != nullptr) {
-            retval = retval && ((*this->lvc_name) == lv.lv_meta.lvm_name);
-        }
-        if (this->lvc_column != -1) {
-            retval = retval && (this->lvc_column == lv.lv_meta.lvm_column);
-        }
-
-        return retval;
+        return (*this->lvc_name) == lv.lv_meta.lvm_name;
     }
 
     const intern_string_t* lvc_name;
-    int lvc_column;
+};
+
+struct logline_value_col_eq {
+    explicit logline_value_col_eq(const logline_value_meta::table_column& col)
+        : lvc_column(col)
+    {
+    }
+
+    bool operator()(const logline_value& lv) const
+    {
+        if (lv.lv_meta.lvm_column.is<logline_value_meta::table_column>()) {
+            return this->lvc_column
+                == lv.lv_meta.lvm_column
+                       .get<logline_value_meta::table_column>();
+        }
+        return false;
+    }
+
+    const logline_value_meta::table_column& lvc_column;
 };
 
 class log_vtab_impl;
@@ -307,7 +101,7 @@ class log_vtab_impl;
 /**
  * Base class for implementations of log format parsers.
  */
-class log_format {
+class log_format : public std::enable_shared_from_this<log_format> {
 public:
     /**
      * @return The collection of builtin log formats.
@@ -315,6 +109,13 @@ public:
     static std::vector<std::shared_ptr<log_format>>& get_root_formats();
 
     static std::shared_ptr<log_format> find_root_format(const char* name);
+
+    struct sample_t {
+        positioned_property<std::string> s_line;
+        std::string s_description;
+        log_level_t s_level{LEVEL_UNKNOWN};
+        std::set<std::string> s_matched_regexes;
+    };
 
     struct action_def {
         std::string ad_name;
@@ -330,12 +131,14 @@ public:
 
     virtual ~log_format() = default;
 
-    virtual void clear()
-    {
-        this->lf_pattern_locks.clear();
-        this->lf_date_time.clear();
-        this->lf_time_scanner.clear();
-    }
+    /**
+     * Reset whatever a previous file left on this object, before it is tried
+     * as a candidate for another one.  Only the state that has not been moved
+     * onto scan_batch_context yet needs this -- the fields a subclass
+     * discovers from the file it is reading, such as the column names in a
+     * header.
+     */
+    virtual void clear() {}
 
     /**
      * Get the name of this log format.
@@ -344,21 +147,37 @@ public:
      */
     virtual const intern_string_t get_name() const = 0;
 
-    virtual bool match_name(const std::string& filename) { return true; }
+    struct name_matched {};
+    struct name_mismatched {
+        size_t nm_partial;
+        std::string nm_pattern;
+    };
 
-    virtual bool match_mime_type(const file_format_t ff) const
+    using match_name_result
+        = mapbox::util::variant<name_matched, name_mismatched>;
+
+    virtual match_name_result match_name(const std::string& filename)
     {
-        if (ff == file_format_t::UNKNOWN) {
-            return true;
-        }
-        return false;
+        return name_matched{};
     }
 
-    enum scan_result_t {
-        SCAN_MATCH,
-        SCAN_NO_MATCH,
-        SCAN_INCOMPLETE,
+    using scan_match = log_format_scan_match;
+
+    struct scan_error {
+        std::string se_message;
     };
+
+    struct scan_no_match {
+        const char* snm_reason{nullptr};
+    };
+
+    struct scan_incomplete {};
+
+    using scan_result_t = mapbox::util::
+        variant<scan_match, scan_no_match, scan_error, scan_incomplete>;
+
+    virtual scan_result_t test_line(
+        sample_t& sample, std::vector<lnav::console::user_message>& msgs);
 
     /**
      * Scan a log line to see if it matches this log format.
@@ -373,10 +192,11 @@ public:
                                std::vector<logline>& dst,
                                const line_info& li,
                                shared_buffer_ref& sbr,
-                               scan_batch_context& sbc)
-        = 0;
+                               scan_batch_context& sbc) = 0;
 
-    virtual bool scan_for_partial(shared_buffer_ref& sbr, size_t& len_out) const
+    virtual bool scan_for_partial(const log_format_file_state& lffs,
+                                  shared_buffer_ref& sbr,
+                                  size_t& len_out) const
     {
         return false;
     }
@@ -391,12 +211,10 @@ public:
      */
     virtual void scrub(std::string& line) {}
 
-    virtual void annotate(uint64_t line_number,
+    virtual void annotate(logfile* lf,
+                          uint64_t line_number,
                           string_attrs_t& sa,
-                          logline_value_vector& values,
-                          bool annotate_module = true) const
-    {
-    }
+                          logline_value_vector& values) const;
 
     virtual void rewrite(exec_context& ec,
                          shared_buffer_ref& line,
@@ -406,22 +224,52 @@ public:
         value_out.assign(line.get_data(), line.length());
     }
 
-    virtual const logline_value_stats* stats_for_value(
+    virtual std::optional<size_t> stats_index_for_value(
         const intern_string_t& name) const
+    {
+        return std::nullopt;
+    }
+
+    virtual std::shared_ptr<log_format> specialized(scan_batch_context& sbc,
+                                                    int fmt_lock = -1) = 0;
+
+    /**
+     * @return Scratch for this format to discover into while it is a
+     * candidate, or null if it discovers nothing from the file.
+     * @see format_scan_state
+     */
+    virtual std::unique_ptr<format_scan_state> make_scan_state() const
     {
         return nullptr;
     }
 
-    virtual std::shared_ptr<log_format> specialized(int fmt_lock = -1) = 0;
+    /**
+     * Take over what was discovered while this format's root was the winning
+     * candidate.  Called on the specialized copy, just after specialized().
+     */
+    virtual void adopt_scan_state(format_scan_state& fss) {}
+
+    /**
+     * The timestamp flags this scan should accumulate into.  A specialized
+     * copy belongs to one file and keeps its own; a root is shared by every
+     * file being probed against it, so a candidate accumulates into the
+     * batch and process_prefix hands the winner's flags to the copy.
+     */
+    uint32_t& timestamp_flags_for(scan_batch_context& sbc)
+    {
+        return this->lf_specialized ? this->lf_timestamp_flags
+                                    : sbc.sbc_timestamp_flags;
+    }
 
     virtual std::shared_ptr<log_vtab_impl> get_vtab_impl() const
     {
         return nullptr;
     }
 
-    virtual void get_subline(const logline& ll,
+    virtual void get_subline(const log_format_file_state& lffs,
+                             const logline& ll,
                              shared_buffer_ref& sbr,
-                             bool full_message = false)
+                             subline_options opts = subline_options{})
     {
     }
 
@@ -445,6 +293,26 @@ public:
         return false;
     }
 
+    virtual std::map<intern_string_t, logline_value_meta> get_field_states()
+    {
+        return {};
+    }
+
+    // Drop user-controlled field visibility state (set via
+    // `:hide-fields`/`:show-fields`) so a fresh session starts
+    // without inherited hide state.  Called from `reset_session()`.
+    // The default implementation walks every known field and marks it
+    // visible; formats with additional hide state (e.g. the static
+    // registry `metric_log_format` uses for cross-instance columns)
+    // are already covered because `get_field_states` includes those
+    // and `hide_field` routes the update through the same channel.
+    virtual void reset_user_field_state()
+    {
+        for (const auto& [name, _] : this->get_field_states()) {
+            this->hide_field(name, false);
+        }
+    }
+
     const char* const* get_timestamp_formats() const
     {
         if (this->lf_timestamp_format.empty()) {
@@ -454,17 +322,41 @@ public:
         return &this->lf_timestamp_format[0];
     }
 
+    /**
+     * @param file_dts The scanner belonging to the file the value came from,
+     * i.e. logfile::get_time_scanner().
+     * @return A scratch scanner carrying that file's base time and zone, for
+     * re-parsing a timestamp-valued field.  It has to come from the file: the
+     * format's own lf_date_time only holds what the format definition set.
+     */
+    date_time_scanner build_time_scanner(
+        const date_time_scanner& file_dts) const;
+
     void check_for_new_year(std::vector<logline>& dst,
                             exttm log_tv,
-                            timeval timeval1);
+                            timeval timeval1,
+                            scan_batch_context& sbc) const;
 
-    virtual std::string get_pattern_path(uint64_t line_number) const;
+    virtual std::string get_pattern_path(const pattern_locks& pl,
+                                         uint64_t line_number) const;
 
-    virtual intern_string_t get_pattern_name(uint64_t line_number) const;
+    virtual intern_string_t get_pattern_name(const pattern_locks& pl,
+                                             uint64_t line_number) const;
 
-    virtual std::string get_pattern_regex(uint64_t line_number) const
+    virtual std::string get_pattern_regex(const pattern_locks& pl,
+                                          uint64_t line_number) const
     {
         return "";
+    }
+
+    // The number of parsed-value columns a row of this format
+    // produces.  Default defers to `get_value_metadata()` (and eats
+    // the vector copy); formats that know the count cheaply — e.g.
+    // `metric_log_format` — should override so hot callers can skip
+    // loading the row just to size its columns.
+    virtual size_t get_value_metadata_count() const
+    {
+        return this->get_value_metadata().size();
     }
 
     virtual std::vector<logline_value_meta> get_value_metadata() const
@@ -472,23 +364,7 @@ public:
         return {};
     }
 
-    struct pattern_for_lines {
-        pattern_for_lines(uint32_t pfl_line, uint32_t pfl_pat_index);
-
-        uint32_t pfl_line;
-        int pfl_pat_index;
-    };
-
-    int last_pattern_index() const
-    {
-        if (this->lf_pattern_locks.empty()) {
-            return -1;
-        }
-
-        return this->lf_pattern_locks.back().pfl_pat_index;
-    }
-
-    int pattern_index_for_line(uint64_t line_number) const;
+    virtual bool format_changed() { return false; }
 
     bool operator<(const log_format& rhs) const
     {
@@ -501,33 +377,132 @@ public:
         return intern_string_t::case_lt(lhs->get_name(), rhs->get_name());
     }
 
+    exttm tm_for_display(logfile::iterator ll,
+                         string_fragment sf,
+                         date_time_scanner& dts);
+
     enum class subsecond_unit {
         milli,
         micro,
         nano,
     };
 
+    /**
+     * The shape of the file that contains the log messages.
+     */
+    enum class file_type_t {
+        TEXT,
+        JSON,
+        TABULAR,
+    };
+
+    /**
+     * The bit for a file type, for use in a set of file types.
+     */
+    static constexpr uint8_t file_type_bit(file_type_t ft)
+    {
+        return 1 << static_cast<uint8_t>(ft);
+    }
+
     std::string lf_description;
-    uint8_t lf_mod_index{0};
+    log_format* lf_root_format{this};
     bool lf_multiline{true};
+    bool lf_structured{false};
+    bool lf_formatted_lines{false};
+    file_type_t lf_file_type{file_type_t::TEXT};
     date_time_scanner lf_date_time;
-    date_time_scanner lf_time_scanner;
-    std::vector<pattern_for_lines> lf_pattern_locks;
     intern_string_t lf_timestamp_field{intern_string::lookup("timestamp", -1)};
+    intern_string_t lf_start_timestamp_field;
     intern_string_t lf_subsecond_field;
-    nonstd::optional<subsecond_unit> lf_subsecond_unit;
+    std::optional<subsecond_unit> lf_subsecond_unit;
     intern_string_t lf_time_field;
     std::vector<const char*> lf_timestamp_format;
-    unsigned int lf_timestamp_flags{0};
+    uint32_t lf_timestamp_flags{0};
+    timestamp_point_of_reference_t lf_timestamp_point_of_reference{
+        timestamp_point_of_reference_t::end};
     std::map<std::string, action_def> lf_action_defs;
-    std::vector<logline_value_stats> lf_value_stats;
     std::vector<highlighter> lf_highlighters;
     bool lf_is_self_describing{false};
     bool lf_time_ordered{true};
     bool lf_specialized{false};
-    nonstd::optional<int64_t> lf_max_unrecognized_lines;
+    bool lf_level_hideable{true};
+    // Flags a format whose loglines are metric samples (one numeric
+    // value per column, timestamped).  The logfile_sub_source uses
+    // this to compose a cross-file `col=value` rendering in the LOG
+    // view, fold sibling rows that share a timestamp, and drive the
+    // stem-labeled overlay above the focused row.
+    bool lf_is_metric{false};
+    std::optional<uint64_t> lf_max_unrecognized_lines;
     std::map<const intern_string_t, std::shared_ptr<format_tag_def>>
         lf_tag_defs;
+
+    std::map<const intern_string_t, std::shared_ptr<format_partition_def>>
+        lf_partition_defs;
+
+    struct opid_descriptor {
+        positioned_property<intern_string_t> od_field;
+        factory_container<lnav::pcre2pp::code> od_extractor;
+        std::optional<std::string> od_prefix;
+        std::string od_suffix;
+        std::string od_joiner{", "};
+
+        std::optional<std::string> matches(const string_fragment& sf) const;
+    };
+
+    struct opid_descriptors {
+        intern_string_t od_name;
+        std::shared_ptr<std::vector<opid_descriptor>> od_descriptors;
+        uint16_t od_index{0};
+
+        std::string to_string(
+            const lnav::map::small<size_t, std::string>& lod) const;
+    };
+
+    enum class opid_source_t {
+        from_field,
+        from_description,
+        from_whole_msg,
+    };
+
+    std::optional<opid_source_t> lf_opid_source{};
+
+    std::shared_ptr<std::map<intern_string_t, opid_descriptors>>
+        lf_opid_description_def{
+            std::make_shared<std::map<intern_string_t, opid_descriptors>>()};
+
+    std::shared_ptr<std::map<intern_string_t, opid_descriptors>>
+        lf_subid_description_def{
+            std::make_shared<std::map<intern_string_t, opid_descriptors>>()};
+
+    std::shared_ptr<std::vector<opid_descriptors*>> lf_opid_description_def_vec{
+        std::make_shared<std::vector<opid_descriptors*>>()};
+
+    std::shared_ptr<std::vector<opid_descriptors*>>
+        lf_subid_description_def_vec{
+            std::make_shared<std::vector<opid_descriptors*>>()};
+
+    ArenaAlloc::Alloc<char> lf_desc_allocator{2 * 1024};
+
+    using desc_field_set
+        = robin_hood::unordered_set<intern_string_t,
+                                    intern_hasher,
+                                    std::equal_to<intern_string_t>>;
+
+    desc_field_set lf_desc_fields;
+
+    using desc_cap_map
+        = robin_hood::unordered_map<intern_string_t,
+                                    string_fragment,
+                                    intern_hasher,
+                                    std::equal_to<intern_string_t>>;
+    desc_cap_map lf_desc_captures;
+
+    static const intern_string_t LOG_TIME_STR;
+    static const intern_string_t LOG_LEVEL_STR;
+    static const intern_string_t LOG_OPID_STR;
+    static const intern_string_t LOG_THREAD_ID_STR;
+    static const intern_string_t LOG_RAW_TEXT_STR;
+    static const intern_string_t LOG_EXTRA_FIELDS_STR;
 
 protected:
     static std::vector<std::shared_ptr<log_format>> lf_root_formats;
@@ -535,8 +510,9 @@ protected:
     struct pcre_format {
         template<typename T, std::size_t N>
         explicit pcre_format(const T (&regex)[N])
-            : name(regex),
-              pcre(lnav::pcre2pp::code::from_const(regex).to_shared()),
+            : name(regex), pcre(lnav::pcre2pp::code::from_const(
+                                    regex, PCRE2_CASELESS | PCRE2_DOTALL)
+                                    .to_shared()),
               pf_timestamp_index(this->pcre->name_index("timestamp"))
         {
         }
@@ -548,17 +524,20 @@ protected:
         int pf_timestamp_index{-1};
     };
 
-    static bool next_format(pcre_format* fmt, int& index, int& locked_index);
+    static bool next_format(const pcre_format* fmt,
+                            int& index,
+                            int& locked_index);
 
-    const char* log_scanf(uint32_t line_number,
+    const char* log_scanf(scan_batch_context& sbc,
+                          uint32_t line_number,
                           string_fragment line,
-                          pcre_format* fmt,
+                          const pcre_format* fmt,
                           const char* time_fmt[],
                           struct exttm* tm_out,
                           struct timeval* tv_out,
 
                           string_fragment* ts_out,
-                          nonstd::optional<string_fragment>* level_out);
+                          std::optional<string_fragment>* level_out);
 };
 
 #endif

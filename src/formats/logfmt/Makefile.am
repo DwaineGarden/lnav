@@ -9,7 +9,6 @@ AM_CPPFLAGS = \
     -I$(top_srcdir)/src/fmtlib \
 	-I$(top_srcdir)/src/third-party/scnlib/include \
     $(LIBARCHIVE_CFLAGS) \
-    $(READLINE_CFLAGS) \
     $(SQLITE3_CFLAGS) \
     $(LIBCURL_CPPFLAGS)
 
@@ -35,7 +34,9 @@ logfmt_parser_test_LDADD = \
     liblogfmt.a \
     $(top_builddir)/src/base/libbase.a \
     $(top_builddir)/src/pcrepp/libpcrepp.a \
-    $(top_builddir)/src/third-party/scnlib/src/libscnlib.a
+    $(top_builddir)/src/fmtlib/libcppfmt.a \
+    $(top_builddir)/src/third-party/scnlib/src/libscnlib.a \
+    -lunistring
 
 TESTS = \
     logfmt.parser.test

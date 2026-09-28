@@ -2,13 +2,17 @@ name: tailer-ape
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, develop ]
+    paths-ignore:
+      - docs
+      - README.md
+      - NEWS.md
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - name: update apt
         run: sudo apt-get update
       - name: Install packages

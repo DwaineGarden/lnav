@@ -11,9 +11,28 @@ Run [37m[40m ./autogen.sh [0m if compiling from a cloned repository.
 
 [1mSee Also[0m
 
-[4mAngle-grinder[1][0m is a tool to slice and dice log files on the
+]8;;https://github.com/rcoh/angle-grinder\[4mAngle-grinder[0m]8;;\¹ is a tool to slice and dice log files on the
 command-line. If you're familiar with the SumoLogic query language,
 you might find this tool more comfortable to work with.
 
- ▌[1] - https://github.com/rcoh/angle-grinder 
+ [34m▌[0m[1] - https://github.com/rcoh/angle-grinder 
 
+[1mCode Signing Policy[0m
+
+Free code signing provided by ]8;;https://about.signpath.io/\[4mSignPath.io[0m]8;;\¹, certificate by ]8;;https://signpath.org/\[4mSignPath[0m]8;;\
+]8;;https://signpath.org/\[4mFoundation[0m]8;;\².
+
+ [34m▌[0m[1] - https://about.signpath.io/ 
+ [34m▌[0m[2] - https://signpath.org/      
+
+This program will not transfer any information to other networked
+systems unless specifically requested by the user or the person
+installing or operating it.
+
+[1mAcknowledgements[0m
+
+Many thanks to:
+
+ [33m•[0m GitHub Sponsors
+ [33m•[0m Anthropic for including lnav in the Claude for Open
+   Source Program

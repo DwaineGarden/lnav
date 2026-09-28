@@ -32,11 +32,18 @@
 #ifndef log_level_hh
 #define log_level_hh
 
+#include <array>
+
 #include <sys/types.h>
 
+#include "base/intern_string.hh"
 #include "base/log_level_enum.hh"
+#include "yajlpp/yajlpp.hh"
 
-extern const char* level_names[LEVEL__MAX + 1];
+extern const std::array<string_fragment, LEVEL__MAX> level_names;
+extern const json_path_handler_base::enum_value_t LEVEL_ENUM[];
+
+constexpr size_t MAX_LEVEL_NAME_LEN = 8;
 
 log_level_t string2level(const char* levelstr,
                          ssize_t len = -1,

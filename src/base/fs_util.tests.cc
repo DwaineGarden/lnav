@@ -27,12 +27,47 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <filesystem>
 #include <iostream>
 
 #include "base/fs_util.hh"
 
 #include "config.h"
 #include "doctest/doctest.h"
+
+TEST_CASE("fs_util::to_posix_path")
+{
+    auto pt = lnav::filesystem::path_transcoder::from("c:\\foo\\bar");
+    CHECK("/c/foo/bar" == pt.pt_path);
+    CHECK_FALSE(pt.pt_root_name_capitalized.value());
+
+    pt = lnav::filesystem::path_transcoder::from("C:\\foo\\bar");
+    CHECK("/c/foo/bar" == pt.pt_path);
+    CHECK(pt.pt_root_name_capitalized.value());
+
+    pt = lnav::filesystem::path_transcoder::from("c:");
+    CHECK("/c/" == pt.pt_path);
+
+    pt = lnav::filesystem::path_transcoder::from("c:\\");
+    CHECK("/c/" == pt.pt_path);
+
+    // XXX what should this be?
+    pt = lnav::filesystem::path_transcoder::from("c:foo\\bar");
+    CHECK("/c/foo/bar" == pt.pt_path);
+
+    pt = lnav::filesystem::path_transcoder::from("");
+    CHECK("" == pt.pt_path);
+}
+
+#if defined(__MSYS__)
+TEST_CASE("fs_util::escape_glob_for_win")
+{
+    CHECK(R"(c:/abc/def/*.log)"
+          == lnav::filesystem::escape_glob_for_win(R"(c:\abc\def\*.log)"));
+    CHECK(R"(c:/abc/def/\*.log)"
+          == lnav::filesystem::escape_glob_for_win(R"(c:\abc\def\^*.log)"));
+}
+#endif
 
 TEST_CASE("fs_util::build_path")
 {
@@ -53,4 +88,25 @@ TEST_CASE("fs_util::build_path")
     if (old_path != nullptr) {
         setenv("PATH", old_path, 1);
     }
+}
+
+TEST_CASE("fs_util::escape_path")
+{
+    auto p1 = std::filesystem::path{"/abc/def"};
+
+    CHECK("/abc/def" == lnav::filesystem::escape_path(p1));
+
+    auto p2 = std::filesystem::path{"$abc"};
+
+    CHECK("\\$abc" == lnav::filesystem::escape_path(p2));
+}
+
+TEST_CASE("fs_util::contains_dotdot")
+{
+    CHECK_FALSE(
+        lnav::filesystem::contains_dotdot(std::filesystem::path{"/abc/def"}));
+    CHECK(lnav::filesystem::contains_dotdot(
+        std::filesystem::path{"/abc/../def"}));
+    CHECK_FALSE(lnav::filesystem::contains_dotdot(
+        std::filesystem::path{"/abc..def"}));
 }

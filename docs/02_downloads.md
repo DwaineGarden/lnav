@@ -6,17 +6,33 @@ permalink: /downloads
 
 The latest **stable** release is [**v{{ site.version }}**](https://github.com/tstack/lnav/releases/latest).
 
+<blockquote>
+<iframe width="560" height="315"
+    src="https://www.youtube-nocookie.com/embed/6peBzqjgI2M?si=eu9ndJcS7m9WJGJ7"
+    title="lnav v0.13.0 release"
+    frameborder="0"
+    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+    referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+</blockquote>
+
 The following options are available for installing **lnav**:
 
 ## Linux
 
 <!-- markdown-link-check-disable-next-line -->
-Download a [statically linked 64-bit binary](https://github.com/tstack/lnav/releases/download/v{{site.version}}/lnav-{{site.version}}-x86_64-linux-musl.zip).
+Download a [statically linked 64-bit binary](https://github.com/tstack/lnav/releases/download/v{{site.version}}/lnav-{{site.version}}-linux-musl-x86_64.zip).
 
 Install from the [Snap Store](https://snapcraft.io/lnav):
 
 ```console
 $ sudo snap install lnav
+```
+
+Install RPMs from [Package Cloud](https://packagecloud.io/tstack/lnav):
+
+```console
+$ curl -s https://packagecloud.io/install/repositories/tstack/lnav/script.rpm.sh | sudo bash
+$ sudo yum install lnav
 ```
 
 ## MacOS
@@ -28,6 +44,12 @@ Install using [Homebrew](https://formulae.brew.sh/formula/lnav):
 
 ```console
 $ brew install lnav
+```
+
+## FreeBSD
+
+```console
+$ pkg install lnav
 ```
 
 ## Source

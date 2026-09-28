@@ -1,0 +1,300 @@
+[
+    {
+        "name": "log",
+        "top": 0,
+        "left": 0,
+        "height": 24,
+        "inner_height": 3,
+        "top_time": "2009-07-20 22:59:26.000000",
+        "top_file": "{test_dir}/logfile_access_log.0",
+        "paused": 0,
+        "search": "",
+        "filtering": 1,
+        "movement": "top",
+        "top_meta": {
+            "time": "2009-07-20 22:59:26.000000",
+            "file": "{test_dir}/logfile_access_log.0",
+            "anchor": "#msg00046f2b16f0cf80-v1:3f7e0f10f2473f83b2b4eacccfc9b4e2",
+            "breadcrumbs": [
+                {
+                    "display_value": "2009-07-20T22:59:26.000000",
+                    "search_placeholder": "(Enter an absolute or relative time)",
+                    "possibilities": [
+                        {
+                            "display_value": "-1 day"
+                        },
+                        {
+                            "display_value": "-1h"
+                        },
+                        {
+                            "display_value": "-30m"
+                        },
+                        {
+                            "display_value": "-15m"
+                        },
+                        {
+                            "display_value": "-5m"
+                        },
+                        {
+                            "display_value": "-1m"
+                        },
+                        {
+                            "display_value": "+1m"
+                        },
+                        {
+                            "display_value": "+5m"
+                        },
+                        {
+                            "display_value": "+15m"
+                        },
+                        {
+                            "display_value": "+30m"
+                        },
+                        {
+                            "display_value": "+1h"
+                        },
+                        {
+                            "display_value": "+1 day"
+                        }
+                    ]
+                },
+                {
+                    "display_value": "access_log",
+                    "search_placeholder": "",
+                    "possibilities": [
+                        {
+                            "display_value": "access_log"
+                        }
+                    ]
+                },
+                {
+                    "display_value": "logfile_access_log.0[0]",
+                    "search_placeholder": "",
+                    "possibilities": [
+                        {
+                            "display_value": "logfile_access_log.0"
+                        }
+                    ]
+                },
+                {
+                    "display_value": "   ⋯",
+                    "search_placeholder": "",
+                    "possibilities": [
+                        {
+                            "display_value": ""
+                        }
+                    ]
+                },
+                {
+                    "display_value": "87ecc75c2bfe711642086a9b8546ab05",
+                    "search_placeholder": "",
+                    "possibilities": [
+                        {
+                            "display_value": "87ecc75c2bfe711642086a9b8546ab05"
+                        }
+                    ]
+                }
+            ]
+        },
+        "selection": 0,
+        "options": {
+            "row-details": "hide",
+            "row-time-offset": "hide",
+            "hidden-fields": "hide",
+            "word-wrap": "none"
+        },
+        "selected_text": null,
+        "row_details": null,
+        "view_details": "{\"zoom-level\":\"5-minute\"}"
+    },
+    {
+        "name": "text",
+        "top": 0,
+        "left": 0,
+        "height": 1,
+        "inner_height": 0,
+        "top_time": null,
+        "top_file": null,
+        "paused": 0,
+        "search": "",
+        "filtering": 1,
+        "movement": "top",
+        "top_meta": null,
+        "selection": 0,
+        "options": {
+            "row-details": "hide",
+            "row-time-offset": "hide",
+            "hidden-fields": "hide",
+            "word-wrap": "none"
+        },
+        "selected_text": null,
+        "row_details": null,
+        "view_details": "{\"zoom-level\":\"5-minute\"}"
+    },
+    {
+        "name": "help",
+        "top": 0,
+        "left": 0,
+        "height": 1,
+        "inner_height": 0,
+        "top_time": null,
+        "top_file": null,
+        "paused": 0,
+        "search": "",
+        "filtering": 0,
+        "movement": "top",
+        "top_meta": null,
+        "selection": 0,
+        "options": {
+            "hidden-fields": "hide",
+            "word-wrap": "none"
+        },
+        "selected_text": null,
+        "row_details": null,
+        "view_details": null
+    },
+    {
+        "name": "histogram",
+        "top": 0,
+        "left": 0,
+        "height": 1,
+        "inner_height": 1,
+        "top_time": "2009-07-20 22:55:00.000000",
+        "top_file": null,
+        "paused": 0,
+        "search": "",
+        "filtering": 0,
+        "movement": "top",
+        "top_meta": {
+            "time": "2009-07-20 22:55:00.000000",
+            "breadcrumbs": [
+
+            ]
+        },
+        "selection": 0,
+        "options": {
+            "hidden-fields": "hide",
+            "word-wrap": "none"
+        },
+        "selected_text": null,
+        "row_details": null,
+        "view_details": "{\"zoom-level\":\"5-minute\"}"
+    },
+    {
+        "name": "db",
+        "top": 0,
+        "left": 0,
+        "height": 1,
+        "inner_height": 4,
+        "top_time": null,
+        "top_file": null,
+        "paused": 0,
+        "search": "",
+        "filtering": 0,
+        "movement": "top",
+        "top_meta": {
+            "breadcrumbs": [
+
+            ]
+        },
+        "selection": 0,
+        "options": {
+            "row-details": "hide",
+            "hidden-fields": "hide",
+            "word-wrap": "none"
+        },
+        "selected_text": null,
+        "row_details": null,
+        "view_details": "{\"zoom-level\":\"5-minute\",\"query\":\"SELECT * FROM lnav_views\",\"}"
+    },
+    {
+        "name": "schema",
+        "top": 0,
+        "left": 0,
+        "height": 1,
+        "inner_height": 0,
+        "top_time": null,
+        "top_file": null,
+        "paused": 0,
+        "search": "",
+        "filtering": 0,
+        "movement": "top",
+        "top_meta": null,
+        "selection": 0,
+        "options": {
+            "hidden-fields": "hide",
+            "word-wrap": "none"
+        },
+        "selected_text": null,
+        "row_details": null,
+        "view_details": null
+    },
+    {
+        "name": "pretty",
+        "top": 0,
+        "left": 0,
+        "height": 1,
+        "inner_height": 0,
+        "top_time": null,
+        "top_file": null,
+        "paused": 0,
+        "search": "",
+        "filtering": 0,
+        "movement": "top",
+        "top_meta": null,
+        "selection": 0,
+        "options": {
+            "hidden-fields": "hide",
+            "word-wrap": "none"
+        },
+        "selected_text": null,
+        "row_details": null,
+        "view_details": null
+    },
+    {
+        "name": "spectro",
+        "top": 0,
+        "left": 0,
+        "height": 1,
+        "inner_height": 0,
+        "top_time": null,
+        "top_file": null,
+        "paused": 0,
+        "search": "",
+        "filtering": 0,
+        "movement": "cursor",
+        "top_meta": null,
+        "selection": null,
+        "options": {
+            "row-details": "hide",
+            "hidden-fields": "hide",
+            "word-wrap": "none"
+        },
+        "selected_text": null,
+        "row_details": null,
+        "view_details": "{\"zoom-level\":\"5-minute\"}"
+    },
+    {
+        "name": "timeline",
+        "top": 0,
+        "left": 0,
+        "height": 1,
+        "inner_height": 0,
+        "top_time": null,
+        "top_file": null,
+        "paused": 0,
+        "search": "",
+        "filtering": 1,
+        "movement": "cursor",
+        "top_meta": null,
+        "selection": null,
+        "options": {
+            "row-details": "hide",
+            "hidden-fields": "hide",
+            "word-wrap": "none"
+        },
+        "selected_text": null,
+        "row_details": null,
+        "view_details": "{\"zoom-level\":\"5-minute\"}"
+    }
+]

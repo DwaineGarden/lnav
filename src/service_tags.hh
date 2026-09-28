@@ -34,14 +34,11 @@
 
 namespace services {
 
-struct main_t {
-};
-struct ui_t {
-};
-struct curl_streamer_t {
-};
-struct remote_tailer_t {
-};
+struct main_t {};
+struct curl_streamer_t {};
+struct remote_tailer_t {};
+struct url_handler_t {};
+struct background_t {};
 
 }  // namespace services
 

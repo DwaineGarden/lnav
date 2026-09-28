@@ -30,53 +30,140 @@
 #ifndef lnav_fs_util_hh
 #define lnav_fs_util_hh
 
+#include <filesystem>
+#include <optional>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "auto_fd.hh"
-#include "ghc/filesystem.hpp"
-#include "intern_string.hh"
-#include "result.h"
+#include <sys/stat.h>
+#include <unistd.h>
 
-namespace lnav {
-namespace filesystem {
+#include "auto_fd.hh"
+#include "enum_util.hh"
+#include "fmt/format.h"
+#include "intern_string.hh"
+#include "mapbox/variant.hpp"
+#include "result.h"
+#include "time_util.hh"
+
+struct default_for_text_format {
+    bool operator==(const default_for_text_format&) const { return true; }
+};
+struct file_location_tail {
+    bool operator==(const file_location_tail&) const { return true; }
+};
+
+using file_location_t = mapbox::util::
+    variant<default_for_text_format, file_location_tail, int, std::string>;
+
+namespace lnav::filesystem {
+
+inline bool
+is_glob(const std::string& fn)
+{
+    return (fn.find('*') != std::string::npos
+            || fn.find('?') != std::string::npos
+            || fn.find('[') != std::string::npos);
+}
+
+std::string escape_glob_for_win(std::string arg);
+
+bool is_url(const std::string& fn);
+
+enum class path_type {
+    normal,
+    pattern,
+    windows,
+    remote,
+    url,
+};
+
+std::string escape_path(const std::filesystem::path& p,
+                        path_type pt = path_type::normal);
+
+bool contains_dotdot(const std::filesystem::path& p);
+
+path_type determine_path_type(const std::string& arg);
+
+struct path_transcoder {
+    static path_transcoder from(std::string arg);
+
+    std::filesystem::path pt_path;
+    std::optional<bool> pt_root_name_capitalized;
+
+    std::string to_native(std::string arg);
+    static std::string to_shell_arg(std::string arg);
+};
+
+std::pair<std::string, file_location_t> split_file_location(
+    const std::string& path);
 
 inline int
-statp(const ghc::filesystem::path& path, struct stat* buf)
+statp(const std::filesystem::path& path, struct stat* buf)
 {
     return stat(path.c_str(), buf);
 }
 
 inline int
-openp(const ghc::filesystem::path& path, int flags)
+openp(const std::filesystem::path& path, int flags)
 {
     return open(path.c_str(), flags);
 }
 
 inline int
-openp(const ghc::filesystem::path& path, int flags, mode_t mode)
+openp(const std::filesystem::path& path, int flags, mode_t mode)
 {
     return open(path.c_str(), flags, mode);
 }
 
-Result<auto_fd, std::string> create_file(const ghc::filesystem::path& path,
+std::optional<std::filesystem::path> self_path();
+
+lnav::time64_t self_mtime();
+
+Result<std::filesystem::path, std::string> realpath(
+    const std::filesystem::path& path);
+
+Result<auto_fd, std::string> create_file(const std::filesystem::path& path,
                                          int flags,
                                          mode_t mode);
 
-Result<auto_fd, std::string> open_file(const ghc::filesystem::path& path,
+Result<auto_fd, std::string> open_file(const std::filesystem::path& path,
                                        int flags);
 
-Result<struct stat, std::string> stat_file(const ghc::filesystem::path& path);
+Result<struct stat, std::string> stat_file(const std::filesystem::path& path);
 
-Result<std::pair<ghc::filesystem::path, auto_fd>, std::string> open_temp_file(
-    const ghc::filesystem::path& pattern);
+Result<std::pair<std::filesystem::path, auto_fd>, std::string> open_temp_file(
+    const std::filesystem::path& pattern);
 
-Result<std::string, std::string> read_file(const ghc::filesystem::path& path);
+Result<std::string, std::string> read_file(const std::filesystem::path& path);
 
-Result<void, std::string> write_file(const ghc::filesystem::path& path,
-                                     const string_fragment& content);
+enum class write_file_options : uint8_t {
+    backup_existing,
+    read_only,
+    executable,
+};
 
-std::string build_path(const std::vector<ghc::filesystem::path>& paths);
+struct write_file_result {
+    std::optional<std::filesystem::path> wfr_backup_path;
+};
+
+Result<write_file_result, std::string> write_file(
+    const std::filesystem::path& path,
+    string_fragment_producer& content,
+    lnav::enums::bitset<write_file_options> options = {});
+
+inline Result<write_file_result, std::string>
+write_file(const std::filesystem::path& path,
+           const string_fragment& content,
+           lnav::enums::bitset<write_file_options> options = {})
+{
+    auto sfp = string_fragment_producer::from(content);
+    return write_file(path, *sfp, options);
+}
+
+std::string build_path(const std::vector<std::filesystem::path>& paths);
 
 class file_lock {
 public:
@@ -111,12 +198,17 @@ public:
 
     void unlock() const { lockf(this->lh_fd, F_ULOCK, 0); }
 
-    explicit file_lock(const ghc::filesystem::path& archive_path);
+    explicit file_lock(const std::filesystem::path& archive_path);
 
     auto_fd lh_fd;
 };
 
-}  // namespace filesystem
-}  // namespace lnav
+}  // namespace lnav::filesystem
+
+template<>
+struct fmt::formatter<std::filesystem::path> : formatter<string_view> {
+    auto format(const std::filesystem::path& p, format_context& ctx)
+        -> decltype(ctx.out()) const;
+};
 
 #endif

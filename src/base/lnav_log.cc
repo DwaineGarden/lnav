@@ -29,6 +29,8 @@
  * @file lnav_log.cc
  */
 
+#include <random>
+
 #include <assert.h>
 #include <ctype.h>
 #include <fcntl.h>
@@ -52,8 +54,12 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
+#include <optional>
+#include <sstream>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #define PCRE2_CODE_UNIT_WIDTH 8
@@ -64,54 +70,32 @@
 #include <sys/utsname.h>
 #include <sys/wait.h>
 
-#if defined HAVE_NCURSESW_CURSES_H
-#    include <ncursesw/curses.h>
-#    include <ncursesw/termcap.h>
-#elif defined HAVE_NCURSESW_H
-#    include <ncursesw.h>
-#    include <termcap.h>
-#elif defined HAVE_NCURSES_CURSES_H
-#    include <ncurses/curses.h>
-#    include <ncurses/termcap.h>
-#elif defined HAVE_NCURSES_H
-#    include <ncurses.h>
-#    include <termcap.h>
-#elif defined HAVE_CURSES_H
-#    include <curses.h>
-#    include <termcap.h>
-#else
-#    error "SysV or X/Open-compatible Curses header file required"
-#endif
-
+#include "ansi_scrubber.hh"
 #include "auto_mem.hh"
+#include "auto_pid.hh"
 #include "enum_util.hh"
+#include "fs_util.hh"
 #include "lnav_log.hh"
+#include "notcurses/notcurses.h"
 #include "opt_util.hh"
 
-static const size_t BUFFER_SIZE = 256 * 1024;
-static const size_t MAX_LOG_LINE_SIZE = 2 * 1024;
+static constexpr size_t BUFFER_SIZE = 256 * 1024;
+static constexpr size_t MAX_LOG_LINE_SIZE = 2 * 1024;
 
-static const char* CRASH_MSG
-    = "\n"
-      "\n"
-      "==== GURU MEDITATION ====\n"
-      "Unfortunately, lnav has crashed, sorry for the inconvenience.\n"
-      "\n"
-      "You can help improve lnav by sending the following file "
-      "to " PACKAGE_BUGREPORT
-      " :\n"
-      "  %s\n"
-      "=========================\n";
-
-nonstd::optional<FILE*> lnav_log_file;
+std::optional<FILE*> lnav_log_file;
 lnav_log_level_t lnav_log_level = lnav_log_level_t::DEBUG;
 const char* lnav_log_crash_dir;
-nonstd::optional<const struct termios*> lnav_log_orig_termios;
+std::optional<const termios*> lnav_log_orig_termios;
 // NOTE: This mutex is leaked so that it is not destroyed during exit.
 // Otherwise, any attempts to log will fail.
 static std::mutex*
 lnav_log_mutex()
 {
+    if (lnav::pid::in_child) {
+        thread_local std::mutex lnav_log_mutex_local;
+        return &lnav_log_mutex_local;
+    }
+
     static auto* retval = new std::mutex();
 
     return retval;
@@ -124,29 +108,239 @@ DUMPER_LIST()
 
     return *retval;
 }
-static std::vector<log_crash_recoverer*> CRASH_LIST;
+
+static std::vector<log_crash_recoverer*>&
+CRASH_LIST()
+{
+    static auto* retval = new std::vector<log_crash_recoverer*>();
+
+    return *retval;
+}
 
 struct thid {
-    static uint32_t COUNTER;
+    // Bumped once by every thread that logs, so it has to be atomic.
+    static std::atomic<uint32_t> COUNTER;
 
-    thid() noexcept : t_id(COUNTER++) {}
+    thid() noexcept : t_id(COUNTER.fetch_add(1, std::memory_order_relaxed)) {}
 
     uint32_t t_id;
 };
 
-uint32_t thid::COUNTER = 0;
+std::atomic<uint32_t> thid::COUNTER{0};
+
+template<size_t SIZE = 256>
+struct fixed_string {
+    using value_type = char;
+
+    bool empty() const { return this->fs_size == 0; }
+
+    size_t size() const { return this->fs_size; }
+
+    const char* data() const { return this->fs_data; }
+
+    void clear() { this->fs_size = 0; }
+
+    void resize(size_t new_size)
+    {
+        if (new_size < SIZE) {
+            this->fs_size = new_size;
+        }
+    }
+
+    void push_back(char c)
+    {
+        if (this->fs_size < SIZE) {
+            this->fs_data[this->fs_size++] = c;
+        }
+    }
+
+    void append(const char* str)
+    {
+        auto in_len = strlen(str);
+        if (this->fs_size + in_len >= SIZE) {
+            in_len = SIZE - this->fs_size - 1;
+        }
+        memcpy(this->fs_data + this->fs_size, str, in_len);
+        this->fs_size += in_len;
+    }
+
+    void append(const std::string& str)
+    {
+        auto in_len = str.size();
+        if (this->fs_size + in_len >= SIZE) {
+            in_len = SIZE - this->fs_size - 1;
+        }
+        memcpy(this->fs_data + this->fs_size, str.data(), in_len);
+        this->fs_size += in_len;
+    }
+
+    fixed_string& operator=(const char* str)
+    {
+        this->clear();
+        this->append(str);
+        return *this;
+    }
+
+    fixed_string& operator=(const std::string& str)
+    {
+        this->clear();
+        this->append(str);
+        return *this;
+    }
+
+    [[nodiscard]] std::string to_string() const
+    {
+        return std::string(this->fs_data, this->fs_size);
+    }
+
+private:
+    char fs_data[SIZE];
+    size_t fs_size{0};
+};
 
 thread_local thid current_thid;
 thread_local std::string thread_log_prefix;
+thread_local fixed_string lnav_opid;
 
+static const char*
+get_pid_str()
+{
+    static char buffer[32];
+
+    if (!buffer[0]) {
+        snprintf(buffer, sizeof(buffer), "%d", getpid());
+    }
+
+    return buffer;
+}
+
+std::string
+lnav_current_opid()
+{
+    return lnav_opid.to_string();
+}
+
+lnav_opid_guard::lnav_opid_guard() : log_opid_size(lnav_opid.size())
+{
+    static const auto* PID_STR = get_pid_str();
+
+    if (lnav_opid.empty()) {
+        lnav_opid = PID_STR;
+    }
+    lnav_opid.append("::");
+}
+
+lnav_opid_guard
+lnav_opid_guard::once(const char* id)
+{
+    auto retval = lnav_opid_guard();
+    lnav_opid.append(id);
+
+    return retval;
+}
+
+lnav_opid_guard
+lnav_opid_guard::internal(lnav_operation& op)
+{
+    auto retval = lnav_opid_guard();
+    lnav_opid.append(op.lo_name);
+    lnav_opid.push_back('-');
+    auto count = op.lo_count.fetch_add(1, std::memory_order_relaxed);
+    fmt::format_to(std::back_inserter(lnav_opid), FMT_STRING("{}"), count);
+
+    return retval;
+}
+
+lnav_opid_guard
+lnav_opid_guard::async(lnav_operation& op)
+{
+    auto orig = lnav_opid.to_string();
+    lnav_opid.clear();
+    auto retval = internal(op);
+    retval.log_orig_opid = std::move(orig);
+    return retval;
+}
+
+lnav_opid_guard
+lnav_opid_guard::resume(const std::string& opid)
+{
+    auto orig = lnav_opid.to_string();
+    auto retval = lnav_opid_guard();
+    retval.log_orig_opid = std::move(orig);
+    lnav_opid = opid;
+    return retval;
+}
+
+lnav_opid_guard
+lnav_opid_guard::unique()
+{
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> dis(0, 15);
+    static std::uniform_int_distribution<> dis2(8, 11);
+
+    std::stringstream ss;
+    ss << std::hex;
+
+    // Generate UUID v4 format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+    for (int i = 0; i < 8; i++) {
+        ss << dis(gen);
+    }
+    ss << "-";
+    for (int i = 0; i < 4; i++) {
+        ss << dis(gen);
+    }
+    ss << "-4";  // UUID version 4
+    for (int i = 0; i < 3; i++) {
+        ss << dis(gen);
+    }
+    ss << "-";
+    ss << dis2(gen);  // Variant bits (8, 9, a, or b)
+    for (int i = 0; i < 3; i++) {
+        ss << dis(gen);
+    }
+    ss << "-";
+    for (int i = 0; i < 12; i++) {
+        ss << dis(gen);
+    }
+
+    auto retval = lnav_opid_guard();
+    lnav_opid.append(ss.str());
+
+    return retval;
+}
+
+lnav_opid_guard::~lnav_opid_guard()
+{
+    if (this->log_guard_helper.gh_enabled) {
+        if (this->log_orig_opid.empty()) {
+            lnav_opid.resize(this->log_opid_size);
+        } else {
+            lnav_opid.clear();
+            lnav_opid.append(this->log_orig_opid);
+        }
+    }
+}
+
+std::string
+lnav_opid_guard::suspend() &&
+{
+    this->log_guard_helper.gh_enabled = false;
+    auto retval = lnav_opid.to_string();
+    lnav_opid.clear();
+    lnav_opid.append(this->log_orig_opid);
+    return retval;
+}
+
+static char log_ring_data[BUFFER_SIZE];
 static struct {
     size_t lr_length;
-    off_t lr_frag_start;
+    off_t lr_frag_start{BUFFER_SIZE};
     off_t lr_frag_end;
-    char lr_data[BUFFER_SIZE];
-} log_ring = {0, BUFFER_SIZE, 0, {}};
+    char* lr_data{log_ring_data};
+} log_ring;
 
-static const char* LEVEL_NAMES[] = {
+static constexpr const char* const LEVEL_NAMES[] = {
     "T",
     "D",
     "I",
@@ -190,7 +384,7 @@ log_argv(int argc, char* argv[])
     const char* log_path = getenv("LNAV_LOG_PATH");
 
     if (log_path != nullptr) {
-        lnav_log_file = make_optional_from_nullable(fopen(log_path, "a"));
+        lnav_log_file = make_optional_from_nullable(fopen(log_path, "ae"));
     }
 
     log_info("argv[%d] =", argc);
@@ -249,6 +443,7 @@ log_host_info()
     }
     log_info("Executable:");
     log_info("  version=%s", VCS_PACKAGE_STRING);
+    log_info("  mtime=%lld", lnav::filesystem::self_mtime());
 
     getrusage(RUSAGE_SELF, &ru);
     log_rusage(lnav_log_level_t::INFO, ru);
@@ -264,13 +459,13 @@ log_rusage_raw(enum lnav_log_level_t level,
     log_msg(level,
             src_file,
             line_number,
-            "  utime=%d.%06d",
+            "  utime=%ld.%06d",
             ru.ru_utime.tv_sec,
             ru.ru_utime.tv_usec);
     log_msg(level,
             src_file,
             line_number,
-            "  stime=%d.%06d",
+            "  stime=%ld.%06d",
             ru.ru_stime.tv_sec,
             ru.ru_stime.tv_usec);
     log_msg(level, src_file, line_number, "  maxrss=%ld", ru.ru_maxrss);
@@ -296,17 +491,32 @@ log_msg(lnav_log_level_t level,
         const char* fmt,
         ...)
 {
+    va_list args;
+
+    va_start(args, fmt);
+    log_msgv(level, src_file, line_number, fmt, args);
+    va_end(args);
+}
+
+void
+log_msgv(lnav_log_level_t level,
+         const char* src_file,
+         int line_number,
+         const char* fmt,
+         va_list args)
+{
     struct timeval curr_time;
     struct tm localtm;
     ssize_t prefix_size;
-    va_list args;
     ssize_t rc;
 
     if (level < lnav_log_level) {
         return;
     }
 
-    std::lock_guard<std::mutex> log_lock(*lnav_log_mutex());
+    gettimeofday(&curr_time, nullptr);
+    localtime_r(&curr_time.tv_sec, &localtm);
+    auto gmtoff = std::abs(localtm.tm_gmtoff) / 60;
 
     {
         // get the base name of the file.  NB: can't use basename() since it
@@ -322,24 +532,31 @@ log_msg(lnav_log_level_t level,
         src_file = last_slash;
     }
 
-    va_start(args, fmt);
-    gettimeofday(&curr_time, nullptr);
-    localtime_r(&curr_time.tv_sec, &localtm);
+    std::lock_guard<std::mutex> log_lock(*lnav_log_mutex());
+
     auto line = log_alloc();
-    prefix_size = snprintf(line,
-                           MAX_LOG_LINE_SIZE,
-                           "%4d-%02d-%02dT%02d:%02d:%02d.%03d %s t%u %s:%d ",
-                           localtm.tm_year + 1900,
-                           localtm.tm_mon + 1,
-                           localtm.tm_mday,
-                           localtm.tm_hour,
-                           localtm.tm_min,
-                           localtm.tm_sec,
-                           (int) (curr_time.tv_usec / 1000),
-                           LEVEL_NAMES[lnav::enums::to_underlying(level)],
-                           current_thid.t_id,
-                           src_file,
-                           line_number);
+    prefix_size = snprintf(
+        line,
+        MAX_LOG_LINE_SIZE,
+        "%4d-%02d-%02dT%02d:%02d:%02d.%06d%c%02d:%02d %s t%u%s%.*s%s %s:%d ",
+        localtm.tm_year + 1900,
+        localtm.tm_mon + 1,
+        localtm.tm_mday,
+        localtm.tm_hour,
+        localtm.tm_min,
+        localtm.tm_sec,
+        (int) curr_time.tv_usec,
+        localtm.tm_gmtoff < 0 ? '-' : '+',
+        (int) gmtoff / 60,
+        (int) gmtoff % 60,
+        LEVEL_NAMES[lnav::enums::to_underlying(level)],
+        current_thid.t_id,
+        lnav_opid.empty() ? "" : " [",
+        (int) lnav_opid.size(),
+        lnav_opid.data(),
+        lnav_opid.empty() ? "" : "]",
+        src_file,
+        line_number);
 #if 0
     if (!thread_log_prefix.empty()) {
         prefix_size += snprintf(
@@ -359,7 +576,6 @@ log_msg(lnav_log_level_t level,
         fwrite(line, 1, prefix_size + rc + 1, file);
         fflush(file);
     };
-    va_end(args);
 }
 
 void
@@ -369,7 +585,7 @@ log_msg_extra(const char* fmt, ...)
     va_list args;
 
     va_start(args, fmt);
-    auto line = log_alloc();
+    auto* line = log_alloc();
     auto rc = vsnprintf(line, MAX_LOG_LINE_SIZE - 1, fmt, args);
     log_ring.lr_length += rc;
     lnav_log_file | [&](auto file) {
@@ -392,11 +608,37 @@ log_msg_extra_complete()
     };
 }
 
+void
+log_backtrace(lnav_log_level_t level)
+{
+#ifdef HAVE_EXECINFO_H
+    void* frames[128];
+
+    const auto frame_count = backtrace(frames, 128);
+    auto* bt = backtrace_symbols(frames, frame_count);
+    for (int lpc = 0; lpc < frame_count; lpc++) {
+        log_msg(level, __FILE__, __LINE__, "%s", bt[lpc]);
+    }
+#endif
+}
+
+void
+log_write_ring_to(int fd)
+{
+    if (log_ring.lr_frag_start < (off_t) BUFFER_SIZE) {
+        (void) write(fd,
+                     &log_ring.lr_data[log_ring.lr_frag_start],
+                     log_ring.lr_frag_end - log_ring.lr_frag_start);
+    }
+    (void) write(fd, log_ring.lr_data, log_ring.lr_length);
+}
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-result"
 static void
 sigabrt(int sig, siginfo_t* info, void* ctx)
 {
+    auto dump_crash = getenv("DUMP_CRASH") != nullptr;
     char crash_path[1024], latest_crash_path[1024];
     int fd;
 #ifdef HAVE_EXECINFO_H
@@ -411,7 +653,23 @@ sigabrt(int sig, siginfo_t* info, void* ctx)
         return;
     }
 
-    log_error("Received signal: %d", sig);
+    log_error("Received signal: %d at %p (code %d)",
+              sig,
+              info == nullptr ? nullptr : info->si_addr,
+              info == nullptr ? 0 : info->si_code);
+#ifdef __APPLE__
+    {
+        // Knowing where the stack sits makes it obvious whether a fault
+        // address is a stack overflow or a wild pointer.
+        const auto* stack_top = pthread_get_stackaddr_np(pthread_self());
+        auto stack_size = pthread_get_stacksize_np(pthread_self());
+
+        log_error("  stack: [%p, %p) size=%zu",
+                  (const char*) stack_top - stack_size,
+                  stack_top,
+                  stack_size);
+    }
+#endif
 
 #ifdef HAVE_EXECINFO_H
     frame_count = backtrace(frames, 128);
@@ -434,12 +692,7 @@ sigabrt(int sig, siginfo_t* info, void* ctx)
              "%s/latest-crash.log",
              lnav_log_crash_dir);
     if ((fd = open(crash_path, O_CREAT | O_TRUNC | O_RDWR, 0600)) != -1) {
-        if (log_ring.lr_frag_start < (off_t) BUFFER_SIZE) {
-            (void) write(fd,
-                         &log_ring.lr_data[log_ring.lr_frag_start],
-                         log_ring.lr_frag_end - log_ring.lr_frag_start);
-        }
-        (void) write(fd, log_ring.lr_data, log_ring.lr_length);
+        log_write_ring_to(fd);
 #ifdef HAVE_EXECINFO_H
         backtrace_symbols_fd(frames, frame_count, fd);
 #endif
@@ -501,7 +754,7 @@ sigabrt(int sig, siginfo_t* info, void* ctx)
                   log_ring.lr_frag_end - log_ring.lr_frag_start);
         }
         write(fd, log_ring.lr_data, log_ring.lr_length);
-        if (getenv("DUMP_CRASH") != nullptr) {
+        if (dump_crash) {
             char buffer[1024];
             int rc;
 
@@ -517,17 +770,39 @@ sigabrt(int sig, siginfo_t* info, void* ctx)
     }
 
     lnav_log_orig_termios | [](auto termios) {
-        for (auto lcr : CRASH_LIST) {
+        for (const auto lcr : CRASH_LIST()) {
             lcr->log_crash_recover();
         }
 
         tcsetattr(STDOUT_FILENO, TCSAFLUSH, termios);
         dup2(STDOUT_FILENO, STDERR_FILENO);
     };
-    fprintf(stderr, CRASH_MSG, crash_path);
+    fmt::print(R"(
+
+{red_start}==== GURU MEDITATION ===={norm}
+
+Unfortunately, lnav has crashed, sorry for the inconvenience.
+
+You can help improve lnav by executing the following command
+to upload the crash logs to https://crash.lnav.org:
+
+  {green_start}${norm} {bold_start}lnav -m crash upload{norm}
+
+Or, you can send the following file to {PACKAGE_BUGREPORT}:
+
+  {crash_path}
+
+{red_start}========================={norm}
+)",
+               fmt::arg("red_start", ANSI_COLOR(1)),
+               fmt::arg("green_start", ANSI_COLOR(2)),
+               fmt::arg("bold_start", ANSI_BOLD_START),
+               fmt::arg("norm", ANSI_NORM),
+               fmt::arg("PACKAGE_BUGREPORT", PACKAGE_BUGREPORT),
+               fmt::arg("crash_path", crash_path));
 
 #ifndef ATTACH_ON_SIGNAL
-    if (isatty(STDIN_FILENO)) {
+    if (!dump_crash && isatty(STDIN_FILENO)) {
         char response;
 
         fprintf(stderr, "\nWould you like to attach a debugger? (y/N) ");
@@ -559,8 +834,7 @@ sigabrt(int sig, siginfo_t* info, void* ctx)
                 default: {
                     int status;
 
-                    while (wait(&status) < 0) {
-                    }
+                    while (wait(&status) < 0) {}
                     break;
                 }
             }
@@ -612,15 +886,32 @@ log_abort()
     _exit(1);
 }
 
-void
-log_pipe_err(int fd)
+log_pipe_err_handle::log_pipe_err_handle(log_pipe_err_handle&& other) noexcept
 {
-    std::thread reader([fd]() {
+    this->h_old_stderr_fd = std::exchange(other.h_old_stderr_fd, -1);
+}
+
+log_pipe_err_handle::~log_pipe_err_handle()
+{
+    if (this->h_old_stderr_fd != -1) {
+        dup2(std::exchange(this->h_old_stderr_fd, -1), STDERR_FILENO);
+    }
+}
+
+log_pipe_err_handle
+log_pipe_err(int readfd, int writefd)
+{
+    fflush(stderr);
+
+    auto retval = log_pipe_err_handle(dup(STDERR_FILENO));
+    dup2(writefd, STDERR_FILENO);
+
+    std::thread reader([readfd]() {
         char buffer[1024];
         bool done = false;
 
         while (!done) {
-            int rc = read(fd, buffer, sizeof(buffer));
+            int rc = read(readfd, buffer, sizeof(buffer));
 
             switch (rc) {
                 case -1:
@@ -637,10 +928,11 @@ log_pipe_err(int fd)
             }
         }
 
-        close(fd);
+        close(readfd);
     });
 
     reader.detach();
+    return retval;
 }
 
 log_state_dumper::log_state_dumper()
@@ -658,14 +950,52 @@ log_state_dumper::~log_state_dumper()
 
 log_crash_recoverer::log_crash_recoverer()
 {
-    CRASH_LIST.push_back(this);
+    CRASH_LIST().push_back(this);
 }
 
 log_crash_recoverer::~log_crash_recoverer()
 {
-    auto iter = std::find(CRASH_LIST.begin(), CRASH_LIST.end(), this);
+    auto iter = std::find(CRASH_LIST().begin(), CRASH_LIST().end(), this);
 
-    if (iter != CRASH_LIST.end()) {
-        CRASH_LIST.erase(iter);
+    if (iter != CRASH_LIST().end()) {
+        CRASH_LIST().erase(iter);
     }
+}
+
+extern "C"
+{
+void
+nclog(ncloglevel_e level, const char* file, int line, const char* fmt, ...)
+{
+    lnav_log_level_t lnav_level = lnav_log_level_t::DEBUG;
+
+    switch (level) {
+        case NCLOGLEVEL_SILENT:
+            return;
+        case NCLOGLEVEL_PANIC:
+        case NCLOGLEVEL_FATAL:
+        case NCLOGLEVEL_ERROR:
+            lnav_level = lnav_log_level_t::ERROR;
+            break;
+        case NCLOGLEVEL_WARNING:
+            lnav_level = lnav_log_level_t::WARNING;
+            break;
+        case NCLOGLEVEL_INFO:
+            lnav_level = lnav_log_level_t::INFO;
+            break;
+        case NCLOGLEVEL_VERBOSE:
+        case NCLOGLEVEL_DEBUG:
+            lnav_level = lnav_log_level_t::DEBUG;
+            break;
+        case NCLOGLEVEL_TRACE:
+            lnav_level = lnav_log_level_t::TRACE;
+            break;
+    }
+
+    va_list args;
+
+    va_start(args, fmt);
+    log_msgv(lnav_level, file, line, fmt, args);
+    va_end(args);
+}
 }

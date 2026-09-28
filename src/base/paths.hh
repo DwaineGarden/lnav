@@ -30,10 +30,9 @@
 #ifndef lnav_paths_hh
 #define lnav_paths_hh
 
-#include "ghc/filesystem.hpp"
+#include <filesystem>
 
-namespace lnav {
-namespace paths {
+namespace lnav::paths {
 
 #ifdef __CYGWIN__
 static const char WINDOWS_FILE_PATH_SEPARATOR = '\\';
@@ -48,11 +47,15 @@ char* windows_to_unix_file_path(char* input);
  * @param  sub The path to the file in the '.lnav' directory.
  * @return     The full path
  */
-ghc::filesystem::path dotlnav();
+std::filesystem::path dotlnav();
 
-ghc::filesystem::path workdir();
+std::filesystem::path workdir();
 
-}  // namespace paths
-}  // namespace lnav
+/**
+ * @return The user's home directory
+ */
+std::filesystem::path userhome();
+
+}  // namespace lnav::paths
 
 #endif

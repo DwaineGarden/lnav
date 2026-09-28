@@ -29,29 +29,58 @@
  * @file time-extension-functions.cc
  */
 
+#include <cmath>
+#include <limits>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
 #include <string.h>
 
+#include "base/attr_line.builder.hh"
 #include "base/date_time_scanner.hh"
 #include "base/humanize.time.hh"
-#include "base/lrucache.hpp"
+#include "base/lnav.tz.hh"
+#include "base/relative_time.hh"
 #include "config.h"
-#include "relative_time.hh"
+#include "ptimec.hh"
 #include "sql_util.hh"
 #include "vtab_module.hh"
 
-static nonstd::optional<text_auto_buffer>
-timeslice(sqlite3_value* time_in, nonstd::optional<const char*> slice_in_opt)
+/**
+ * Scan a timestamp passed to a SQL function.  The arguments are unrelated to
+ * each other, so a locked format that only matches the start of one is not
+ * trusted: the format is rediscovered to find one that matches all of it.
+ */
+static const char*
+scan_sql_timestamp(date_time_scanner& dts,
+                   const char* str,
+                   size_t len,
+                   exttm* tm_out,
+                   timeval& tv_out)
+{
+    const auto* retval
+        = dts.scan_relocking(str, len, nullptr, tm_out, tv_out, false);
+
+    if (retval != nullptr && retval != str + len) {
+        // The unlocked scan still tries the format that matched the start,
+        // so it cannot do worse than that.
+        dts.unlock();
+        retval = dts.scan(str, len, nullptr, tm_out, tv_out, false);
+    }
+
+    return retval;
+}
+
+static std::optional<text_auto_buffer>
+timeslice(sqlite3_value* time_in, std::optional<string_fragment> slice_in_opt)
 {
     thread_local date_time_scanner dts;
     thread_local struct {
         std::string c_slice_str;
         relative_time c_rel_time;
     } cache;
-    const auto slice_in
-        = string_fragment::from_c_str(slice_in_opt.value_or("15m"));
+    const auto slice_in = slice_in_opt.value_or("15m"_frag);
 
     if (slice_in.empty()) {
         throw sqlite_func_error("no time slice value given");
@@ -84,59 +113,79 @@ timeslice(sqlite3_value* time_in, nonstd::optional<const char*> slice_in_opt)
             const char* time_in_str
                 = reinterpret_cast<const char*>(sqlite3_value_text(time_in));
 
-            if (dts.scan(
-                    time_in_str, strlen(time_in_str), nullptr, &tm, tv, false)
+            if (scan_sql_timestamp(
+                    dts, time_in_str, strlen(time_in_str), &tm, tv)
                 == nullptr)
             {
-                dts.unlock();
-                if (dts.scan(time_in_str,
-                             strlen(time_in_str),
-                             nullptr,
-                             &tm,
-                             tv,
-                             false)
-                    == nullptr)
-                {
-                    throw sqlite_func_error("unable to parse time value -- {}",
-                                            time_in_str);
-                }
+                throw sqlite_func_error("unable to parse time value -- {}",
+                                        time_in_str);
             }
             break;
         }
         case SQLITE_INTEGER: {
-            auto msecs
-                = std::chrono::milliseconds(sqlite3_value_int64(time_in));
+            // Round toward negative infinity so the fraction of a time
+            // before the epoch is not negative.
+            auto msecs = sqlite3_value_int64(time_in);
+            auto secs = msecs / 1000;
+            auto rem_msecs = msecs % 1000;
+            if (rem_msecs < 0) {
+                secs -= 1;
+                rem_msecs += 1000;
+            }
 
-            tv.tv_sec = std::chrono::duration_cast<std::chrono::seconds>(msecs)
-                            .count();
-            tm.et_tm = *gmtime(&tv.tv_sec);
-            tm.et_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             msecs % 1000)
-                             .count();
+            tv.tv_sec = secs;
+            if (gmtime_r(&tv.tv_sec, &tm.et_tm) == nullptr) {
+                throw sqlite_func_error("time value is out of range -- {}",
+                                        msecs);
+            }
+            tm.et_nsec = rem_msecs * 1000000;
             break;
         }
         case SQLITE_FLOAT: {
             auto secs = sqlite3_value_double(time_in);
-            double integ;
-            auto fract = modf(secs, &integ);
+            auto integ = std::floor(secs);
 
+            if (!std::isfinite(secs)
+                || integ < (double) std::numeric_limits<time_t>::min()
+                || integ >= (double) std::numeric_limits<time_t>::max())
+            {
+                throw sqlite_func_error("time value is out of range -- {}",
+                                        secs);
+            }
             tv.tv_sec = integ;
-            tm.et_tm = *gmtime(&tv.tv_sec);
-            tm.et_nsec = floor(fract * 1000000000.0);
+            if (gmtime_r(&tv.tv_sec, &tm.et_tm) == nullptr) {
+                throw sqlite_func_error("time value is out of range -- {}",
+                                        secs);
+            }
+            tm.et_nsec = std::floor((secs - integ) * 1000000000.0);
             break;
         }
         case SQLITE_NULL: {
-            return nonstd::nullopt;
+            return std::nullopt;
         }
+    }
+
+    // Times are only converted and formatted for the years 1970 to 9999.
+    auto year = tm.et_tm.tm_year + 1900;
+    if (year < 1970 || year > 9999) {
+        throw sqlite_func_error(
+            "time value is outside of the supported years 1970-9999 -- {}",
+            year);
     }
 
     auto win_start_opt = cache.c_rel_time.window_start(tm);
 
     if (!win_start_opt) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     auto win_start = *win_start_opt;
+    auto win_year = win_start.et_tm.tm_year + 1900;
+    if (win_year < 1970 || win_year > 9999) {
+        throw sqlite_func_error(
+            "time slice starts outside of the supported years 1970-9999");
+    }
+
     auto ts = auto_buffer::alloc(64);
     auto actual_length
         = sql_strftime(ts.in(), ts.size(), win_start.to_timeval());
@@ -145,7 +194,7 @@ timeslice(sqlite3_value* time_in, nonstd::optional<const char*> slice_in_opt)
     return text_auto_buffer{std::move(ts)};
 }
 
-static nonstd::optional<double>
+static std::optional<double>
 sql_timediff(string_fragment time1, string_fragment time2)
 {
     struct timeval tv1, tv2, retval;
@@ -157,7 +206,7 @@ sql_timediff(string_fragment time1, string_fragment time2)
     } else if (!dts1.convert_to_timeval(
                    time1.data(), time1.length(), nullptr, tv1))
     {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     auto parse_res2 = relative_time::from_str(time2);
@@ -166,7 +215,7 @@ sql_timediff(string_fragment time1, string_fragment time2)
     } else if (!dts2.convert_to_timeval(
                    time2.data(), time2.length(), nullptr, tv2))
     {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     timersub(&tv1, &tv2, &retval);
@@ -177,13 +226,90 @@ sql_timediff(string_fragment time1, string_fragment time2)
 static std::string
 sql_humanize_duration(double value)
 {
-    auto secs = std::trunc(value);
-    auto usecs = (value - secs) * 1000000.0;
-    timeval tv;
+    static const auto MAX_SECS
+        = std::chrono::duration<double>(std::chrono::nanoseconds::max())
+              .count();
 
-    tv.tv_sec = secs;
-    tv.tv_usec = usecs;
-    return humanize::time::duration::from_tv(tv).to_string();
+    if (!std::isfinite(value) || std::abs(value) >= MAX_SECS) {
+        throw sqlite_func_error("duration is out of range -- {}", value);
+    }
+
+    return humanize::time::duration::from(std::chrono::duration<double>{value})
+        .with_compact(false)
+        .to_string();
+}
+
+static std::optional<std::string>
+sql_timezone(string_fragment tz_str, string_fragment ts_str)
+{
+    thread_local date_time_scanner dts;
+    struct timeval tv;
+    exttm tm1;
+
+    auto scan_end
+        = scan_sql_timestamp(dts, ts_str.data(), ts_str.length(), &tm1, tv);
+    if (scan_end == nullptr) {
+        auto um = lnav::console::user_message::error(
+            attr_line_t("unrecognized timestamp: ").append(ts_str));
+        throw um;
+    }
+    size_t matched_size = scan_end - ts_str.data();
+    auto ts_remaining = ts_str.substr(matched_size);
+    if (!ts_remaining.empty()) {
+        auto um
+            = lnav::console::user_message::error(
+                  attr_line_t("invalid timestamp: ").append(ts_str))
+                  .with_reason(attr_line_t("the leading part of the timestamp "
+                                           "was matched, however, the trailing "
+                                           "text ")
+                                   .append_quoted(ts_remaining)
+                                   .append(" was not"))
+                  .with_note(attr_line_t("input matched time format ")
+                                 .append_quoted(
+                                     PTIMEC_FORMATS[dts.dts_fmt_lock].pf_fmt))
+                  .with_help("fix the timestamp or remove the trailing text")
+                  .move();
+
+        auto ts_attr = attr_line_t().append(ts_str).move();
+        attr_line_builder alb(ts_attr);
+
+        alb.append("\n").append(matched_size, ' ');
+        {
+            auto attr_guard = alb.with_attr(VC_ROLE.value(role_t::VCR_COMMENT));
+
+            alb.append("^");
+            if (ts_remaining.length() > 1) {
+                if (ts_remaining.length() > 2) {
+                    alb.append(ts_remaining.length() - 2, '-');
+                }
+                alb.append("^");
+            }
+            alb.append(" unrecognized input");
+        }
+        um.with_note(ts_attr);
+        throw um;
+    }
+
+    thread_local std::string last_tz;
+    thread_local const date::time_zone* tz;
+
+    if (tz_str != last_tz) {
+        auto locate_res = lnav::locate_zone(tz_str);
+        if (locate_res.isErr()) {
+            throw locate_res.unwrapErr();
+        }
+        tz = locate_res.unwrap();
+        last_tz = tz_str.to_string();
+    }
+
+    auto stime = std::chrono::time_point_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::from_time_t(tv.tv_sec));
+    stime += std::chrono::microseconds{tv.tv_usec};
+    auto ztime = date::make_zoned(tz, stime);
+
+    auto retval = date::format("%FT%T%z", ztime);
+
+    return retval;
 }
 
 int
@@ -198,8 +324,13 @@ time_extension_functions(struct FuncDef** basic_funcs,
                 "timestamp falls in.  "
                 "If the time falls outside of the slice, NULL is returned.")
                 .sql_function()
-                .with_parameter(
-                    {"time", "The timestamp to get the time slice for."})
+                .with_prql_path({"time", "slice"})
+                .with_parameter({
+                    "time",
+                    "The timestamp to get the time slice for.  A number is "
+                    "taken as time since the epoch: an integer in "
+                    "milliseconds and a real in seconds.",
+                })
                 .with_parameter({"slice", "The size of the time slices"})
                 .with_tags({"datetime"})
                 .with_example({
@@ -224,6 +355,7 @@ time_extension_functions(struct FuncDef** basic_funcs,
                 "timediff",
                 "Compute the difference between two timestamps in seconds")
                 .sql_function()
+                .with_prql_path({"time", "diff"})
                 .with_parameter({"time1", "The first timestamp"})
                 .with_parameter(
                     {"time2", "The timestamp to subtract from the first"})
@@ -245,6 +377,7 @@ time_extension_functions(struct FuncDef** basic_funcs,
                           "Format the given seconds value as an abbreviated "
                           "duration string")
                     .sql_function()
+                    .with_prql_path({"humanize", "duration"})
                     .with_parameter({"secs", "The duration in seconds"})
                     .with_tags({"datetime", "string"})
                     .with_example({
@@ -255,6 +388,19 @@ time_extension_functions(struct FuncDef** basic_funcs,
                         "To format a sub-second value",
                         "SELECT humanize_duration(1.5)",
                     })),
+
+        sqlite_func_adapter<decltype(&sql_timezone), sql_timezone>::builder(
+            help_text("timezone", "Convert a timestamp to the given timezone")
+                .sql_function()
+                .with_prql_path({"time", "to_zone"})
+                .with_parameter({"tz", "The target timezone"})
+                .with_parameter({"ts", "The source timestamp"})
+                .with_tags({"datetime", "string"})
+                .with_example({
+                    "To convert a time to America/Los_Angeles",
+                    "SELECT timezone('America/Los_Angeles', "
+                    "'2022-03-02T10:00')",
+                })),
 
         {nullptr},
     };

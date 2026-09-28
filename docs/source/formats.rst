@@ -1,7 +1,11 @@
 .. _log_formats:
 
+***********
 Log Formats
-===========
+***********
+
+Built-in Formats
+================
 
 Log files loaded into **lnav** are parsed based on formats defined in
 configuration files.  Many
@@ -19,6 +23,20 @@ The following log formats are built into **lnav**:
    :widths: 8 5 20
    :file: format-table.csv
 
+The definitions for these formats can be read in two places:
+
+* On GitHub, in the
+  `src/formats <https://github.com/tstack/lnav/tree/master/src/formats>`_
+  directory of the **lnav** source tree.
+* Locally, in the :file:`~/.lnav/formats/default` directory.  On startup,
+  **lnav** writes a copy of each built-in format to a
+  :file:`<name>.sample` file in that directory, so you can consult the exact
+  definition **lnav** is using as a reference when writing or modifying your
+  own formats.
+
+XSV Formats
+-----------
+
 In addition to the above formats, the following self-describing formats are
 supported:
 
@@ -33,34 +51,108 @@ supported:
   self-describing, so **lnav** will read the header to determine the shape of
   the file.
 
+JSON-lines
+----------
+
+Logs encoded as `JSON-lines <https://jsonlines.org>`_ can be parsed and
+pretty-printed in lnav by creating a log format file.  The format file
+is a bit simpler to create since it doesn't require a regular expression
+to match plain text.  Instead, the format defines the relevant fields
+and provides a :code:`line-format` array that specifies how the fields
+in the JSON object should be displayed.
+
+See the following formats that are built into lnav as examples:
+
+* `cloudflare_log.json <https://github.com/tstack/lnav/blob/master/src/formats/cloudflare_log.json>`_
+* `github_events_log.json <https://github.com/tstack/lnav/blob/master/src/formats/github_events_log.json>`_
+
+.. _tabular_format:
+
+Tabular files
+-------------
+
+Delimited files (CSV, TSV, and similar) can be parsed by declaring
+a format with :code:`"file-type": "tabular"`.  The first row of the
+file must be a header naming each column; the separator is
+auto-detected from the header and is one of comma, tab, semicolon,
+pipe (:code:`|`), or runs of two-or-more spaces.
+
+Each column is mapped to a :code:`value` definition by name.  The
+standard field bindings work the same as for other types of formats.
+A row may use a single :code:`-` or :code:`--` to indicate that
+:code:`opid-field` or :code:`thread-id-field` is absent for that
+row.
+
+logfmt
+------
+
 There is also basic support for the `logfmt <https://brandur.org/logfmt>`_
 convention for formatting log messages.  Files that use this format must
-have the entire line be key/value pairs and the timestamp contained in a
-field named :code:`time` or :code:`ts`.  If the file you're using does not
+have the entire line be key/value pairs.  If the file you're using does not
 quite follow this formatting, but wraps logfmt data with another recognized
 format, you can use the :ref:`logfmt2json` SQL function to convert the data
 into JSON for further analysis.
 
+The following keys are recognized by lnav:
+
+* :code:`timestamp`, :code:`time`, :code:`ts`, :code:`t`: The timestamp for the log message.
+* :code:`level`, :code:`lvl`: The log level.
+* :code:`message`, :code:`msg`: The body of the message.
+
+Any other keys are available in the :code:`fields` column of the
+:code:`logfmt_log` table as a JSON object.
+
+.. _metrics_log:
+
+Metric CSVs
+-----------
+
+Comma-separated files whose first column is a timestamp header
+(:code:`Time`, :code:`Timestamp`, :code:`ts`, or a name starting
+with :code:`date`) are detected as the built-in :code:`metrics_log`
+format.  The detector tries to automatically handle exports
+from tools like Excel, PowerShell, and Grafana.
+
+Each data row is rendered in the LOG view as the timestamp
+followed by a :code:`<column>=<value>` pair for each numeric
+column.  When multiple metric files are loaded and the rows
+share a timestamp, their rows are merged into a single line.
+
+.. note::
+
+   :code:`:filter-in` and :code:`:filter-out` match against the raw
+   CSV bytes, not the rendered :code:`<column>=<value>` text, so a
+   pattern like :code:`:filter-out cpu_pct` will only match the CSV
+   header (which is already hidden from the LOG view) and will not
+   filter data rows.  Patterns that match literal cell values still
+   work — for example, :code:`:filter-out "99.99"` will hide any data
+   row that contains that value.  To project or restrict by column,
+   query the :ref:`all_metrics<table_all_metrics>` SQL table instead.
+
+The :ref:`all_metrics<table_all_metrics>` SQL virtual table
+provides a long-format view over every open metric file, suitable
+for aggregate queries and for feeding :code:`:spectrogram`.
 
 Defining a New Format
----------------------
+=====================
 
 New log formats can be defined by placing JSON configuration files in
 subdirectories of the :file:`/etc/lnav/formats` and :file:`~/.lnav/formats/`
 directories. The directories and files can be named anything you like, but the
-files must have the '.json' suffix.  A sample file containing the builtin
-configuration will be written to this directory when **lnav** starts up.
-You can consult that file when writing your own formats or if you need to
-modify existing ones.  Format directories can also contain '.sql' and '.lnav'
+files must have the '.json' suffix.  Sample files containing the builtin
+configurations are written to the :file:`~/.lnav/formats/default` directory
+when **lnav** starts up (see `Built-in Formats`_).  You can consult those
+files when writing your own formats or if you need to modify existing ones.
+Format directories can also contain '.sql' and '.lnav'
 script files that can be used automate log file analysis.
 
 Creating a Format Using Regex101.com (v0.11.0+)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+-----------------------------------------------
 
 For plain-text log files, the easiest way to create a log format definition is
 to create the regular expression that recognizes log messages using
 https://regex101.com .  Simply copy a log line into the test string input box
-on the site and then start editing the regular expression.  When building the
+on the site and then start editing a PCRE2 regular expression.  When building the
 regular expression, you'll want to use named captures for the structured parts
 of the log message.  Any raw message text should be matched by a captured named
 "body".  Once you have a regex that matches the whole log message, you can use
@@ -70,7 +162,7 @@ string, along with any unit tests, will be added to the "samples" list.  The
 "regex101 import" management command is used to create the skeleton and has
 the following form:
 
-.. prompt:: bash
+.. code-block:: bash
 
    lnav -m regex101 import <regex101-url> <format-name> [<regex-name>]
 
@@ -81,7 +173,7 @@ default to :code:`string`, but you'll want to change them to the appropriate
 type.
 
 Format File Reference
-^^^^^^^^^^^^^^^^^^^^^
+---------------------
 
 An **lnav** format file must contain a single JSON object, preferably with a
 :code:`$schema` property that refers to the
@@ -121,17 +213,53 @@ object with the following fields:
   "lock-on" behavior is needed to avoid the performance hit of having to
   try too many different regexes.
 
+  .. note:: If the format allows for multiline log entries, the regex must 
+     match also only the first line for automatic format detection to work 
+     correctly, i.e. everything after the first line must be optional.
+
   .. note:: Log files that contain JSON messages should not specify this field.
 
   :pattern: The regular expression that should be used to match log messages.
     The `PCRE2 <http://www.pcre.org>`_ library is used by **lnav** to do all
     regular expression matching.
 
-  :module-format: If true, this regex will only be used to parse message
-    bodies for formats that can act as containers, such as syslog.  Default:
-    false.
+:file-type: The shape of the file.  One of:
 
-:json: True if each log line is JSON-encoded.
+  :text: Plain-text log files matched by one or more
+    :code:`regex` patterns.  This is the default.
+  :json: Each line is a JSON object (JSON-lines).  The
+    :code:`value` definitions name the JSON properties to
+    extract and :code:`line-format` controls how messages
+    are rendered.
+  :tabular: A delimited file whose first row is a header
+    naming each column.  See :ref:`tabular_format`.
+
+:json: (Deprecated, use :code:`"file-type": "json"` instead.) True if
+  each log line is JSON-encoded.
+
+:converter: An object that describes how an input file can be detected and
+  then converted to a form that can be interpreted by **lnav**.  For
+  example, a PCAP file is in a binary format that cannot be handled natively
+  by **lnav**.  However, a PCAP file can be converted by :file:`tshark`
+  into JSON-lines that can be handled by **lnav**.  So, this configuration
+  describes how the input file format can be detected and converted.  See
+  `Automatic File Conversion`_ for more information.
+
+  :header: An object that describes how to match the header of the input
+    file.
+
+    :expr: An object that contains SQLite expressions that can be used to
+      check if the input file's header is of this type.  The property
+      name is the name of the expression and the value is the expression.
+      The expression is evaluated with the following variables:
+
+        :\:header: The hex-encoded version of the header content.
+
+        :\:filepath: The path to the input file.
+
+    :size: The minimum size of header that is needed to do the match.
+
+  :command: The command to execute to convert the input file.
 
 :line-format: An array that specifies the text format for JSON-encoded
   log messages.  Log files that are JSON-encoded will have each message
@@ -146,11 +274,15 @@ object with the following fields:
 
       [ { "field": "ts" }, " ", { "field": "msg" } ]
 
+  .. note:: Line-feeds at the end of a value are automatically stripped.
+
   :field: The name or `JSON-Pointer <https://tools.ietf.org/html/rfc6901>`_
     of the message field that should be inserted at this point in the
     message.  The special :code:`__timestamp__` field name can be used to
     insert a human-readable timestamp.  The :code:`__level__` field can be
-    used to insert the level name as defined by lnav.
+    used to insert the level name as defined by lnav.  The
+    :code:`__duration__` field can be used to insert a humanized duration
+    value (e.g. "1m23s") when a duration field is defined for the format.
 
     .. tip::
 
@@ -177,6 +309,9 @@ object with the following fields:
       :truncate: Truncates any text past the maximum width.
       :dot-dot: Cuts out the middle of the text and replaces it with two
         dots (i.e. '..').
+      :last-word: Removes all but the last word in text with dot, dash,
+        forward-slash, or colon separators. For example, "com.example.foo"
+        would be shortened to "foo".
 
     (v0.8.2+)
   :timestamp-format: The timestamp format to use when displaying the time
@@ -185,13 +320,19 @@ object with the following fields:
     in the current log message.  The built-in default is "-".
   :text-transform: Transform the text in the field.  Supported options are:
     none, uppercase, lowercase, capitalize
+  :prefix: Text to prepend to the value.  If the value is empty, this prefix
+    will not be added.
+  :suffix: Text to append to the value.  If the value is empty, this suffix
+    will not be added.
 
 :timestamp-field: The name of the field that contains the log message
-  timestamp.  Defaults to "timestamp".
+  timestamp.
+  Internally, timestamps are stored with microsecond precision.
+  Defaults to "timestamp".
 
 :timestamp-format: An array of timestamp formats using a subset of the
   strftime conversion specification.  The following conversions are
-  supported: %a, %b, %L, %M, %H, %I, %d, %e, %k, %l, %m, %p, %y, %Y, %S, %s,
+  supported: %a, %b, %L, %M, %H, %I, %d, %e, %j, %k, %l, %m, %p, %y, %Y, %S, %s,
   %Z, %z.  In addition, you can also use the following:
 
   :%L: Milliseconds as a decimal number (range 000 to 999).
@@ -200,6 +341,26 @@ object with the following fields:
   :%q: Seconds from the epoch as a hexidecimal number.
   :%i: Milliseconds from the epoch.
   :%6: Microseconds from the epoch.
+  :%9: Nanoseconds from the epoch.
+  :%2: Picoseconds from the epoch.  Precision past nanoseconds is dropped.
+
+  A :code:`%f` right after :code:`%i` or :code:`%6` is read as a fraction
+  of a millisecond or microsecond, so :code:`12345.9` with the format
+  :code:`%i.%f` is 12.3459 seconds.
+
+  The conversions that count from the epoch also work for timestamps that
+  are relative to the start of a run, like in a simulation log.  A time
+  before 1979-07-05 (300,000,000 seconds) is displayed as-is instead of
+  being converted to local time.
+
+  The :code:`-` flag from glibc, for example :code:`%-d`, reads a number
+  without padding.  The :code:`_` flag, for example :code:`%_d`, reads a
+  number that is padded with a space.  These flags can be used with
+  :code:`%d`, :code:`%m`, :code:`%H`, :code:`%I`, :code:`%M`, and :code:`%S`.
+
+:convert-to-local-time: If :code:`true`, timestamps are converted to the
+  local time zone before being displayed.  This is useful for log formats
+  whose timestamps are recorded in UTC.  Defaults to :code:`false`.
 
 :timestamp-divisor: For JSON logs with numeric timestamps, this value is used
   to divide the timestamp by to get the number of seconds and fractional
@@ -215,6 +376,24 @@ object with the following fields:
   :micro: for microseconds
   :nano: for nanoseconds
 
+:timestamp-point-of-reference: (v0.14.0+) Specifies the relationship of the
+  timestamp to the operation that the message refers to.  This is used in
+  conjunction with :code:`duration-field` to determine time spans in the
+  TIMELINE view.  The following values are supported:
+
+  :end: The timestamp indicates when the message was sent/logged.
+    This is the default.
+  :start: The timestamp indicates when the operation started.  The
+    operation's time span will extend from the timestamp to the
+    timestamp plus the duration.
+
+:start-timestamp-field: The name of a field that contains the start time
+  of the operation.  When set, the :code:`timestamp-field` is treated as
+  the end time and the duration is computed as the difference between the
+  two.  The :code:`timestamp-divisor` is applied to both fields.  This is
+  an alternative to using :code:`duration-field` for logs that record
+  separate start and end timestamps.
+
 :ordered-by-time: (v0.8.3+) Indicates that the order of messages in the file
   is time-based.  Files that are not naturally ordered by time will be sorted
   in order to display them in the correct order.  Note that this sorting can
@@ -222,6 +401,32 @@ object with the following fields:
 
 :level-field: The name of the regex capture group that contains the log
   message level.  Defaults to "level".
+
+  The following log level strings are recognized automatically
+  (case-insensitive) and do not require a custom :code:`level` mapping:
+
+  ============  ========================================
+  Level         Recognized strings
+  ============  ========================================
+  trace         ``trace``, ``verbose``
+  debug         ``debug``
+  debug2        ``debug2``
+  debug3        ``debug3``
+  debug4        ``debug4``
+  debug5        ``debug5``
+  info          ``info``, ``system``
+  notice        ``notice``, ``note``, ``log``
+  stats         ``stats``
+  warning       ``warn``, ``warning``, ``deprecation``
+  error         ``err``, ``error``, ``fail``
+  critical      ``critical``, ``severe``, ``alert``
+  fatal         ``fatal``, ``emergency``
+  ============  ========================================
+
+  Single-letter abbreviations are also recognized:
+  **T** (trace), **D**/**V** (debug), **I** (info), **S** (stats),
+  **N** (notice), **W** (warning), **E** (error), **C** (critical),
+  **F** (fatal).
 
 :body-field: The name of the field that contains the main body of the
   message.  Defaults to "body".
@@ -235,17 +440,68 @@ object with the following fields:
   nested in an object and it MUST be included in the "line-format" for the
   'o' hotkeys to work.
 
-:module-field: The name of the field that contains the module identifier
-  that distinguishes messages from one log source from another.  This field
-  should be used if this message format can act as a container for other
-  types of log messages.  For example, an Apache access log can be sent to
-  syslog instead of written to a file.  In this case, **lnav** will parse
-  the syslog message and then separately parse the body of the message to
-  determine the "sub" format.  This module identifier is used to help
-  **lnav** quickly identify the format to use when parsing message bodies.
+  (v0.14.0+) For JSON-lines logs, the opid field can refer to a JSON array
+  or object.  The OPID will be computed by hashing the contents of the
+  array or object and the description will be the container itself.  For
+  example, the :code:`spans` array in a Rust tracing log message.
 
-:hide-extra: A boolean for JSON logs that indicates whether fields not
-  present in the line-format should be displayed on their own lines.
+  To construct an OPID from multiple fields, leave :code:`opid-field` blank
+  and create a single :code:`opid/description` definition with a
+  :code:`format` array.  The content of the format fields will be hashed to
+  create the OPID.  For example, the built-in :code:`access_log` format uses
+  :code:`c_ip` and :code:`cs_user_agent` as the OPID.
+
+:opid: This object contains further options related to OP IDs:
+
+  :source: Specifies the source of the operation ID if :code:`opid-field`
+    is not set. The possible values are:
+
+      :from-description: The description captured from the log message
+        is hashed and used as the operation ID.  This is the default if
+        a description is set.
+      :from-whole-msg: The log message line is hashed and used as the
+        operation ID.  This is the default if no descriptions are
+        given.
+
+  :description: This object contains definitions for how to construct a
+    description of an operation.  Each definition should contain a
+    :code:`format` array with objects that have the following fields:
+
+      :field: The field in the log message to capture as part of the
+        description.
+      :extractor: An optional regular expression used to extract portions
+        of the :code:`field`.
+      :prefix: A prefix to insert before this field in the description.
+      :suffix: A suffix to insert after this field in the description.
+
+:thread-id-field: The name of the field that contains the identifier for a
+  thread.  Thread identifiers are tracked by lnav and can be accessed through
+  the :code:`all_thread_ids` table.
+
+:duration-field: The name of the field that contains the duration of an
+  operation.  If a duration is available, it will be used to calculate
+  time spans in the TIMELINE view.
+
+:duration-divisor: The value to divide a duration by to convert it to
+  seconds.  For example, if the duration field is in milliseconds,
+  the divisor should be 1000.
+
+:src-file-field: (v0.14.0+) The name of the field that contains the source
+  file name where the log statement originated.  This field is accessible
+  in SQL queries as the :code:`log_src_file` column.
+
+:src-line-field: (v0.14.0+) The name of the field that contains the source
+  line number where the log statement originated.  This field is accessible
+  in SQL queries as the :code:`log_src_line` column.
+
+:src-location-field: (v0.14.0+) The name of a field that contains both the
+  source file and line number as a combined value (e.g. :code:`file.c:42`).
+  This is an alternative to using both :code:`src-file-field` and
+  :code:`src-line-field` separately.  The field will be parsed to populate
+  the :code:`log_src_file` and :code:`log_src_line` SQL columns.
+
+:hide-extra: A boolean for JSON logs that, when :code:`true`, hides fields
+  not defined in the :code:`value` object.
 
 :level: A mapping of error levels to regular expressions.  During scanning
   the contents of the capture group specified by *level-field* will be
@@ -272,7 +528,7 @@ object with the following fields:
   regexes.
 
   :kind: The type of data that was captured **string**, **integer**,
-    **float**, **json**, **quoted**.
+    **float**, **json**, **quoted**, **timestamp**.
   :collate: The name of the SQLite collation function for this value.
     The standard SQLite collation functions can be used as well as the
     ones defined by lnav, as described in :ref:`collators`.
@@ -286,6 +542,48 @@ object with the following fields:
     will be added with the key/value pair.  For text logs, this property
     controls whether the value should be displayed by default or replaced
     with an ellipsis.
+  :unit: An object describing the unit of measure for this value.  The unit
+    is used to humanize numeric values in contexts like the spectrogram
+    header and the field overlay (e.g. rendering :code:`1258291` as
+    :code:`1.2 MB`).
+
+    :field: The name of another captured value whose contents give the unit
+      for this one at runtime.
+    :scaling-factor: An object mapping unit strings to scaling factors
+      applied before rendering.  Each key is a unit string; each value is
+      an object with :code:`op` (:code:`identity`, :code:`multiply`, or
+      :code:`divide`) and :code:`value` (a number).
+    :suffix: (v0.14.0+) A display suffix that selects a humanization family
+      for numeric rendering.  :code:`B` (bytes) picks a binary prefix
+      (e.g. :code:`KB`, :code:`MB`).  :code:`s` (seconds) renders sub-second
+      values with SI prefixes (:code:`ms`, :code:`us`, :code:`ns`) and
+      values ≥ 1s with a compact duration breakdown (e.g. :code:`1h22m33s`).
+      Any other suffix gets up-only SI scaling — large values pick a
+      prefix (e.g. :code:`1.2kHz`, :code:`15kqueries`) while values below
+      the base unit are rendered as-is so count-like suffixes don't
+      acquire misleading sub-unit prefixes.
+      Example:
+
+      .. code-block:: json
+
+          "bytes_sent": {
+              "kind": "integer",
+              "unit": { "suffix": "B" }
+          }
+
+    :divisor: (v0.14.0+) A divisor applied to the raw numeric value before
+      humanization to normalize it to the base unit implied by
+      :code:`suffix`.  For example, a field that stores milliseconds should
+      pair :code:`"suffix": "s"` with :code:`"divisor": 1000`; a field in
+      microseconds uses :code:`1000000`.  Example:
+
+      .. code-block:: json
+
+          "response_time_ms": {
+              "kind": "integer",
+              "unit": { "suffix": "s", "divisor": 1000 }
+          }
+
   :rewriter: A command to rewrite this field when pretty-printing log
     messages containing this value.  The command must start with ':', ';',
     or '|' to signify whether it is a regular command, SQL query, or a script
@@ -301,6 +599,54 @@ object with the following fields:
             SELECT message FROM http_status_codes
                 WHERE status = :sc_status) || ') '
 
+  :highlights: (v0.14.0+) This object contains definitions for patterns to
+    be highlighted within this specific field, rather than across the whole
+    log line.  Each entry should have a name and a definition with the
+    following fields:
+
+    :pattern: The regular expression to match within the field value.
+    :base-style: The style to apply to the entire matched text.  This is an
+      object with the following fields:
+
+      :color: The foreground color.  Colors can be specified using hexadecimal
+        notation (e.g. :code:`#aabbcc`) or using a color name.
+      :background-color: The background color.
+      :underline: If true, underline the text.
+      :bold: If true, bold the text.
+      :italic: If true, italicize the text.
+      :strike: If true, strike through the text.
+      :nestable: If true, this highlight can be applied to text contained
+        within another highlight.  Defaults to :code:`true`.
+
+    :captures: This object maps named capture groups in the pattern to
+      individual styles.  Each key should be the name of a capture group
+      and the value is a style object (with the same fields as
+      :code:`base-style`).
+
+    For example, the following highlights Java package names within a
+    :code:`tag` field, with the final component in a different color:
+
+    .. code-block:: json
+
+        "tag": {
+            "kind": "string",
+            "identifier": true,
+            "highlights": {
+                "package": {
+                    "pattern": "(?<pkg>([a-z]+\\\\.){2,})(?<cls>[a-z]+)(?=[ '\\\"])",
+                    "base-style": {
+                        "color": "#97d1F6"
+                    },
+                    "captures": {
+                        "cls": {
+                            "color": "#c0d1F6",
+                            "bold": true
+                        }
+                    }
+                }
+            }
+        }
+
 :tags: This object contains the tags that should automatically be added to
   log messages.
 
@@ -310,6 +656,19 @@ object with the following fields:
   :paths: This array contains objects that define restrictions on the file
     paths that the tags will be applied to.  The objects in this array can
     contain:
+
+    :glob: A glob pattern to check against the log files read by lnav.
+
+:partitions: This object contains a description of partitions that should
+  automatically be created in the log view.
+
+  :pattern: The regular expression evaluated over a line in the log file as
+    it is read in.  If there is a match, the log message the line is a part
+    of will be used as the start of the partition.  The name of the
+    partition will be taken from any captures in the regex.
+  :paths: This array contains objects that define restrictions on the file
+    paths in which partitions will be created.  The objects in this array
+    can contain:
 
     :glob: A glob pattern to check against the log files read by lnav.
 
@@ -340,6 +699,8 @@ object with the following fields:
   :underline: If true, underline the part of the message that matched the
     pattern.
   :blink: If true, blink the part of the message that matched the pattern.
+  :nestable: If true, this highlight can be applied to text contained within
+    another highlight.  Defaults to :code:`true`.
 
 Example format:
 
@@ -374,6 +735,8 @@ Example format:
             ]
         }
     }
+
+.. _patch_format:
 
 Patching an Existing Format
 ---------------------------
@@ -416,78 +779,15 @@ error detection regex to **not** match the :code:`errors=` string.
     }
   }
 
+.. _installing_format_files:
 
-.. _scripts:
-
-Scripts
--------
-
-Format directories may also contain :file:`.sql` and :file:`.lnav` files to help automate
-log file analysis.  The SQL files are executed on startup to create any helper
-tables or views and the '.lnav' script files can be executed using the pipe
-hotkey :kbd:`|`.  For example, **lnav** includes a "partition-by-boot" script that
-partitions the log view based on boot messages from the Linux kernel.  A script
-can have a mix of SQL and **lnav** commands, as well as include other scripts.
-The type of statement to execute is determined by the leading character on a
-line: a semi-colon begins a SQL statement; a colon starts an **lnav** command;
-and a pipe :code:`|` denotes another script to be executed.  Lines beginning with a
-hash are treated as comments.  The following variables are defined in a script:
-
-.. envvar:: #
-
-   The number of arguments passed to the script.
-
-.. envvar:: __all__
-
-   A string containing all the arguments joined by a single space.
-
-.. envvar:: 0
-
-   The path to the script being executed.
-
-.. envvar:: 1-N
-
-   The arguments passed to the script.
-
-Remember that you need to use the :ref:`:eval<eval>` command when referencing
-variables in most **lnav** commands.  Scripts can provide help text to be
-displayed during interactive usage by adding the following tags in a comment
-header:
-
-  :@synopsis: The synopsis should contain the name of the script and any
-    parameters to be passed.  For example::
-
-    # @synopsis: hello-world <name1> [<name2> ... <nameN>]
-
-  :@description: A one-line description of what the script does.  For example::
-
-    # @description: Say hello to the given names.
-
-
-
-.. tip::
-
-   The :ref:`:eval<eval>` command can be used to do variable substitution for
-   commands that do not natively support it.  For example, to substitute the
-   variable, :code:`pattern`, in a :ref:`:filter-out<filter_out>` command:
-
-   .. code-block:: lnav
-
-      :eval :filter-out ${pattern}
-
-VSCode Extension
-^^^^^^^^^^^^^^^^
-
-The `lnav VSCode Extension <https://marketplace.visualstudio.com/items?itemName=lnav.lnav>`_
-can be installed to add syntax highlighting to lnav scripts.
-
-Installing Formats
-------------------
+Installing Format Files
+-----------------------
 
 File formats are loaded from subdirectories in :file:`/etc/lnav/formats` and
 :file:`~/.lnav/formats/`.  You can manually create these subdirectories and
-copy the format files into there.  Or, you can pass the '-i' option to **lnav**
-to automatically install formats from the command-line.  For example:
+copy the format files into there.  Or, you can pass the :option:`-i` option to
+**lnav** to automatically install formats from the command-line.  For example:
 
 .. code-block:: bash
 
@@ -497,12 +797,17 @@ to automatically install formats from the command-line.  For example:
 Format files installed using this method will be placed in the :file:`installed`
 subdirectory and named based on the first format name found in the file.
 
+The :option:`-i` option can also be used to install :file:`.sql` and
+:file:`.lnav` script files.  The SQL files are executed on startup to
+create any helper tables or views and the '.lnav' script files can be executed
+using the pipe hotkey :kbd:`|`.
+
 You can also install formats from git repositories by passing the repository's
 clone URL.  A standard set of repositories is maintained at
 (https://github.com/tstack/lnav-config) and can be installed by passing 'extra'
 on the command line, like so:
 
-.. prompt:: bash
+.. code-block:: bash
 
     lnav -i extra
 
@@ -527,7 +832,7 @@ Executing the format file should then install it automatically:
 .. _format_order:
 
 Format Order When Scanning a File
----------------------------------
+=================================
 
 When **lnav** loads a file, it tries each log format against the first 15,000
 lines [#]_ of the file trying to find a match.  When a match is found, that log
@@ -542,9 +847,44 @@ will match its own samples and those in the more specific format.  You can
 see the order of the format by enabling debugging and checking the **lnav**
 log file for the "Format order" message:
 
-.. prompt:: bash
+.. code-block:: bash
 
     lnav -d /tmp/lnav.log
 
+For JSON-lines log files, the log message must have the timestamp property
+specified in the format in order to match.  If multiple formats match a
+message, the format that has the most matching :code:`line-format` elements
+will win (referred to as "quality").  In the case of a tie, the format with
+the least number of required :code:`line-format` elements missing ("strikes")
+wins.
+
 .. [#] The maximum number of lines to check can be configured.  See the
        :ref:`tuning` section for more details.
+
+Automatic File Conversion
+=========================
+
+File formats that are not naturally understood by **lnav** can be
+automatically detected and converted to a usable form using the
+:code:`converter` property.  For example, PCAP files can be
+detected and converted to a JSON-lines form using :code:`tshark`.
+The conversion process works as follows:
+
+#. The first 1024 bytes of the file are read, if available.
+#. This header is converted into a hex string.
+#. For each log format that has defined a :code:`converter`,
+   every "header expression" is evaluated to see if there is a
+   match.  The header expressions are SQLite expressions where
+   the following variables are defined:
+
+   :\:header: A string containing the header as a hex string.
+
+   :\:filepath: The path to the file.
+
+#. If a match is found, the converter script defined in the
+   log format will be invoked and passed the format name and
+   path to the file as arguments.  The script should write
+   the converted form of the input file on its standard output.
+   Any errors should be written to the standard error.
+#. The log format will be associated with the original file will
+   be used to interpret the converted file.

@@ -30,8 +30,12 @@
 #include "config.h"
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "base/ansi_scrubber.hh"
+#include "data_parser.hh"
+#include "data_scanner.hh"
 #include "doctest/doctest.h"
 #include "document.sections.hh"
+#include "pretty_printer.hh"
 
 TEST_CASE("lnav::document::sections::basics")
 {
@@ -66,7 +70,7 @@ TEST_CASE("lnav::document::sections::basics")
 }
 )";
 
-    auto meta = lnav::document::discover_structure(INPUT, line_range{0, -1});
+    auto meta = lnav::document::discover(INPUT).perform();
 
     meta.m_sections_tree.visit_all([](const auto& intv) {
         auto ser = intv.value.match(
@@ -88,7 +92,7 @@ TEST_CASE("lnav::document::sections::empty")
     attr_line_t INPUT
         = R"(SOCKET 1 (10) creating new listening socket on port -1)";
 
-    auto meta = lnav::document::discover_structure(INPUT, line_range{0, -1});
+    auto meta = lnav::document::discover(INPUT).perform();
 
     meta.m_sections_tree.visit_all([](const auto& intv) {
         auto ser = intv.value.match(
@@ -123,7 +127,9 @@ DESCRIPTION
 
 )";
 
-    auto meta = lnav::document::discover_structure(INPUT, line_range{0, -1});
+    auto meta = lnav::document::discover(INPUT)
+                    .with_text_format(text_format_t::TF_MAN)
+                    .perform();
 
     CHECK(meta.m_sections_root->hn_named_children.size() == 3);
     meta.m_sections_tree.visit_all([](const auto& intv) {
@@ -141,18 +147,41 @@ DESCRIPTION
         });
 }
 
-TEST_CASE("lnav::document::sections::sql")
+TEST_CASE("lnav::document::sections::doc for diff")
 {
-    attr_line_t INPUT
-        = R"(2022-06-03T22:05:58.186Z verbose -[35642] [Originator@6876 sub=Default] [VdbStatement]Executing SQL:
--->       INSERT INTO PM_CLUSTER_DRAFT_VALIDATION_STATE
--->         (draft_id, errors, hosts) VALUES (?::integer, ?::jsonb, ARRAY[]::text[])
--->         ON CONFLICT (draft_id) DO UPDATE
--->           SET errors = EXCLUDED.errors, hosts = EXCLUDED.hosts
--->
+    attr_line_t INPUT = R"(
+[sql] add json_group_object aggregate function
+
+diff --git a/NEWS b/NEWS
+index d239d2f..7a06070 100644
+--- a/NEWS
++++ b/NEWS
+@@ -4,6 +4,8 @@ lnav v0.8.1:
+      * Log formats can now create SQL views and execute other statements
+        by adding '.sql' files to their format directories.  The SQL scripts
+        will be executed on startup.
++     * Added a 'json_group_object' aggregate SQL function that collects values
++       from a GROUP BY query into an JSON object.
+
+      Interface Changes:
+      * The 'o/O' hotkeys have been reassigned to navigate through log
+diff --git a/configure.ac b/configure.ac
+index 718a2d4..10f5580 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -39,8 +39,8 @@ AC_PROG_CXX
+
+ CPPFLAGS="$CPPFLAGS -D_ISOC99_SOURCE -D__STDC_LIMIT_MACROS"
+
+-# CFLAGS=`echo $CFLAGS | sed 's/-O2//g'`
+-# CXXFLAGS=`echo $CXXFLAGS | sed 's/-O2//g'`
++CFLAGS=`echo $CFLAGS | sed 's/-O2//g'`
++CXXFLAGS=`echo $CXXFLAGS | sed 's/-O2//g'`
+
+ AC_ARG_VAR(SFTP_TEST_URL)
 )";
 
-    auto meta = lnav::document::discover_structure(INPUT, line_range{0, -1});
+    auto meta = lnav::document::discover(INPUT).perform();
 
     meta.m_sections_tree.visit_all([](const auto& intv) {
         auto ser = intv.value.match(
@@ -167,4 +196,144 @@ TEST_CASE("lnav::document::sections::sql")
                 printf("  child: %p %s\n", pair.second, pair.first.c_str());
             }
         });
+
+    CHECK(meta.m_sections_root->hn_named_children.size() == 2);
+}
+
+TEST_CASE("lnav::document::sections::doc for SQL")
+{
+    attr_line_t INPUT = R"(
+CREATE TABLE IF NOT EXISTS http_status_codes
+(
+    status  INTEGER PRIMARY KEY,
+    message TEXT,
+
+    FOREIGN KEY (status) REFERENCES access_log (sc_status)
+);
+
+CREATE TABLE lnav_example_log
+(
+    log_line        INTEGER PRIMARY KEY,
+    log_part        TEXT COLLATE naturalnocase,
+    log_time        DATETIME,
+    log_actual_time DATETIME hidden,
+    log_idle_msecs  int,
+    log_level       TEXT collate loglevel,
+    log_mark        boolean,
+    log_comment     TEXT,
+    log_tags        TEXT,
+    log_filters     TEXT,
+
+    ex_procname     TEXT collate 'BINARY',
+    ex_duration     INTEGER,
+
+    log_time_msecs  int hidden,
+    log_path        TEXT hidden collate naturalnocase,
+    log_text        TEXT hidden,
+    log_body        TEXT hidden
+);
+)";
+
+    auto meta = lnav::document::discover(INPUT).perform();
+
+    for (const auto& sa : INPUT.al_attrs) {
+        printf("attr %d:%d %s\n",
+               sa.sa_range.lr_start,
+               sa.sa_range.lr_end,
+               sa.sa_type->sat_name);
+    }
+    meta.m_sections_tree.visit_all([](const auto& intv) {
+        auto ser = intv.value.match(
+            [](const std::string& name) { return name; },
+            [](const size_t index) { return fmt::format("{}", index); });
+        printf("interval %d:%d %s\n", intv.start, intv.stop, ser.c_str());
+    });
+    lnav::document::hier_node::depth_first(
+        meta.m_sections_root.get(), [](const auto* node) {
+            printf("node %p %d\n", node, node->hn_start);
+            for (const auto& pair : node->hn_named_children) {
+                printf("  child: %p %s\n", pair.second, pair.first.c_str());
+            }
+        });
+
+    CHECK(meta.m_sections_root->hn_named_children.size() == 2);
+}
+
+TEST_CASE("lnav::document::sections::sql")
+{
+    attr_line_t INPUT
+        = R"(2022-06-03T22:05:58.186Z verbose -[35642] [Originator@6876 sub=Default] [VdbStatement]Executing SQL:
+-->       INSERT INTO PM_CLUSTER_DRAFT_VALIDATION_STATE
+-->         (draft_id, errors, hosts) VALUES (?::integer, ?::jsonb, ARRAY[]::text[])
+-->         ON CONFLICT (draft_id) DO UPDATE
+-->           SET errors = EXCLUDED.errors, hosts = EXCLUDED.hosts
+-->
+)";
+
+    auto meta = lnav::document::discover(INPUT).perform();
+
+    meta.m_sections_tree.visit_all([](const auto& intv) {
+        auto ser = intv.value.match(
+            [](const std::string& name) { return name; },
+            [](const size_t index) { return fmt::format("{}", index); });
+        printf("interval %d:%d %s\n", intv.start, intv.stop, ser.c_str());
+    });
+    lnav::document::hier_node::depth_first(
+        meta.m_sections_root.get(), [](const auto* node) {
+            printf("node %p %d\n", node, node->hn_start);
+            for (const auto& pair : node->hn_named_children) {
+                printf("  child: %p %s\n", pair.second, pair.first.c_str());
+            }
+        });
+}
+
+TEST_CASE("lnav::document::sections::afl1")
+{
+    attr_line_t INPUT = "{(</:>(\n---\x00\n+++\x00\n(";
+
+    auto meta = lnav::document::discover(INPUT).perform();
+
+    CHECK(meta.m_sections_root->hn_children.empty());
+}
+
+TEST_CASE("lnav::document::sections::afl2")
+{
+    attr_line_t INPUT = "{(</:>(\n---\x000\n+++\x000\n0";
+
+    auto meta = lnav::document::discover(INPUT).perform();
+
+    CHECK(meta.m_sections_root->hn_children.empty());
+}
+
+TEST_CASE("lnav::document::sections::afl3")
+{
+    attr_line_t INPUT = "0\x5b\n\n\x1b[70O[";
+
+    scrub_ansi_string(INPUT.al_string, &INPUT.al_attrs);
+
+    data_scanner ds(INPUT.al_string);
+    pretty_printer pp(&ds, INPUT.al_attrs);
+    attr_line_t pretty_al;
+
+    pp.append_to(pretty_al);
+    for (const auto& sa : pretty_al.al_attrs) {
+        require(sa.sa_range.lr_end == -1
+                || sa.sa_range.lr_start <= sa.sa_range.lr_end);
+    }
+}
+
+TEST_CASE("lnav::document::sections::afl4")
+{
+    attr_line_t INPUT = "\t\t0000\t\t0000\x1b[67;0O0";
+
+    scrub_ansi_string(INPUT.al_string, &INPUT.al_attrs);
+
+    data_scanner ds(INPUT.al_string);
+    pretty_printer pp(&ds, INPUT.al_attrs);
+    attr_line_t pretty_al;
+
+    pp.append_to(pretty_al);
+    for (const auto& sa : pretty_al.al_attrs) {
+        CHECK(sa.sa_range.lr_start <= sa.sa_range.lr_end);
+    }
 }

@@ -29,26 +29,37 @@
  * @file file_collection.cc
  */
 
+#include <map>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 
 #include "file_collection.hh"
 
 #include <glob.h>
 
+#include "base/fs_util.hh"
 #include "base/humanize.network.hh"
 #include "base/isc.hh"
 #include "base/itertools.hh"
 #include "base/opt_util.hh"
 #include "base/string_util.hh"
 #include "config.h"
-#include "lnav_util.hh"
+#include "file_converter_manager.hh"
 #include "logfile.hh"
-#include "pcap_manager.hh"
 #include "service_tags.hh"
 #include "tailer/tailer.looper.hh"
 
 static std::mutex REALPATH_CACHE_MUTEX;
 static std::unordered_map<std::string, std::string> REALPATH_CACHE;
+
+void
+child_poller::send_sigint()
+{
+    if (this->cp_child) {
+        kill(this->cp_child->in(), SIGINT);
+    }
+}
 
 child_poll_result_t
 child_poller::poll(file_collection& fc)
@@ -58,7 +69,7 @@ child_poller::poll(file_collection& fc)
     }
 
     auto poll_res = std::move(this->cp_child.value()).poll();
-    this->cp_child = nonstd::nullopt;
+    this->cp_child = std::nullopt;
     return poll_res.match(
         [this](auto_pid<process_state::running>& alive) {
             this->cp_child = std::move(alive);
@@ -68,8 +79,45 @@ child_poller::poll(file_collection& fc)
             require(this->cp_finalizer);
 
             this->cp_finalizer(fc, finished);
+            this->cp_exit_status = finished.exit_status();
             return child_poll_result_t::FINISHED;
         });
+}
+
+file_collection::limits_t::limits_t()
+{
+    static constexpr rlim_t RESERVED_FDS = 32;
+    static constexpr rlim_t HIGH_FD = 24;
+
+    struct rlimit rl;
+
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        this->l_fds = rl.rlim_cur;
+    } else {
+        log_error("getrlimit() failed -- %s", strerror(errno));
+
+        this->l_fds = 8192;
+    }
+
+    if (this->l_fds < RESERVED_FDS) {
+        this->l_high_fd = this->l_fds;
+        this->l_open_files = this->l_fds;
+    } else {
+        this->l_high_fd = this->l_fds - HIGH_FD;
+        this->l_open_files = this->l_fds - RESERVED_FDS;
+    }
+
+    log_info("fd limit: %zu; open file limit: %zu",
+             (size_t) this->l_fds,
+             (size_t) this->l_open_files);
+}
+
+const file_collection::limits_t&
+file_collection::get_limits()
+{
+    static const limits_t INSTANCE;
+
+    return INSTANCE;
 }
 
 void
@@ -94,7 +142,8 @@ file_collection::close_files(const std::vector<std::shared_ptr<logfile>>& files)
         } else {
             this->fc_file_names.erase(lf->get_filename());
         }
-        auto file_iter = find(this->fc_files.begin(), this->fc_files.end(), lf);
+        auto file_iter
+            = std::find(this->fc_files.begin(), this->fc_files.end(), lf);
         if (file_iter != this->fc_files.end()) {
             this->fc_files.erase(file_iter);
         }
@@ -116,27 +165,32 @@ file_collection::regenerate_unique_file_names()
     upg.generate();
 
     this->fc_largest_path_length = 0;
-    for (const auto& pair : this->fc_name_to_errors) {
-        auto path = ghc::filesystem::path(pair.first).filename().string();
+    {
+        safe::ReadAccess<safe_name_to_stubs> errs(*this->fc_name_to_stubs);
 
-        if (path.length() > this->fc_largest_path_length) {
-            this->fc_largest_path_length = path.length();
+        for (const auto& pair : *errs) {
+            auto path = std::filesystem::path(pair.first).filename().string();
+
+            if (path.length() > this->fc_largest_path_length) {
+                this->fc_largest_path_length = path.length();
+            }
         }
     }
     for (const auto& lf : this->fc_files) {
         const auto& path = lf->get_unique_path();
 
-        if (path.length() > this->fc_largest_path_length) {
-            this->fc_largest_path_length = path.length();
+        if (path.native().length() > this->fc_largest_path_length) {
+            this->fc_largest_path_length = path.native().length();
         }
     }
     for (const auto& pair : this->fc_other_files) {
         switch (pair.second.ofd_format) {
             case file_format_t::UNKNOWN:
+            case file_format_t::UNSUPPORTED:
             case file_format_t::ARCHIVE:
-            case file_format_t::PCAP:
+            case file_format_t::MULTIPLEXED:
             case file_format_t::SQLITE_DB: {
-                auto bn = ghc::filesystem::path(pair.first).filename().string();
+                auto bn = std::filesystem::path(pair.first).filename().string();
                 if (bn.length() > this->fc_largest_path_length) {
                     this->fc_largest_path_length = bn.length();
                 }
@@ -155,19 +209,61 @@ file_collection::regenerate_unique_file_names()
 void
 file_collection::merge(file_collection& other)
 {
+    // A read lock is taken on the other collection's stubs below, followed by
+    // a write lock on this one's, so the two must not share a map.
+    require(this->fc_name_to_stubs != other.fc_name_to_stubs);
+
+    bool do_regen = !other.fc_files.empty() || !other.fc_other_files.empty()
+        || !other.fc_name_to_stubs->readAccess()->empty();
+
     this->fc_recursive = this->fc_recursive || other.fc_recursive;
     this->fc_rotated = this->fc_rotated || other.fc_rotated;
+    if (other.fc_files_high_mark) {
+        if (this->fc_files_high_mark) {
+            this->fc_files_high_mark
+                = std::min(this->fc_files_high_mark.value(),
+                           other.fc_files_high_mark.value());
+        } else {
+            this->fc_files_high_mark = other.fc_files_high_mark;
+        }
+    }
 
     this->fc_synced_files.insert(other.fc_synced_files.begin(),
                                  other.fc_synced_files.end());
-    this->fc_name_to_errors.insert(other.fc_name_to_errors.begin(),
-                                   other.fc_name_to_errors.end());
-    this->fc_file_names.insert(
-        std::make_move_iterator(other.fc_file_names.begin()),
-        std::make_move_iterator(other.fc_file_names.end()));
+    std::map<std::string, file_stub_info> new_stubs;
+    {
+        safe::ReadAccess<safe_name_to_stubs> errs(*other.fc_name_to_stubs);
+
+        new_stubs.insert(errs->cbegin(), errs->cend());
+    }
+    if (!new_stubs.empty()) {
+        safe::WriteAccess<safe_name_to_stubs> errs(*this->fc_name_to_stubs);
+
+        errs->insert(new_stubs.begin(), new_stubs.end());
+        this->fc_files_generation += 1;
+    }
+    if (!other.fc_file_names.empty()) {
+        this->fc_files_generation += 1;
+    }
+    if (this->fc_file_names.empty()) {
+        this->fc_file_names = other.fc_file_names;
+    } else {
+        for (const auto& fn_pair : other.fc_file_names) {
+            this->fc_file_names[fn_pair.first] = fn_pair.second;
+        }
+    }
     if (!other.fc_files.empty()) {
+        auto errs = this->fc_name_to_stubs->writeAccess();
+
         for (const auto& lf : other.fc_files) {
-            this->fc_name_to_errors.erase(lf->get_filename());
+            // The stub could have been recorded by the scan, under the path
+            // that was scanned, or by something working with the name the
+            // file is displayed under, like the tailer.
+            errs->erase(lf->get_stub_key());
+            errs->erase(lf->get_filename_as_string());
+            if (auto actual_path_opt = lf->get_actual_path()) {
+                errs->erase(actual_path_opt.value().string());
+            }
         }
         this->fc_files.insert(
             this->fc_files.end(), other.fc_files.begin(), other.fc_files.end());
@@ -187,13 +283,21 @@ file_collection::merge(file_collection& other)
             std::make_move_iterator(other.fc_child_pollers.end()));
         other.fc_child_pollers.clear();
     }
+
+    if (do_regen) {
+        this->regenerate_unique_file_names();
+    }
 }
 
 /**
  * Functor used to compare files based on their device and inode number.
  */
 struct same_file {
-    explicit same_file(const struct stat& stat) : sf_stat(stat){};
+    explicit same_file(const std::filesystem::path& filename,
+                       const struct stat& stat)
+        : sf_filename(filename), sf_stat(stat)
+    {
+    }
 
     /**
      * Compare the given log file against the 'stat' given in the constructor.
@@ -203,10 +307,30 @@ struct same_file {
      */
     bool operator()(const std::shared_ptr<logfile>& lf) const
     {
-        return !lf->is_closed() && this->sf_stat.st_dev == lf->get_stat().st_dev
+        if (lf->is_closed()) {
+            return false;
+        }
+
+        if (lf->get_actual_path()
+            && lf->get_actual_path().value() == this->sf_filename)
+        {
+            return true;
+        }
+
+        const auto& lf_loo = lf->get_open_options();
+
+        if (lf_loo.loo_temp_dev != 0
+            && this->sf_stat.st_dev == lf_loo.loo_temp_dev
+            && this->sf_stat.st_ino == lf_loo.loo_temp_ino)
+        {
+            return true;
+        }
+
+        return this->sf_stat.st_dev == lf->get_stat().st_dev
             && this->sf_stat.st_ino == lf->get_stat().st_ino;
     }
 
+    const std::filesystem::path& sf_filename;
     const struct stat& sf_stat;
 };
 
@@ -219,33 +343,28 @@ struct same_file {
  * @param fd       An already-opened descriptor for 'filename'.
  * @param required Specifies whether or not the file must exist and be valid.
  */
-std::future<file_collection>
-file_collection::watch_logfile(const std::string& filename,
-                               logfile_open_options& loo,
-                               bool required)
+std::optional<std::future<file_collection>>
+file_collection::watch_logfile(
+    lnav::futures::future_queue<file_collection>& fq,
+    const std::string& user_req,
+    const std::string& filename,
+    logfile_open_options& loo,
+    bool required)
 {
-    file_collection retval;
+    static auto op = lnav_operation{__FUNCTION__};
+
     struct stat st;
     int rc;
-
-    if (this->fc_closed_files.count(filename)) {
-        return lnav::futures::make_ready_future(std::move(retval));
+    auto op_guard = lnav_opid_guard::internal(op);
+    auto filename_key = loo.loo_filename.empty() ? filename : loo.loo_filename;
+    if (this->fc_closed_files.count(filename)
+        || this->fc_closed_files.count(filename_key))
+    {
+        log_trace("%s: file is closed, ignore", filename.c_str());
+        return std::nullopt;
     }
 
-    if (loo.loo_fd != -1) {
-        rc = fstat(loo.loo_fd, &st);
-        if (rc == 0) {
-            loo.with_stat_for_temp(st);
-        }
-    } else if (loo.loo_temp_file) {
-        memset(&st, 0, sizeof(st));
-        st.st_dev = loo.loo_temp_dev;
-        st.st_ino = loo.loo_temp_ino;
-        st.st_mode = S_IFREG;
-        rc = 0;
-    } else {
-        rc = stat(filename.c_str(), &st);
-    }
+    rc = stat(filename.c_str(), &st);
 
     if (rc == 0) {
         if (S_ISDIR(st.st_mode) && this->fc_recursive) {
@@ -253,138 +372,193 @@ file_collection::watch_logfile(const std::string& filename,
 
             if (this->fc_file_names.find(wilddir) == this->fc_file_names.end())
             {
-                retval.fc_file_names.emplace(wilddir, logfile_open_options());
+                file_collection retval;
+
+                retval.fc_file_names.insert2(
+                    wilddir,
+                    logfile_open_options()
+                        .with_non_utf_visibility(false)
+                        .with_visible_size_limit(256 * 1024)
+                        .with_time_range(loo.loo_time_range));
+                return lnav::futures::make_ready_future(std::move(retval));
             }
-            return lnav::futures::make_ready_future(std::move(retval));
+            return std::nullopt;
         }
         if (!S_ISREG(st.st_mode)) {
             if (required) {
                 rc = -1;
                 errno = EINVAL;
             } else {
-                return lnav::futures::make_ready_future(std::move(retval));
+                return std::nullopt;
             }
         }
-        auto err_iter = this->fc_name_to_errors.find(filename);
-        if (err_iter != this->fc_name_to_errors.end()) {
-            if (err_iter->second.fei_mtime != st.st_mtime) {
-                this->fc_name_to_errors.erase(err_iter);
+        {
+            safe::WriteAccess<safe_name_to_stubs> errs(*this->fc_name_to_stubs);
+
+            // The stub could have been recorded under the path being scanned
+            // or under the name the user asked for, which is the glob pattern
+            // when the file was turned up by an expansion.
+            for (const auto& key : {std::cref(filename),
+                                    std::cref(user_req),
+                                    std::cref(filename_key)})
+            {
+                auto err_iter = errs->find(key.get());
+                if (err_iter != errs->end()
+                    && is_stub_stale(err_iter->second, st))
+                {
+                    log_debug("clearing error info for file: %s",
+                              key.get().c_str());
+                    errs->erase(err_iter);
+                }
             }
         }
     }
     if (rc == -1) {
         if (required) {
-            retval.fc_name_to_errors.emplace(filename,
-                                             file_error_info{
-                                                 time(nullptr),
-                                                 std::string(strerror(errno)),
-                                             });
+            auto ec = lnav::from_errno();
+            log_error("failed to open required file: %s -- %s",
+                      filename.c_str(),
+                      ec.message().c_str());
+            file_collection retval;
+            auto um = lnav::console::user_message::error(
+                          attr_line_t("failed to open required file ")
+                              .append_quoted(lnav::roles::file(filename)))
+                          .with_reason(ec.message());
+            retval.fc_name_to_stubs->writeAccess()->emplace(filename,
+                                                            file_stub_info{
+                                                                filename,
+                                                                std::nullopt,
+                                                                std::nullopt,
+                                                                um.move(),
+                                                            });
+            return lnav::futures::make_ready_future(std::move(retval));
         }
-        return lnav::futures::make_ready_future(std::move(retval));
+        return std::nullopt;
     }
 
     if (this->fc_new_stats | lnav::itertools::find_if([&st](const auto& elem) {
             return st.st_ino == elem.st_ino && st.st_dev == elem.st_dev;
         }))
     {
+        log_trace("same stat: %s", filename.c_str());
         // this file is probably a link that we have already scanned in this
         // pass.
-        return lnav::futures::make_ready_future(std::move(retval));
+        return std::nullopt;
     }
 
     this->fc_new_stats.emplace_back(st);
 
-    auto file_iter = std::find_if(
-        this->fc_files.begin(), this->fc_files.end(), same_file(st));
+    const auto fn_path = std::filesystem::path(filename);
+    const auto file_iter = std::find_if(
+        this->fc_files.begin(), this->fc_files.end(), same_file(fn_path, st));
 
     if (file_iter == this->fc_files.end()) {
         if (this->fc_other_files.find(filename) != this->fc_other_files.end()) {
-            return lnav::futures::make_ready_future(std::move(retval));
+            return std::nullopt;
+        }
+
+        if (this->fc_files_high_mark
+            && this->fc_files.size() >= this->fc_files_high_mark.value())
+        {
+            log_trace("too many open files, cannot open %s", filename.c_str());
+            return std::nullopt;
         }
 
         require(this->fc_progress.get() != nullptr);
 
+        auto curr_opid = lnav_current_opid();
+
         auto func = [filename,
                      st,
-                     loo2 = std::move(loo),
+                     loo,
+                     curr_opid,
                      prog = this->fc_progress,
-                     errs = this->fc_name_to_errors]() mutable {
+                     errs = this->fc_name_to_stubs]() mutable {
+            static auto inner_op = lnav_operation{"watch_new_file"};
+
             file_collection retval;
 
-            if (errs.find(filename) != errs.end()) {
-                // The file is broken, no reason to try and reopen
-                return retval;
+            {
+                safe::ReadAccess<safe_name_to_stubs> errs_inner(*errs);
+
+                if (errs_inner->find(filename) != errs_inner->end()) {
+                    // The file is broken, no reason to try and reopen
+                    return retval;
+                }
             }
 
-            auto ff = loo2.loo_temp_file ? file_format_t::UNKNOWN
-                                         : detect_file_format(filename);
+            auto outer_op = lnav_opid_guard::resume(curr_opid);
 
-            loo2.loo_file_format = ff;
-            switch (ff) {
+            auto op_guard = lnav_opid_guard::internal(inner_op);
+
+            log_debug("watching new file: %s", filename.c_str());
+
+            auto fd_res
+                = lnav::filesystem::open_file(filename, O_RDONLY | O_CLOEXEC);
+            if (fd_res.isErr()) {
+                auto um = lnav::console::user_message::error(
+                              attr_line_t("failed to open file ")
+                                  .append_quoted(lnav::roles::file(filename)))
+                              .with_reason(fd_res.unwrapErr());
+                retval.fc_name_to_stubs->writeAccess()->emplace(filename,
+                                                                file_stub_info{
+                                                                    filename,
+                                                                    st.st_mtime,
+                                                                    st.st_ctime,
+                                                                    um.move(),
+                                                                });
+                return retval;
+            }
+            auto fd = fd_res.unwrap();
+            auto ff_res = detect_file_format(filename, fd.get());
+
+            loo.loo_file_format = ff_res.dffr_file_format;
+            loo.loo_scan_key = filename;
+            switch (ff_res.dffr_file_format) {
                 case file_format_t::SQLITE_DB:
-                    retval.fc_other_files[filename].ofd_format = ff;
+                case file_format_t::UNSUPPORTED:
+                    retval.fc_other_files[filename].ofd_format
+                        = ff_res.dffr_file_format;
+                    retval.fc_other_files[filename].ofd_details
+                        = ff_res.dffr_details;
                     break;
 
-                case file_format_t::PCAP: {
-                    auto res = pcap_manager::convert(filename);
+                case file_format_t::MULTIPLEXED: {
+                    log_info("%s: file is multiplexed, creating piper",
+                             filename.c_str());
 
-                    if (res.isOk()) {
-                        auto convert_res = res.unwrap();
-
-                        loo2.with_fd(std::move(convert_res.cr_destination));
-                        retval.fc_child_pollers.emplace_back(child_poller{
-                            std::move(convert_res.cr_child),
-                            [filename,
-                             st,
-                             error_queue = convert_res.cr_error_queue](
-                                auto& fc, auto& child) {
-                                if (child.was_normal_exit()
-                                    && child.exit_status() == EXIT_SUCCESS)
-                                {
-                                    log_info("pcap[%d] exited normally",
-                                             child.in());
-                                    return;
-                                }
-                                log_error("pcap[%d] exited with %d",
-                                          child.in(),
-                                          child.status());
-                                fc.fc_name_to_errors.emplace(
-                                    filename,
-                                    file_error_info{
-                                        st.st_mtime,
-                                        fmt::format(
-                                            FMT_STRING("{}"),
-                                            fmt::join(*error_queue, "\n")),
-                                    });
-                            },
-                        });
-                        auto open_res = logfile::open(filename, loo2);
-                        if (open_res.isOk()) {
-                            retval.fc_files.push_back(open_res.unwrap());
-                        } else {
-                            retval.fc_name_to_errors.emplace(
-                                filename,
-                                file_error_info{
-                                    st.st_mtime,
-                                    open_res.unwrapErr(),
-                                });
-                        }
+                    if (lseek(fd.get(), 0, SEEK_SET) == -1) {
+                        log_error("%s: unable to seek to start -- %s",
+                                  filename.c_str(),
+                                  strerror(errno));
                     } else {
-                        retval.fc_name_to_errors.emplace(filename,
-                                                         file_error_info{
-                                                             st.st_mtime,
-                                                             res.unwrapErr(),
-                                                         });
+                        auto looper_options = lnav::piper::options{};
+                        looper_options.with_follow(loo.loo_follow);
+                        auto create_res
+                            = lnav::piper::create_looper(filename,
+                                                         std::move(fd),
+                                                         auto_fd{-1},
+                                                         looper_options);
+
+                        if (create_res.isOk()) {
+                            auto& ofd = retval.fc_other_files[filename];
+
+                            ofd.ofd_format = ff_res.dffr_file_format;
+                            ofd.ofd_details = ff_res.dffr_details;
+                            retval.fc_file_names[filename] = loo;
+                            retval.fc_file_names[filename].with_piper(
+                                create_res.unwrap());
+                        }
                     }
                     break;
                 }
 
                 case file_format_t::ARCHIVE: {
-                    nonstd::optional<
+                    std::optional<
                         std::list<archive_manager::extract_progress>::iterator>
                         prog_iter_opt;
 
-                    if (loo2.loo_source == logfile_name_source::ARCHIVE) {
+                    if (loo.loo_source == logfile_name_source::ARCHIVE) {
                         // Don't try to open nested archives
                         return retval;
                     }
@@ -404,9 +578,9 @@ file_collection::watch_logfile(const std::string& filename,
 
                             return &(*prog_iter);
                         },
-                        [&filename, &retval](const auto& tmp_path,
-                                             const auto& entry) {
-                            auto arc_path = ghc::filesystem::relative(
+                        [&filename, &retval, &loo](const auto& tmp_path,
+                                                   const auto& entry) {
+                            auto arc_path = std::filesystem::relative(
                                 entry.path(), tmp_path);
                             auto custom_name = filename / arc_path;
                             bool is_visible = true;
@@ -425,19 +599,30 @@ file_collection::watch_logfile(const std::string& filename,
                                 .with_source(logfile_name_source::ARCHIVE)
                                 .with_visibility(is_visible)
                                 .with_non_utf_visibility(false)
-                                .with_visible_size_limit(256 * 1024);
+                                .with_visible_size_limit(256 * 1024)
+                                .with_time_range(loo.loo_time_range);
                         });
                     if (res.isErr()) {
                         log_error("archive extraction failed: %s",
                                   res.unwrapErr().c_str());
+                        auto um = lnav::console::user_message::error(
+                                      attr_line_t("failed to extract archive ")
+                                          .append_quoted(
+                                              lnav::roles::file(filename)))
+                                      .with_reason(res.unwrapErr());
                         retval.clear();
-                        retval.fc_name_to_errors.emplace(filename,
-                                                         file_error_info{
-                                                             st.st_mtime,
-                                                             res.unwrapErr(),
-                                                         });
+                        retval.fc_name_to_stubs->writeAccess()->emplace(
+                            filename,
+                            file_stub_info{
+                                filename,
+                                st.st_mtime,
+                                st.st_ctime,
+                                um.move(),
+                            });
                     } else {
-                        retval.fc_other_files[filename] = ff;
+                        auto& ofd = retval.fc_other_files[filename];
+                        ofd.ofd_format = ff_res.dffr_file_format;
+                        ofd.ofd_details = ff_res.dffr_details;
                     }
                     {
                         prog_iter_opt | [&prog](auto prog_iter) {
@@ -448,27 +633,114 @@ file_collection::watch_logfile(const std::string& filename,
                     break;
                 }
 
-                default:
+                default: {
+                    auto filename_to_open = filename;
+
+                    loo.loo_match_details = ff_res.dffr_details;
+                    auto eff = detect_mime_type(
+                        filename,
+                        string_fragment::from_bytes(ff_res.dffr_header.data(),
+                                                    ff_res.dffr_header.size()));
+
+                    if (eff) {
+                        auto cr = file_converter_manager::convert(eff.value(),
+                                                                  filename);
+
+                        if (cr.isErr()) {
+                            auto um = lnav::console::user_message::error(
+                                          attr_line_t("failed to convert file ")
+                                              .append_quoted(
+                                                  lnav::roles::file(filename)))
+                                          .with_reason(cr.unwrapErr());
+                            retval.fc_name_to_stubs->writeAccess()->emplace(
+                                filename,
+                                file_stub_info{
+                                    filename,
+                                    st.st_mtime,
+                                    st.st_ctime,
+                                    um.move(),
+                                });
+                            break;
+                        }
+
+                        auto convert_res = cr.unwrap();
+                        auto poller = std::make_shared<child_poller>(
+                            eff->eff_converter,
+                            filename,
+                            std::move(convert_res.cr_child),
+                            [filename,
+                             st,
+                             error_queue = convert_res.cr_error_queue](
+                                auto& fc, auto& child) {
+                                if (child.was_normal_exit()
+                                    && child.exit_status() == EXIT_SUCCESS)
+                                {
+                                    log_info("converter[%d] exited normally",
+                                             child.in());
+                                    return;
+                                }
+                                log_error("converter[%d] exited with %d",
+                                          child.in(),
+                                          child.status());
+                                auto reason = fmt::format(
+                                    FMT_STRING("{}"),
+                                    fmt::join(*error_queue, "\n"));
+                                auto um
+                                    = lnav::console::user_message::error(
+                                          attr_line_t("failed to convert file ")
+                                              .append_quoted(
+                                                  lnav::roles::file(filename)))
+                                          .with_reason(reason);
+                                fc.fc_name_to_stubs->writeAccess()->emplace(
+                                    filename,
+                                    file_stub_info{
+                                        filename,
+                                        st.st_mtime,
+                                        st.st_ctime,
+                                        um.move(),
+                                    });
+                            });
+                        retval.fc_child_pollers.emplace_back(poller);
+                        loo.with_filename(filename);
+                        loo.with_stat_for_temp(st);
+                        loo.with_child_poller(poller);
+                        loo.loo_format_name = eff->eff_format_name;
+                        filename_to_open = convert_res.cr_destination;
+                    }
+
                     log_info("loading new file: filename=%s", filename.c_str());
 
-                    auto open_res = logfile::open(filename, loo2);
+                    auto open_res = eff
+                        ? logfile::open(filename_to_open, loo)
+                        : logfile::open(filename_to_open,
+                                        loo,
+                                        std::move(fd),
+                                        logfile::fd_source::of_path);
                     if (open_res.isOk()) {
                         retval.fc_files.push_back(open_res.unwrap());
                     } else {
-                        retval.fc_name_to_errors.emplace(
+                        auto um = lnav::console::user_message::error(
+                                      attr_line_t("failed to open file ")
+                                          .append_quoted(lnav::roles::file(
+                                              filename_to_open)))
+                                      .with_reason(open_res.unwrapErr());
+                        retval.fc_name_to_stubs->writeAccess()->emplace(
                             filename,
-                            file_error_info{
+                            file_stub_info{
+                                filename,
                                 st.st_mtime,
-                                open_res.unwrapErr(),
+                                st.st_ctime,
+                                um.move(),
                             });
                     }
                     break;
+                }
             }
 
             return retval;
         };
 
-        return std::async(std::launch::async, std::move(func));
+        return fq.submit(std::move(func));
     }
 
     auto lf = *file_iter;
@@ -477,10 +749,16 @@ file_collection::watch_logfile(const std::string& filename,
         /* The file is already loaded, but has been found under a different
          * name.  We just need to update the stored file name.
          */
+        file_collection retval;
+
+        log_info("renamed file: %s -> %s",
+                 lf->get_filename().c_str(),
+                 filename.c_str());
         retval.fc_renamed_files.emplace_back(lf, filename);
+        return lnav::futures::make_ready_future(std::move(retval));
     }
 
-    return lnav::futures::make_ready_future(std::move(retval));
+    return std::nullopt;
 }
 
 /**
@@ -499,20 +777,27 @@ file_collection::expand_filename(
     static_root_mem<glob_t, globfree> gl;
 
     {
-        std::lock_guard<std::mutex> lg(REALPATH_CACHE_MUTEX);
+        std::lock_guard lg(REALPATH_CACHE_MUTEX);
 
         if (REALPATH_CACHE.find(path) != REALPATH_CACHE.end()) {
             return;
         }
     }
 
-    if (is_url(path.c_str())) {
+    if (lnav::filesystem::is_url(path)) {
         return;
     }
 
-    if (glob(path.c_str(), GLOB_NOCHECK, nullptr, gl.inout()) == 0) {
-        int lpc;
+    auto filename_key = loo.loo_filename.empty() ? path : loo.loo_filename;
+#if defined(__MSYS__)
+    auto win_path = lnav::filesystem::escape_glob_for_win(path);
+    auto glob_rc = glob(win_path.c_str(), GLOB_NOCHECK, nullptr, gl.inout());
+#else
+    auto glob_rc = glob(path.c_str(), GLOB_NOCHECK, nullptr, gl.inout());
+#endif
+    auto glob_matched_nothing = false;
 
+    if (glob_rc == 0) {
         if (gl->gl_pathc == 1 /*&& gl.gl_matchc == 0*/) {
             /* It's a pattern that doesn't match any files
              * yet, allow it through since we'll load it in
@@ -539,8 +824,7 @@ file_collection::expand_filename(
                     {
                         this->fc_progress->writeAccess()
                             ->sp_tailers[fmt::to_string(rp.home())]
-                            .tp_message
-                            = "Initializing...";
+                            .tp_message = "Initializing...";
                     }
 
                     fq.push_back(
@@ -548,6 +832,7 @@ file_collection::expand_filename(
                     return;
                 }
 
+                glob_matched_nothing = lnav::filesystem::is_glob(path);
                 required = false;
             }
         }
@@ -555,9 +840,18 @@ file_collection::expand_filename(
             required = false;
         }
 
-        std::lock_guard<std::mutex> lg(REALPATH_CACHE_MUTEX);
-        for (lpc = 0; lpc < (int) gl->gl_pathc; lpc++) {
+        std::lock_guard lg(REALPATH_CACHE_MUTEX);
+        for (size_t lpc = 0; lpc < gl->gl_pathc; lpc++) {
             auto path_str = std::string(gl->gl_pathv[lpc]);
+
+            // watch_logfile() makes this same check, but a path that only
+            // ever produced a stub never gets that far.
+            if (this->fc_closed_files.count(path_str)
+                || this->fc_closed_files.count(filename_key))
+            {
+                continue;
+            }
+
             auto iter = REALPATH_CACHE.find(path_str);
 
             if (iter == REALPATH_CACHE.end()) {
@@ -572,27 +866,57 @@ file_collection::expand_filename(
                                 "Cannot find file: %s -- %s",
                                 gl->gl_pathv[lpc],
                                 errmsg);
-                    } else if (loo.loo_source != logfile_name_source::REMOTE) {
-                        // XXX The remote code path adds the file name before
-                        // the file exists...  not sure checking for that here
-                        // is a good idea (prolly not)
-                        file_collection retval;
+                    } else if (loo.loo_filename.empty()
+                               && !glob_matched_nothing)
+                    {
+                        auto in_map
+                            = this->fc_name_to_stubs->readAccess()->count(
+                                  path_str)
+                            > 0;
 
-                        if (gl->gl_pathc == 1) {
-                            retval.fc_name_to_errors.emplace(path,
-                                                             file_error_info{
-                                                                 time(nullptr),
-                                                                 errmsg,
-                                                             });
-                        } else {
-                            retval.fc_name_to_errors.emplace(path_str,
-                                                             file_error_info{
-                                                                 time(nullptr),
-                                                                 errmsg,
-                                                             });
+                        if (!in_map) {
+                            file_collection retval;
+                            if (gl->gl_pathc == 1 && path == path_str) {
+                                log_error("failed to find path: %s (%s) -- %s",
+                                          filename_key.c_str(),
+                                          path.c_str(),
+                                          errmsg);
+                                auto um
+                                    = lnav::console::user_message::error(
+                                          attr_line_t("failed to find path of ")
+                                              .append_quoted(lnav::roles::file(
+                                                  filename_key)))
+                                          .with_reason(errmsg);
+                                retval.fc_name_to_stubs->writeAccess()->emplace(
+                                    filename_key,
+                                    file_stub_info{
+                                        filename_key,
+                                        std::nullopt,
+                                        std::nullopt,
+                                        um.move(),
+                                    });
+                            } else {
+                                log_error("failed to find path: %s -- %s",
+                                          path_str.c_str(),
+                                          errmsg);
+                                auto um
+                                    = lnav::console::user_message::error(
+                                          attr_line_t("failed to find path of ")
+                                              .append_quoted(
+                                                  lnav::roles::file(path_str)))
+                                          .with_reason(errmsg);
+                                retval.fc_name_to_stubs->writeAccess()->emplace(
+                                    path_str,
+                                    file_stub_info{
+                                        path_str,
+                                        std::nullopt,
+                                        std::nullopt,
+                                        um.move(),
+                                    });
+                            }
+                            fq.push_back(lnav::futures::make_ready_future(
+                                std::move(retval)));
                         }
-                        fq.push_back(lnav::futures::make_ready_future(
-                            std::move(retval)));
                     }
                     continue;
                 }
@@ -600,32 +924,117 @@ file_collection::expand_filename(
                 auto p = REALPATH_CACHE.emplace(path_str, abspath.in());
 
                 iter = p.first;
+
+                // A stub recorded before the path could be resolved is keyed
+                // by the unresolved spelling, which nothing downstream will
+                // look for again, so drop it now that there is a resolved
+                // path to key off of.  The stub for the resolved path itself
+                // belongs to watch_logfile(), which only drops it when the
+                // file has actually changed.  Note that the realpath lock is
+                // held here, and it must always be taken before the stub
+                // lock.
+                if (iter->second != path_str) {
+                    auto errs = this->fc_name_to_stubs->writeAccess();
+
+                    errs->erase(path_str);
+                    if (filename_key != path_str) {
+                        errs->erase(filename_key);
+                    }
+                }
             }
 
             if (required || access(iter->second.c_str(), R_OK) == 0) {
-                fq.push_back(watch_logfile(iter->second, loo, required));
+                auto future_opt
+                    = watch_logfile(
+                        fq, filename_key, iter->second, loo, required);
+                if (future_opt) {
+                    auto fut = std::move(future_opt.value());
+                    if (fq.push_back(std::move(fut))
+                        == lnav::progress_result_t::interrupt)
+                    {
+                        break;
+                    }
+                }
             }
         }
+    } else if (glob_rc != GLOB_NOMATCH) {
+        log_error("glob(%s) failed -- %s", path.c_str(), strerror(errno));
     }
 }
 
 file_collection
 file_collection::rescan_files(bool required)
 {
+    static auto rescan_op = lnav_operation{"rescan_files"};
+
+    auto op_guard = lnav_opid_guard::internal(rescan_op);
+
     file_collection retval;
     lnav::futures::future_queue<file_collection> fq(
-        [&retval](auto& fc) { retval.merge(fc); });
+        [this, &retval](std::future<file_collection>& fc) {
+            const auto& lim = get_limits();
+            try {
+                auto v = fc.get();
 
+                if (!v.fc_files.empty()
+                    && v.fc_files.back()->get_fd() > lim.l_high_fd)
+                {
+                    log_warning(
+                        "open file FD is too high (%d > %llu), dropping...",
+                        v.fc_files.back()->get_fd(),
+                        lim.l_high_fd);
+                    v.fc_files.clear();
+                    retval.fc_files_high_mark
+                        = this->fc_files.size() + retval.fc_files.size();
+                    log_debug("setting high mark to %zu",
+                              retval.fc_files_high_mark.value());
+                }
+                retval.merge(v);
+            } catch (const std::exception& e) {
+                log_error("rescan future exception: %s", e.what());
+            } catch (...) {
+                log_error("unknown exception thrown by rescan future");
+            }
+
+            if (retval.fc_files.size() < 100
+                && this->fc_files.size() + retval.fc_files.size()
+                    < lim.l_open_files)
+            {
+                return lnav::progress_result_t::ok;
+            }
+            return lnav::progress_result_t::interrupt;
+        });
+
+    this->fc_new_stats.clear();
     for (auto& pair : this->fc_file_names) {
-        if (!pair.second.loo_temp_file) {
+        if (this->fc_files.size() + retval.fc_files.size()
+            >= get_limits().l_open_files)
+        {
+            log_warning("too many files open, breaking...");
+            break;
+        }
+
+        if (pair.second.loo_piper) {
+            this->expand_filename(
+                fq,
+                pair.second.loo_piper->get_out_pattern().string(),
+                pair.second,
+                required);
+            if (!pair.second.loo_piper.value().get_demux_id().empty()
+                && this->fc_other_files.count(pair.first) == 0)
+            {
+                auto& ofd = retval.fc_other_files[pair.first];
+                ofd.ofd_format = file_format_t::MULTIPLEXED;
+                ofd.ofd_details
+                    = pair.second.loo_piper.value().get_demux_details();
+            }
+        } else {
             this->expand_filename(fq, pair.first, pair.second, required);
             if (this->fc_rotated) {
                 std::string path = pair.first + ".*";
 
                 this->expand_filename(fq, path, pair.second, false);
             }
-        } else if (pair.second.loo_fd.get() != -1) {
-            fq.push_back(watch_logfile(pair.first, pair.second, required));
         }
 
         if (retval.fc_files.size() >= 100) {
@@ -636,8 +1045,6 @@ file_collection::rescan_files(bool required)
 
     fq.pop_to();
 
-    this->fc_new_stats.clear();
-
     return retval;
 }
 
@@ -646,4 +1053,91 @@ file_collection::request_close(const std::shared_ptr<logfile>& lf)
 {
     lf->close();
     this->fc_files_generation += 1;
+}
+
+size_t
+file_collection::initial_indexing_pipers() const
+{
+    size_t retval = 0;
+
+    for (const auto& pair : this->fc_file_names) {
+        if (pair.second.loo_piper
+            && pair.second.loo_piper->get_loop_count() == 0)
+        {
+            retval += 1;
+        }
+    }
+
+    return retval;
+}
+
+size_t
+file_collection::active_pipers() const
+{
+    size_t retval = 0;
+    for (const auto& pair : this->fc_file_names) {
+        if (pair.second.loo_piper && !pair.second.loo_piper->is_finished()) {
+            retval += 1;
+        }
+    }
+
+    return retval;
+}
+
+size_t
+file_collection::finished_pipers()
+{
+    size_t retval = 0;
+
+    for (auto& pair : this->fc_file_names) {
+        if (pair.second.loo_piper) {
+            retval += pair.second.loo_piper->consume_finished();
+        }
+    }
+
+    return retval;
+}
+
+file_collection
+file_collection::copy()
+{
+    file_collection retval;
+
+    retval.merge(*this);
+    retval.fc_name_to_stubs = this->fc_name_to_stubs;
+    retval.fc_progress = this->fc_progress;
+    return retval;
+}
+
+void
+file_collection::clear()
+{
+    this->fc_name_to_stubs->writeAccess()->clear();
+    this->fc_file_names.clear();
+    this->fc_files.clear();
+    this->fc_renamed_files.clear();
+    this->fc_closed_files.clear();
+    this->fc_other_files.clear();
+    this->fc_new_stats.clear();
+}
+
+bool
+file_collection::is_below_open_file_limit() const
+{
+    return !this->fc_files_high_mark
+        || this->fc_files.size() < this->fc_files_high_mark.value();
+}
+
+size_t
+file_collection::other_file_format_count(file_format_t ff) const
+{
+    size_t retval = 0;
+
+    for (const auto& pair : this->fc_other_files) {
+        if (pair.second.ofd_format == ff) {
+            retval += 1;
+        }
+    }
+
+    return retval;
 }

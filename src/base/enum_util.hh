@@ -30,10 +30,10 @@
 #ifndef lnav_enum_util_hh
 #define lnav_enum_util_hh
 
+#include <cstdint>
 #include <type_traits>
 
-namespace lnav {
-namespace enums {
+namespace lnav::enums {
 
 template<typename E>
 constexpr auto
@@ -42,7 +42,42 @@ to_underlying(E e) noexcept
     return static_cast<std::underlying_type_t<E>>(e);
 }
 
-}  // namespace enums
-}  // namespace lnav
+template<typename T>
+struct bitset {
+    template<typename... Args>
+    bitset(Args... args)
+    {
+        this->bs_data = ((1 << to_underlying<T>(args)) | ... | 0);
+    }
+
+    template<T arg>
+    [[nodiscard]] constexpr bool is_set() const
+    {
+        static_assert(to_underlying(arg) >= 0);
+        static_assert(to_underlying(arg) < sizeof(this->bs_data) * 8);
+
+        return this->bs_data & 1 << to_underlying(arg);
+    }
+
+    [[nodiscard]] bool is_set(T arg) const
+    {
+        return this->bs_data & 1 << to_underlying(arg);
+    }
+
+    template<T arg>
+    void set()
+    {
+        static_assert(to_underlying(arg) >= 0);
+        static_assert(to_underlying(arg) < sizeof(this->bs_data) * 8);
+
+        this->bs_data |= 1 << to_underlying(arg);
+    }
+
+    void set(T arg) { this->bs_data |= 1 << to_underlying(arg); }
+
+    uint64_t bs_data;
+};
+
+}  // namespace lnav::enums
 
 #endif

@@ -31,24 +31,80 @@
 
 #include "pcre2pp.hh"
 
-#include "config.h"
+#include <algorithm>
 
-namespace lnav {
-namespace pcre2pp {
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "config.h"
+#include "ww898/cp_utf8.hpp"
+
+namespace lnav::pcre2pp {
+
+static uint32_t jit_epoch = 0;
+
+void
+jit_after_fork()
+{
+    jit_epoch += 1;
+}
+
+uint32_t
+current_jit_epoch()
+{
+    return jit_epoch;
+}
+
+void
+code::ensure_local_jit() const
+{
+    if (this->p_jit_epoch == jit_epoch) {
+        return;
+    }
+
+    auto recompile_res = this->recompile();
+    if (recompile_res.isErr()) {
+        // The pattern compiled once already, so this only happens if the
+        // process is in no state to compile at all.  Carrying on would mean
+        // either running the inherited JIT, which faults, or the interpreter,
+        // which is the silent slowdown this exists to avoid.
+        //
+        // base/ depends on this library, so lnav_log is out of reach here --
+        // hence stderr rather than log_error().  A grep child's stderr is
+        // read and logged by the parent, which also reports the abort as the
+        // signal that killed the child.
+        fprintf(stderr,
+                "error: unable to rebuild pattern after fork: %s -- %s\n",
+                this->p_pattern.c_str(),
+                recompile_res.unwrapErr().get_message().c_str());
+        abort();
+    }
+
+    auto rebuilt = recompile_res.unwrap();
+
+    // The pattern and options are the same, so the capture count is too, and
+    // p_match_proto stays valid.
+    this->p_code = std::move(rebuilt.p_code);
+    this->p_jit_epoch = jit_epoch;
+}
 
 std::string
-quote(const char* unquoted)
+match_data::to_string() const
 {
     std::string retval;
 
-    for (int lpc = 0; unquoted[lpc]; lpc++) {
-        if (isalnum(unquoted[lpc]) || unquoted[lpc] == '_'
-            || unquoted[lpc] & 0x80)
-        {
-            retval.push_back(unquoted[lpc]);
-        } else {
-            retval.push_back('\\');
-            retval.push_back(unquoted[lpc]);
+    if (this->get_count() == 1) {
+        auto cap = (*this)[0];
+        retval += cap.value();
+    } else {
+        for (size_t lpc = 1; lpc < this->get_count(); lpc++) {
+            auto cap = (*this)[lpc];
+
+            if (!cap) {
+                continue;
+            }
+
+            retval += cap.value();
         }
     }
 
@@ -102,6 +158,18 @@ code::from(string_fragment sf, int options)
     return Ok(code{std::move(co), sf.to_string()});
 }
 
+Result<code, compile_error>
+code::recompile() const
+{
+    uint32_t options = 0;
+
+    // The options that were handed to pcre2_compile(), so the copy behaves
+    // exactly like the original.
+    pcre2_pattern_info(this->p_code.in(), PCRE2_INFO_ARGOPTIONS, &options);
+
+    return from(string_fragment::from_str(this->p_pattern), options);
+}
+
 code::named_captures
 code::get_named_captures() const
 {
@@ -117,31 +185,73 @@ code::get_named_captures() const
     return retval;
 }
 
+matcher::matches_result
+code::find_in(string_fragment in, uint32_t options) const
+{
+    thread_local match_data md = this->create_match_data();
+
+    if (md.md_ovector_count < this->p_match_proto.md_ovector_count) {
+        md = this->create_match_data();
+    }
+
+    return this->capture_from(in).into(md).matches(options);
+}
+
 size_t
 code::match_partial(string_fragment in) const
 {
-    auto md = this->create_match_data();
-    auto length = in.length();
+    // This function is used for error reporting to show where a line
+    // diverges from the expected pattern.  Cap the input length to
+    // avoid excessive work on very large (e.g. multi-MB binary) lines.
+    static constexpr size_t MAX_PARTIAL_LEN = 8192;
 
-    do {
-        auto rc = pcre2_match(this->p_code.in(),
-                              in.udata(),
-                              length,
-                              0,
-                              PCRE2_PARTIAL_HARD,
-                              md.md_data.in(),
-                              nullptr);
+    auto md = this->create_match_data();
+    auto length = std::min((size_t) in.length(), MAX_PARTIAL_LEN);
+
+    this->ensure_local_jit();
+
+    // Try the full (capped) length first -- if it partially matches,
+    // we're done.
+    auto rc = pcre2_match(this->p_code.in(),
+                          in.udata(),
+                          length,
+                          0,
+                          PCRE2_PARTIAL_HARD,
+                          md.md_data.in(),
+                          nullptr);
+
+    if (rc == PCRE2_ERROR_PARTIAL) {
+        return md.md_ovector[1];
+    }
+
+    // Binary search for the largest length that yields a partial match.
+    // For anchored patterns (the primary use case), partial-match is
+    // monotonic over length.
+    size_t lo = 1;
+    size_t hi = length;
+    size_t best = 0;
+
+    while (lo <= hi) {
+        auto mid = lo + (hi - lo) / 2;
+
+        // Already rebuilt above, so p_code is this process's.
+        rc = pcre2_match(this->p_code.in(),
+                         in.udata(),
+                         mid,
+                         0,
+                         PCRE2_PARTIAL_HARD,
+                         md.md_data.in(),
+                         nullptr);
 
         if (rc == PCRE2_ERROR_PARTIAL) {
-            return md.md_ovector[1];
+            best = md.md_ovector[1];
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
         }
+    }
 
-        if (length > 0) {
-            length -= 1;
-        }
-    } while (length > 0);
-
-    return 0;
+    return best;
 }
 
 const char*
@@ -169,87 +279,133 @@ code::get_capture_count() const
 std::vector<string_fragment>
 code::get_captures() const
 {
-    bool in_class = false, in_escape = false, in_literal = false;
-    auto pat_frag = string_fragment::from_str(this->p_pattern);
-    std::vector<string_fragment> cap_in_progress;
-    std::vector<string_fragment> retval;
+    struct group {
+        int g_begin;
+        std::optional<size_t> g_capture;
+        bool g_branch_reset{false};
+        size_t g_reset_start{0};
+        size_t g_reset_max{0};
+    };
 
-    for (int lpc = 0; this->p_pattern[lpc]; lpc++) {
+    const auto pat_len = (int) this->p_pattern.length();
+    auto pat_char = [this, pat_len](int index) {
+        return index < pat_len ? this->p_pattern[index] : '\0';
+    };
+    int class_start = 0;
+    bool in_class = false, in_escape = false, in_literal = false;
+    std::vector<group> groups;
+    std::vector<string_fragment> retval;
+    // The number of the next capture, less one.  It is tracked separately
+    // from the size of the result since a branch reset group, "(?|...)",
+    // numbers the captures in each of its alternatives from the same start.
+    size_t next_capture = 0;
+
+    for (int lpc = 0; lpc < pat_len; lpc++) {
+        const auto ch = this->p_pattern[lpc];
+
         if (in_escape) {
             in_escape = false;
-            if (this->p_pattern[lpc] == 'Q') {
+            if (ch == 'Q') {
                 in_literal = true;
             }
         } else if (in_class) {
-            if (this->p_pattern[lpc] == ']') {
+            if (lpc == class_start + 1 && ch == '^') {
+                class_start = lpc;
+            } else if (lpc > class_start + 1 && ch == ']') {
                 in_class = false;
             }
-            if (this->p_pattern[lpc] == '\\') {
+            if (ch == '\\') {
                 in_escape = true;
             }
         } else if (in_literal) {
-            if (this->p_pattern[lpc] == '\\' && this->p_pattern[lpc + 1] == 'E')
-            {
+            if (ch == '\\' && pat_char(lpc + 1) == 'E') {
                 in_literal = false;
                 lpc += 1;
             }
         } else {
-            switch (this->p_pattern[lpc]) {
+            switch (ch) {
                 case '\\':
                     in_escape = true;
                     break;
                 case '[':
                     in_class = true;
+                    class_start = lpc;
                     break;
-                case '(':
-                    cap_in_progress.emplace_back(pat_frag.sub_range(lpc, lpc));
-                    break;
-                case ')': {
-                    if (!cap_in_progress.empty()) {
-                        static const auto DEFINE_SF
-                            = string_fragment::from_const("(?(DEFINE)");
+                case '(': {
+                    const auto first = pat_char(lpc + 1);
+                    const auto second = pat_char(lpc + 2);
+                    const auto third = pat_char(lpc + 3);
+                    auto is_cap = false;
+                    group grp{lpc};
 
-                        auto& cap = cap_in_progress.back();
-                        char first = '\0', second = '\0', third = '\0';
-                        bool is_cap = false;
+                    if (first == '?' && second == '#') {
+                        // A comment runs to the first ")", whatever is
+                        // inside of it.
+                        while (lpc < pat_len && this->p_pattern[lpc] != ')') {
+                            lpc += 1;
+                        }
+                        break;
+                    }
 
-                        cap.sf_end = lpc + 1;
-                        if (cap.length() >= 2) {
-                            first = this->p_pattern[cap.sf_begin + 1];
-                        }
-                        if (cap.length() >= 3) {
-                            second = this->p_pattern[cap.sf_begin + 2];
-                        }
-                        if (cap.length() >= 4) {
-                            third = this->p_pattern[cap.sf_begin + 3];
-                        }
-                        if (cap.sf_begin >= 2) {
-                            auto poss_define = string_fragment::from_str_range(
-                                this->p_pattern, cap.sf_begin - 2, cap.sf_end);
-                            if (poss_define == DEFINE_SF) {
-                                cap_in_progress.pop_back();
-                                continue;
-                            }
-                        }
-                        if (first == '?') {
-                            if (second == '\'') {
-                                is_cap = true;
-                            }
-                            if (second == '<'
-                                && (isalpha(third) || third == '_'))
-                            {
-                                is_cap = true;
-                            }
-                            if (second == 'P' && third == '<') {
-                                is_cap = true;
-                            }
-                        } else if (first != '*') {
+                    if (lpc >= 2 && this->p_pattern[lpc - 2] == '('
+                        && this->p_pattern[lpc - 1] == '?')
+                    {
+                        // The condition of a conditional group, like the
+                        // "(1)" in "(?(1)a|b)" or "(?(DEFINE)...)".
+                    } else if (first == '?') {
+                        if (second == '|') {
+                            grp.g_branch_reset = true;
+                            grp.g_reset_start = next_capture;
+                            grp.g_reset_max = next_capture;
+                        } else if (second == '\'') {
+                            is_cap = true;
+                        } else if (second == '<'
+                                   && (isalpha(third) || third == '_'))
+                        {
+                            is_cap = true;
+                        } else if (second == 'P' && third == '<') {
                             is_cap = true;
                         }
-                        if (is_cap) {
-                            retval.emplace_back(cap);
+                    } else if (first != '*') {
+                        is_cap = true;
+                    }
+                    if (is_cap) {
+                        grp.g_capture = next_capture;
+                        next_capture += 1;
+                        if (grp.g_capture.value() == retval.size()) {
+                            retval.emplace_back();
                         }
-                        cap_in_progress.pop_back();
+                    }
+                    groups.emplace_back(grp);
+                    break;
+                }
+                case '|':
+                    if (!groups.empty() && groups.back().g_branch_reset) {
+                        auto& grp = groups.back();
+
+                        grp.g_reset_max = std::max(grp.g_reset_max, next_capture);
+                        next_capture = grp.g_reset_start;
+                    }
+                    break;
+                case ')': {
+                    if (groups.empty()) {
+                        break;
+                    }
+
+                    const auto grp = groups.back();
+                    groups.pop_back();
+                    if (grp.g_capture) {
+                        auto& cap = retval[grp.g_capture.value()];
+
+                        // In a branch reset group, the first alternative to
+                        // use a number is the one kept for it.
+                        if (cap.empty()) {
+                            cap = string_fragment::from_str_range(
+                                this->p_pattern, grp.g_begin, lpc + 1);
+                        }
+                    }
+                    if (grp.g_branch_reset) {
+                        next_capture = std::max(grp.g_reset_max, next_capture);
                     }
                     break;
                 }
@@ -283,19 +439,19 @@ code::replace(string_fragment str, const char* repl) const
         remaining = find_res->f_remaining;
         bool in_escape = false;
 
-        retval.append(str.data(), start, (all.sf_begin - start));
+        retval.append(&str.data()[start], (all.sf_begin - start));
         start = all.sf_end;
         for (int lpc = 0; repl[lpc]; lpc++) {
             auto ch = repl[lpc];
 
             if (in_escape) {
                 if (isdigit(ch)) {
-                    auto capture_index = (ch - '0');
+                    auto capture_index = size_t(ch - '0');
 
                     if (capture_index < md.get_count()) {
                         auto cap = md[capture_index];
                         if (cap) {
-                            retval.append(cap->data(), cap->length());
+                            retval += cap.value();
                         }
                     } else if (capture_index > this->get_capture_count()) {
                         retval.push_back('\\');
@@ -321,17 +477,45 @@ code::replace(string_fragment str, const char* repl) const
         }
     }
     if (remaining.is_valid()) {
-        retval.append(str.data(), remaining.sf_begin, std::string::npos);
+        retval += remaining;
     }
 
     return retval;
 }
 
+code
+code::from_const(string_fragment sf, int options)
+{
+    auto res = from(sf, options);
+
+    if (res.isErr()) {
+        fprintf(stderr,
+                "failed to compile constant regex: %.*s\n",
+                sf.length(),
+                sf.data());
+        fprintf(stderr, "  %s\n", res.unwrapErr().get_message().c_str());
+    }
+
+    return res.unwrap();
+}
+
 int
 code::name_index(const char* name) const
 {
-    return pcre2_substring_number_from_name(this->p_code.in(),
-                                            (PCRE2_SPTR) name);
+    auto retval = pcre2_substring_number_from_name(this->p_code.in(),
+                                                   (PCRE2_SPTR) name);
+    if (retval == PCRE2_ERROR_NOUNIQUESUBSTRING) {
+        // The name table lists groups with the same name in order, so the
+        // first entry has the lowest number.
+        const auto name_sf = string_fragment::from_c_str(name);
+        for (const auto cap : this->get_named_captures()) {
+            if (cap.get_name() == name_sf) {
+                return cap.get_index();
+            }
+        }
+    }
+
+    return retval;
 }
 
 size_t
@@ -390,6 +574,55 @@ code::named_captures::end() const
     };
 }
 
+bool
+matcher::found_p(uint32_t options)
+{
+    this->mb_input.i_offset = this->mb_input.i_next_offset;
+
+    if (this->mb_input.i_offset == -1) {
+        return false;
+    }
+
+    this->mb_code.ensure_local_jit();
+
+    auto rc = pcre2_match(this->mb_code.p_code.in(),
+                          this->mb_input.i_string.udata(),
+                          this->mb_input.i_string.length(),
+                          this->mb_input.i_offset,
+                          options,
+                          this->mb_match_data.md_data.in(),
+                          nullptr);
+
+    if (rc > 0) {
+        this->mb_match_data.md_input = this->mb_input;
+        this->mb_match_data.md_code = &this->mb_code;
+        this->mb_match_data.md_capture_end = rc;
+        if (this->mb_match_data[0]->empty()
+            && this->mb_match_data[0]->sf_end >= this->mb_input.i_string.sf_end)
+        {
+            this->mb_input.i_next_offset = -1;
+        } else if (this->mb_match_data[0]->empty()) {
+            this->mb_input.i_next_offset
+                = this->mb_match_data.md_ovector[1] + 1;
+        } else {
+            this->mb_input.i_next_offset = this->mb_match_data.md_ovector[1];
+        }
+        this->mb_match_data.md_input.i_next_offset
+            = this->mb_input.i_next_offset;
+        return true;
+    }
+
+    this->mb_match_data.md_input = this->mb_input;
+    this->mb_match_data.md_ovector[0] = this->mb_input.i_offset;
+    this->mb_match_data.md_ovector[1] = this->mb_input.i_offset;
+    this->mb_match_data.md_capture_end = 1;
+    if (rc == PCRE2_ERROR_NOMATCH) {
+        return false;
+    }
+
+    return false;
+}
+
 matcher::matches_result
 matcher::matches(uint32_t options)
 {
@@ -398,6 +631,8 @@ matcher::matches(uint32_t options)
     if (this->mb_input.i_offset == -1) {
         return not_found{};
     }
+
+    this->mb_code.ensure_local_jit();
 
     auto rc = pcre2_match(this->mb_code.p_code.in(),
                           this->mb_input.i_string.udata(),
@@ -469,5 +704,4 @@ matcher::error::get_message()
     return {(const char*) buffer};
 }
 
-}  // namespace pcre2pp
-}  // namespace lnav
+}  // namespace lnav::pcre2pp

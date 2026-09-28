@@ -32,27 +32,30 @@
 #ifndef highlighter_hh
 #define highlighter_hh
 
-#include <set>
+#include <memory>
+#include <string>
 #include <utility>
 
-#include "optional.hpp"
-#include "pcrepp/pcre2pp.hh"
-#include "text_format.hh"
-#include "view_curses.hh"
+#include "base/attr_line.hh"
+#include "base/intern_string.hh"
+#include "base/line_range.hh"
+#include "base/map_util.hh"
+#include "base/string_attr_type.hh"
+#include "base/text_format_enum.hh"
+#include "pcrepp/pcre2pp_fwd.hh"
 
 struct highlighter {
     highlighter() = default;
 
-    explicit highlighter(const std::shared_ptr<lnav::pcre2pp::code>& regex)
-        : h_regex(regex)
-    {
-    }
-
-    highlighter(const highlighter& other) = default;
-
-    highlighter& operator=(const highlighter& other);
+    explicit highlighter(const std::shared_ptr<lnav::pcre2pp::code>& regex);
 
     virtual ~highlighter() = default;
+
+    highlighter& with_field(intern_string_t field)
+    {
+        this->h_field = field;
+        return *this;
+    }
 
     highlighter& with_role(role_t role)
     {
@@ -75,22 +78,6 @@ struct highlighter {
         return *this;
     }
 
-    highlighter& with_format_name(intern_string_t name)
-    {
-        this->h_format_name = name;
-
-        return *this;
-    }
-
-    highlighter& with_color(const styling::color_unit& fg,
-                            const styling::color_unit& bg)
-    {
-        this->h_fg = fg;
-        this->h_bg = bg;
-
-        return *this;
-    }
-
     highlighter& with_name(std::string name)
     {
         this->h_name = std::move(name);
@@ -103,21 +90,40 @@ struct highlighter {
         return *this;
     }
 
+    highlighter& with_preview(bool val)
+    {
+        this->h_preview = val;
+        return *this;
+    }
+
+    highlighter& with_full_line(bool val)
+    {
+        this->h_full_line = val;
+        return *this;
+    }
+
     text_attrs get_attrs() const { return this->h_attrs; }
 
-    void annotate(attr_line_t& al, int start) const;
+    bool annotate(attr_line_t& al, const line_range& lr) const;
 
-    void annotate_capture(attr_line_t& al, const line_range& lr) const;
+    void annotate_capture(attr_line_t& al, line_range lr) const;
+
+    bool applies_to_format(text_format_t tf) const
+    {
+        return this->h_text_formats.empty()
+            || this->h_text_formats.contains(tf);
+    }
 
     std::string h_name;
+    intern_string_t h_field;
     role_t h_role{role_t::VCR_NONE};
-    styling::color_unit h_fg{styling::color_unit::make_empty()};
-    styling::color_unit h_bg{styling::color_unit::make_empty()};
     std::shared_ptr<lnav::pcre2pp::code> h_regex;
     text_attrs h_attrs;
-    std::set<text_format_t> h_text_formats;
-    intern_string_t h_format_name;
+    std::vector<text_attrs> h_capture_attrs;
+    lnav::set::small<text_format_t> h_text_formats;
     bool h_nestable{true};
+    bool h_preview{false};
+    bool h_full_line{false};
 };
 
 #endif

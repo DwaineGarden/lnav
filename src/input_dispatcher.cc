@@ -31,148 +31,96 @@
 
 #include <array>
 
+#include "input_dispatcher.hh"
+
 #include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
 
-#include "config.h"
-
-#if defined HAVE_NCURSESW_CURSES_H
-#    include <ncursesw/curses.h>
-#elif defined HAVE_NCURSESW_H
-#    include <ncursesw.h>
-#elif defined HAVE_NCURSES_CURSES_H
-#    include <ncurses/curses.h>
-#elif defined HAVE_NCURSES_H
-#    include <ncurses.h>
-#elif defined HAVE_CURSES_H
-#    include <curses.h>
-#else
-#    error "SysV or X/Open-compatible Curses header file required"
-#endif
-
 #include "base/lnav_log.hh"
 #include "base/time_util.hh"
-#include "input_dispatcher.hh"
+#include "config.h"
+#include "fmt/color.h"
 #include "ww898/cp_utf8.hpp"
 
 using namespace ww898;
 
 template<typename A>
 static void
-to_key_seq(A& dst, const char* src)
+to_key_seq(A& dst, ncinput& ch)
 {
     dst[0] = '\0';
-    for (size_t lpc = 0; src[lpc]; lpc++) {
-        snprintf(dst.data() + strlen(dst.data()),
-                 dst.size() - strlen(dst.data()),
-                 "x%02x",
-                 src[lpc] & 0xff);
+    if (ncinput_super_p(&ch)) {
+        strcpy(&dst[0], "cmd-");
+    }
+    for (size_t lpc = 0; ch.eff_text[lpc]; lpc++) {
+        ww898::utf::utf8::write(ch.eff_text[lpc], [&dst](uint8_t ch) {
+            snprintf(dst.data() + strlen(dst.data()),
+                     dst.size() - strlen(dst.data()),
+                     "x%02x",
+                     ch & 0xff);
+        });
     }
 }
 
 void
-input_dispatcher::new_input(const struct timeval& current_time, int ch)
+input_dispatcher::new_input(const timeval& current_time,
+                            notcurses* nc,
+                            ncinput& ch)
 {
-    nonstd::optional<bool> handled = nonstd::nullopt;
+    std::optional<bool> handled = std::nullopt;
     std::array<char, 32 * 3 + 1> keyseq{0};
+    std::string eff_str;
 
-    switch (ch) {
-        case KEY_ESCAPE:
-            this->reset_escape_buffer(ch, current_time);
-            break;
-        case KEY_MOUSE:
-            this->id_mouse_handler();
-            break;
-        default:
-            if (this->id_escape_index > 0) {
-                this->append_to_escape_buffer(ch);
+    for (size_t lpc = 0; ch.eff_text[lpc]; lpc++) {
+        fmt::format_to(std::back_inserter(eff_str),
+                       FMT_STRING("{:02x}"),
+                       ch.eff_text[lpc]);
+    }
+    log_debug("new input %x %d/%x(%c)/%s/%s evtype=%d",
+              ch.modifiers,
+              ch.id,
+              ch.id,
+              ch.id < 0x7f && isprint(ch.id) ? ch.id : ' ',
+              ch.utf8,
+              eff_str.c_str(),
+              ch.evtype);
+    if (ncinput_mouse_p(&ch)) {
+        log_debug("  mouse [x=%d;y=%d]", ch.x, ch.y);
+    }
+    if (!ncinput_mouse_p(&ch) && ch.evtype == NCTYPE_RELEASE) {
+        return;
+    }
 
-                if (strcmp("\x1b[", this->id_escape_buffer) == 0) {
-                } else if (strcmp("\x1b[<", this->id_escape_buffer) == 0) {
-                    this->id_mouse_handler();
-                    this->id_escape_index = 0;
-                } else if (this->id_escape_expected_size == -1
-                           || this->id_escape_index
-                               == this->id_escape_expected_size)
-                {
-                    to_key_seq(keyseq, this->id_escape_buffer);
-                    switch (this->id_escape_matcher(keyseq.data())) {
-                        case escape_match_t::NONE: {
-                            for (int lpc = 0; this->id_escape_buffer[lpc];
-                                 lpc++) {
-                                handled = this->id_key_handler(
-                                    this->id_escape_buffer[lpc]);
-                            }
-                            this->id_escape_index = 0;
-                            break;
-                        }
-                        case escape_match_t::PARTIAL:
-                            break;
-                        case escape_match_t::FULL:
-                            this->id_escape_handler(keyseq.data());
-                            this->id_escape_index = 0;
-                            break;
-                    }
-                }
-                if (this->id_escape_expected_size != -1
-                    && this->id_escape_index == this->id_escape_expected_size)
-                {
-                    this->id_escape_index = 0;
-                }
-            } else {
-                auto seq_size = utf::utf8::char_size([ch]() {
-                                    return std::make_pair(ch, 16);
-                                }).unwrapOr(size_t{1});
+    if (ncinput_lock_p(&ch) || ncinput_modifier_p(&ch)) {
+        return;
+    }
 
-                if (seq_size == 1) {
-                    snprintf(keyseq.data(), keyseq.size(), "x%02x", ch & 0xff);
-                    handled = this->id_key_handler(ch);
-                } else {
-                    this->reset_escape_buffer(ch, current_time, seq_size);
-                }
-            }
-            break;
+    if (ncinput_mouse_p(&ch)) {
+        this->id_mouse_handler(nc, ch);
+        return;
+    }
+
+    if (ch.id == NCKEY_PASTE) {
+        keyseq[0] = '\0';
+        this->id_key_handler(nc, ch, keyseq.data());
+        return;
+    }
+
+    if (ch.id > 0xff) {
+        if (NCKEY_F00 <= ch.id && ch.id <= NCKEY_F60) {
+            snprintf(keyseq.data(), keyseq.size(), "f%d", ch.id - NCKEY_F00);
+        } else {
+            snprintf(keyseq.data(), keyseq.size(), "n%04o", ch.id);
+        }
+        log_debug("nckey %s", keyseq.data());
+        handled = this->id_key_handler(nc, ch, keyseq.data());
+    } else {
+        to_key_seq(keyseq, ch);
+        handled = this->id_key_handler(nc, ch, keyseq.data());
     }
 
     if (handled && !handled.value()) {
         this->id_unhandled_handler(keyseq.data());
-    }
-}
-
-void
-input_dispatcher::poll(const struct timeval& current_time)
-{
-    if (this->id_escape_index == 1) {
-        static const struct timeval escape_threshold = {0, 10000};
-        struct timeval diff;
-
-        timersub(&current_time, &this->id_escape_start_time, &diff);
-        if (escape_threshold < diff) {
-            this->id_key_handler(KEY_CTRL_RBRACKET);
-            this->id_escape_index = 0;
-        }
-    }
-}
-
-void
-input_dispatcher::reset_escape_buffer(int ch,
-                                      const timeval& current_time,
-                                      ssize_t expected_size)
-{
-    this->id_escape_index = 0;
-    this->append_to_escape_buffer(ch);
-    this->id_escape_expected_size = expected_size;
-    this->id_escape_start_time = current_time;
-}
-
-void
-input_dispatcher::append_to_escape_buffer(int ch)
-{
-    if (this->id_escape_index
-        < static_cast<ssize_t>(sizeof(this->id_escape_buffer) - 1))
-    {
-        this->id_escape_buffer[this->id_escape_index++] = static_cast<char>(ch);
-        this->id_escape_buffer[this->id_escape_index] = '\0';
     }
 }

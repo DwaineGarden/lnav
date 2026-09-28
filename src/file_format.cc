@@ -29,88 +29,203 @@
  * @file file_format.hh
  */
 
-#include <unordered_map>
-
 #include "file_format.hh"
 
 #include "archive_manager.hh"
 #include "base/auto_fd.hh"
 #include "base/fs_util.hh"
 #include "base/intern_string.hh"
+#include "base/lnav.console.hh"
 #include "base/lnav_log.hh"
 #include "config.h"
+#include "line_buffer.hh"
+#include "piper.match.hh"
+#include "text_format.hh"
 
-static bool
-is_pcap_header(uint8_t* buffer)
+detect_file_format_result
+detect_file_format(const std::filesystem::path& filename)
 {
-    size_t offset = 0;
-    if (buffer[0] == 0x0a && buffer[1] == 0x0d && buffer[2] == 0x0d
-        && buffer[3] == 0x0a)
-    {
-        offset += sizeof(uint32_t) * 2;
-        if (buffer[offset + 0] == 0x1a && buffer[offset + 1] == 0x2b
-            && buffer[offset + 2] == 0x3c && buffer[offset + 3] == 0x4d)
-        {
-            return true;
-        }
-
-        if (buffer[offset + 0] == 0x4d && buffer[offset + 1] == 0x3c
-            && buffer[offset + 2] == 0x2b && buffer[offset + 3] == 0x1a)
-        {
-            return true;
-        }
-        return false;
+    auto open_res
+        = lnav::filesystem::open_file(filename, O_RDONLY | O_CLOEXEC);
+    if (open_res.isErr()) {
+        log_error("unable to open file for format detection: %s -- %s",
+                  filename.c_str(),
+                  open_res.unwrapErr().c_str());
+        return {file_format_t::UNKNOWN};
     }
 
-    if (buffer[0] == 0xa1 && buffer[1] == 0xb2 && buffer[2] == 0xc3
-        && buffer[3] == 0xd4)
-    {
-        return true;
-    }
-
-    if (buffer[0] == 0xd4 && buffer[1] == 0xc3 && buffer[2] == 0xb2
-        && buffer[3] == 0xa1)
-    {
-        return true;
-    }
-
-    if (buffer[0] == 0xa1 && buffer[1] == 0xb2 && buffer[2] == 0x3c
-        && buffer[3] == 0x4d)
-    {
-        return true;
-    }
-
-    if (buffer[0] == 0x4d && buffer[1] == 0x3c && buffer[2] == 0xb2
-        && buffer[3] == 0xa1)
-    {
-        return true;
-    }
-
-    return false;
+    auto fd = open_res.unwrap();
+    return detect_file_format(filename, fd.get());
 }
 
-file_format_t
-detect_file_format(const ghc::filesystem::path& filename)
+detect_file_format_result
+detect_file_format(const std::filesystem::path& filename, int fd)
 {
-    if (archive_manager::is_archive(filename)) {
-        return file_format_t::ARCHIVE;
+    static const auto JAR_EXT = std::filesystem::path(".jar");
+    static const auto WAR_EXT = std::filesystem::path(".war");
+
+    // static auto op = lnav_operation{"detect_file_format"};
+    // auto op_guard = lnav_opid_guard::internal(op);
+    log_trace("detecting format of file: %s", filename.c_str());
+
+    detect_file_format_result retval = {file_format_t::UNKNOWN};
+    auto ext = filename.extension();
+
+    if (ext == JAR_EXT) {
+        static const auto JAR_MSG
+            = lnav::console::user_message::info("ignoring Java JAR file");
+        return {file_format_t::UNSUPPORTED, {JAR_MSG}};
+    }
+    if (ext == WAR_EXT) {
+        static const auto WAR_MSG
+            = lnav::console::user_message::info("ignoring Java WAR file");
+        return {file_format_t::UNSUPPORTED, {WAR_MSG}};
     }
 
-    file_format_t retval = file_format_t::UNKNOWN;
-    auto_fd fd;
+    auto describe_res = archive_manager::describe(filename, fd);
+    if (describe_res.isOk()) {
+        auto describe_inner = describe_res.unwrap();
+        if (describe_inner.is<archive_manager::archive_info>()) {
+            auto& ai = describe_inner.get<archive_manager::archive_info>();
+            auto um = lnav::console::user_message::info(
+                attr_line_t()
+                    .append_quoted(ai.ai_format_name)
+                    .append(" archive with ")
+                    .append(lnav::roles::number(
+                        fmt::to_string(ai.ai_entries.size())))
+                    .append(ai.ai_entries.size() == 1 ? " entry" : " entries"));
+            return {file_format_t::ARCHIVE, {um}};
+        }
+    }
 
-    if ((fd = lnav::filesystem::openp(filename, O_RDONLY)) != -1) {
-        uint8_t buffer[32];
-        ssize_t rc;
+    {
+        uint8_t buffer[1024];
+        auto rc = pread(fd, buffer, sizeof(buffer), 0);
 
-        if ((rc = read(fd, buffer, sizeof(buffer))) > 0) {
-            static auto SQLITE3_HEADER = "SQLite format 3";
-            auto header_frag = string_fragment(buffer, 0, rc);
+        if (rc < 0) {
+            log_error("unable to read file for format detection: %s -- %s",
+                      filename.c_str(),
+                      strerror(errno));
+        } else {
+            static const auto* SQLITE3_HEADER = "SQLite format 3";
+            static const auto* JAVA_CLASS_HEADER = "\xca\xfe\xba\xbe";
+
+            retval.dffr_header.assign(buffer, buffer + rc);
+            auto header_frag = string_fragment::from_bytes(
+                buffer, std::min(rc, static_cast<ssize_t>(32)));
 
             if (header_frag.startswith(SQLITE3_HEADER)) {
-                retval = file_format_t::SQLITE_DB;
-            } else if (rc > 24 && is_pcap_header(buffer)) {
-                retval = file_format_t::PCAP;
+                static const auto DB_MSG
+                    = lnav::console::user_message::info("SQLite database file");
+
+                log_info("%s: appears to be a SQLite DB", filename.c_str());
+                retval.dffr_file_format = file_format_t::SQLITE_DB;
+                retval.dffr_details.emplace_back(DB_MSG);
+            } else if (header_frag.startswith(JAVA_CLASS_HEADER)) {
+                static const auto CLASS_MSG = lnav::console::user_message::info(
+                    "ignoring Java Class file");
+
+                retval.dffr_file_format = file_format_t::UNSUPPORTED;
+                retval.dffr_details.emplace_back(CLASS_MSG);
+            } else {
+                auto tf = detect_text_format(header_frag, filename);
+                auto looping = true;
+
+                if (tf) {
+                    switch (tf.value()) {
+                        case text_format_t::TF_PLAINTEXT:
+                        case text_format_t::TF_BINARY:
+                        case text_format_t::TF_LOG:
+                        case text_format_t::TF_JSON:
+                            log_info(
+                                "file does not have a known text format: %s",
+                                filename.c_str());
+                            break;
+                        default:
+                            log_info("file has text format: %s -> %d",
+                                     filename.c_str(),
+                                     tf.value());
+                            looping = false;
+                            break;
+                    }
+                }
+
+                lnav::piper::multiplex_matcher mm;
+                file_range next_range;
+                line_buffer lb;
+
+                if (lseek(fd, 0, SEEK_SET) == -1) {
+                    log_error("unable to seek file for demux matching: %s -- %s",
+                              filename.c_str(),
+                              strerror(errno));
+                    looping = false;
+                }
+                auto lb_fd = auto_fd::dup_of(fd);
+                lb.set_fd(lb_fd);
+
+                while (looping) {
+                    auto load_res = lb.load_next_line(next_range);
+                    if (load_res.isErr()) {
+                        log_error(
+                            "unable to load line for demux matching: %s -- %s",
+                            filename.c_str(),
+                            load_res.unwrapErr().c_str());
+                        break;
+                    }
+                    if (!lb.is_header_utf8()) {
+                        log_info("file is not UTF-8: %s", filename.c_str());
+                        break;
+                    }
+                    if (lb.is_piper()) {
+                        log_info("skipping demux match for piper file: %s",
+                                 filename.c_str());
+                        break;
+                    }
+                    const auto li = load_res.unwrap();
+                    if (li.li_partial) {
+                        log_info("skipping demux match for partial line");
+                        break;
+                    }
+                    auto read_res = lb.read_range(li.li_file_range);
+                    if (read_res.isErr()) {
+                        log_error(
+                            "unable to read line for demux matching: %s -- %s",
+                            filename.c_str(),
+                            read_res.unwrapErr().c_str());
+                        break;
+                    }
+                    auto sbr = read_res.unwrap();
+                    auto match_res = mm.match(sbr.to_string_fragment());
+
+                    looping = match_res.match(
+                        [&retval, &filename](
+                            lnav::piper::multiplex_matcher::found_regex f) {
+                            log_info("%s: is multiplexed using pattern %s",
+                                     filename.c_str(),
+                                     f.f_id.c_str());
+                            retval.dffr_file_format
+                                = file_format_t::MULTIPLEXED;
+                            return false;
+                        },
+                        [&retval, &filename](
+                            lnav::piper::multiplex_matcher::found_json f) {
+                            log_info("%s: is multiplexed using JSON %s",
+                                     filename.c_str(),
+                                     f.fj_id.c_str());
+                            retval.dffr_file_format
+                                = file_format_t::MULTIPLEXED;
+                            return false;
+                        },
+                        [](lnav::piper::multiplex_matcher::not_found nf) {
+                            return false;
+                        },
+                        [](lnav::piper::multiplex_matcher::partial p) {
+                            return true;
+                        });
+
+                    next_range = li.li_file_range;
+                }
+                retval.dffr_details = std::move(mm.mm_details);
             }
         }
     }

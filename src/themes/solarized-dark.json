@@ -4,6 +4,7 @@
         "theme-defs": {
             "solarized-dark": {
                 "vars": {
+                    "base04": "#001d25",
                     "base03": "#002b36",
                     "base02": "#073642",
                     "base01": "#586e75",
@@ -25,20 +26,29 @@
                 },
                 "styles": {
                     "identifier": {
-                        "background-color": "$base03",
                         "color": "semantic()"
                     },
                     "text": {
                         "color": "$base0",
                         "background-color": "$base03"
                     },
-                    "alt-text": {
-                        "color": "$base0",
-                        "background-color": "$base03",
+                    "selected-text": {
+                        "background-color": "$cyan"
+                    },
+                    "fuzzy-match": {
+                        "color": "$orange",
+                        "underline": true,
                         "bold": true
+                    },
+                    "alt-text": {
+                        "background-color": "$base04"
                     },
                     "ok": {
                         "color": "$green",
+                        "bold": true
+                    },
+                    "info": {
+                        "color": "$magenta",
                         "bold": true
                     },
                     "error": {
@@ -55,9 +65,15 @@
                     },
                     "cursor-line": {
                         "color": "$cyan",
-                        "background-color": "$red",
-                        "bold": true,
-                        "underline": true
+                        "background-color": "$base02",
+                        "bold": true
+                    },
+                    "disabled-cursor-line": {
+                        "color": "$cyan",
+                        "background-color": "#5f005f"
+                    },
+                    "time-column": {
+                        "background-color": "$base02"
                     },
                     "adjusted-time": {
                         "color": "$magenta"
@@ -68,16 +84,32 @@
                     "offset-time": {
                         "color": "$cyan"
                     },
+                    "time-ago": {
+                        "bold": true
+                    },
+                    "file-offset": {
+                        "color": "#888"
+                    },
                     "invalid-msg": {
                         "color": "$yellow"
                     },
                     "popup": {
                         "color": "$base00",
-                        "background-color": "$base3"
+                        "background-color": "#00212b"
+                    },
+                    "popup-border": {
+                        "color": "#2aa198",
+                        "background-color": "#00212b"
                     },
                     "scrollbar": {
                         "color": "$base03",
                         "background-color": "$base0"
+                    },
+                    "timeline-bar": {
+                        "background-color": "$magenta"
+                    },
+                    "context-line": {
+                        "background-color": "$base04"
                     },
                     "focused": {
                         "color": "$base03",
@@ -88,25 +120,83 @@
                         "background-color": "$base02"
                     },
                     "h1": {
-                        "underline": true
+                        "color": "$magenta",
+                        "bold": true
                     },
                     "h2": {
+                        "color": "$magenta",
                         "underline": true
                     },
                     "h3": {
-                        "underline": true
+                        "color": "$magenta"
                     },
                     "h4": {
                         "underline": true
                     },
                     "h5": {
-                        "underline": true
+                        "italic": true
                     },
                     "h6": {
+                        "italic": true
+                    },
+                    "hr": {
+                        "color": "#444"
+                    },
+                    "hyperlink": {
                         "underline": true
+                    },
+                    "list-glyph": {
+                        "color": "$yellow"
+                    },
+                    "breadcrumb": {
+                        "color": "#99a",
+                        "bold": true
+                    },
+                    "table-border": {
+                        "color": "#444"
+                    },
+                    "table-header": {
+                        "color": "$base1",
+                        "bold": true
+                    },
+                    "quote-border": {
+                        "color": "#666",
+                        "background-color": "#444"
+                    },
+                    "quoted-text": {
+                        "background-color": "#444"
+                    },
+                    "footnote-border": {
+                        "color": "$blue",
+                        "background-color": "#444"
+                    },
+                    "footnote-text": {
+                        "color": "#eee",
+                        "background-color": "#444"
+                    },
+                    "snippet-border": {
+                        "color": "$cyan"
+                    },
+                    "indent-guide": {
+                        "color": "#444"
                     }
                 },
                 "syntax-styles": {
+                    "inline-code": {
+                        "color": "$red",
+                        "background-color": "#121212"
+                    },
+                    "quoted-code": {
+                        "color": "#eee",
+                        "background-color": "#121212"
+                    },
+                    "code-border": {
+                        "color": "#444",
+                        "background-color": "#121212"
+                    },
+                    "object-key": {
+                        "color": "semantic()"
+                    },
                     "keyword": {
                         "color": "$yellow"
                     },
@@ -142,21 +232,58 @@
                         "color": "$magenta"
                     },
                     "spectrogram-low": {
-                        "background-color": "$green"
+                        "color": "$black",
+                        "background-color": "$green",
+                        "bold": true
                     },
                     "spectrogram-medium": {
-                        "background-color": "$yellow"
+                        "color": "$black",
+                        "background-color": "$yellow",
+                        "bold": true
                     },
                     "spectrogram-high": {
-                        "background-color": "$red"
+                        "color": "$black",
+                        "background-color": "$red",
+                        "bold": true
                     },
                     "file": {
+                        "color": "$blue"
+                    },
+                    "null": {
+                        "color": "#888"
+                    },
+                    "ascii-control": {
+                        "color": "$green"
+                    },
+                    "non-ascii": {
+                        "color": "$yellow"
+                    },
+                    "number": {
+                        "bold": true
+                    },
+                    "function": {
+                        "color": "$cyan"
+                    },
+                    "separators-references-accessors": {
+                        "color": "$red"
+                    },
+                    "type": {
                         "color": "$blue"
                     }
                 },
                 "status-styles": {
+                    "disabled-title": {
+                        "color": "$base01",
+                        "background-color": "$base03",
+                        "bold": true
+                    },
                     "title": {
                         "color": "$base02",
+                        "background-color": "$blue",
+                        "bold": true
+                    },
+                    "alert-title": {
+                        "color": "$red",
                         "background-color": "$blue",
                         "bold": true
                     },
@@ -185,13 +312,29 @@
                         "color": "$base1",
                         "background-color": "$base02"
                     },
+                    "title-hotkey": {
+                        "color": "$black",
+                        "background-color": "#5394ec",
+                        "underline": true
+                    },
+                    "hotkey": {
+                        "color": "#fff",
+                        "underline": true
+                    },
                     "inactive": {
                         "color": "$base1",
+                        "background-color": "$base02"
+                    },
+                    "inactive-warn": {
+                        "color": "$yellow",
                         "background-color": "$base02"
                     },
                     "inactive-alert": {
                         "color": "$red",
                         "background-color": "$base02"
+                    },
+                    "suggestion": {
+                        "color": "$base02"
                     }
                 },
                 "log-level-styles": {

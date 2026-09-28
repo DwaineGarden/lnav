@@ -28,6 +28,7 @@
  */
 
 #include <algorithm>
+#include <fstream>
 
 #include <assert.h>
 #include <stdio.h>
@@ -37,7 +38,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "base/injector.bind.hh"
 #include "base/injector.hh"
+#include "base/isc.hh"
 #include "base/opt_util.hh"
 #include "config.h"
 #include "log_format.hh"
@@ -52,7 +55,11 @@ typedef enum {
     MODE_LINE_COUNT,
     MODE_TIMES,
     MODE_LEVELS,
+    MODE_TIME_ORDER,
 } dl_mode_t;
+
+static auto bound_file_options_hier
+    = injector::bind<lnav::safe_file_options_hier>::to_singleton();
 
 time_t
 time(time_t* _unused)
@@ -66,6 +73,7 @@ main(int argc, char* argv[])
     int c, retval = EXIT_SUCCESS;
     dl_mode_t mode = MODE_NONE;
     string expected_format;
+    string append_path;
 
     {
         static auto builtin_formats
@@ -80,15 +88,18 @@ main(int argc, char* argv[])
 
     {
         std::vector<lnav::console::user_message> errors;
-        vector<ghc::filesystem::path> paths;
+        vector<std::filesystem::path> paths;
 
         getenv_opt("test_dir") |
-            [&paths](auto value) { paths.template emplace_back(value); };
+            [&paths](auto value) { paths.emplace_back(value); };
         load_formats(paths, errors);
     }
 
-    while ((c = getopt(argc, argv, "ef:ltv")) != -1) {
+    while ((c = getopt(argc, argv, "a:ef:lotv")) != -1) {
         switch (c) {
+            case 'a':
+                append_path = optarg;
+                break;
             case 'f':
                 expected_format = optarg;
                 break;
@@ -97,6 +108,9 @@ main(int argc, char* argv[])
                 break;
             case 'l':
                 mode = MODE_LINE_COUNT;
+                break;
+            case 'o':
+                mode = MODE_TIME_ORDER;
                 break;
             case 't':
                 mode = MODE_TIMES;
@@ -114,6 +128,7 @@ main(int argc, char* argv[])
     } else if (argc == 0) {
         fprintf(stderr, "error: expecting log file name\n");
     } else {
+        isc::supervisor root_superv(injector::get<isc::service_list>());
         logfile_open_options default_loo;
         auto open_res = logfile::open(argv[0], default_loo);
 
@@ -146,7 +161,21 @@ main(int argc, char* argv[])
             assert(lf->get_format()->get_name().to_string() == expected_format);
         }
         if (!lf->is_compressed()) {
-            assert(lf->get_modified_time() == st.st_mtime);
+            assert(std::chrono::duration_cast<std::chrono::seconds>(
+                       lf->get_modified_time())
+                       .count()
+                   == st.st_mtime);
+        }
+
+        if (!append_path.empty()) {
+            std::ifstream append_in(append_path, std::ios::binary);
+            std::ofstream log_out(argv[0], std::ios::binary | std::ios::app);
+            assert(log_out.is_open());
+
+            log_out << append_in.rdbuf();
+            log_out.close();
+            lf->rebuild_index();
+            assert(!lf->is_closed());
         }
 
         switch (mode) {
@@ -169,24 +198,42 @@ main(int argc, char* argv[])
                     }
 
                     char buffer[1024];
-                    time_t lt;
-
-                    lt = iter.get_time();
+                    auto lt = to_time_t(iter.get_time<std::chrono::seconds>());
                     strftime(buffer,
                              sizeof(buffer),
                              "%b %d %H:%M:%S %Y",
                              gmtime(&lt));
-                    printf("%s -- %03d\n", buffer, iter.get_millis());
+                    printf("%s -- %03lld\n",
+                           buffer,
+                           iter.get_subsecond_time<std::chrono::milliseconds>()
+                               .count());
                 }
                 break;
             case MODE_LEVELS:
                 for (auto& iter : *lf) {
-                    log_level_t level = iter.get_level_and_flags();
-                    printf("%s 0x%x\n",
-                           level_names[level & ~LEVEL__FLAGS],
-                           level & LEVEL__FLAGS);
+                    auto level_sf = iter.get_level_name();
+                    auto flags = iter.is_continued() ? 0x80 : 0;
+                    printf(
+                        "%.*s 0x%x\n", level_sf.length(), level_sf.data(), flags);
                 }
                 break;
+            case MODE_TIME_ORDER: {
+                const auto& order = lf->get_time_order();
+
+                if (order.empty()) {
+                    printf("identity\n");
+                    break;
+                }
+                for (const auto index : order) {
+                    const auto& ll = (*lf)[index];
+
+                    printf("%u %lld%s\n",
+                           index,
+                           (long long) ll.get_time<>().count(),
+                           ll.is_ignored() ? " ignored" : "");
+                }
+                break;
+            }
         }
     }
 

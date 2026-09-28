@@ -30,18 +30,20 @@
 #ifndef lnav_tailer_looper_hh
 #define lnav_tailer_looper_hh
 
+#include <filesystem>
 #include <set>
-
-#include <logfile_fwd.hh>
 
 #include "base/auto_fd.hh"
 #include "base/auto_pid.hh"
 #include "base/isc.hh"
 #include "base/network.tcp.hh"
-#include "ghc/filesystem.hpp"
+#include "logfile_fwd.hh"
 #include "mapbox/variant.hpp"
+#include "safe/safe.h"
 
 namespace tailer {
+
+using safe_error_queue = safe::Safe<std::vector<std::string>>;
 
 class looper : public isc::service<looper> {
 public:
@@ -86,22 +88,24 @@ private:
 
         void load_preview(int64_t id, const std::string& path);
 
+        void report_preview_disconnect(int64_t id) const;
+
         void complete_path(const std::string& path);
 
         bool is_synced() const { return this->ht_state.is<synced>(); }
 
     protected:
-        void* run() override;
+        void* run(worker*) override;
 
         void loop_body() override;
 
         void stopped() override;
 
-        std::chrono::milliseconds compute_timeout(
+        std::optional<std::chrono::milliseconds> compute_timeout(
             mstime_t current_time) const override;
 
     private:
-        static ghc::filesystem::path tmp_path();
+        static std::filesystem::path tmp_path();
 
         std::string get_display_path(const std::string& remote_path) const;
 
@@ -125,9 +129,9 @@ private:
 
         const std::string ht_netloc;
         std::string ht_uname;
-        const ghc::filesystem::path ht_local_path;
-        std::set<ghc::filesystem::path> ht_active_files;
-        std::vector<std::string> ht_error_queue;
+        const std::filesystem::path ht_local_path;
+        std::set<std::filesystem::path> ht_active_files;
+        safe_error_queue ht_error_queue;
         std::thread ht_error_reader;
         state_v ht_state{disconnected()};
         uint64_t ht_cycle_count{0};
@@ -151,7 +155,7 @@ private:
     std::map<std::string, std::shared_ptr<host_tailer>> l_remotes;
 };
 
-void cleanup_cache();
+[[nodiscard]] std::future<void> cleanup_cache();
 
 }  // namespace tailer
 

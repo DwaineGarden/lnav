@@ -27,17 +27,15 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifdef __CYGWIN__
-#    include <alloca.h>
-#endif
-
 #include <fstream>
 #include <iostream>
 
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "base/injector.bind.hh"
 #include "base/injector.hh"
+#include "base/isc.hh"
 #include "config.h"
 #include "data_parser.hh"
 #include "data_scanner.hh"
@@ -50,6 +48,9 @@
 #include "view_curses.hh"
 
 const char* TMP_NAME = "scanned.tmp";
+
+static auto bound_file_options_hier
+    = injector::bind<lnav::safe_file_options_hier>::to_singleton();
 
 int
 main(int argc, char* argv[])
@@ -70,7 +71,7 @@ main(int argc, char* argv[])
     }
 
     {
-        std::vector<ghc::filesystem::path> paths;
+        std::vector<std::filesystem::path> paths;
         std::vector<lnav::console::user_message> errors;
 
         load_formats(paths, errors);
@@ -132,8 +133,9 @@ main(int argc, char* argv[])
                         "error: unable to temporary file for writing\n");
                 retval = EXIT_FAILURE;
             } else {
+                isc::supervisor root_superv(injector::get<isc::service_list>());
+                std::shared_ptr<logfile> lf;
                 std::shared_ptr<log_format> format;
-                char* log_line;
                 bool found = false;
                 char cmd[2048];
                 std::string line;
@@ -144,8 +146,6 @@ main(int argc, char* argv[])
                     line = "             " + line;
                 }
 
-                log_line = (char*) alloca(line.length());
-                strcpy(log_line, &line[13]);
                 auto sub_line = line.substr(13);
                 struct line_range body(0, sub_line.length());
                 shared_buffer share_manager;
@@ -157,25 +157,35 @@ main(int argc, char* argv[])
 
                 auto& root_formats = log_format::get_root_formats();
                 std::vector<std::shared_ptr<log_format>>::iterator iter;
-                std::vector<logline> index;
 
                 if (is_log) {
+                    std::vector<logline> index;
                     logfile_open_options loo;
                     auto open_res = logfile::open(argv[lpc], loo);
-                    auto lf = open_res.unwrap();
+                    lf = open_res.unwrap();
                     ArenaAlloc::Alloc<char> allocator;
-                    scan_batch_context sbc{allocator};
+                    date_time_scanner time_scanner;
+                    auto lffs = lf->get_format_file_state();
+                    scan_batch_context sbc{
+                        allocator,
+                        const_cast<pattern_locks&>(lffs.lffs_pattern_locks),
+                        time_scanner,
+                    };
+                    sbc.sbc_value_stats = lffs.lffs_value_stats;
+                    line_info li = {{13}};
+                    index.emplace_back(li.li_file_range.fr_offset,
+                                       std::chrono::microseconds::zero(),
+                                       LEVEL_UNKNOWN);
                     for (iter = root_formats.begin();
                          iter != root_formats.end() && !found;
                          ++iter)
                     {
-                        line_info li = {{13}};
-
                         (*iter)->clear();
-                        if ((*iter)->scan(*lf, index, li, sbr, sbc)
-                            == log_format::SCAN_MATCH)
+                        if ((*iter)
+                                ->scan(*lf, index, li, sbr, sbc)
+                                .is<log_format::scan_match>())
                         {
-                            format = (*iter)->specialized();
+                            format = (*iter)->specialized(sbc);
                             found = true;
                         }
                     }
@@ -189,11 +199,12 @@ main(int argc, char* argv[])
                 string_attrs_t sa;
 
                 if (format.get() != nullptr) {
-                    format->annotate(0, sa, ll_values);
+                    format->annotate(lf.get(), 0, sa, ll_values);
                     body = find_string_attr_range(sa, &SA_BODY);
                 }
 
                 data_parser::TRACE_FILE = fopen("scanned.dpt", "w");
+                setvbuf(data_parser::TRACE_FILE, nullptr, _IONBF, 0);
 
                 data_scanner ds(sub_line, body.lr_start);
 
@@ -276,7 +287,8 @@ main(int argc, char* argv[])
 
                 fclose(out);
 
-                sprintf(cmd, "diff -u %s %s", argv[lpc], TMP_NAME);
+                snprintf(
+                    cmd, sizeof(cmd), "diff -u %s %s", argv[lpc], TMP_NAME);
                 rc = system(cmd);
                 if (rc != 0) {
                     if (prompt) {

@@ -49,6 +49,16 @@ bind_to_sqlite(sqlite3_stmt* stmt, int index, const struct timeval& tv)
 }
 
 inline int
+bind_to_sqlite(sqlite3_stmt* stmt,
+               int index,
+               const std::chrono::system_clock::time_point& tp)
+{
+    auto epoch_ts = tp.time_since_epoch().count();
+
+    return sqlite3_bind_int64(stmt, index, epoch_ts);
+}
+
+inline int
 bind_to_sqlite(sqlite3_stmt* stmt, int index, const char* str)
 {
     return sqlite3_bind_text(stmt, index, str, -1, SQLITE_TRANSIENT);
@@ -57,8 +67,18 @@ bind_to_sqlite(sqlite3_stmt* stmt, int index, const char* str)
 inline int
 bind_to_sqlite(sqlite3_stmt* stmt, int index, intern_string_t ist)
 {
+    if (ist.empty()) {
+        return sqlite3_bind_null(stmt, index);
+    }
     return sqlite3_bind_text(
-        stmt, index, ist.get(), ist.size(), SQLITE_TRANSIENT);
+        stmt, index, ist.get(), ist.size(), SQLITE_STATIC);
+}
+
+inline int
+bind_to_sqlite(sqlite3_stmt* stmt, int index, string_fragment sf)
+{
+    return sqlite3_bind_text(
+        stmt, index, sf.data(), sf.length(), SQLITE_TRANSIENT);
 }
 
 inline int
@@ -74,6 +94,16 @@ bind_to_sqlite(sqlite3_stmt* stmt, int index, int64_t i)
     return sqlite3_bind_int64(stmt, index, i);
 }
 
+template<typename T>
+int
+bind_to_sqlite(sqlite3_stmt* stmt, int index, const std::optional<T>& v)
+{
+    if (v.has_value()) {
+        return bind_to_sqlite(stmt, index, v.value());
+    }
+    return sqlite3_bind_null(stmt, index);
+}
+
 template<typename... Args, std::size_t... Idx>
 int
 bind_values_helper(sqlite3_stmt* stmt,
@@ -84,9 +114,10 @@ bind_values_helper(sqlite3_stmt* stmt,
 
     for (size_t lpc = 0; lpc < idxs.size(); lpc++) {
         if (rcs[lpc] != SQLITE_OK) {
-            log_error("Failed to bind column %d in statement: %s",
+            log_error("Failed to bind column %zu in statement: %s -- %s",
                       lpc,
-                      sqlite3_sql(stmt));
+                      sqlite3_sql(stmt),
+                      sqlite3_errstr(rcs[lpc]));
             return rcs[lpc];
         }
     }
@@ -103,7 +134,10 @@ bind_values(sqlite3_stmt* stmt, Args... args)
 }
 
 struct prepared_stmt {
-    prepared_stmt(auto_mem<sqlite3_stmt> stmt) : ps_stmt(std::move(stmt)) {}
+    explicit prepared_stmt(auto_mem<sqlite3_stmt> stmt)
+        : ps_stmt(std::move(stmt))
+    {
+    }
 
     Result<void, std::string> execute()
     {
@@ -142,14 +176,7 @@ struct prepared_stmt {
         }
 
         if (rc == SQLITE_ROW) {
-            const auto argc = sqlite3_column_count(this->ps_stmt.in());
-            sqlite3_value* argv[argc];
-
-            for (int lpc = 0; lpc < argc; lpc++) {
-                argv[lpc] = sqlite3_column_value(this->ps_stmt.in(), lpc);
-            }
-
-            return from_sqlite<T>()(argc, argv, 0);
+            return from_column<T>()(this->ps_stmt.in(), 0);
         }
 
         return fetch_error{
@@ -160,7 +187,7 @@ struct prepared_stmt {
     template<typename T, typename F>
     Result<void, fetch_error> for_each_row(F func)
     {
-        nonstd::optional<fetch_error> err;
+        std::optional<fetch_error> err;
         auto done = false;
 
         while (!done) {
@@ -195,10 +222,12 @@ prepare_stmt(sqlite3* db, const char* sql, Args... args)
                         sqlite3_errmsg(db)));
     }
 
-    if (bind_values(retval.in(), args...) != SQLITE_OK) {
-        return Err(
-            fmt::format(FMT_STRING("unable to prepare SQL statement: {}"),
-                        sqlite3_errmsg(db)));
+    if (sizeof...(args) > 0) {
+        if (bind_values(retval.in(), args...) != SQLITE_OK) {
+            return Err(
+                fmt::format(FMT_STRING("unable to prepare SQL statement: {}"),
+                            sqlite3_errmsg(db)));
+        }
     }
 
     return Ok(prepared_stmt{

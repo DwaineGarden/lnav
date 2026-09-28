@@ -36,7 +36,6 @@
 #include <string>
 
 #include "attr_line.hh"
-#include "shlex.resolver.hh"
 
 #define ANSI_CSI             "\x1b["
 #define ANSI_CHAR_ATTR       "m"
@@ -49,8 +48,10 @@
 
 #define ANSI_BOLD(msg)      ANSI_BOLD_START msg ANSI_NORM
 #define ANSI_UNDERLINE(msg) ANSI_UNDERLINE_START msg ANSI_NORM
+#define ANSI_HOTKEY(key)    ANSI_CSI "1;4m" key ANSI_NORM
 
 #define ANSI_ROLE(msg)        ANSI_CSI "%dO" msg ANSI_NORM
+#define ANSI_ROLE_FMT(msg)    ANSI_CSI "{}O" msg ANSI_NORM
 #define XANSI_COLOR(col)      "3" #col
 #define ANSI_COLOR_PARAM(col) XANSI_COLOR(col)
 #define ANSI_COLOR(col)       ANSI_CSI XANSI_COLOR(col) "m"
@@ -65,11 +66,5 @@
 void scrub_ansi_string(std::string& str, string_attrs_t* sa);
 
 size_t erase_ansi_escapes(string_fragment input);
-
-/**
- * Populate a variable map with strings that contain escape sequences that
- * might be useful to script writers.
- */
-void add_ansi_vars(std::map<std::string, scoped_value_t>& vars);
 
 #endif

@@ -38,10 +38,43 @@ files to be added or removed from the view.  If the path is an archive or
 compressed file (and lnav was built with libarchive), the archive will be
 extracted to a temporary location and the files within will be loaded.  The
 files that are found will be scanned to identify their file format.  Files
-that match a log format will be collated by time and displayed in the LOG
+that match a log format will be collated by time [#]_ and displayed in the LOG
 view.  Plain text files can be viewed in the TEXT view, which can be accessed
 by pressing :kbd:`t`.
 
+.. [#] Log message timestamps are stored in the index with a resolution of
+   microseconds.
+
+Standard Input
+^^^^^^^^^^^^^^
+
+Content piped into **lnav** will be captured and displayed as it comes in.
+Each line is timestamped as it arrives and is stored as part of the capture.
+To display the timestamps, pass the :option:`-t` option when invoking lnav.
+The time elapsed between lines can also be viewed by pressing
+:kbd:`Shift` + :kbd:`T`.  For example, if you wanted a basic measurement
+of what is taking a long time in a run of :code:`make`, you can pipe the
+output into lnav and enable the elapsed time column.
+
+By default, the captured output is saved in the work directory and a command
+is printed out to reopen the content.  You can get a listing
+of all captures by running the following :ref:`management<management_cli>`
+command:
+
+.. code-block:: bash
+
+    lnav -m piper list
+
+Captures that are older than 48 hours will be deleted on the next lnav
+invocation or you can run the following command to clean them up immediately:
+
+.. code-block:: bash
+
+    lnav -m piper clean
+
+In order to limit the amount of data captured, lnav will rotate the
+underlying files as needed.  To capture more/less data, adjust the options
+detailed in the :ref:`piper configuration<pipercfg>` section.
 
 Archive Support
 ^^^^^^^^^^^^^^^
@@ -84,7 +117,7 @@ given, followed by a colon, and then the path to the files, like so::
 For example, to open :file:`/var/log/syslog.log` on "host1.example.com" as the
 user "dean", you would write:
 
-.. prompt:: bash
+.. code-block:: bash
 
    lnav dean@host1.example.com:/var/log/syslog.log
 
@@ -100,21 +133,110 @@ file.
   `ssh-keys plug <https://snapcraft.io/docs/ssh-keys-interface>`_ using the
   following command:
 
-  .. prompt:: bash
+  .. code-block:: bash
 
     sudo snap connect lnav:ssh-keys
 
 .. note::
 
-  Remote file access is implemented by transferring an
-  `αcτµαlly pδrταblε εxεcµταblε <https://justine.lol/ape.html>`_ to the
-  destination and invoking it.  An APE binary can run on most any x86_64
-  machine and OS (i.e. MacOS, Linux, FreeBSD, Windows).  The binary is
-  baked into the lnav executable itself, so there is no extra setup that
+  Remote file access is implemented through a "tailer" executable that is
+  transferred to the host.  The tailer handles requests from lnav for
+  synchronizing file blocks, completing path names, previewing files,
+  and so on.
+
+  There are two implementations of the tailer: Python3 and an
+  `αcτµαlly pδrταblε εxεcµταblε <https://justine.lol/ape.html>`_.
+  If the target host does not have Python3 installed, the APE binary will
+  be used.  An APE binary can run on most any x86_64 machine and OS
+  (i.e. MacOS, Linux, FreeBSD, Windows).  The implementations are baked
+  into the lnav executable itself.  So, there is no extra setup that
   needs to be done on the remote machine.
   
-  The binary file is named ``tailer.bin.XXXXXX`` where *XXXXXX* is 6 random digits.
-  The file is, under normal circumstancies, deleted immediately.
+  The tailer is copied to the user's home directory and is named
+  ``tailer.bin.XXXXXX`` where *XXXXXX* is 6 random digits.
+  Under normal circumstances, the file should be deleted immediately.
+
+Command Output
+^^^^^^^^^^^^^^
+
+The output of commands can be captured and displayed in **lnav** using
+the :ref:`:sh<sh>` command or by passing the :option:`-e` option on the
+command-line.   The captured output will be displayed in the TEXT view.
+The lines from stdout and stderr are recorded separately so that the
+lines from stderr can be shown in the theme's "error" highlight.  The
+time that the lines were received are also recorded internally so that
+the "time-offset" display (enabled by pressing :kbd:`Shift` + :kbd:`T`)
+can be shown and the "jump to slow-down" hotkeys (:kbd:`s` /
+:kbd:`Shift` + :kbd:`S`) work.  Since the line-by-line timestamps are
+recorded internally, they will not interfere with timestamps that are
+in the commands output.
+
+Docker Logs
+^^^^^^^^^^^
+
+To make it easier to view
+`docker logs <https://docs.docker.com/engine/reference/commandline/logs/>`_
+within **lnav**, a :code:`docker://` URL scheme is available.  Passing
+the container name in the authority field will run the :code:`docker logs`
+command.  If a path is added to the URL, then **lnav** will execute
+:code:`docker exec <container> tail -F -n +0 /path/to/file` to try and
+tail the file in the container.
+
+strace
+^^^^^^
+
+The default output of :code:`strace` does not have enough information for
+lnav to make use of it.  The :code:`-ttt -T` flags need to be passed to
+add a high-resolution timestamp and the duration of the call.  The
+timestamp is needed for lnav to recognize the content as a log file and
+the duration is useful for visualizing how long it takes a syscall to
+run in the TIMELINE view.  It is also advisable to use the :code:`-f`
+flag so all of the threads/sub-processes are traced.
+
+You can use the :code:`strace://localhost/<pid>` URL to run strace on an
+existing process and have the appropriate flags passed.
+
+Custom URL Schemes
+^^^^^^^^^^^^^^^^^^
+
+Custom URL schemes can be defined using the :ref:`/tuning/url-schemes<url_scheme>`
+configuration.  By adding a scheme name to the tuning configuration along
+with the name of an **lnav** handler script, you can control how the URL is
+interpreted and turned into **lnav** commands.  This feature is how the
+`Docker Logs`_ functionality is implemented.
+
+Custom URLs can be passed on the command-line or to the :ref:`:open<open>`
+command.  When passed on the command-line, an :code:`:open` command with the
+URL is added to the list of initial commands.  When the :code:`:open` command
+detects a custom URL, it checks for the definition in the configuration.
+If found, it will call the associated handler script with the URL as the
+first parameter.  The script can parse the URL using the :ref:`parse_url`
+SQL function, if needed.  The script should then execute whatever commands
+it needs to open the destination for viewing in **lnav**.  For example,
+the docker URL handler uses the :ref:`:sh<sh>` command to run
+:code:`docker logs` with the container.
+
+Using as a PAGER
+^^^^^^^^^^^^^^^^
+
+Setting **lnav** as your :envvar:`PAGER` can have some advantages, like
+basic syntax highlighting and discovering sections in a document.  For
+example, when viewing a man page, the current section is displayed in
+the breadcrumb bar and you can jump to a section with the
+:ref:`:goto<goto>` command.
+
+When setting the :envvar:`PAGER` variable, pass the :option:`-q` option
+to modify lnav's behavior to make it more amenable for this purpose:
+
+.. code-block:: bash
+
+   export PAGER="lnav -q"
+
+With this option, lnav will:
+
+* Not save the piped content after exiting.
+* Print any marked lines to the screen OR all lines if the total
+  height is less than the terminal height.
 
 Searching
 ---------
@@ -126,6 +248,85 @@ next error in the file and pressing :kbd:`Shift` + :kbd:`e` will jump to
 the previous error.  Plain text searches can be done by pressing :kbd:`/`
 to enter the search prompt.  A regular expression can be entered into the
 prompt to start a search through the current view.
+
+
+.. _named_searches:
+
+Named Searches
+^^^^^^^^^^^^^^
+
+.. note:: This feature is available in v0.15.0+.
+
+A search that is worth keeping around can be given a name.  A named search
+stays active and highlighted while other searches are run, so several patterns
+can be tracked at the same time.
+
+A named search can be created with the
+:ref:`:create-named-search<create_named_search>` command, either by giving it a
+pattern directly or by leaving the pattern off to adopt the search that is
+currently active.  The name must be a valid SQL identifier, since it is also
+the name of the search's table (see below).  In the latter case, the active search is cleared, so a
+search can be promoted once it turns out to be interesting.  Searches can be
+deleted with the :ref:`:delete-named-search<delete_named_search>` command or by
+doing a :code:`DELETE` on the
+:ref:`lnav_view_searches<table_lnav_view_searches>` table.
+
+In the LOG view, each named search also gets a
+:ref:`search table<search_tables>` of the same name that contains the messages
+it matched, with a column for each capture in the pattern.  So the hits can be
+examined with SQL without writing the pattern again::
+
+    :create-named-search gpxe gPXE/(?<ver>[\d\.]+)
+    ;SELECT DISTINCT ver FROM gpxe
+
+The messages the search already found are used during queries of the table, so
+it costs about as much as the number of hits.  The table is removed when the
+search is deleted, but is left in place when the search is only disabled.
+Searches in the other views do not get a table, since a search table is
+built out of log messages.
+
+A search that is not interesting at the moment can be turned off with the
+:ref:`:disable-named-search<disable_named_search>` command instead of being
+deleted.  A disabled search keeps its hits up-to-date, so the
+:ref:`:enable-named-search<enable_named_search>` command will bring its
+highlighting back without another pass over the view.
+
+The text matched by a named search is given a background color that is derived
+from the name, so each search reads as its own block.  The :kbd:`n` /
+:kbd:`Shift` + :kbd:`n` and :kbd:`<` / :kbd:`>` keys move through the hits of
+the named searches as well as the current search.
+
+When several searches are active, one of them can be *focused* so that those
+keys move through its hits alone.  The :kbd:`.` and :kbd:`,` keys move the
+focus to the next and previous search, running from nothing focused, through
+the current search, then the named searches, and back to nothing, so there is
+always a way back to moving through all of them.  A search can also be focused
+by name with the :ref:`:focus-search<focus_search>` command, which clears the
+focus when it is given no name.
+
+The status bar says which hits the keys are moving through.  A focused named
+search is given by name, wearing the same background color that its matches
+wear in the view; the focused current search is given by its pattern; and with
+nothing focused the field reads :code:`all searches` and the count covers every
+enabled search at once.
+
+Named searches also show up in the following places:
+
+* The :ref:`filter editor<ui_filters>`, where they are listed below the view's
+  filters with their hit counts and can be created, edited, enabled/disabled,
+  focused, and deleted.
+* The :ref:`timeline<timeline>` view, where each search is a row that spans
+  its first to its last hit.  The current search gets a row of its own,
+  labelled with its pattern in quotes since it has no name.  The
+  :ref:`:hide-in-timeline<hide_in_timeline>` :code:`search` command will hide
+  all of these rows.
+* The :code:`log_named_searches` column on the log tables, which contains a
+  JSON list of the searches that matched a message.
+* The :ref:`lnav_view_searches<table_lnav_view_searches>` table, which supports
+  :code:`INSERT` and :code:`DELETE` to create and remove searches from SQL.
+
+Named searches are saved in the session and are included in the output of the
+:ref:`:export-session-to<export_session_to>` command.
 
 
 .. _filtering:
@@ -178,6 +379,78 @@ Log level
 To hide messages below a certain log level, you can use the
 :ref:`:set-min-log-level<set_min_log_level>` command.
 
+
+.. _filter_context:
+
+Context Lines
+^^^^^^^^^^^^^
+
+When filtering, it can be useful to see the log messages surrounding a
+match to understand the context.  Similar to :command:`grep`'s
+:option:`-C` option, **lnav** can show extra messages before and after
+each filter match.
+
+The :ref:`:filter-context<filter_context>` command sets the number of
+context messages to show.  For example, ``:filter-context 2`` shows two
+messages before and after each match.  You can also specify different
+values for before and after: ``:filter-context 3 1`` shows three messages
+before and one after.
+
+In the **LOG** view, context is counted in whole messages, including any
+continuation lines.  In the **TEXT** view, context is counted in lines.
+
+The :kbd:`z` and :kbd:`Shift` + :kbd:`Z` keys provide a quick way to
+increase or decrease the context by one in the LOG, TEXT, and TIMELINE
+views.
+
+Context lines are visually distinguished from matched lines using the
+``context-line`` theme style.
+
+
+Log-oriented Debugging
+----------------------
+
+Breakpoints
+^^^^^^^^^^^
+
+Breakpoints let you mark log messages that originate from a particular
+source file location (e.g. :code:`main.cc:42`) or that share a common
+message schema.  Log messages that have a source location and match a
+breakpoint will be highlighted with a red circle, making it easy to spot
+related messages as you scroll through logs.
+
+.. figure:: lnav-breakpoint-dot.png
+    :align: center
+    :figwidth: 90%
+
+    A screenshot of lnav's logs where a breakpoint is set.  The red
+    circle next to the source file name and line indicates the location
+    of the breakpoint.
+
+To toggle a breakpoint on the focused log message, press :kbd:`Ctrl` +
+:kbd:`B` or use the :ref:`:breakpoint<breakpoint>` command.
+You can also set breakpoints explicitly with the
+:ref:`:breakpoint<breakpoint>` command, specifying a
+:code:`[format:]file:line` location.
+
+Once breakpoints are set, you can jump between matching log messages
+using the :kbd:`F7` and :kbd:`F8` keys to move to the previous and next
+breakpoint hit, respectively.
+
+Breakpoints can be disabled without deleting them using the
+:ref:`:toggle-breakpoint<toggle_breakpoint>` command.
+The :ref:`lnav_log_breakpoints<table_lnav_log_breakpoints>`
+SQL table, which allows you to query, insert, update, and delete breakpoints.
+For example, to disable all breakpoints matching a file:
+
+.. code-block:: custsqlite
+
+    ;UPDATE lnav_log_breakpoints SET enabled = 0 WHERE description LIKE '%main.cc%'
+
+Breakpoints are saved as part of the session, so they will be restored
+the next time you open the same files.
+
+
 .. _search_tables:
 
 Search Tables
@@ -198,15 +471,57 @@ columns defined in that format.  Whereas a table created with the command
 will search messages from all different formats and no format-specific
 columns will be included in the table.
 
+A search table is also created for every :ref:`named search<named_searches>`
+in the LOG view, so the hits for a search can be queried from SQL without
+having to write the pattern a second time.  Such a table is named after the
+search and is removed when the search is deleted.
+
 .. _taking_notes:
 
 Taking Notes
 ------------
 
-A few of the columns in the log tables can be updated on a row-by-row basis to
-allow you to take notes.  The majority of the columns in a log table are
-read-only since they are backed by the log files themselves.  However, the
-following columns can be changed by an :code:`UPDATE` statement:
+As you are looking through logs, you might find that you want to leave some
+notes of your findings.  **lnav** can help here by saving information in
+the session without needing to modify the actual log files.  Thus, when
+you re-open the files in lnav, the notes will be restored.  The following
+types of information can be saved:
+
+:tags: Log messages can be tagged with the :ref:`:tag<tag>` command as a
+  simple way to leave a descriptive mark.  The tags attached to a
+  message will be shown underneath the message.  You can press
+  :kbd:`u` and :kbd:`Shift` + :kbd:`u` to jump to the next/previous
+  marked line.  A regular search will also match tags.
+
+:comments: Free-form text can be attached to a log message with the
+  :ref:`:comment<comment>` command.  The comment will be shown
+  underneath the message. If the text contains Markdown syntax,
+  it will be rendered to the best of the terminal's ability.
+  The comment can reference other log messages using Markdown links
+  with the target being the permalink of the other log message.
+  You can then click the link to jump to the other message and then
+  press :kbd:`Ctrl` + :kbd:`O` to jump back.
+  You can press :kbd:`u` and :kbd:`Shift` + :kbd:`u` to jump to the
+  next/previous marked line.  A regular search will also match the
+  comment text.
+
+.. _partitions:
+
+:partitions: The LOG view can be partitioned to provide some context
+  about where you are in a collection of logs.  For example, in logs
+  for a test run, partitions could be created with the name for each
+  test.  The current partition is shown in the breadcrumb bar and
+  prefixed by the "⊑" symbol.  You can select the partition breadcrumb
+  to jump to another partition.  Pressing :kbd:`{` and :kbd:`}` will
+  jump to the next/previous partition.
+
+Accessing notes through the SQLite interface
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The note taking functionality in lnav can also be accessed through the
+log tables exposed through SQLite.  The majority of the columns in a log
+table are read-only since they are backed by the log files themselves.
+However, the following columns can be changed by an :code:`UPDATE` statement:
 
 * **log_part** - The "partition" the log message belongs to.  This column can
   also be changed by the :ref:`:partition-name<partition_name>` command.
@@ -234,6 +549,9 @@ with a single SQL statement [#]_, we will break things down into a few steps for
 this example.  First, we will use the :ref:`:create-search-table<create_search_table>`
 command to match the dhclient message and extract the IP address:
 
+.. [#] The expression :code:`regexp_match('bound to ([^ ]+)', log_body) as ip`
+   can be used to extract the IP address from the log message body.
+
 .. code-block:: lnav
 
    :create-search-table dhclient_ip bound to (?<ip>[^ ]+)
@@ -260,9 +578,6 @@ Since the above can be a lot to type out interactively, you can put these
 commands into a :ref:`script<scripts>` and execute that script with the
 :kbd:`\|` hotkey.
 
-.. [#] The expression :code:`regexp_match('bound to ([^ ]+)', log_body) as ip`
-   can be used to extract the IP address from the log message body.
-
 Sharing Sessions With Others
 ----------------------------
 
@@ -283,9 +598,9 @@ directory.
 Also, in order to support archives of log files, lnav will try to find the
 directory where the archive was unpacked and use that as the base for the
 :code:`:open` command.  Currently, this is done by searching for the top
-"README" file in the directory hierarchy containing the files [1]_.  The
+"README" file in the directory hierarchy containing the files [#]_.  The
 consumer of the session script can then set the :code:`LOG_DIR_0` (or 1, 2,
 ...) environment variable to change where the log files will be loaded from.
 
-.. [1] It is assumed a log archive would have a descriptive README file.
+.. [#] It is assumed a log archive would have a descriptive README file.
    Other heuristics may be added in the future.

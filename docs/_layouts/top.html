@@ -7,10 +7,6 @@
 <link rel="icon" type="image/png" href="/assets/images/favicon.png">
 
 <style>
-    main {
-        margin: 0 50px;
-    }
-
     #top-description {
         font-size: xx-large;
         margin-top: 3em;
@@ -21,41 +17,41 @@
         font-size: x-large;
         font-weight: lighter;
         margin-top: 2em;
-        margin-left: 2em;
     }
 
-    .dlrow {
-        display: grid;
-        align-items: start;
-        grid-template-columns: repeat(auto-fit, minmax(22em, 1fr));
-        width: 100%;
+    #intro p {
+        width: auto;
     }
 
-    p:before, #top-description:before {
-        content: "";
-        width: 6em;
-        display: block;
-        overflow: hidden;
+    .section h2 {
+        padding-left: 1em;
+        padding-right: 1em;
+        text-align: left;
+        font-weight: normal;
+        font-size: xx-large;
+        border-bottom: 1px solid #8d8;
     }
 
-    dl {
-        display: grid;
-        grid-template-rows: auto auto;
-        grid-auto-flow: column;
-    }
-    dl dt {
+    .section h3 {
+        padding: 1em 2em 1em 2em;
+        text-align: center;
         font-weight: normal;
         font-size: x-large;
-        text-align: center;
         border-bottom: 1px solid #8d8;
-        margin: 20px 30px;
-        height: 2em;
     }
-    dl dd {
-        margin: 0 30px 20px 30px;
-        min-height: 3em;
-        color: #828282;
-        font-size: medium;
+
+    .section-contents {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+
+    .section-contents p {
+        margin-top: 2em;
+        margin-left: 1em;
+        margin-right: 1em;
+        width: 30em;
+        font-size: large;
     }
 </style>
 

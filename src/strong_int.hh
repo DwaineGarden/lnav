@@ -45,59 +45,59 @@ template<typename T, class DISTINCT>
 class strong_int {
 public:
     explicit constexpr strong_int(T v = 0) noexcept : value(v){};
-    operator const T&() const
-    {
-        return this->value;
-    };
-    strong_int operator+(const strong_int& rhs) const
+    operator const T&() const { return this->value; }
+    constexpr strong_int operator+(const strong_int& rhs) const
     {
         return strong_int(this->value + rhs.value);
-    };
-    strong_int operator-(const strong_int& rhs) const
+    }
+    constexpr strong_int operator-(const strong_int& rhs) const
     {
         return strong_int(this->value - rhs.value);
-    };
-    strong_int operator/(const strong_int& rhs) const
+    }
+    constexpr strong_int operator/(const strong_int& rhs) const
     {
         return strong_int(this->value / rhs.value);
-    };
-    bool operator<(const strong_int& rhs) const
+    }
+    constexpr strong_int operator*(const strong_int& rhs) const
+    {
+        return strong_int(this->value * rhs.value);
+    }
+    constexpr bool operator<(const strong_int& rhs) const
     {
         return this->value < rhs.value;
-    };
+    }
     strong_int& operator+=(const strong_int& rhs)
     {
         this->value += rhs.value;
         return *this;
-    };
+    }
     strong_int& operator-=(const strong_int& rhs)
     {
         this->value -= rhs.value;
         return *this;
-    };
+    }
     strong_int& operator-()
     {
         this->value = -this->value;
         return *this;
-    };
+    }
     strong_int& operator++()
     {
         this->value++;
         return *this;
-    };
+    }
     strong_int& operator--()
     {
         this->value--;
         return *this;
-    };
-    bool operator==(const strong_int& rhs) const
+    }
+    constexpr bool operator==(const strong_int& rhs) const
     {
         return this->value == rhs.value;
-    };
-    T* out()
-    {
-        return &this->value;
-    };
+    }
+    T* out() { return &this->value; }
+
+    T& lvalue() { return this->value; }
 
 private:
     T value;

@@ -33,6 +33,7 @@
 #define line_buffer_hh
 
 #include <array>
+#include <atomic>
 #include <exception>
 #include <future>
 #include <vector>
@@ -44,17 +45,23 @@
 
 #include "base/auto_fd.hh"
 #include "base/auto_mem.hh"
+#include "base/enum_util.hh"
 #include "base/file_range.hh"
-#include "base/lnav_log.hh"
+#include "base/is_utf8.hh"
+#include "base/lnav.gzip.hh"
+#include "base/log_level_enum.hh"
+#include "base/piper.file.hh"
 #include "base/result.h"
+#include "mapbox/variant.hpp"
 #include "safe/safe.h"
 #include "shared_buffer.hh"
 
 struct line_info {
     file_range li_file_range;
+    timeval li_timestamp{0, 0};
+    log_level_t li_level{LEVEL_UNKNOWN};
     bool li_partial{false};
-    bool li_valid_utf{true};
-    bool li_has_ansi{false};
+    utf8_scan_result li_utf8_scan_result{};
 };
 
 /**
@@ -77,22 +84,10 @@ public:
         int e_err;
     };
 
-    struct header_data {
-        timeval hd_mtime{};
-        auto_buffer hd_extra{auto_buffer::alloc(0)};
-        std::string hd_name;
-        std::string hd_comment;
-
-        bool empty() const
-        {
-            return this->hd_mtime.tv_sec == 0 && this->hd_extra.empty()
-                && this->hd_name.empty() && this->hd_comment.empty();
-        }
-    };
-
 #define GZ_WINSIZE           32768U /*> gzip's max supported dictionary is 15-bits */
 #define GZ_RAW_MODE          (-15) /*> Raw inflate data mode */
 #define GZ_HEADER_MODE       (15 + 32) /*> Automatic zstd or gzip decoding */
+#define GZ_TRAILER_SIZE      8 /*> Size of a gzip member's CRC32 + ISIZE */
 #define GZ_BORROW_BITS_MASK  7 /*> Bits (0-7) consumed in previous block */
 #define GZ_END_OF_BLOCK_MASK 128 /*> Stopped because reached end-of-block */
 #define GZ_END_OF_FILE_MASK  64 /*> Stopped because reached end-of-file */
@@ -107,7 +102,7 @@ public:
         gz_indexed(gz_indexed&& other) = default;
         ~gz_indexed() { this->close(); }
 
-        inline operator bool() const { return this->gz_fd != -1; }
+        operator bool() const { return this->gz_fd != -1; }
 
         uLong get_source_offset() const
         {
@@ -117,7 +112,15 @@ public:
         void close();
         void init_stream();
         void continue_stream();
-        void open(int fd, header_data& hd);
+
+        /**
+         * Set while the stream is a raw one, which is what resuming from a
+         * syncpoint gives.  A raw stream ends at the end of the deflate data
+         * and leaves the member's gzip trailer unread, where a header-mode
+         * stream consumes and checks it before reporting the end.
+         */
+        bool raw_stream{false};
+        void open(int fd, lnav::gzip::header& hd);
         int stream_data(void* buf, size_t size);
         void seek(off_t offset);
 
@@ -138,8 +141,8 @@ public:
             int apply(z_streamp s);
         };
 
-    private:
-        z_stream strm; /*< gzip streams structure */
+        line_buffer* parent;
+        z_stream strm{}; /*< gzip streams structure */
         std::vector<indexDict>
             syncpoints; /*< indexed dictionaries as discovered */
         auto_mem<Bytef> inbuf; /*< Compressed data buffer */
@@ -152,6 +155,15 @@ public:
     line_buffer(line_buffer&& other) = delete;
 
     virtual ~line_buffer();
+
+    void set_do_preloading(bool value) { this->lb_do_preloading = value; }
+
+    bool get_do_preloading() const { return this->lb_do_preloading; }
+
+    bool set_decompress_extra(bool value)
+    {
+        return this->lb_decompress_extra = value;
+    }
 
     /** @param fd The file descriptor that data should be pulled from. */
     void set_fd(auto_fd& fd);
@@ -174,6 +186,23 @@ public:
     }
 
     bool is_compressed() const { return this->lb_compressed; }
+
+    /**
+     * @return The size of the decompressed stream when the format can say it
+     * before the stream has been read, or nullopt when it cannot.
+     *
+     * Only a hint.  It comes from the gzip trailer today, which records the
+     * size modulo 2^32 and covers only the last member of a concatenated
+     * file, so a caller must treat being overrun as proof it was wrong.
+     */
+    std::optional<file_ssize_t> uncompressed_size() const
+    {
+        return this->lb_uncompressed_size;
+    }
+
+    bool is_header_utf8() const { return this->lb_is_utf8; }
+
+    bool has_line_metadata() const { return this->lb_line_metadata; }
 
     file_off_t get_read_offset(file_off_t off) const
     {
@@ -200,7 +229,20 @@ public:
      */
     Result<line_info, std::string> load_next_line(file_range prev_line = {});
 
-    Result<shared_buffer_ref, std::string> read_range(file_range fr);
+    enum class scan_direction {
+        forward,
+        backward,
+    };
+
+    Result<shared_buffer_ref, std::string> read_range(
+        file_range fr, scan_direction dir = scan_direction::forward);
+
+    enum class peek_options : uint8_t {
+        allow_short_read,
+    };
+
+    Result<auto_buffer, std::string> peek_range(
+        file_range fr, lnav::enums::bitset<peek_options> options = {});
 
     file_range get_available();
 
@@ -223,7 +265,7 @@ public:
         this->lb_file_offset = 0;
         this->lb_file_size = (ssize_t) -1;
         this->lb_buffer.resize(0);
-        this->lb_last_line_offset = -1;
+        this->lb_last_line_offset.store(-1, std::memory_order_relaxed);
     }
 
     /** Check the invariants for this object. */
@@ -249,17 +291,60 @@ public:
         uint32_t s_requested_preloads{0};
         uint32_t s_used_preloads{0};
         std::array<uint32_t, 10> s_hist{};
+        std::chrono::microseconds s_preload_wait_time{};
     };
 
     struct stats consume_stats() { return std::exchange(this->lb_stats, {}); }
 
     size_t get_buffer_size() const { return this->lb_buffer.size(); }
 
-    const header_data& get_header_data() const { return this->lb_header; }
+    using file_header_t
+        = mapbox::util::variant<lnav::gzip::header, lnav::piper::header>;
+
+    const file_header_t& get_header_data() const { return this->lb_header; }
 
     void enable_cache();
 
-    static void cleanup_cache();
+    file_ssize_t get_piper_header_size() const
+    {
+        return this->lb_piper_header_size;
+    }
+
+    bool is_piper() const { return this->lb_piper_header_size > 0; }
+
+    size_t line_count_guess() const { return this->lb_line_starts.size(); }
+
+    size_t get_byte_size() const
+    {
+        size_t total = this->lb_buffer.capacity();
+        total += this->lb_line_starts.capacity() * sizeof(uint32_t);
+        total += this->lb_line_col_widths.capacity() * sizeof(size_t);
+        total += (this->lb_line_is_utf.capacity() + 7) / 8;
+        total += (this->lb_line_has_ansi.capacity() + 7) / 8;
+        // The alt buffers belong to the preload thread until the future is
+        // consumed, so while one is in flight they are left out of the total
+        // rather than measured out from under it.  This is a statistic; a
+        // sample that misses one buffer is better than a race.
+        if (!this->lb_loader_future.valid()) {
+            if (this->lb_alt_buffer) {
+                total += this->lb_alt_buffer->capacity();
+            }
+            total += this->lb_alt_line_starts.capacity() * sizeof(uint32_t);
+            total += this->lb_alt_line_col_widths.capacity() * sizeof(size_t);
+            total += (this->lb_alt_line_is_utf.capacity() + 7) / 8;
+            total += (this->lb_alt_line_has_ansi.capacity() + 7) / 8;
+        }
+        return total;
+    }
+
+    const std::string& get_decompress_error() const
+    {
+        return this->lb_decompress_error;
+    }
+
+    void send_initial_load();
+
+    [[nodiscard]] static std::future<void> cleanup_cache();
 
 private:
     /**
@@ -276,6 +361,24 @@ private:
     void resize_buffer(size_t new_max);
 
     /**
+     * @return `want`, less whatever of it the file cannot fill.
+     *
+     * The extra buffer a compressed file gets is there to save decompressing
+     * the same bytes twice, so there is nothing to gain from making it larger
+     * than the whole stream.  Falls back to `want` when the size is not known
+     * -- see uncompressed_size().
+     */
+    file_ssize_t buffer_size_for(file_ssize_t want) const
+    {
+        if (this->lb_uncompressed_size
+            && this->lb_uncompressed_size.value() < want)
+        {
+            return this->lb_uncompressed_size.value();
+        }
+        return want;
+    }
+
+    /**
      * Ensure there is enough room in the buffer to cache a range of data from
      * the file.  First, this method will check to see if there is enough room
      * from where 'start' begins in the buffer to the maximum buffer size.  If
@@ -287,7 +390,9 @@ private:
      * @param start The file offset of the start of the line.
      * @param max_length The amount of data to be cached in the buffer.
      */
-    void ensure_available(file_off_t start, ssize_t max_length);
+    void ensure_available(file_off_t start,
+                          ssize_t max_length,
+                          scan_direction dir = scan_direction::forward);
 
     /**
      * Fill the buffer with the given range of data from the file.
@@ -297,7 +402,9 @@ private:
      * @param max_length The maximum amount of data to read from the file.
      * @return True if any data was read from the file.
      */
-    bool fill_range(file_off_t start, ssize_t max_length);
+    bool fill_range(file_off_t start,
+                    ssize_t max_length,
+                    scan_direction dir = scan_direction::forward);
 
     /**
      * After a successful fill, the cached data can be retrieved with this
@@ -331,23 +438,37 @@ private:
     auto_fd lb_fd; /*< The file to read data from. */
     safe_gz_indexed lb_gz_file; /*< File reader for gzipped files. */
     bool lb_bz_file{false}; /*< Flag set for bzip2 compressed files. */
+    bool lb_line_metadata{false};
+    file_ssize_t lb_piper_header_size{0};
+    file_ssize_t lb_bom_size{0};
 
     auto_buffer lb_buffer{auto_buffer::alloc(DEFAULT_LINE_BUFFER_SIZE)};
-    nonstd::optional<auto_buffer> lb_alt_buffer;
+    std::optional<auto_buffer> lb_alt_buffer;
     std::vector<uint32_t> lb_alt_line_starts;
     std::vector<bool> lb_alt_line_is_utf;
     std::vector<bool> lb_alt_line_has_ansi;
+    std::vector<size_t> lb_alt_line_col_widths;
     std::future<bool> lb_loader_future;
-    nonstd::optional<file_off_t> lb_loader_file_offset;
+    std::optional<file_off_t> lb_loader_file_offset;
 
     file_off_t lb_compressed_offset{
         0}; /*< The offset into the compressed file. */
-    file_ssize_t lb_file_size{
-        -1}; /*<
-              * The size of the file.  When lb_fd refers to
-              * a pipe, this is set to the amount of data
-              * read from the pipe when EOF is reached.
-              */
+    /**
+     * The decompressed size, when the format can say it ahead of the read.
+     * @see uncompressed_size()
+     */
+    std::optional<file_ssize_t> lb_uncompressed_size;
+    /**
+     * The size of the file.  When lb_fd refers to a pipe, this is set to the
+     * amount of data read from the pipe when EOF is reached.
+     *
+     * Atomic because the preload running on the io_looper thread grows it as
+     * it decompresses, while the owning thread is reading it to decide
+     * whether there is more data to index.  Both sides only ever revise it
+     * upward as more of the file is seen, so a lost update just gets
+     * rediscovered on the next read.
+     */
+    std::atomic<file_ssize_t> lb_file_size{-1};
     file_off_t lb_file_offset{0}; /*<
                                    * Data cached in the buffer comes from this
                                    * offset in the file.
@@ -355,16 +476,31 @@ private:
     time_t lb_file_time{0};
     bool lb_seekable{false}; /*< Flag set for seekable file descriptors. */
     bool lb_compressed{false};
-    file_off_t lb_last_line_offset{-1}; /*< */
+    bool lb_decompress_extra{false};
+    bool lb_is_utf8{true};
+    bool lb_do_preloading{false};
+    /**
+     * Read by the preload running on the io_looper thread while the owning
+     * thread is still advancing it, so it has to be atomic.  Relaxed
+     * throughout: the preload only uses it to decide whether to scan line
+     * starts, and the value can go stale the instant after it is read
+     * either way.
+     */
+    std::atomic<file_off_t> lb_last_line_offset{-1}; /*< */
 
     std::vector<uint32_t> lb_line_starts;
+    file_off_t lb_next_buffer_offset{0};
+    size_t lb_next_line_start_index{0};
     std::vector<bool> lb_line_is_utf;
     std::vector<bool> lb_line_has_ansi;
+    std::vector<size_t> lb_line_col_widths;
     stats lb_stats;
 
-    nonstd::optional<auto_fd> lb_cached_fd;
+    std::optional<auto_fd> lb_cached_fd;
 
-    header_data lb_header;
+    file_header_t lb_header{mapbox::util::no_init{}};
+
+    std::string lb_decompress_error;
 };
 
 #endif

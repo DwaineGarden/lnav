@@ -29,6 +29,9 @@
 
 #include "dump_internals.hh"
 
+#include "base/injector.hh"
+#include "bound_tags.hh"
+#include "help_text_formatter.hh"
 #include "lnav.events.hh"
 #include "lnav.hh"
 #include "lnav_config.hh"
@@ -36,12 +39,16 @@
 #include "sql_help.hh"
 #include "view_helpers.examples.hh"
 #include "yajlpp/yajlpp.hh"
+#include "yajlpp/yajlpp_def.hh"
 
 namespace lnav {
 
 void
 dump_internals(const char* internals_dir)
 {
+    static const auto* sql_cmd_map
+        = injector::get<lnav::commands::command_map_t*, sql_cmd_map_tag>();
+
     for (const auto* handlers :
          std::initializer_list<const json_path_container*>{
              &lnav_config_handlers,
@@ -55,14 +62,12 @@ dump_internals(const char* internals_dir)
         dump_schema_to(*handlers, internals_dir);
     }
 
-    execute_examples();
-
-    auto cmd_ref_path = ghc::filesystem::path(internals_dir) / "cmd-ref.rst";
+    auto cmd_ref_path = std::filesystem::path(internals_dir) / "cmd-ref.rst";
     auto cmd_file = std::unique_ptr<FILE, decltype(&fclose)>(
         fopen(cmd_ref_path.c_str(), "w+"), fclose);
 
     if (cmd_file != nullptr) {
-        std::set<readline_context::command_t*> unique_cmds;
+        std::set<lnav::commands::command_t*> unique_cmds;
 
         for (auto& cmd : lnav_commands) {
             if (unique_cmds.find(cmd.second) != unique_cmds.end()) {
@@ -74,18 +79,25 @@ dump_internals(const char* internals_dir)
         }
     }
 
-    auto sql_ref_path = ghc::filesystem::path(internals_dir) / "sql-ref.rst";
+    auto sql_ref_path = std::filesystem::path(internals_dir) / "sql-ref.rst";
     auto sql_file = std::unique_ptr<FILE, decltype(&fclose)>(
         fopen(sql_ref_path.c_str(), "w+"), fclose);
-    std::set<help_text*> unique_sql_help;
+    std::set<const help_text*> unique_sql_help;
 
     if (sql_file != nullptr) {
-        for (auto& sql : sqlite_function_help) {
+        for (const auto& sql : sqlite_function_help) {
             if (unique_sql_help.find(sql.second) != unique_sql_help.end()) {
                 continue;
             }
             unique_sql_help.insert(sql.second);
             format_help_text_for_rst(*sql.second, eval_example, sql_file.get());
+        }
+        for (const auto& cmd_pair : *sql_cmd_map) {
+            if (cmd_pair.second->c_help.ht_name == nullptr) {
+                continue;
+            }
+            format_help_text_for_rst(
+                cmd_pair.second->c_help, eval_example, sql_file.get());
         }
     }
 }

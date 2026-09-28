@@ -34,11 +34,13 @@
 
 #include "pcrepp/pcre2pp.hh"
 #include "shared_buffer.hh"
+#include "text_format.hh"
 
 enum data_token_t {
     DT_INVALID = -1,
 
     DT_QUOTED_STRING = 0,
+    DT_COMMENT,
     DT_URL,
     DT_PATH,
     DT_MAC_ADDRESS,
@@ -62,6 +64,7 @@ enum data_token_t {
     DT_EQUALS,
     DT_COMMA,
     DT_SEMI,
+    DT_EMDASH,
 
     DT_EMPTY_CONTAINER,
 
@@ -90,7 +93,9 @@ enum data_token_t {
     DT_EMAIL,
     DT_CONSTANT,
     DT_WORD,
+    DT_ID,
     DT_SYMBOL,
+    DT_UNIT,
     DT_LINE,
     DT_WHITE,
     DT_DOT,
@@ -98,10 +103,18 @@ enum data_token_t {
     DT_CSI,
 
     DT_GARBAGE,
+    DT_ZERO_WIDTH_SPACE,
 
-    DT_TERMINAL_MAX = DT_GARBAGE + 1,
+    DT_DIFF_FILE_HEADER,
+    DT_DIFF_HUNK_HEADING,
 
-    DNT_KEY = 50,
+    DT_CODE_BLOCK,
+
+    DT_ANCHOR,
+
+    DT_TERMINAL_MAX = DT_ANCHOR + 1,
+
+    DNT_KEY = 56,
     DNT_PAIR,
     DNT_VALUE,
     DNT_ROW,
@@ -121,8 +134,7 @@ public:
     static const char* token2name(data_token_t token);
 
     struct capture_t {
-        capture_t()
-        { /* We don't initialize anything since it's a perf hit. */
+        capture_t() { /* We don't initialize anything since it's a perf hit. */
         }
 
         capture_t(int begin, int end) : c_begin(begin), c_end(end)
@@ -151,25 +163,23 @@ public:
         : ds_line(line), ds_input(this->ds_line), ds_init_offset(off),
           ds_next_offset(off)
     {
-        if (!line.empty() && line.back() == '.') {
-            this->ds_input.sf_end -= 1;
-        }
+        this->cleanup_end();
     }
 
-    explicit data_scanner(string_fragment sf) : ds_input(sf)
+    explicit data_scanner(string_fragment sf, bool do_cleanup = true)
+        : ds_input(sf), ds_init_offset(sf.sf_begin), ds_next_offset(sf.sf_begin)
     {
-        if (!sf.empty() && sf.back() == '.') {
-            this->ds_input.sf_end -= 1;
+        if (do_cleanup) {
+            this->cleanup_end();
         }
     }
 
-    explicit data_scanner(shared_buffer_ref& line, size_t off, size_t end)
-        : ds_sbr(line), ds_input(line.to_string_fragment().sub_range(0, end)),
+    explicit data_scanner(const shared_buffer_ref& line, size_t off, size_t end)
+        : ds_sbr(line.clone()),
+          ds_input(line.to_string_fragment().sub_range(0, end)),
           ds_init_offset(off), ds_next_offset(off)
     {
-        if (!this->ds_input.empty() && this->ds_input.back() == '.') {
-            this->ds_input.sf_end -= 1;
-        }
+        this->cleanup_end();
     }
 
     struct tokenize_result {
@@ -178,14 +188,35 @@ public:
         capture_t tr_inner_capture;
         const char* tr_data{nullptr};
 
+        string_fragment to_string_fragment() const
+        {
+            return string_fragment::from_byte_range(this->tr_data,
+                                                    this->tr_capture.c_begin,
+                                                    this->tr_capture.c_end);
+        }
+
+        string_fragment inner_string_fragment() const
+        {
+            return string_fragment::from_byte_range(
+                this->tr_data,
+                this->tr_inner_capture.c_begin,
+                this->tr_inner_capture.c_end);
+        }
+
         std::string to_string() const
         {
-            return {&this->tr_data[this->tr_capture.c_begin],
-                    (size_t) this->tr_capture.length()};
+            return {
+                &this->tr_data[this->tr_capture.c_begin],
+                (size_t) this->tr_capture.length(),
+            };
         }
     };
 
-    nonstd::optional<tokenize_result> tokenize2();
+    std::optional<tokenize_result> tokenize2(text_format_t tf
+                                             = text_format_t::TF_PLAINTEXT);
+
+    std::optional<tokenize_result> find_matching_bracket(text_format_t tf,
+                                                         tokenize_result tr);
 
     void reset() { this->ds_next_offset = this->ds_init_offset; }
 
@@ -195,17 +226,61 @@ public:
 
     string_fragment to_string_fragment(capture_t cap) const
     {
-        return this->ds_input.sub_range(cap.c_begin, cap.c_end);
+        return string_fragment{
+            this->ds_input.sf_string, cap.c_begin, cap.c_end};
     }
 
 private:
+    void cleanup_end();
+
     bool is_credit_card(string_fragment frag) const;
+
+    std::optional<tokenize_result> tokenize_int(text_format_t tf
+                                                = text_format_t::TF_PLAINTEXT);
 
     std::string ds_line;
     shared_buffer_ref ds_sbr;
     string_fragment ds_input;
     int ds_init_offset{0};
     int ds_next_offset{0};
+    bool ds_bol{true};
+    bool ds_units{false};
+    std::vector<tokenize_result> ds_matching_brackets;
+    bool ds_last_bracket_matched{false};
 };
+
+inline data_token_t
+to_opener(data_token_t dt)
+{
+    switch (dt) {
+        case DT_XML_CLOSE_TAG:
+            return DT_XML_OPEN_TAG;
+        case DT_RCURLY:
+            return DT_LCURLY;
+        case DT_RSQUARE:
+            return DT_LSQUARE;
+        case DT_RPAREN:
+            return DT_LPAREN;
+        default:
+            ensure(0);
+    }
+}
+
+inline data_token_t
+to_closer(data_token_t dt)
+{
+    switch (dt) {
+        case DT_XML_OPEN_TAG:
+            return DT_XML_CLOSE_TAG;
+        case DT_LCURLY:
+            return DT_RCURLY;
+        case DT_LSQUARE:
+            return DT_RSQUARE;
+        case DT_LPAREN:
+            return DT_RPAREN;
+        default:
+            ensure(0);
+    }
+}
 
 #endif

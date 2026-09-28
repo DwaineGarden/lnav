@@ -2,11 +2,11 @@ cmake_minimum_required(VERSION 3.14)
 
 include(cmake/prelude.cmake)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 project(
         lnav
-        VERSION 0.11.1
-        DESCRIPTION "An advanced log file viewer for the small-scale."
+        VERSION 0.15.0
+        DESCRIPTION "An advanced log file viewer for the terminal."
         HOMEPAGE_URL "https://lnav.org/"
         LANGUAGES CXX C
 )
@@ -14,30 +14,26 @@ project(
 include(cmake/project-is-top-level.cmake)
 include(cmake/variables.cmake)
 
-find_package(SQLite3 REQUIRED)
+find_package(PkgConfig REQUIRED)
+find_package(unofficial-sqlite3 CONFIG REQUIRED)
 find_package(BZip2 REQUIRED)
 find_package(LibArchive REQUIRED)
 find_package(ZLIB REQUIRED)
-find_package(pcre REQUIRED)
-find_package(pcre2 REQUIRED)
-find_package(readline REQUIRED)
-find_package(ncurses REQUIRED)
+find_package(pcre2 CONFIG REQUIRED)
 find_package(CURL REQUIRED)
 
 set(lnav_LIBS
         CURL::libcurl
-        SQLite::SQLite3
+        unofficial::sqlite3::sqlite3
         BZip2::BZip2
-        ncurses::libcurses
-        pcre::libpcre
-        pcre2::pcre2
-        readline::readline
+        PCRE2::8BIT PCRE2::16BIT PCRE2::32BIT PCRE2::POSIX
         LibArchive::LibArchive
         ZLIB::ZLIB
-        )
+        ${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/libunistring.a
+)
 
 add_subdirectory(src)
-# add_subdirectory(test)
+add_subdirectory(test)
 
 # ---- Install rules ----
 

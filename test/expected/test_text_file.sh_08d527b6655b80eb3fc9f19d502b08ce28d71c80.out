@@ -1,0 +1,224 @@
+[32m<!-- This is a comment for testing purposes -->[0m
+
+[34m[[0m![Build](https://github.com/tstack/lnav/workflows/ci-build/badge.svg)[34m]([0mhttps://github.com/tstack/lnav/actions?[4mquery[0m=workflow%3Aci-build[34m)[0m
+[34m[[0m![Docs](https://readthedocs.org/projects/lnav/badge/?[4mversion[0m=latest&[4mstyle[0m=plastic)[34m]([0mhttps://docs.lnav.org[34m)[0m
+[34m[[0m![Coverage Status](https://coveralls.io/repos/github/tstack/lnav/badge.svg?[4mbranch[0m=master)[34m]([0mhttps://coveralls.io/github/tstack/lnav?[4mbranch[0m=master[34m)[0m
+[34m[[0m![lnav](https://snapcraft.io/lnav/badge.svg)[34m]([0mhttps://snapcraft.io/lnav[34m)[0m
+[34m[[0m![Gurubase](https://img.shields.io/badge/Gurubase-Ask%20LNAV%20Guru-006BFF)[34m]([0mhttps://gurubase.io/g/lnav[34m)[0m
+
+[34m[[0m<img [4msrc[0m=[35m"https://assets-global.website-files.com/6257adef93867e50d84d30e2/62594fddd654fc29fcc07359_cb48d2a8d4991281d7a6a95d2f58195e.svg"[0m [4mheight[0m=[35m"20"[0m [4malt[0m=[35m"Discord Logo"[0m/>[34m]([0mhttps://discord.gg/erBPnKwz7R[34m)[0m
+
+[4m_This is the source repository for [0m[1m[4m**lnav**[0m[4m, visit [0m[4m[34m[[0m[4mhttps://lnav.org[0m[4m[34m]([0m[4mhttps://lnav.org[0m[4m[34m)[0m[4m for a high level overview._[0m
+
+[1m[35m# LNAV -- The Logfile Navigator[0m
+
+The Logfile Navigator is a log file viewer for the terminal.  Given a
+set of files/directories, [1m**lnav**[0m will:
+
+[33m-[0m decompress as needed;
+[33m-[0m detect their format;
+[33m-[0m merge the files by time into a single view;
+[33m-[0m tail the files, follow renames, find new files in directories;
+[33m-[0m build an index of errors and warnings;
+[33m-[0m [34m[[0mpretty-print JSON-lines[34m]([0mhttps://docs.lnav.org/en/latest/formats.html#json-lines[34m)[0m.
+
+Then, in the [1m**lnav**[0m TUI, you can:
+
+[33m-[0m jump quickly to the previous/next error ([34m[[0mpress [35m`e`[0m/[35m`E`[0m[34m]([0mhttps://docs.lnav.org/en/latest/hotkeys.html#spatial-navigation[34m)[0m);
+[33m-[0m search using regular expressions ([34m[[0mpress [35m`/`[0m[34m]([0mhttps://docs.lnav.org/en/latest/hotkeys.html#spatial-navigation[34m)[0m);
+[33m-[0m highlight text with a regular expression ([34m[[0m[35m`:highlight`[0m[34m]([0mhttps://docs.lnav.org/en/latest/commands.html#highlight-pattern[34m)[0m command);
+[33m-[0m filter messages using [34m[[0mregular expressions](https://docs.lnav.org/en/latest/usage.html#regular-expression-match) or [SQLite expressions[34m]([0mhttps://docs.lnav.org/en/latest/usage.html#sqlite-expression[34m)[0m;
+[33m-[0m pretty-print structured text ([34m[[0mpress [35m`P`[0m[34m]([0mhttps://docs.lnav.org/en/latest/ui.html#pretty[34m)[0m);
+[33m-[0m view a histogram of messages over time ([34m[[0mpress [35m`i`[0m[34m]([0mhttps://docs.lnav.org/en/latest/ui.html#hist[34m)[0m);
+[33m-[0m analyze messages using SQLite ([34m[[0mpress [35m`;`[0m[34m]([0mhttps://docs.lnav.org/en/latest/sqlext.html[34m)[0m)
+
+[1m## Screenshot[0m
+
+The following screenshot shows a mix of syslog and web access log
+files.  Failed requests are shown in red.  Identifiers, like IP
+address and PIDs are semantically highlighted.
+
+[34m[[0m![Screenshot](docs/assets/images/lnav-front-page.png)[34m]([0mdocs/assets/images/lnav-front-page.png[34m)[0m
+
+[1m## Why not [0m[1m**just**[0m[1m use [0m[1m[35m`tail`[0m[1m/[0m[1m[35m`grep`[0m[1m/[0m[1m[35m`less`[0m[1m?[0m
+
+The standard Unix utilities are great for processing raw text lines,
+however, they do not understand log messages.  Tail can watch
+multiple files at a time, but it won't display messages in order by
+time and you can't scroll backwards.  Grep will only find matching
+lines, but won't return a full multi-line log message.  Less can only
+display a single file at a time.  Also, none of these basic tools
+handle compressed files.
+
+[1m## Try online before installing[0m
+
+You can SSH into a demo node to play with lnav before installing.
+
+The [35m"playground"[0m account starts lnav with a couple of log files as
+an example:
+
+[34m[[0m[35m`$ ssh playground@demo.lnav.org`[0m[34m]([0mssh://playground@demo.lnav.org[34m)[0m
+
+The [35m"tutorial 1"[0m account is an interactive tutorial that can teach
+you the basics of operation:
+
+[34m[[0m[35m`$ ssh tutorial1@demo.lnav.org`[0m[34m]([0mssh://tutorial1@demo.lnav.org[34m)[0m
+
+[1m## Installation[0m
+
+[34m[[0mDownload a statically-linked binary for Linux/MacOS/Windows from the release page[34m]([0mhttps://github.com/tstack/lnav/releases/latest#release-artifacts[34m)[0m
+
+[4m### Brew on MacOS[0m
+
+[35m```console[0m
+[35m$ brew install lnav[0m
+[35m```[0m
+
+[4m### FreeBSD[0m
+
+[35m```console[0m
+[35m$ pkg install lnav[0m
+[35m```[0m
+
+[1m## Usage[0m
+
+Simply point [1m**lnav**[0m at the files or directories you want to
+monitor, it will figure out the rest:
+
+[35m```console[0m
+[35m$ lnav /path/to/file1 /path/to/dir ...[0m
+[35m```[0m
+
+The [1m**lnav**[0m TUI will pop up right away and begin indexing the
+files. Progress is displayed in the [35m"Files"[0m panel at the
+bottom. Once the indexing has finished, the LOG view will display
+the log messages that were recognized[^1]. You can then use the
+usual hotkeys to move around the view (arrow keys or
+[35m`j`[0m/[35m`k`[0m/[35m`h`[0m/[35m`l`[0m to move down/up/left/right).
+
+See the [34m[[0mUsage section[34m]([0mhttps://docs.lnav.org/en/latest/usage.html[34m)[0m
+of the online documentation for more information.
+
+[34m[^[0m1[34m][0m[34m:[0m Files that do not contain log messages can be seen in the
+      TEXT view (reachable by pressing [35m`t`[0m).
+
+[4m### Usage with [0m[4m[35m`systemd-journald`[0m
+
+On systems running [35m`systemd-journald`[0m, you can use [35m`lnav`[0m as the pager:
+
+[35m```[0m
+[35m$ journalctl [0m[35m|[0m[35m lnav[0m
+[35m```[0m
+
+or in follow mode:
+
+[35m```[0m
+[35m$ journalctl -f [0m[35m|[0m[35m lnav[0m
+[35m```[0m
+
+Since [35m`journalctl`[0m's default output format omits the year, if you are
+viewing logs which span multiple years you will need to change the
+output format to include the year, otherwise [35m`lnav`[0m gets confused:
+
+[35m```[0m
+[35m$ journalctl -o short-iso [0m[35m|[0m[35m lnav[0m
+[35m```[0m
+
+It is also possible to use [35m`journalctl`[0m's json output format and [35m`lnav`[0m
+will make use of additional fields such as PRIORITY and \_SYSTEMD_UNIT:
+
+[35m```[0m
+[35m$ journalctl -o json [0m[35m|[0m[35m lnav[0m
+[35m```[0m
+
+In case some MESSAGE fields contain special characters such as
+ANSI color codes which are considered as unprintable by journalctl,
+specifying [35m`journalctl`[0m's [35m`-a`[0m option might be preferable in order
+to output those messages still in a non-binary representation:
+
+[35m```[0m
+[35m$ journalctl -a -o json [0m[35m|[0m[35m lnav[0m
+[35m```[0m
+
+If using systemd v236 or newer, the output fields can be limited to
+the ones actually recognized by [35m`lnav`[0m for increased efficiency:
+
+[35m```[0m
+[35m$ journalctl -o json --output-fields=MESSAGE,PRIORITY,_PID,SYSLOG_IDENTIFIER,_SYSTEMD_UNIT [0m[35m|[0m[35m lnav[0m
+[35m```[0m
+
+If your system has been running for a long time, for increased
+efficiency you may want to limit the number of log lines fed into
+[35m`lnav`[0m, e.g. via [35m`journalctl`[0m's [35m`-n`[0m or [35m`--since=...`[0m options.
+
+In case of a persistent journal, you may want to limit the number
+of log lines fed into [35m`lnav`[0m via [35m`journalctl`[0m's [35m`-b`[0m option.
+
+[1m## Support[0m
+
+Please file issues on this repository or use the discussions section.
+The following alternatives are also available:
+
+[33m-[0m [34m[[0msupport@lnav.org[34m]([0mmailto:support@lnav.org[34m)[0m
+[33m-[0m [34m[[0mDiscord[34m]([0mhttps://discord.gg/erBPnKwz7R[34m)[0m
+[33m-[0m [34m[[0mGoogle Groups[34m]([0mhttps://groups.google.com/g/lnav[34m)[0m
+
+[1m## Links[0m
+
+[33m-[0m [34m[[0mMain Site[34m]([0mhttps://lnav.org[34m)[0m
+[33m-[0m [34m[[0m[1m**Documentation**[0m[34m]([0mhttps://docs.lnav.org[34m)[0m on Read the Docs
+[33m-[0m [34m[[0mInternal Architecture[34m]([0mARCHITECTURE.md[34m)[0m
+
+[1m## Contributing[0m
+
+[33m-[0m [34m[[0mBecome a Sponsor on GitHub[34m]([0mhttps://github.com/sponsors/tstack[34m)[0m
+
+[4m### Building From Source[0m
+
+[4m#### Prerequisites[0m
+
+The following software packages are required to build lnav:
+
+[33m-[0m gcc/clang    - A C++14-compatible compiler.
+[33m-[0m libpcre2     - The Perl Compatible Regular Expression v2 (PCRE2) library.
+[33m-[0m sqlite       - The SQLite database engine.  Version 3.9.0 or higher is required.
+[33m-[0m zlib         - The zlib compression library.
+[33m-[0m bz2          - The bzip2 compression library.
+[33m-[0m libcurl      - The cURL library for downloading files from URLs.  Version 7.23.0 or higher is required.
+[33m-[0m libarchive   - The libarchive library for opening archive files, like zip/tgz.
+[33m-[0m libunistring - The libunistring library for dealing with unicode.
+[33m-[0m wireshark    - The [35m'tshark'[0m program is used to interpret pcap files.
+[33m-[0m cargo/rust   - The Rust language is used to build the PRQL compiler.
+
+[4m#### Build[0m
+
+Lnav follows the usual GNU style for configuring and installing software:
+
+Run [35m`./autogen.sh`[0m if compiling from a cloned repository.
+
+[35m```console[0m
+[35m$ ./configure[0m
+[35m$ make[0m
+[35m$ sudo make install[0m
+[35m```[0m
+
+[1m## See Also[0m
+
+[34m[[0mAngle-grinder[34m]([0mhttps://github.com/rcoh/angle-grinder[34m)[0m is a tool to slice and dice log files on the command-line.
+If you're familiar with the SumoLogic query language, you might find this tool more comfortable to work with.
+
+[1m## Code Signing Policy[0m
+
+Free code signing provided by [34m[[0mSignPath.io[34m]([0mhttps://about.signpath.io/[34m)[0m,
+certificate by [34m[[0mSignPath Foundation[34m]([0mhttps://signpath.org/[34m)[0m.
+
+This program will not transfer any information to other networked systems
+unless specifically requested by the user or the person installing or
+operating it.
+
+[1m## Acknowledgements[0m
+
+Many thanks to:
+
+[33m*[0m GitHub Sponsors
+[33m*[0m Anthropic for including lnav in the Claude for Open Source Program

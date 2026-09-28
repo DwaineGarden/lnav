@@ -68,6 +68,12 @@ typedef struct
     void * ctx;
 } yajl_alloc_funcs;
 
+typedef struct {
+    int has_ansi;
+    int line_feeds;
+    int ptr_escapes;
+} yajl_string_props_t;
+
 #ifdef __cplusplus
 }
 #endif

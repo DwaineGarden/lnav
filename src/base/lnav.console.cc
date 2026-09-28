@@ -28,22 +28,66 @@
  */
 
 #include <algorithm>
+#include <set>
 
 #include "lnav.console.hh"
 
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "color_spaces.hh"
 #include "config.h"
 #include "fmt/color.h"
+#include "fmt/format.h"
 #include "itertools.hh"
 #include "lnav.console.into.hh"
+#include "lnav_log.hh"
 #include "log_level_enum.hh"
 #include "pcrepp/pcre2pp.hh"
 #include "snippet_highlighters.hh"
-#include "view_curses.hh"
 
 using namespace lnav::roles::literals;
 
-namespace lnav {
-namespace console {
+namespace lnav::console {
+
+snippet
+snippet::from_content_with_offset(intern_string_t src,
+                                  const attr_line_t& content,
+                                  size_t offset,
+                                  const std::string& errmsg)
+{
+    const auto content_sf = string_fragment::from_str(content.get_string());
+    const auto line_with_error = content_sf.find_boundaries_around(
+        offset, string_fragment::tag1{'\n'});
+    const auto line_with_context = content_sf.find_boundaries_around(
+        offset, string_fragment::tag1{'\n'}, 3);
+    const auto line_number = content_sf.sub_range(0, offset).count('\n');
+    const auto erroff_in_line = offset - line_with_error.sf_begin;
+
+    attr_line_t pointer;
+
+    pointer.append(erroff_in_line, ' ')
+        .append("^ "_snippet_border)
+        .append(lnav::roles::error(errmsg))
+        .with_attr_for_all(VC_ROLE.value(role_t::VCR_QUOTED_CODE));
+
+    snippet retval;
+    retval.s_content
+        = content.subline(line_with_context.sf_begin,
+                          line_with_error.sf_end - line_with_context.sf_begin);
+    if (line_with_error.sf_end >= (int) retval.s_content.get_string().size()) {
+        retval.s_content.append("\n");
+    }
+    retval.s_content.append(pointer).append(
+        content.subline(line_with_error.sf_end,
+                        line_with_context.sf_end - line_with_error.sf_end));
+    retval.s_location = source_location{
+        src,
+        static_cast<int32_t>(1 + line_number),
+    };
+
+    return retval;
+}
 
 user_message
 user_message::raw(const attr_line_t& al)
@@ -51,6 +95,16 @@ user_message::raw(const attr_line_t& al)
     user_message retval;
 
     retval.um_level = level::raw;
+    retval.um_message.append(al);
+    return retval;
+}
+
+user_message
+user_message::fatal(const attr_line_t& al)
+{
+    user_message retval;
+
+    retval.um_level = level::fatal;
     retval.um_message.append(al);
     return retval;
 }
@@ -95,8 +149,23 @@ user_message::warning(const attr_line_t& al)
     return retval;
 }
 
+user_message&
+user_message::remove_internal_snippets()
+{
+    auto new_end = std::remove_if(
+        this->um_snippets.begin(),
+        this->um_snippets.end(),
+        [](const snippet& snip) {
+            return snip.s_location.sl_source.to_string_fragment().startswith(
+                "__");
+        });
+    this->um_snippets.erase(new_end, this->um_snippets.end());
+
+    return *this;
+}
+
 attr_line_t
-user_message::to_attr_line(std::set<render_flags> flags) const
+user_message::to_attr_line(render_flags flags) const
 {
     auto indent = 1;
     attr_line_t retval;
@@ -105,23 +174,41 @@ user_message::to_attr_line(std::set<render_flags> flags) const
         indent = 3;
     }
 
-    if (flags.count(render_flags::prefix)) {
+    if (flags == render_flags::prefix) {
         switch (this->um_level) {
             case level::raw:
                 break;
             case level::ok:
-                retval.append(lnav::roles::ok("\u2714 "));
+                retval.append("  ");
+                retval.al_attrs.emplace_back(line_range{0, 1},
+                                             VC_ICON.value(ui_icon_t::ok));
                 break;
             case level::info:
-                retval.append("\u24d8 info"_info).append(": ");
+                retval.append("  ").append("info"_info).append(": ");
+                retval.al_attrs.emplace_back(line_range{0, 1},
+                                             VC_ICON.value(ui_icon_t::info));
                 break;
             case level::warning:
-                retval.append(lnav::roles::warning("\u26a0 warning"))
-                    .append(": ");
+                retval.append("  ").append("warning"_warning).append(": ");
+                retval.al_attrs.emplace_back(line_range{0, 1},
+                                             VC_ICON.value(ui_icon_t::warning));
                 break;
             case level::error:
-                retval.append(lnav::roles::error("\u2718 error")).append(": ");
+                retval.append("  ").append("error"_error).append(": ");
+                retval.al_attrs.emplace_back(line_range{0, 1},
+                                             VC_ICON.value(ui_icon_t::error));
                 break;
+            case level::fatal: {
+                auto label = attr_line_t()
+                                 .append("fatal"_error)
+                                 .with_attr_for_all(
+                                     VC_STYLE.value(text_attrs::with_underline()
+                                                    | text_attrs::style::bold));
+                retval.append("  ").append(label).append(": ");
+                retval.al_attrs.emplace_back(line_range{0, 1},
+                                             VC_ICON.value(ui_icon_t::fatal));
+                break;
+            }
         }
     }
 
@@ -213,56 +300,349 @@ user_message::to_attr_line(std::set<render_flags> flags) const
     return retval;
 }
 
-static nonstd::optional<fmt::terminal_color>
-curses_color_to_terminal_color(int curses_color)
+static std::optional<fmt::terminal_color>
+color_to_terminal_color(const styling::color_unit& curses_color)
 {
-    switch (curses_color) {
-        case COLOR_BLACK:
-            return fmt::terminal_color::black;
-        case COLOR_CYAN:
-            return fmt::terminal_color::cyan;
-        case COLOR_WHITE:
-            return fmt::terminal_color::white;
-        case COLOR_MAGENTA:
-            return fmt::terminal_color::magenta;
-        case COLOR_BLUE:
-            return fmt::terminal_color::blue;
-        case COLOR_YELLOW:
-            return fmt::terminal_color::yellow;
-        case COLOR_GREEN:
-            return fmt::terminal_color::green;
-        case COLOR_RED:
-            return fmt::terminal_color::red;
-        default:
-            return nonstd::nullopt;
+    return std::visit(
+        styling::overload{
+            [](const styling::semantic& s)
+                -> std::optional<fmt::terminal_color> { return std::nullopt; },
+            [](const styling::transparent& s)
+                -> std::optional<fmt::terminal_color> { return std::nullopt; },
+            [](const palette_color& pc) -> std::optional<fmt::terminal_color> {
+                switch (pc) {
+                    case COLOR_BLACK:
+                        return fmt::terminal_color::black;
+                    case COLOR_RED:
+                        return fmt::terminal_color::red;
+                    case COLOR_GREEN:
+                        return fmt::terminal_color::green;
+                    case COLOR_YELLOW:
+                        return fmt::terminal_color::yellow;
+                    case COLOR_BLUE:
+                        return fmt::terminal_color::blue;
+                    case COLOR_MAGENTA:
+                        return fmt::terminal_color::magenta;
+                    case COLOR_CYAN:
+                        return fmt::terminal_color::cyan;
+                    case COLOR_WHITE:
+                        return fmt::terminal_color::white;
+                    default:
+                        return std::nullopt;
+                }
+            },
+            [](const rgb_color& rgb) -> std::optional<fmt::terminal_color> {
+                switch (to_ansi_color(rgb)) {
+                    case ansi_color::black:
+                        return fmt::terminal_color::black;
+                    case ansi_color::cyan:
+                        return fmt::terminal_color::cyan;
+                    case ansi_color::white:
+                        return fmt::terminal_color::white;
+                    case ansi_color::magenta:
+                        return fmt::terminal_color::magenta;
+                    case ansi_color::blue:
+                        return fmt::terminal_color::blue;
+                    case ansi_color::yellow:
+                        return fmt::terminal_color::yellow;
+                    case ansi_color::green:
+                        return fmt::terminal_color::green;
+                    case ansi_color::red:
+                        return fmt::terminal_color::red;
+                    default:
+                        return std::nullopt;
+                }
+            }},
+        curses_color.cu_value);
+}
+
+static bool
+get_no_color()
+{
+    return getenv("NO_COLOR") != nullptr;
+}
+
+static bool
+get_yes_color()
+{
+    return getenv("YES_COLOR") != nullptr;
+}
+
+static bool
+get_fd_tty(int fd)
+{
+    return isatty(fd);
+}
+
+static void
+set_rev(fmt::text_style& line_style)
+{
+    if (line_style.has_emphasis()
+        && lnav::enums::to_underlying(line_style.get_emphasis())
+            & lnav::enums::to_underlying(fmt::emphasis::reverse))
+    {
+        auto old_style = line_style;
+        auto old_emph = fmt::emphasis(
+            lnav::enums::to_underlying(old_style.get_emphasis())
+            & ~lnav::enums::to_underlying(fmt::emphasis::reverse));
+        line_style = fmt::text_style{};
+        if (old_style.has_foreground()) {
+            line_style |= fmt::fg(old_style.get_foreground());
+        }
+        if (old_style.has_background()) {
+            line_style |= fmt::bg(old_style.get_background());
+        }
+        line_style |= old_emph;
+    } else {
+        line_style |= fmt::emphasis::reverse;
     }
 }
+
+static void
+role_to_style(const role_t role,
+              fmt::text_style& default_bg_style,
+              fmt::text_style& default_fg_style,
+              fmt::text_style& line_style)
+{
+    switch (role) {
+        case role_t::VCR_TEXT:
+        case role_t::VCR_IDENTIFIER:
+            break;
+        case role_t::VCR_ALT_ROW:
+            line_style |= fmt::emphasis::bold;
+            break;
+        case role_t::VCR_SEARCH:
+            set_rev(line_style);
+            break;
+        case role_t::VCR_ERROR:
+        case role_t::VCR_DIFF_DELETE:
+            line_style
+                |= fmt::fg(fmt::terminal_color::red) | fmt::emphasis::bold;
+            break;
+        case role_t::VCR_HIDDEN:
+        case role_t::VCR_WARNING:
+        case role_t::VCR_RE_REPEAT:
+        case role_t::VCR_NON_ASCII:
+            line_style |= fmt::fg(fmt::terminal_color::yellow);
+            break;
+        case role_t::VCR_ASCII_CTRL:
+        case role_t::VCR_COMMENT:
+        case role_t::VCR_DIFF_ADD:
+            line_style |= fmt::fg(fmt::terminal_color::green);
+            break;
+        case role_t::VCR_SNIPPET_BORDER:
+            line_style |= fmt::fg(fmt::terminal_color::cyan);
+            break;
+        case role_t::VCR_OK:
+            line_style
+                |= fmt::emphasis::bold | fmt::fg(fmt::terminal_color::green);
+            break;
+        case role_t::VCR_FOOTNOTE_BORDER:
+            line_style |= fmt::fg(fmt::terminal_color::blue);
+            break;
+        case role_t::VCR_INFO:
+        case role_t::VCR_STATUS:
+            line_style
+                |= fmt::emphasis::bold | fmt::fg(fmt::terminal_color::magenta);
+            break;
+        case role_t::VCR_NULL:
+        case role_t::VCR_KEYWORD:
+        case role_t::VCR_RE_SPECIAL:
+            line_style
+                |= fmt::emphasis::bold | fmt::fg(fmt::terminal_color::cyan);
+            break;
+        case role_t::VCR_STRING:
+            line_style |= fmt::fg(fmt::terminal_color::magenta);
+            break;
+        case role_t::VCR_VARIABLE:
+            line_style |= fmt::emphasis::underline;
+            break;
+        case role_t::VCR_SYMBOL:
+        case role_t::VCR_NUMBER:
+        case role_t::VCR_FILE:
+            line_style |= fmt::emphasis::bold;
+            break;
+        case role_t::VCR_H1:
+            line_style
+                |= fmt::emphasis::bold | fmt::fg(fmt::terminal_color::magenta);
+            break;
+        case role_t::VCR_H2:
+            line_style |= fmt::emphasis::bold;
+            break;
+        case role_t::VCR_H3:
+        case role_t::VCR_H4:
+        case role_t::VCR_H5:
+        case role_t::VCR_H6:
+            line_style |= fmt::emphasis::underline;
+            break;
+        case role_t::VCR_TABLE_HEADER:
+            line_style |= fmt::emphasis::bold;
+            break;
+        case role_t::VCR_LIST_GLYPH:
+            line_style |= fmt::fg(fmt::terminal_color::yellow);
+            break;
+        case role_t::VCR_INLINE_CODE:
+        case role_t::VCR_QUOTED_CODE:
+            default_fg_style = fmt::fg(fmt::terminal_color::white);
+            default_bg_style = fmt::bg(fmt::terminal_color::black);
+            break;
+        case role_t::VCR_LOW_THRESHOLD:
+        case role_t::VCR_SPECTRO_THRESHOLD0:
+        case role_t::VCR_SPECTRO_THRESHOLD1:
+            line_style |= fmt::bg(fmt::terminal_color::green);
+            break;
+        case role_t::VCR_MED_THRESHOLD:
+        case role_t::VCR_SPECTRO_THRESHOLD2:
+        case role_t::VCR_SPECTRO_THRESHOLD3:
+        case role_t::VCR_SPECTRO_THRESHOLD4:
+            line_style |= fmt::bg(fmt::terminal_color::yellow);
+            break;
+        case role_t::VCR_HIGH_THRESHOLD:
+        case role_t::VCR_SPECTRO_THRESHOLD5:
+        case role_t::VCR_SPECTRO_THRESHOLD6:
+            line_style |= fmt::bg(fmt::terminal_color::red);
+            break;
+        case role_t::VCR_TIMELINE_BAR:
+            line_style |= fmt::bg(fmt::terminal_color::magenta);
+            break;
+        default:
+            // log_debug("missing role handler %d", (int) role);
+            break;
+    }
+}
+
+static block_elem_t
+wchar_for_icon(ui_icon_t ic)
+{
+    switch (ic) {
+        case ui_icon_t::hidden:
+            return {U'\u22ee', role_t::VCR_HIDDEN};
+        case ui_icon_t::ok:
+            return {U'\u2714', role_t::VCR_OK};
+        case ui_icon_t::info:
+            return {U'\u24d8', role_t::VCR_INFO};
+        case ui_icon_t::warning:
+            return {U'\u26a0', role_t::VCR_WARNING};
+        case ui_icon_t::error:
+            return {U'\u2718', role_t::VCR_ERROR};
+        case ui_icon_t::fatal:
+            return {U'\U0001f480', role_t::VCR_ERROR};
+
+        case ui_icon_t::log_level_trace:
+            return {U'\U0001F143', role_t::VCR_TEXT};
+        case ui_icon_t::log_level_debug:
+            return {U'\U0001F133', role_t::VCR_TEXT};
+        case ui_icon_t::log_level_info:
+            return {U'\U0001F138', role_t::VCR_TEXT};
+        case ui_icon_t::log_level_stats:
+            return {U'\U0001F142', role_t::VCR_TEXT};
+        case ui_icon_t::log_level_notice:
+            return {U'\U0001F13d', role_t::VCR_TEXT};
+        case ui_icon_t::log_level_warning:
+            return {U'\U0001F146', role_t::VCR_WARNING};
+        case ui_icon_t::log_level_error:
+            return {U'\U0001F134', role_t::VCR_ERROR};
+        case ui_icon_t::log_level_critical:
+            return {U'\U0001F132', role_t::VCR_ERROR};
+        case ui_icon_t::log_level_fatal:
+            return {U'\U0001F135', role_t::VCR_ERROR};
+        case ui_icon_t::breakpoint:
+            return {U'\u25CF', role_t::VCR_ERROR};
+        case ui_icon_t::disabled_breakpoint:
+            return {U'\u25CB', role_t::VCR_WARNING};
+        case ui_icon_t::play:
+            return {U'\u25b6', role_t::VCR_TEXT};
+        case ui_icon_t::edit:
+            return {U'\u270f', role_t::VCR_TEXT};
+        case ui_icon_t::file:
+            return {U'\U0001f4c4', role_t::VCR_TEXT};
+        case ui_icon_t::thread:
+            return {U'\U0001F9F5', role_t::VCR_TEXT};
+        case ui_icon_t::tag:
+            return {U'\U0001F3F7', role_t::VCR_TEXT};
+        case ui_icon_t::partition:
+            return {U'\u2291', role_t::VCR_TEXT};
+        case ui_icon_t::search:
+            return {U'\U0001F50D', role_t::VCR_TEXT};
+        case ui_icon_t::busy:
+            return {U'\u23f3', role_t::VCR_TEXT};
+        case ui_icon_t::reload:
+            return {U'\u21bb', role_t::VCR_WARNING};
+    }
+
+    ensure(false);
+}
+
+namespace detail {
+
+line_range
+to_byte_range(const std::string& str, const line_range& lr)
+{
+    // Rendering works in bytes, indexing into str directly, so a range that is
+    // measured in code points has to be converted first.
+    if (lr.lr_unit == line_range::unit::bytes) {
+        return lr;
+    }
+
+    const auto sf = string_fragment::from_str(str);
+    // A range can reach past the line it was built for -- the timeline's chart
+    // range is sized from the view width -- so an index that runs off the end
+    // sticks to the end instead.
+    const auto to_byte = [&sf](int cp_index) {
+        return (int) sf.codepoint_to_byte_index(cp_index).unwrapOr(sf.length());
+    };
+
+    return line_range{
+        to_byte(lr.lr_start),
+        lr.lr_end < 0 ? lr.lr_end : to_byte(lr.lr_end),
+    };
+}
+
+}  // namespace detail
 
 void
 println(FILE* file, const attr_line_t& al)
 {
+    static const auto IS_NO_COLOR = get_no_color();
+    static const auto IS_YES_COLOR = get_yes_color();
+    static const auto IS_STDOUT_TTY = get_fd_tty(STDOUT_FILENO);
+    static const auto IS_STDERR_TTY = get_fd_tty(STDERR_FILENO);
+
     const auto& str = al.get_string();
 
-    if (getenv("NO_COLOR") != nullptr
-        || (!isatty(fileno(file)) && getenv("YES_COLOR") == nullptr))
+    if (IS_NO_COLOR || (file != stdout && file != stderr)
+        || (((file == stdout && !IS_STDOUT_TTY)
+             || (file == stderr && !IS_STDERR_TTY))
+            && !IS_YES_COLOR))
     {
         fmt::print(file, "{}\n", str);
         return;
     }
 
-    std::set<size_t> points = {0, static_cast<size_t>(al.length())};
-
+    auto attr_ranges = std::vector<std::pair<line_range, const string_attr*>>{};
     for (const auto& attr : al.get_attrs()) {
         if (!attr.sa_range.is_valid()) {
             continue;
         }
-        points.insert(attr.sa_range.lr_start);
-        if (attr.sa_range.lr_end > 0) {
-            points.insert(attr.sa_range.lr_end);
+        attr_ranges.emplace_back(detail::to_byte_range(str, attr.sa_range),
+                                 &attr);
+    }
+
+    // A boundary that fell inside a character would split it in two, leaving
+    // the tail to be read as an invalid sequence and printed as an escape, so
+    // each one is moved back to the start of the character it lands in.  That
+    // leaves a bad range mis-styling the line instead of corrupting it.
+    const auto str_sf = string_fragment::from_str(str);
+    auto points = std::set<size_t>{0, static_cast<size_t>(al.length())};
+
+    for (const auto& ar : attr_ranges) {
+        points.insert(str_sf.start_of_codepoint(ar.first.lr_start));
+        if (ar.first.lr_end > 0) {
+            points.insert(str_sf.start_of_codepoint(ar.first.lr_end));
         }
     }
 
-    nonstd::optional<size_t> last_point;
+    std::optional<size_t> last_point;
     for (const auto& point : points) {
         if (!last_point) {
             last_point = point;
@@ -273,53 +653,82 @@ println(FILE* file, const attr_line_t& al)
         auto line_style = fmt::text_style{};
         auto fg_style = fmt::text_style{};
         auto start = last_point.value();
+        std::optional<std::string> href;
+        auto replaced = false;
 
-        for (const auto& attr : al.get_attrs()) {
-            if (!attr.sa_range.contains(start)
-                && !attr.sa_range.contains(point - 1))
+        for (const auto& [attr_range, attr_ptr] : attr_ranges) {
+            const auto& attr = *attr_ptr;
+
+            if (!attr_range.contains(start) && !attr_range.contains(point - 1))
             {
                 continue;
             }
 
             try {
-                if (attr.sa_type == &VC_BACKGROUND) {
-                    auto saw = string_attr_wrapper<int64_t>(&attr);
-                    auto color_opt = curses_color_to_terminal_color(saw.get());
+                if (attr.sa_type == &VC_ICON) {
+                    auto ic = attr.sa_value.get<ui_icon_t>();
+                    auto be = wchar_for_icon(ic);
+                    auto icon_fg_style = default_fg_style;
+                    auto icon_bg_style = default_bg_style;
+                    auto icon_style = line_style;
+                    std::string utf8_out;
+
+                    role_to_style(
+                        be.role, icon_bg_style, icon_fg_style, icon_style);
+                    ww898::utf::utf8::write(
+                        be.value,
+                        [&utf8_out](const char ch) { utf8_out.push_back(ch); });
+                    fmt::print(file, icon_style, FMT_STRING("{}"), utf8_out);
+                    replaced = true;
+                } else if (attr.sa_type == &VC_HYPERLINK) {
+                    auto saw = string_attr_wrapper<std::string>(&attr);
+                    href = saw.get();
+                } else if (attr.sa_type == &VC_BACKGROUND) {
+                    auto saw = string_attr_wrapper<styling::color_unit>(&attr);
+                    auto color_opt = color_to_terminal_color(saw.get());
 
                     if (color_opt) {
                         line_style |= fmt::bg(color_opt.value());
                     }
                 } else if (attr.sa_type == &VC_FOREGROUND) {
-                    auto saw = string_attr_wrapper<int64_t>(&attr);
-                    auto color_opt = curses_color_to_terminal_color(saw.get());
+                    auto saw = string_attr_wrapper<styling::color_unit>(&attr);
+                    auto color_opt = color_to_terminal_color(saw.get());
 
                     if (color_opt) {
                         fg_style = fmt::fg(color_opt.value());
                     }
+                } else if (attr.sa_type == &SAT_UNSUPPORTED) {
+                    line_style |= fmt::fg(fmt::terminal_color::yellow);
                 } else if (attr.sa_type == &VC_STYLE) {
                     auto saw = string_attr_wrapper<text_attrs>(&attr);
                     auto style = saw.get();
 
-                    if (style.ta_attrs & A_REVERSE) {
-                        line_style |= fmt::emphasis::reverse;
+                    if (style.has_style(text_attrs::style::reverse)) {
+                        set_rev(line_style);
                     }
-                    if (style.ta_attrs & A_BOLD) {
+                    if (style.has_style(text_attrs::style::bold)) {
                         line_style |= fmt::emphasis::bold;
                     }
-                    if (style.ta_attrs & A_UNDERLINE) {
+                    if (style.has_style(text_attrs::style::underline)) {
                         line_style |= fmt::emphasis::underline;
                     }
-                    if (style.ta_fg_color) {
-                        auto color_opt = curses_color_to_terminal_color(
-                            style.ta_fg_color.value());
+                    if (style.has_style(text_attrs::style::italic)) {
+                        line_style |= fmt::emphasis::italic;
+                    }
+                    if (style.has_style(text_attrs::style::struck)) {
+                        line_style |= fmt::emphasis::strikethrough;
+                    }
+                    if (!style.ta_fg_color.empty()) {
+                        auto color_opt
+                            = color_to_terminal_color(style.ta_fg_color);
 
                         if (color_opt) {
                             fg_style = fmt::fg(color_opt.value());
                         }
                     }
-                    if (style.ta_bg_color) {
-                        auto color_opt = curses_color_to_terminal_color(
-                            style.ta_bg_color.value());
+                    if (!style.ta_bg_color.empty()) {
+                        auto color_opt
+                            = color_to_terminal_color(style.ta_bg_color);
 
                         if (color_opt) {
                             line_style |= fmt::bg(color_opt.value());
@@ -341,91 +750,14 @@ println(FILE* file, const attr_line_t& al)
                         default:
                             break;
                     }
-                } else if (attr.sa_type == &VC_ROLE) {
+                } else if (attr.sa_type == &VC_ROLE
+                           || attr.sa_type == &VC_ROLE_FG)
+                {
                     auto saw = string_attr_wrapper<role_t>(&attr);
                     auto role = saw.get();
 
-                    switch (role) {
-                        case role_t::VCR_TEXT:
-                        case role_t::VCR_IDENTIFIER:
-                            break;
-                        case role_t::VCR_SEARCH:
-                            line_style |= fmt::emphasis::reverse;
-                            break;
-                        case role_t::VCR_ERROR:
-                            line_style |= fmt::fg(fmt::terminal_color::red)
-                                | fmt::emphasis::bold;
-                            break;
-                        case role_t::VCR_WARNING:
-                        case role_t::VCR_RE_REPEAT:
-                            line_style |= fmt::fg(fmt::terminal_color::yellow);
-                            break;
-                        case role_t::VCR_COMMENT:
-                            line_style |= fmt::fg(fmt::terminal_color::green);
-                            break;
-                        case role_t::VCR_SNIPPET_BORDER:
-                            line_style |= fmt::fg(fmt::terminal_color::cyan);
-                            break;
-                        case role_t::VCR_OK:
-                            line_style |= fmt::emphasis::bold
-                                | fmt::fg(fmt::terminal_color::green);
-                            break;
-                        case role_t::VCR_INFO:
-                        case role_t::VCR_STATUS:
-                            line_style |= fmt::emphasis::bold
-                                | fmt::fg(fmt::terminal_color::magenta);
-                            break;
-                        case role_t::VCR_KEYWORD:
-                        case role_t::VCR_RE_SPECIAL:
-                            line_style |= fmt::emphasis::bold
-                                | fmt::fg(fmt::terminal_color::cyan);
-                            break;
-                        case role_t::VCR_STRING:
-                            line_style |= fmt::fg(fmt::terminal_color::magenta);
-                            break;
-                        case role_t::VCR_VARIABLE:
-                            line_style |= fmt::emphasis::underline;
-                            break;
-                        case role_t::VCR_SYMBOL:
-                        case role_t::VCR_NUMBER:
-                        case role_t::VCR_FILE:
-                            line_style |= fmt::emphasis::bold;
-                            break;
-                        case role_t::VCR_H1:
-                            line_style |= fmt::emphasis::bold
-                                | fmt::fg(fmt::terminal_color::magenta);
-                            break;
-                        case role_t::VCR_H2:
-                            line_style |= fmt::emphasis::bold;
-                            break;
-                        case role_t::VCR_H3:
-                        case role_t::VCR_H4:
-                        case role_t::VCR_H5:
-                        case role_t::VCR_H6:
-                            line_style |= fmt::emphasis::underline;
-                            break;
-                        case role_t::VCR_LIST_GLYPH:
-                            line_style |= fmt::fg(fmt::terminal_color::yellow);
-                            break;
-                        case role_t::VCR_QUOTED_CODE:
-                            default_fg_style
-                                = fmt::fg(fmt::terminal_color::white);
-                            default_bg_style
-                                = fmt::bg(fmt::terminal_color::black);
-                            break;
-                        case role_t::VCR_LOW_THRESHOLD:
-                            line_style |= fmt::bg(fmt::terminal_color::green);
-                            break;
-                        case role_t::VCR_MED_THRESHOLD:
-                            line_style |= fmt::bg(fmt::terminal_color::yellow);
-                            break;
-                        case role_t::VCR_HIGH_THRESHOLD:
-                            line_style |= fmt::bg(fmt::terminal_color::red);
-                            break;
-                        default:
-                            // log_debug("missing role handler %d", (int) role);
-                            break;
-                    }
+                    role_to_style(
+                        role, default_bg_style, default_fg_style, line_style);
                 }
             } catch (const fmt::format_error& e) {
                 log_error("style error: %s", e.what());
@@ -442,12 +774,88 @@ println(FILE* file, const attr_line_t& al)
             line_style |= default_bg_style;
         }
 
-        if (start < str.size()) {
+        if (line_style.has_foreground() && line_style.has_background()
+            && !line_style.get_foreground().is_rgb
+            && !line_style.get_background().is_rgb
+            && line_style.get_foreground().value.term_color
+                == line_style.get_background().value.term_color)
+        {
+            auto new_style = fmt::text_style{};
+
+            if (line_style.has_emphasis()) {
+                new_style |= line_style.get_emphasis();
+            }
+            new_style |= fmt::fg(line_style.get_foreground());
+            if (line_style.get_background().value.term_color
+                == lnav::enums::to_underlying(fmt::terminal_color::black))
+            {
+                new_style |= fmt::bg(fmt::terminal_color::white);
+            } else {
+                new_style |= fmt::bg(fmt::terminal_color::black);
+            }
+            line_style = new_style;
+        }
+
+        if (href) {
+            fmt::print(file, FMT_STRING("\x1b]8;;{}\x1b\\"), href.value());
+        }
+        if (!replaced && start < str.size()) {
             auto actual_end = std::min(str.size(), static_cast<size_t>(point));
-            fmt::print(file,
-                       line_style,
-                       FMT_STRING("{}"),
-                       str.substr(start, actual_end - start));
+            auto sub = std::string{};
+
+            for (auto lpc = start; lpc < actual_end;) {
+                auto cp_start = lpc;
+                // Bounded at the end of this run so that a character which
+                // straddles the boundary is reported as invalid here instead
+                // of being read out of the run and then again by the next one.
+                auto read_res
+                    = ww898::utf::utf8::read([&str, &lpc, actual_end] {
+                          return lpc < actual_end ? str[lpc++] : '\0';
+                      });
+
+                if (read_res.isErr()) {
+                    fmt::print(file, line_style, FMT_STRING("{}"), sub);
+                    sub.clear();
+                    fmt::print(
+                        file,
+                        fmt::fg(fmt::terminal_color::yellow),
+                        FMT_STRING("{:?}"),
+                        fmt::string_view{&str[cp_start], lpc - cp_start});
+                    continue;
+                }
+
+                auto ch = read_res.unwrap();
+                switch (ch) {
+                    case '\b':
+                        sub.append("\u232b");
+                        break;
+                    case '\x1b':
+                        sub.append("\u238b");
+                        break;
+                    case '\x07':
+                        sub.append("\U0001F514");
+                        break;
+                    case '\t':
+                    case '\n':
+                        sub.push_back(ch);
+                        break;
+
+                    default:
+                        if (ch <= 0x1f) {
+                            sub.push_back(0xe2);
+                            sub.push_back(0x90);
+                            sub.push_back(0x80 + ch);
+                        } else {
+                            sub.append(&str[cp_start], lpc - cp_start);
+                        }
+                        break;
+                }
+            }
+
+            fmt::print(file, line_style, FMT_STRING("{}"), sub);
+        }
+        if (href) {
+            fmt::print(file, FMT_STRING("\x1b]8;;\x1b\\"));
         }
         last_point = point;
     }
@@ -478,7 +886,7 @@ to_user_message(intern_string_t src, const lnav::pcre2pp::compile_error& ce)
                                       });
     pcre_error_content.append("\n")
         .append(ce.ce_offset, ' ')
-        .append(lnav::roles::error("^ "))
+        .append("^ "_error)
         .append(lnav::roles::error(ce.get_message()))
         .with_attr_for_all(VC_ROLE.value(role_t::VCR_QUOTED_CODE));
 
@@ -490,5 +898,4 @@ to_user_message(intern_string_t src, const lnav::pcre2pp::compile_error& ce)
         .with_snippet(lnav::console::snippet::from(src, pcre_error_content));
 }
 
-}  // namespace console
-}  // namespace lnav
+}  // namespace lnav::console

@@ -1,6 +1,8 @@
 #! /bin/bash
 
-lnav_test="${top_builddir}/src/lnav-test"
+export TZ=UTC
+export YES_COLOR=1
+export DUMP_CRASH=1
 
 touch scripts-empty
 
@@ -49,3 +51,7 @@ if test $? -ne 0; then
     echo "Script output was not redirected?"
     exit 1
 fi
+
+run_cap_test ${lnav_test} -n \
+    -c '|report-access-log' \
+    ${test_dir}/logfile_shop_access_log.0

@@ -2,7 +2,8 @@ Welcome to lnav's documentation!
 ================================
 
 The `Log File Navigator <http://lnav.org>`_ (**lnav**) is an advanced log file
-viewer for the console.
+viewer for the console.  If you have a bunch of log files that you need to
+look through to find issues, **lnav** is the tool for you.
 
 Contents:
 
@@ -14,6 +15,7 @@ Contents:
    hotkeys
    cli
    usage
+   scripts
    cookbook
    config
    formats
@@ -22,7 +24,9 @@ Contents:
    sqlext
    sqltab
    events
+   extacc
    data
+   performance
    howitworks
    faq
 

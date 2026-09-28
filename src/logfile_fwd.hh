@@ -33,29 +33,93 @@
 #define lnav_logfile_fwd_hh
 
 #include <chrono>
+#include <optional>
 #include <string>
+#include <vector>
 
-#include "base/auto_fd.hh"
+#include <sys/stat.h>
+
+#include "base/file_range.hh"
+#include "base/fs_util.hh"
+#include "base/lnav.console.hh"
+#include "base/text_format_enum.hh"
+#include "base/time_util.hh"
 #include "file_format.hh"
+#include "piper.looper.hh"
 
 using ui_clock = std::chrono::steady_clock;
 
 class logfile;
 class logline;
 class logline_observer;
+class child_poller;
 
 using logfile_const_iterator = std::vector<logline>::const_iterator;
 
-enum class logfile_name_source {
+/**
+ * One file's worth of a parallel indexing tick's reading of the progress
+ * atomics (see index_progress in logfile.hh), handed to the UI thread so
+ * it can draw the file list without going back to the logfile for the
+ * numbers.  A worker owns that logfile for the length of the pass, so
+ * everything the UI needs about a file still in flight has to come through
+ * here.
+ */
+struct index_progress_report {
+    /**
+     * logfile::get_serial() for the file this reading is about.
+     *
+     * An id rather than the logfile, because this is only ever compared:
+     * nothing here needs to reach the file, and an id cannot dangle or be
+     * mistaken for a later file that reused the address.
+     */
+    uint64_t ipr_file_id{0};
+    file_off_t ipr_offset{0};
+    file_ssize_t ipr_total{0};
+    /**
+     * False for a file that cannot say where it is in the stream (bzip2), so
+     * the UI draws "working" rather than a bar built from a made-up
+     * denominator.
+     */
+    bool ipr_has_progress{false};
+};
+
+enum class logfile_name_source : uint8_t {
     USER,
     ARCHIVE,
     REMOTE,
 };
 
+template<>
+struct fmt::formatter<logfile_name_source> : formatter<string_view> {
+    template<typename FormatContext>
+    auto format(logfile_name_source lns, FormatContext& ctx)
+    {
+        string_view name = "unknown";
+        switch (lns) {
+            case logfile_name_source::USER:
+                name = "user";
+                break;
+            case logfile_name_source::ARCHIVE:
+                name = "archive";
+                break;
+            case logfile_name_source::REMOTE:
+                name = "remote";
+                break;
+        }
+        return formatter<string_view>::format(name, ctx);
+    }
+};
+
 struct logfile_open_options_base {
     std::string loo_filename;
+    /**
+     * The path that the file scan was working with when this file was found.
+     * This is the key that file_collection::fc_name_to_stubs uses, so that a
+     * stub recorded during the scan can be found again by the file that was
+     * eventually opened, whatever name that file ends up displaying.
+     */
+    std::string loo_scan_key;
     logfile_name_source loo_source{logfile_name_source::USER};
-    bool loo_temp_file{false};
     dev_t loo_temp_dev{0};
     ino_t loo_temp_ino{0};
     bool loo_detect_format{true};
@@ -63,11 +127,26 @@ struct logfile_open_options_base {
     bool loo_is_visible{true};
     bool loo_non_utf_is_visible{true};
     ssize_t loo_visible_size_limit{-1};
-    bool loo_tail{true};
+    bool loo_follow{true};
     file_format_t loo_file_format{file_format_t::UNKNOWN};
+    std::optional<std::string> loo_format_name;
+    std::optional<text_format_t> loo_text_format;
+    std::optional<lnav::piper::running_handle> loo_piper;
+    std::shared_ptr<child_poller> loo_child_poller;
+    file_location_t loo_init_location{default_for_text_format{}};
+    std::vector<lnav::console::user_message> loo_match_details;
+    time_range loo_time_range{time_range::unbounded()};
+    /**
+     * Read the file front to back without keeping the whole index: the
+     * caller drops entries it is done with using
+     * logfile::discard_index_before(), and each rebuild_index() call reads
+     * at most loo_stream_batch_lines lines.
+     */
+    bool loo_streaming{false};
+    size_t loo_stream_batch_lines{100 * 1000};
 };
 
-struct logfile_open_options : public logfile_open_options_base {
+struct logfile_open_options : logfile_open_options_base {
     logfile_open_options() = default;
 
     explicit logfile_open_options(const logfile_open_options_base& base)
@@ -82,10 +161,9 @@ struct logfile_open_options : public logfile_open_options_base {
         return *this;
     }
 
-    logfile_open_options& with_fd(auto_fd fd)
+    logfile_open_options& with_scan_key(const std::string& val)
     {
-        this->loo_fd = std::move(fd);
-        this->loo_temp_file = true;
+        this->loo_scan_key = val;
 
         return *this;
     }
@@ -117,7 +195,7 @@ struct logfile_open_options : public logfile_open_options_base {
         this->loo_include_in_session = val;
 
         return *this;
-    };
+    }
 
     logfile_open_options& with_visibility(bool val)
     {
@@ -131,7 +209,7 @@ struct logfile_open_options : public logfile_open_options_base {
         this->loo_non_utf_is_visible = val;
 
         return *this;
-    };
+    }
 
     logfile_open_options& with_visible_size_limit(ssize_t val)
     {
@@ -140,9 +218,9 @@ struct logfile_open_options : public logfile_open_options_base {
         return *this;
     }
 
-    logfile_open_options& with_tail(bool val)
+    logfile_open_options& with_follow(bool val)
     {
-        this->loo_tail = val;
+        this->loo_follow = val;
 
         return *this;
     }
@@ -154,7 +232,47 @@ struct logfile_open_options : public logfile_open_options_base {
         return *this;
     }
 
-    auto_fd loo_fd;
+    logfile_open_options& with_piper(lnav::piper::running_handle handle)
+    {
+        this->loo_piper = handle;
+        this->loo_filename = handle.get_name();
+
+        return *this;
+    }
+
+    logfile_open_options& with_child_poller(std::shared_ptr<child_poller> cp)
+    {
+        this->loo_child_poller = cp;
+        return *this;
+    }
+
+    logfile_open_options& with_init_location(file_location_t fl)
+    {
+        this->loo_init_location = fl;
+
+        return *this;
+    }
+
+    logfile_open_options& with_text_format(text_format_t tf)
+    {
+        this->loo_text_format = tf;
+
+        return *this;
+    }
+
+    logfile_open_options& with_time_range(time_range tr)
+    {
+        this->loo_time_range = tr;
+
+        return *this;
+    }
+
+    logfile_open_options& with_streaming(bool val)
+    {
+        this->loo_streaming = val;
+
+        return *this;
+    }
 };
 
 #endif

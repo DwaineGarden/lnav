@@ -1,5 +1,6 @@
 #! /bin/bash
 
+export TZ=UTC
 export YES_COLOR=1
 
 # journald json log format is not working"
@@ -7,9 +8,22 @@ run_cap_test env TZ=UTC ${lnav_test} -n \
     -I ${test_dir} \
     ${test_dir}/logfile_journald.json
 
+cat ${test_dir}/logfile_journald.json | \
+    run_cap_test env TZ=UTC ${lnav_test} -n \
+    -c ':test-comment json format on stdin'
+
 # json log format is not working"
 run_cap_test ${lnav_test} -n \
     -I ${test_dir} \
+    ${test_dir}/logfile_json.json
+
+run_cap_test env TZ=America/New_York ${lnav_test} -n \
+    -I ${test_dir} \
+    ${test_dir}/logfile_json.json
+
+run_cap_test ${lnav_test} -n \
+    -I ${test_dir} \
+    -c ':filter-in up service' \
     ${test_dir}/logfile_json.json
 
 # json log format is not working"
@@ -139,3 +153,82 @@ run_cap_test ${lnav_test} -n \
 run_cap_test ${lnav_test} -n \
     -I ${test_dir} \
     ${test_dir}/logfile_json_subsec.json
+
+run_cap_test ${lnav_test} -n \
+    ${test_dir}/logfile_bunyan.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":filter-expr :type = 'PushEvent'" \
+    -c ":hide-fields payload/commits#/message" \
+    ${test_dir}/gharchive_log.jsonl
+
+run_cap_test ${lnav_test} -n \
+    ${test_dir}/logfile_pino.0
+
+run_cap_test ${lnav_test} -n \
+    ${test_dir}/logfile_cloudflare.json
+
+run_cap_test ${lnav_test} -n \
+    -c ':show-fields RayID' \
+    ${test_dir}/logfile_cloudflare.json
+
+run_cap_test ${lnav_test} -n \
+    ${test_dir}/logfile_nextcloud.0
+
+run_cap_test ${lnav_test} -n \
+    ${test_dir}/gharchive_log.jsonl
+
+run_cap_test ${lnav_test} -n \
+    -I ${test_dir} \
+    -c ':goto 9' \
+    ${test_dir}/logfile_json_invalid.json
+
+run_cap_test ${lnav_test} -n \
+    ${test_dir}/logfile_ecs_log.json
+
+run_cap_test ${lnav_test} -n \
+    -I ${test_dir} \
+    -c ';SELECT filepath, format FROM lnav_file' \
+    ${test_dir}/logfile_jsonid.json
+
+# issue #1712: identifiers on sub-lines after a newline in the line-format
+# should still be highlighted.
+run_cap_test ${lnav_test} -n \
+    -I ${test_dir} \
+    ${test_dir}/logfile_jsonid.json
+
+run_cap_test ${lnav_test} -n \
+    ${test_dir}/logfile_mongodb.0
+
+run_cap_test ${lnav_test} -n \
+    -c ';select * from mongodb_json_log' \
+    -c ':write-csv-to -' \
+    ${test_dir}/logfile_mongodb.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";select \"payload/pull_request/updated_at\", \"payload/pull_request/merged_at\", \"payload/pull_request/closed_at\" from github_events_log where type = 'PullRequestEvent' limit 1" \
+    -c ':write-csv-to -' \
+    ${test_dir}/gharchive_log.jsonl
+
+
+# postgres_json_log format
+run_cap_test env TZ=UTC ${lnav_test} -n \
+    ${test_dir}/logfile_postgres_json.json
+
+run_cap_test env TZ=UTC ${lnav_test} -n \
+    -c ';select log_level, error_severity, pid, dbname, log_opid, log_body from postgres_json_log' \
+    -c ':write-csv-to -' \
+    ${test_dir}/logfile_postgres_json.json
+
+# A duration must not replace the opid that was captured from the line.
+run_cap_test ${lnav_test} -n \
+    -I ${test_dir} \
+    -c ';select log_line, log_opid, req, log_duration from test_json_opid_dur_log' \
+    -c ':write-csv-to -' \
+    ${test_dir}/logfile_json_opid_dur.json
+
+# The opids recorded while indexing are what the timeline groups by.
+run_cap_test ${lnav_test} -n \
+    -I ${test_dir} \
+    -c ':switch-to-view timeline' \
+    ${test_dir}/logfile_json_opid_dur.json

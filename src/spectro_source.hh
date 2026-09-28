@@ -32,28 +32,33 @@
 #ifndef spectro_source_hh
 #define spectro_source_hh
 
+#include <chrono>
+#include <functional>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
 #include <math.h>
-#include <time.h>
 
+#include "digestible/digestible.h"
+#include "hasher.hh"
 #include "statusview_curses.hh"
 #include "textview_curses.hh"
 
 struct exec_context;
 
 struct spectrogram_bounds {
-    time_t sb_begin_time{0};
-    time_t sb_end_time{0};
+    std::chrono::microseconds sb_begin_time{0};
+    std::chrono::microseconds sb_end_time{0};
     double sb_min_value_out{0.0};
     double sb_max_value_out{0.0};
     int64_t sb_count{0};
+    size_t sb_mark_generation{0};
+    digestible::tdigest<double> sb_tdigest{200};
 };
 
 struct spectrogram_thresholds {
-    int st_green_threshold{0};
-    int st_yellow_threshold{0};
+    int st_thresholds[7]{};
 };
 
 struct spectrogram_request {
@@ -61,8 +66,8 @@ struct spectrogram_request {
 
     spectrogram_bounds& sr_bounds;
     unsigned long sr_width{0};
-    time_t sr_begin_time{0};
-    time_t sr_end_time{0};
+    std::chrono::microseconds sr_begin_time{0};
+    std::chrono::microseconds sr_end_time{0};
     double sr_column_size{0};
 };
 
@@ -75,15 +80,29 @@ struct spectrogram_row {
         int rb_marks{0};
     };
 
+    enum class value_type : uint8_t {
+        integer,
+        real,
+    };
+
     std::vector<row_bucket> sr_values;
+    value_type sr_value_type{value_type::integer};
     unsigned long sr_width{0};
     double sr_column_size{0.0};
     std::function<std::unique_ptr<text_sub_source>(
         const spectrogram_request&, double range_min, double range_max)>
         sr_details_source_provider;
+    digestible::tdigest<double> sr_tdigest{200};
+    int sr_thresholds[7]{};
 
-    void add_value(spectrogram_request& sr, double value, bool marked)
+    void add_value(spectrogram_request& sr,
+                   value_type vt,
+                   double value,
+                   bool marked)
     {
+        if (vt != value_type::integer) {
+            this->sr_value_type = vt;
+        }
         long index = std::floor((value - sr.sr_bounds.sb_min_value_out)
                                 / sr.sr_column_size);
 
@@ -93,7 +112,7 @@ struct spectrogram_row {
         }
     }
 
-    nonstd::optional<size_t> nearest_column(size_t current) const;
+    std::optional<size_t> nearest_column(size_t current) const;
 };
 
 class spectrogram_value_source {
@@ -105,36 +124,73 @@ public:
     virtual void spectro_row(spectrogram_request& sr, spectrogram_row& row_out)
         = 0;
 
+    virtual bool spectro_is_marked(spectrogram_request& sr) { return false; }
+
+    enum class mark_op_t {
+        add,
+        clear,
+    };
+
     virtual void spectro_mark(textview_curses& tc,
-                              time_t begin_time,
-                              time_t end_time,
+                              std::chrono::microseconds begin_time,
+                              std::chrono::microseconds end_time,
                               double range_min,
-                              double range_max)
+                              double range_max,
+                              mark_op_t op)
         = 0;
+
+    // Optional unit suffix for the spectrogram's value axis.  Used by
+    // the header renderer to humanize Min/Max (e.g. "1.2 MB" instead
+    // of "1258291") when the source column declares a unit.  Empty
+    // string means "no humanization — render raw number".
+    //
+    // Sources are responsible for emitting bounds and row values in
+    // the same units the suffix describes — any divisor between the
+    // raw column representation and the display unit is applied
+    // inside the source, not here.
+    virtual std::string spectro_value_suffix() const { return {}; }
 };
 
 class spectrogram_source
     : public text_sub_source
     , public text_time_translator
     , public list_overlay_source
-    , public list_input_delegate {
+    , public text_delegate {
 public:
     ~spectrogram_source() override = default;
+
+    bool empty() const override { return this->ss_details_source == nullptr; }
+
+    void register_view(textview_curses* tc) override
+    {
+        text_sub_source::register_view(tc);
+        tc->tc_mark_style = std::nullopt;
+    }
 
     void invalidate()
     {
         this->ss_cached_bounds.sb_count = 0;
+        this->ss_cached_bounds.sb_mark_generation = 0;
         this->ss_row_cache.clear();
-        this->ss_cursor_column = nonstd::nullopt;
+        this->ss_cursor_column = std::nullopt;
+        this->ss_cursor_details_checksum.clear();
     }
 
-    bool list_input_handle_key(listview_curses& lv, int ch) override;
+    bool list_input_handle_key(listview_curses& lv, const ncinput& ch) override;
 
-    bool list_value_for_overlay(const listview_curses& lv,
-                                int y,
-                                int bottom,
+    bool text_handle_mouse(textview_curses& tc,
+                           const listview_curses::display_line_content_t&,
+                           mouse_event& me) override;
+
+    bool list_static_overlay(const listview_curses& lv,
+                             media_t media,
+                             int y,
+                             int bottom,
+                             attr_line_t& value_out) override;
+
+    void list_value_for_overlay(const listview_curses& lv,
                                 vis_line_t row,
-                                attr_line_t& value_out) override;
+                                std::vector<attr_line_t>& value_out) override;
 
     size_t text_line_count() override;
 
@@ -151,39 +207,52 @@ public:
 
     void text_selection_changed(textview_curses& tc) override;
 
-    nonstd::optional<struct timeval> time_for_row(vis_line_t row) override;
+    std::optional<row_info> time_for_row(vis_line_t row) override;
 
-    nonstd::optional<vis_line_t> row_for_time(
-        struct timeval time_bucket) override;
+    std::optional<vis_line_t> row_for_time(struct timeval time_bucket) override;
 
-    void text_value_for_line(textview_curses& tc,
-                             int row,
-                             std::string& value_out,
-                             line_flags_t flags) override;
+    line_info text_value_for_line(textview_curses& tc,
+                                  int row,
+                                  std::string& value_out,
+                                  line_flags_t flags) override;
 
     void text_attrs_for_line(textview_curses& tc,
                              int row,
                              string_attrs_t& value_out) override;
 
+    void chart_attrs_for_line(textview_curses& tc,
+                              int row,
+                              string_attrs_t& value_out);
+
+    void text_mark(const bookmark_type_t* bm,
+                   vis_line_t line,
+                   bool added) override;
+
     void cache_bounds();
 
-    nonstd::optional<struct timeval> time_for_row_int(vis_line_t row);
+    std::optional<row_info> time_for_row_int(vis_line_t row);
 
     const spectrogram_row& load_row(const listview_curses& lv, int row);
 
     void reset_details_source();
 
-    textview_curses* ss_details_view;
-    text_sub_source* ss_no_details_source;
-    exec_context* ss_exec_context;
+    Result<std::string, lnav::console::user_message> text_reload_data(
+        exec_context& ec) override;
+
+    textview_curses* ss_details_view{nullptr};
+    text_sub_source* ss_no_details_source{nullptr};
+    exec_context* ss_exec_context{nullptr};
     std::unique_ptr<text_sub_source> ss_details_source;
-    int ss_granularity{60};
     spectrogram_value_source* ss_value_source{nullptr};
     spectrogram_bounds ss_cached_bounds;
-    spectrogram_thresholds ss_cached_thresholds;
     size_t ss_cached_line_count{0};
-    std::unordered_map<time_t, spectrogram_row> ss_row_cache;
-    nonstd::optional<size_t> ss_cursor_column;
+    std::unordered_map<std::chrono::microseconds,
+                       spectrogram_row,
+                       lnav::duration_hasher>
+        ss_row_cache;
+    std::optional<size_t> ss_cursor_column;
+    attr_line_t ss_cursor_details;
+    hasher::array_t ss_cursor_details_checksum;
 };
 
 class spectro_status_source : public status_data_source {

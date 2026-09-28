@@ -30,12 +30,20 @@
  */
 
 #include <chrono>
+#include <exception>
 
 #include "date_time_scanner.hh"
 
+#include <time.h>
+
 #include "config.h"
+#include "date_time_scanner.cfg.hh"
+#include "humanize.time.hh"
+#include "injector.hh"
+#include "math_util.hh"
 #include "ptimec.hh"
-#include "scn/scn.h"
+#include "relative_time.hh"
+#include "scn/scan.h"
 
 size_t
 date_time_scanner::ftime(char* dst,
@@ -45,17 +53,28 @@ date_time_scanner::ftime(char* dst,
 {
     off_t off = 0;
 
-    if (time_fmt == nullptr) {
-        PTIMEC_FORMATS[this->dts_fmt_lock].pf_ffunc(dst, off, len, tm);
-        if (tm.et_flags & ETF_MILLIS_SET) {
-            dst[off++] = '.';
-            ftime_L(dst, off, len, tm);
-        } else if (tm.et_flags & ETF_MICROS_SET) {
-            dst[off++] = '.';
-            ftime_f(dst, off, len, tm);
-        } else if (tm.et_flags & ETF_NANOS_SET) {
-            dst[off++] = '.';
-            ftime_N(dst, off, len, tm);
+    if (time_fmt == nullptr || this->dts_fmt_lock == -1
+        || (tm.et_flags & ETF_MACHINE_ORIENTED))
+    {
+        auto index
+            = this->dts_fmt_lock != -1 && !(tm.et_flags & ETF_MACHINE_ORIENTED)
+            ? this->dts_fmt_lock
+            : PTIMEC_DEFAULT_FMT_INDEX;
+        PTIMEC_FORMATS[index].pf_ffunc(dst, off, len, tm);
+        if (tm.et_flags & ETF_SUB_NOT_IN_FORMAT) {
+            if (tm.et_flags & ETF_MILLIS_SET) {
+                dst[off++] = '.';
+                ftime_L(dst, off, len, tm);
+            } else if (tm.et_flags & ETF_MICROS_SET) {
+                dst[off++] = '.';
+                ftime_f(dst, off, len, tm);
+            } else if (tm.et_flags & ETF_NANOS_SET) {
+                dst[off++] = '.';
+                ftime_N(dst, off, len, tm);
+            }
+        }
+        if (index == PTIMEC_DEFAULT_FMT_INDEX && tm.et_flags & ETF_ZONE_SET) {
+            ftime_z(dst, off, len, tm);
         }
         dst[off] = '\0';
     } else {
@@ -92,6 +111,9 @@ date_time_scanner::scan(const char* time_dest,
                         struct timeval& tv_out,
                         bool convert_local)
 {
+    static const auto& cfg
+        = injector::get<const date_time_scanner_ns::config&>();
+
     int curr_time_fmt = -1;
     bool found = false;
     const char* retval = nullptr;
@@ -100,75 +122,134 @@ date_time_scanner::scan(const char* time_dest,
         time_fmt = PTIMEC_FORMAT_STR;
     }
 
-    while (next_format(time_fmt, curr_time_fmt, this->dts_fmt_lock)) {
+    this->dts_zoned_to_local = cfg.c_zoned_to_local;
+    // Whether the input is an epoch is decided by the input alone, so it does
+    // not depend on which format the loop is looking at.  The guard mirrors
+    // the loop's: with nothing to walk, the body would never run.
+    const auto is_epoch_input
+        = (this->dts_fmt_lock != -1 || time_fmt[0] != nullptr) && time_len > 1
+        && time_dest[0] == '+' && isdigit(time_dest[1]);
+    if (is_epoch_input) {
         *tm_out = this->dts_base_tm;
+        tm_out->et_tm.tm_yday = -1;
         tm_out->et_flags = 0;
-        if (time_len > 1 && time_dest[0] == '+' && isdigit(time_dest[1])) {
-            retval = nullptr;
-            auto epoch_scan_res = scn::scan_value<int64_t>(
-                scn::string_view{time_dest, time_len});
+        {
+            auto sv = std::string_view{time_dest, time_len};
+            auto epoch_scan_res = scn::scan_value<int64_t>(sv);
             if (epoch_scan_res) {
-                time_t gmt = epoch_scan_res.value();
-
-                if (convert_local && this->dts_local_time) {
-                    localtime_r(&gmt, &tm_out->et_tm);
+                time_t gmt = epoch_scan_res->value();
+                if (gmt > 300000000) {
+                    if (convert_local
+                        && (this->dts_local_time || this->dts_zoned_to_local))
+                    {
+                        localtime_r(&gmt, &tm_out->et_tm);
 #ifdef HAVE_STRUCT_TM_TM_ZONE
-                    tm_out->et_tm.tm_zone = nullptr;
+                        tm_out->et_tm.tm_zone = nullptr;
 #endif
-                    tm_out->et_tm.tm_isdst = 0;
-                    gmt = tm2sec(&tm_out->et_tm);
-                }
-                tv_out.tv_sec = gmt;
-                tv_out.tv_usec = 0;
-                tm_out->et_flags = ETF_DAY_SET | ETF_MONTH_SET | ETF_YEAR_SET
-                    | ETF_MACHINE_ORIENTED | ETF_EPOCH_TIME;
+                        tm_out->et_tm.tm_isdst = 0;
+                        gmt = tm_out->to_timeval().tv_sec;
+                    }
+                    tv_out.tv_sec = gmt;
+                    tv_out.tv_usec = 0;
+                    tm_out->et_flags = ETF_HOUR_SET | ETF_MINUTE_SET
+                        | ETF_SECOND_SET | ETF_DAY_SET | ETF_MONTH_SET
+                        | ETF_YEAR_SET | ETF_MACHINE_ORIENTED | ETF_EPOCH_TIME
+                        | ETF_ZONE_SET;
 
-                this->dts_fmt_lock = curr_time_fmt;
-                this->dts_fmt_len = std::distance(epoch_scan_res.begin(),
-                                                  epoch_scan_res.end());
-                retval = time_dest + this->dts_fmt_len;
-                found = true;
-                break;
+                    // Unlocked, the loop would have been on its first entry,
+                    // which is the epoch format.
+                    this->dts_fmt_lock
+                        = this->dts_fmt_lock == -1 ? 0 : this->dts_fmt_lock;
+                    this->dts_fmt_len
+                        = sv.length() - epoch_scan_res->range().size();
+                    retval = time_dest + this->dts_fmt_len;
+                    found = true;
+                }
             }
-        } else if (time_fmt == PTIMEC_FORMAT_STR) {
-            ptime_func func = PTIMEC_FORMATS[curr_time_fmt].pf_func;
+        }
+    }
+    while (!is_epoch_input
+           && next_format(time_fmt, curr_time_fmt, this->dts_fmt_lock))
+    {
+        if (time_fmt == PTIMEC_FORMAT_STR) {
+            const auto& ptf = PTIMEC_FORMATS[curr_time_fmt];
+            ptime_func func = ptf.pf_func;
             off_t off = 0;
 
+            tm_out->et_tm.tm_yday = -1;
+            tm_out->et_flags = 0;
 #ifdef HAVE_STRUCT_TM_TM_ZONE
-            if (!this->dts_keep_base_tz) {
+            if (this->dts_keep_base_tz) {
+                tm_out->et_tm.tm_zone = this->dts_base_tm.et_tm.tm_zone;
+            } else {
                 tm_out->et_tm.tm_zone = nullptr;
             }
 #endif
-            if (func(tm_out, time_dest, off, time_len)) {
+            auto matched = func(tm_out, time_dest, off, time_len);
+            if (matched == 0) {
+                // The leading conversion failed, and the formats are grouped
+                // by that conversion, so the rest of this group cannot match
+                // either.  A format with no leading conversion has a group of
+                // one, which steps to the next format.  Only a scan that is
+                // still searching can move the index: next_format() stops a
+                // locked scan by finding the index where it left it.
+                if (this->dts_fmt_lock == -1) {
+                    curr_time_fmt = static_cast<int>(ptf.pf_next_group) - 1;
+                }
+            } else if (matched == PTIME_MATCHED) {
                 retval = &time_dest[off];
 
+                tm_out->fill_from_base(this->dts_base_tm);
                 if (tm_out->et_tm.tm_year < 70) {
                     tm_out->et_tm.tm_year = 80;
                 }
                 if (convert_local
                     && (this->dts_local_time
-                        || tm_out->et_flags & ETF_EPOCH_TIME))
+                        || tm_out->et_flags & ETF_EPOCH_TIME
+                        || ((tm_out->et_flags & ETF_ZONE_SET
+                             || this->dts_default_zone != nullptr)
+                            && this->dts_zoned_to_local)))
                 {
-                    time_t gmt = tm2sec(&tm_out->et_tm);
+                    lnav::time64_t gmt = tm_out->to_timeval().tv_sec;
 
+                    if (!(tm_out->et_flags & ETF_ZONE_SET)
+                        && !(tm_out->et_flags & ETF_EPOCH_TIME)
+                        && this->dts_default_zone != nullptr)
+                    {
+                        try {
+                            date::local_seconds stime;
+                            stime += std::chrono::seconds{gmt};
+                            auto ztime
+                                = date::make_zoned(this->dts_default_zone,
+                                                   stime,
+                                                   date::choose::earliest);
+                            gmt = std::chrono::duration_cast<
+                                      std::chrono::seconds>(
+                                      ztime.get_sys_time().time_since_epoch())
+                                      .count();
+                        } catch (const std::exception& e) {
+                            log_error("failed to convert time %lld -- %s",
+                                      gmt,
+                                      e.what());
+                        }
+                    }
                     this->to_localtime(gmt, *tm_out);
                 }
-                const auto& last_tm = this->dts_last_tm.et_tm;
+                const auto& last_tm = this->dts_last_tm;
                 if (last_tm.tm_year == tm_out->et_tm.tm_year
                     && last_tm.tm_mon == tm_out->et_tm.tm_mon
                     && last_tm.tm_mday == tm_out->et_tm.tm_mday
                     && last_tm.tm_hour == tm_out->et_tm.tm_hour
-                    && last_tm.tm_min == tm_out->et_tm.tm_min)
+                    && last_tm.tm_min == tm_out->et_tm.tm_min
+                    && this->dts_last_gmtoff == tm_out->et_gmtoff)
                 {
                     const auto sec_diff = tm_out->et_tm.tm_sec - last_tm.tm_sec;
 
-                    // log_debug("diff %d", sec_diff);
                     tv_out = this->dts_last_tv;
                     tv_out.tv_sec += sec_diff;
                     tm_out->et_tm.tm_wday = last_tm.tm_wday;
                 } else {
-                    // log_debug("doing tm2sec");
-                    tv_out.tv_sec = tm2sec(&tm_out->et_tm);
+                    tv_out = tm_out->to_timeval();
                     secs2wday(tv_out, &tm_out->et_tm);
                 }
                 tv_out.tv_usec = tm_out->et_nsec / 1000;
@@ -182,6 +263,8 @@ date_time_scanner::scan(const char* time_dest,
         } else {
             off_t off = 0;
 
+            tm_out->et_tm.tm_yday = -1;
+            tm_out->et_flags = 0;
 #ifdef HAVE_STRUCT_TM_TM_ZONE
             if (!this->dts_keep_base_tz) {
                 tm_out->et_tm.tm_zone = nullptr;
@@ -193,25 +276,51 @@ date_time_scanner::scan(const char* time_dest,
                     || off == (off_t) time_len))
             {
                 retval = &time_dest[off];
+                tm_out->fill_from_base(this->dts_base_tm);
                 if (tm_out->et_tm.tm_year < 70) {
                     tm_out->et_tm.tm_year = 80;
                 }
                 if (convert_local
                     && (this->dts_local_time
-                        || tm_out->et_flags & ETF_EPOCH_TIME))
+                        || tm_out->et_flags & ETF_EPOCH_TIME
+                        || ((tm_out->et_flags & ETF_ZONE_SET
+                             || this->dts_default_zone != nullptr)
+                            && this->dts_zoned_to_local)))
                 {
-                    time_t gmt = tm2sec(&tm_out->et_tm);
+                    time_t gmt = tm_out->to_timeval().tv_sec;
 
+                    if (!(tm_out->et_flags & ETF_ZONE_SET)
+                        && !(tm_out->et_flags & ETF_EPOCH_TIME)
+                        && this->dts_default_zone != nullptr)
+                    {
+                        date::local_seconds stime;
+                        stime += std::chrono::seconds{gmt};
+                        auto ztime
+                            = date::make_zoned(this->dts_default_zone, stime);
+                        gmt = std::chrono::duration_cast<std::chrono::seconds>(
+                                  ztime.get_sys_time().time_since_epoch())
+                                  .count();
+                    }
                     this->to_localtime(gmt, *tm_out);
-#ifdef HAVE_STRUCT_TM_TM_ZONE
-                    tm_out->et_tm.tm_zone = nullptr;
-#endif
-                    tm_out->et_tm.tm_isdst = 0;
                 }
+                const auto& last_tm = this->dts_last_tm;
+                if (last_tm.tm_year == tm_out->et_tm.tm_year
+                    && last_tm.tm_mon == tm_out->et_tm.tm_mon
+                    && last_tm.tm_mday == tm_out->et_tm.tm_mday
+                    && last_tm.tm_hour == tm_out->et_tm.tm_hour
+                    && last_tm.tm_min == tm_out->et_tm.tm_min
+                    && this->dts_last_gmtoff == tm_out->et_gmtoff)
+                {
+                    const auto sec_diff = tm_out->et_tm.tm_sec - last_tm.tm_sec;
 
-                tv_out.tv_sec = tm2sec(&tm_out->et_tm);
+                    tv_out = this->dts_last_tv;
+                    tv_out.tv_sec += sec_diff;
+                    tm_out->et_tm.tm_wday = last_tm.tm_wday;
+                } else {
+                    tv_out = tm_out->to_timeval();
+                    secs2wday(tv_out, &tm_out->et_tm);
+                }
                 tv_out.tv_usec = tm_out->et_nsec / 1000;
-                secs2wday(tv_out, &tm_out->et_tm);
 
                 this->dts_fmt_lock = curr_time_fmt;
                 this->dts_fmt_len = retval - time_dest;
@@ -227,14 +336,18 @@ date_time_scanner::scan(const char* time_dest,
     }
 
     if (retval != nullptr) {
-        this->dts_last_tm = *tm_out;
+        this->dts_last_tm = tm_out->et_tm;
+        this->dts_last_gmtoff = tm_out->et_gmtoff;
         this->dts_last_tv = tv_out;
     }
 
     if (retval != nullptr && static_cast<size_t>(retval - time_dest) < time_len)
     {
         /* Try to pull out the milli/micro-second value. */
-        if (retval[0] == '.' || retval[0] == ',') {
+        if (!(tm_out->et_flags
+              & (ETF_MILLIS_SET | ETF_MICROS_SET | ETF_NANOS_SET))
+            && (retval[0] == '.' || retval[0] == ','))
+        {
             off_t off = (retval - time_dest) + 1;
 
             if (ptime_N(tm_out, time_dest, off, time_len)) {
@@ -243,24 +356,41 @@ date_time_scanner::scan(const char* time_dest,
                           std::chrono::nanoseconds{tm_out->et_nsec})
                           .count();
                 this->dts_fmt_len += 10;
-                tm_out->et_flags |= ETF_NANOS_SET;
+                tm_out->et_flags |= ETF_NANOS_SET | ETF_SUB_NOT_IN_FORMAT;
                 retval += 10;
             } else if (ptime_f(tm_out, time_dest, off, time_len)) {
                 tv_out.tv_usec
                     = std::chrono::duration_cast<std::chrono::microseconds>(
                           std::chrono::nanoseconds{tm_out->et_nsec})
                           .count();
-                this->dts_fmt_len += 7;
-                tm_out->et_flags |= ETF_MICROS_SET;
-                retval += 7;
-            } else if (ptime_L(tm_out, time_dest, off, time_len)) {
-                tv_out.tv_usec
-                    = std::chrono::duration_cast<std::chrono::microseconds>(
-                          std::chrono::nanoseconds{tm_out->et_nsec})
-                          .count();
-                this->dts_fmt_len += 4;
-                tm_out->et_flags |= ETF_MILLIS_SET;
-                retval += 4;
+                this->dts_fmt_len = off;
+                tm_out->et_flags |= ETF_SUB_NOT_IN_FORMAT;
+                retval = time_dest + this->dts_fmt_len;
+            }
+        }
+    }
+
+    if (retval != nullptr) {
+        if (!(tm_out->et_flags
+              & (ETF_MILLIS_SET | ETF_MICROS_SET | ETF_NANOS_SET)))
+        {
+            tm_out->et_nsec = 0;
+            tv_out.tv_usec = 0;
+            if (!(tm_out->et_flags & ETF_SECOND_SET)) {
+                tm_out->et_tm.tm_sec = 0;
+                if (!(tm_out->et_flags & ETF_MINUTE_SET)) {
+                    tm_out->et_tm.tm_min = 0;
+                    if (!(tm_out->et_flags & ETF_HOUR_SET)) {
+                        tm_out->et_tm.tm_hour = 0;
+                        if (!(tm_out->et_flags & ETF_DAY_SET)) {
+                            tm_out->et_tm.tm_mday = 1;
+                            if (!(tm_out->et_flags & ETF_MONTH_SET)) {
+                                tm_out->et_tm.tm_mon = 0;
+                            }
+                        }
+                    }
+                }
+                tv_out.tv_sec = tm2sec(&tm_out->et_tm);
             }
         }
     }
@@ -268,41 +398,199 @@ date_time_scanner::scan(const char* time_dest,
     return retval;
 }
 
+const char*
+date_time_scanner::scan_relocking(const char* time_src,
+                                  size_t time_len,
+                                  const char* const time_fmt[],
+                                  struct exttm* tm_out,
+                                  struct timeval& tv_out,
+                                  bool convert_local)
+{
+    const auto was_locked = this->dts_fmt_lock != -1;
+    const auto* retval
+        = this->scan(time_src, time_len, time_fmt, tm_out, tv_out, convert_local);
+
+    if (was_locked && retval == nullptr) {
+        const auto lock = this->unlock();
+        retval = this->scan(
+            time_src, time_len, time_fmt, tm_out, tv_out, convert_local);
+        if (retval == nullptr) {
+            this->relock(lock);
+        }
+    }
+
+    return retval;
+}
+
+date_time_scanner
+date_time_scanner::unlocked_copy() const
+{
+    auto retval = *this;
+
+    retval.dts_fmt_lock = -1;
+    retval.dts_fmt_len = -1;
+    retval.dts_last_tv = timeval{};
+    retval.dts_last_tm = tm{};
+    retval.dts_last_gmtoff = 0;
+    retval.dts_local_offset_cache = 0;
+    retval.dts_local_offset_valid = 0;
+    retval.dts_local_offset_expiry = 0;
+    retval.dts_localtime_cached_gmt = 0;
+    retval.dts_localtime_cached_tm = tm{};
+
+    return retval;
+}
+
+void
+date_time_scanner::clear()
+{
+    this->dts_base_time = 0;
+    this->dts_base_tm = exttm{};
+    this->dts_fmt_lock = -1;
+    this->dts_fmt_len = -1;
+    this->dts_last_tv = timeval{};
+    this->dts_last_tm = tm{};
+    this->dts_last_gmtoff = 0;
+    this->dts_localtime_cached_gmt = 0;
+    this->dts_localtime_cached_tm = tm{};
+}
+
 void
 date_time_scanner::set_base_time(time_t base_time, const tm& local_tm)
 {
     this->dts_base_time = base_time;
     this->dts_base_tm.et_tm = local_tm;
-    this->dts_last_tm = exttm{};
+    this->dts_last_tm = tm{};
+    this->dts_last_gmtoff = 0;
     this->dts_last_tv = timeval{};
 }
 
 void
 date_time_scanner::to_localtime(time_t t, exttm& tm_out)
 {
-    if (t < (24 * 60 * 60)) {
-        // Don't convert and risk going past the epoch.
+    if (t < MIN_LOCAL_TIME) {
+        // A time this close to the epoch is a count from the start of a run
+        // rather than a wall-clock time, so there is no zone to convert to.
+        // Converting would also risk going past the epoch.
         return;
     }
 
     if (t < this->dts_local_offset_valid || t >= this->dts_local_offset_expiry)
     {
-        time_t new_gmt;
-
         localtime_r(&t, &tm_out.et_tm);
+        // Clear the gmtoff set by localtime_r() otherwise tm2sec() will
+        // convert the time back again.
 #ifdef HAVE_STRUCT_TM_TM_ZONE
+        tm_out.et_tm.tm_gmtoff = 0;
         tm_out.et_tm.tm_zone = nullptr;
 #endif
         tm_out.et_tm.tm_isdst = 0;
-
-        new_gmt = tm2sec(&tm_out.et_tm);
-        this->dts_local_offset_cache = t - new_gmt;
+        auto new_gmt = tm2sec(&tm_out.et_tm);
+        this->dts_local_offset_cache = new_gmt - t;
         this->dts_local_offset_valid = t;
         this->dts_local_offset_expiry = t + (EXPIRE_TIME - 1);
         this->dts_local_offset_expiry
             -= this->dts_local_offset_expiry % EXPIRE_TIME;
     } else {
-        time_t adjust_gmt = t - this->dts_local_offset_cache;
-        gmtime_r(&adjust_gmt, &tm_out.et_tm);
+        time_t adjust_gmt = t + this->dts_local_offset_cache;
+        auto adjust_gmt_min = adjust_gmt / 60;
+        if (this->dts_localtime_cached_gmt == adjust_gmt_min) {
+            tm_out.et_tm = this->dts_localtime_cached_tm;
+            tm_out.et_tm.tm_sec = adjust_gmt % 60;
+        } else {
+            secs2tm(adjust_gmt, &tm_out.et_tm);
+            this->dts_localtime_cached_gmt = adjust_gmt_min;
+            this->dts_localtime_cached_tm = tm_out.et_tm;
+            this->dts_localtime_cached_tm.tm_sec = 0;
+        }
+#if 0
+        {
+            tm verify_tm;
+            secs2tm(adjust_gmt, &verify_tm);
+            require(tm_out.et_tm.tm_year == verify_tm.tm_year);
+            require(tm_out.et_tm.tm_mon == verify_tm.tm_mon);
+            require(tm_out.et_tm.tm_mday == verify_tm.tm_mday);
+            require(tm_out.et_tm.tm_hour == verify_tm.tm_hour);
+            require(tm_out.et_tm.tm_min == verify_tm.tm_min);
+            require(tm_out.et_tm.tm_sec == verify_tm.tm_sec);
+        }
+#endif
     }
+    tm_out.et_orig_gmtoff = this->dts_local_offset_cache;
+    tm_out.et_gmtoff = 0;
+#ifdef HAVE_STRUCT_TM_TM_ZONE
+    tm_out.et_tm.tm_gmtoff = 0;
+    tm_out.et_tm.tm_zone = nullptr;
+#endif
 }
+
+namespace humanize::time {
+Result<point, lnav::console::user_message>
+point::from(string_fragment in, std::optional<timeval> ref_point)
+{
+    auto parse_res = relative_time::from_str(in);
+
+    std::optional<timeval> tv_opt;
+
+    if (parse_res.isOk()) {
+        auto now_tv = current_timeval();
+        now_tv.tv_sec = convert_log_time_to_local(now_tv.tv_sec);
+        auto tm = exttm::from_tv(ref_point.value_or(now_tv));
+        tv_opt = parse_res.unwrap().adjust(tm).to_timeval();
+    } else {
+        date_time_scanner dts;
+        timeval tv_abs;
+        exttm tm;
+
+        {
+            auto curr_time = ::time(nullptr);
+            struct tm base_tm;
+            localtime_r(&curr_time, &base_tm);
+            dts.set_base_time(curr_time, base_tm);
+        }
+        auto scan_end = dts.scan(in.data(), in.length(), nullptr, &tm, tv_abs);
+        if (scan_end != nullptr) {
+            size_t matched_size = scan_end - in.data();
+            if (matched_size != in.length()) {
+                auto um
+                    = lnav::console::user_message::error(
+                          attr_line_t("invalid timestamp: ").append(in))
+                          .with_reason(
+                              attr_line_t("the leading part of the timestamp "
+                                          "was matched, however, the trailing "
+                                          "text ")
+                                  .append_quoted(scan_end)
+                                  .append(" was not"))
+                          .with_note(
+                              attr_line_t("input matched time format ")
+                                  .append_quoted(
+                                      PTIMEC_FORMATS[dts.dts_fmt_lock].pf_fmt))
+                          .with_help(
+                              "fix the timestamp or remove the trailing text")
+                          .move();
+                return Err(um);
+            }
+            tv_opt = tv_abs;
+        }
+    }
+    if (!tv_opt) {
+        auto pe = parse_res.unwrapErr();
+        if (!pe.pe_msg.empty()) {
+            auto um = lnav::console::user_message::error(
+                          attr_line_t("invalid timestamp ").append_quoted(in))
+                          .with_reason(pe.pe_msg)
+                          .move();
+            return Err(um);
+        }
+
+        auto um
+            = lnav::console::user_message::error(
+                  attr_line_t("invalid timestamp ").append_quoted(in))
+                  .with_reason("Not recognized as a relative or absolute time")
+                  .move();
+        return Err(um);
+    }
+
+    return Ok(point{tv_opt.value()});
+}
+}  // namespace humanize::time

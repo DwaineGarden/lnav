@@ -65,56 +65,7 @@ struct noop_func {
     }
 };
 
-namespace lnav {
-namespace func {
-
-class scoped_cb {
-public:
-    class guard {
-    public:
-        explicit guard(scoped_cb* owner) : g_owner(owner) {}
-
-        guard(const guard&) = delete;
-        guard& operator=(const guard&) = delete;
-
-        guard(guard&& gu) noexcept : g_owner(std::exchange(gu.g_owner, nullptr))
-        {
-        }
-
-        guard& operator=(guard&& gu) noexcept
-        {
-            this->g_owner = std::exchange(gu.g_owner, nullptr);
-            return *this;
-        }
-
-        ~guard()
-        {
-            if (this->g_owner != nullptr) {
-                this->g_owner->s_callback = {};
-            }
-        }
-
-    private:
-        scoped_cb* g_owner;
-    };
-
-    guard install(std::function<void()> cb)
-    {
-        this->s_callback = std::move(cb);
-
-        return guard{this};
-    }
-
-    void operator()()
-    {
-        if (s_callback) {
-            s_callback();
-        }
-    }
-
-private:
-    std::function<void()> s_callback;
-};
+namespace lnav::func {
 
 template<typename Fn,
          typename... Args,
@@ -153,7 +104,6 @@ struct is_invocable {
     static constexpr bool value = decltype(test<F, Args...>(0))::value;
 };
 
-}  // namespace func
-}  // namespace lnav
+}  // namespace lnav::func
 
 #endif

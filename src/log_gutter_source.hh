@@ -30,7 +30,6 @@
 #ifndef lnav_log_gutter_source_hh
 #define lnav_log_gutter_source_hh
 
-#include "command_executor.hh"
 #include "logfile_sub_source.hh"
 
 class log_gutter_source : public list_gutter_source {
@@ -38,11 +37,11 @@ public:
     void listview_gutter_value_for_range(const listview_curses& lv,
                                          int start,
                                          int end,
-                                         chtype& ch,
+                                         const char*& ch,
                                          role_t& role_out,
-                                         role_t& bar_role_out)
+                                         role_t& bar_role_out) override
     {
-        textview_curses* tc = (textview_curses*) &lv;
+        auto tc = (textview_curses*) &lv;
         vis_bookmarks& bm = tc->get_bookmarks();
         bool search_hit = false;
 
@@ -56,20 +55,25 @@ public:
             next = bm[&textview_curses::BM_META].next(vis_line_t(start));
         }
         if (next && next.value() <= end) {
-            ch = search_hit ? ACS_PLUS : ACS_LTEE;
+             ch = search_hit ? NCACS_PLUS : NCACS_LTEE;
         } else {
-            ch = search_hit ? ACS_RTEE : ACS_VLINE;
+             ch = search_hit ? NCACS_RTEE : NCACS_VLINE;
         }
-        next = bm[&logfile_sub_source::BM_ERRORS].next(vis_line_t(start));
-        if (next && next.value() <= end) {
+        // `start` was stepped back above so that the bookmark probes read
+        // as "at or after the row the range began on"; the half-open range
+        // that covers the same rows is therefore [start + 1, end + 1).
+        if (tc->any_mark_in_range(&textview_curses::BM_ERRORS,
+                                  vis_line_t(start + 1),
+                                  vis_line_t(end + 1)))
+        {
             role_out = role_t::VCR_ERROR;
             bar_role_out = role_t::VCR_SCROLLBAR_ERROR;
-        } else {
-            next = bm[&logfile_sub_source::BM_WARNINGS].next(vis_line_t(start));
-            if (next && next.value() <= end) {
-                role_out = role_t::VCR_WARNING;
-                bar_role_out = role_t::VCR_SCROLLBAR_WARNING;
-            }
+        } else if (tc->any_mark_in_range(&textview_curses::BM_WARNINGS,
+                                         vis_line_t(start + 1),
+                                         vis_line_t(end + 1)))
+        {
+            role_out = role_t::VCR_WARNING;
+            bar_role_out = role_t::VCR_SCROLLBAR_WARNING;
         }
     }
 };

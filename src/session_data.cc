@@ -34,7 +34,6 @@
 
 #include "session_data.hh"
 
-#include <fcntl.h>
 #include <glob.h>
 #include <stdio.h>
 #include <sys/types.h>
@@ -42,28 +41,34 @@
 
 #include "base/fs_util.hh"
 #include "base/isc.hh"
+#include "base/itertools.hh"
 #include "base/opt_util.hh"
 #include "base/paths.hh"
+#include "bookmarks.json.hh"
+#include "bound_tags.hh"
 #include "command_executor.hh"
 #include "config.h"
+#include "hasher.hh"
 #include "lnav.events.hh"
 #include "lnav.hh"
-#include "lnav_util.hh"
+#include "lnav.indexing.hh"
 #include "log_format_ext.hh"
 #include "logfile.hh"
 #include "service_tags.hh"
 #include "sql_util.hh"
 #include "sqlitepp.client.hh"
 #include "tailer/tailer.looper.hh"
+#include "timeline_source.hh"
 #include "vtab_module.hh"
 #include "yajlpp/yajlpp.hh"
 #include "yajlpp/yajlpp_def.hh"
 
-struct session_data_t session_data;
+session_data_t session_data;
+recent_refs_t recent_refs;
 
-static const char* LOG_METADATA_NAME = "log_metadata.db";
+static const char* const LOG_METADATA_NAME = "log_metadata.db";
 
-static const char* META_TABLE_DEF = R"(
+static const char* const META_TABLE_DEF = R"(
 CREATE TABLE IF NOT EXISTS bookmarks (
     log_time datetime,
     log_format varchar(64),
@@ -73,6 +78,9 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     access_time datetime DEFAULT CURRENT_TIMESTAMP,
     comment text DEFAULT '',
     tags text DEFAULT '',
+    annotations text DEFAULT NULL,
+    log_opid text DEFAULT NULL,
+    sticky integer DEFAULT 0,
 
     PRIMARY KEY (log_time, log_format, log_hash, session_time)
 );
@@ -110,28 +118,110 @@ CREATE TABLE IF NOT EXISTS regex101_entries (
        regex_name   <> '' AND
        permalink    <> '')
 );
+
+CREATE TABLE IF NOT EXISTS text_bookmarks2 (
+    file_path     text NOT NULL,
+    line_number   integer NOT NULL,
+    line_hash     text NOT NULL,
+    mark_type     text NOT NULL DEFAULT 'user',
+    session_time  integer NOT NULL,
+    anchor        text DEFAULT NULL,
+    anchor_offset integer DEFAULT NULL CHECK (anchor_offset >= 0),
+
+    PRIMARY KEY (file_path, line_number, mark_type, session_time),
+
+    CHECK(line_number >= 0),
+    CHECK(mark_type IN ('user', 'sticky'))
+);
+
+CREATE TABLE IF NOT EXISTS timeline_bookmarks (
+    row_type     text NOT NULL,
+    row_name     text NOT NULL,
+    mark_type    text NOT NULL DEFAULT 'sticky',
+    session_time integer NOT NULL,
+
+    PRIMARY KEY (row_type, row_name, mark_type, session_time),
+
+    CHECK(mark_type IN ('user', 'sticky'))
+);
 )";
 
-static const char* BOOKMARK_LRU_STMT
+static const char* const BOOKMARK_LRU_STMT
     = "DELETE FROM bookmarks WHERE access_time <= "
-      "  (SELECT access_time FROM bookmarks "
+      "  (SELECT DISTINCT access_time FROM bookmarks "
       "   ORDER BY access_time DESC LIMIT 1 OFFSET 50000)";
 
-static const char* NETLOC_LRU_STMT
+static const char* const NETLOC_LRU_STMT
     = "DELETE FROM recent_netlocs WHERE access_time <= "
-      "  (SELECT access_time FROM bookmarks "
+      "  (SELECT DISTINCT access_time FROM bookmarks "
       "   ORDER BY access_time DESC LIMIT 1 OFFSET 10)";
 
-static const char* UPGRADE_STMTS[] = {
+static const char* const TEXT_BOOKMARK_LRU_STMT
+    = "DELETE FROM text_bookmarks2 WHERE session_time <= "
+      "  (SELECT DISTINCT session_time FROM text_bookmarks2 "
+      "   ORDER BY session_time DESC LIMIT 1 OFFSET 50000)";
+
+static const char* const TIMELINE_BOOKMARK_LRU_STMT
+    = "DELETE FROM timeline_bookmarks WHERE session_time <= "
+      "  (SELECT DISTINCT session_time FROM timeline_bookmarks "
+      "   ORDER BY session_time DESC LIMIT 1 OFFSET 50000)";
+
+static const char* const UPGRADE_STMTS[] = {
     R"(ALTER TABLE bookmarks ADD COLUMN comment text DEFAULT '';)",
     R"(ALTER TABLE bookmarks ADD COLUMN tags text DEFAULT '';)",
+    R"(ALTER TABLE bookmarks ADD COLUMN annotations text DEFAULT NULL;)",
+    R"(ALTER TABLE bookmarks ADD COLUMN log_opid text DEFAULT NULL;)",
+    R"(ALTER TABLE bookmarks ADD COLUMN sticky integer DEFAULT 0;)",
+    R"(DROP TABLE IF EXISTS text_bookmarks;)",
+    R"(ALTER TABLE text_bookmarks2 ADD COLUMN anchor text DEFAULT NULL;)",
+    R"(ALTER TABLE text_bookmarks2
+         ADD COLUMN anchor_offset integer
+             DEFAULT NULL CHECK (anchor_offset >= 0);)",
 };
 
-static const size_t MAX_SESSIONS = 8;
-static const size_t MAX_SESSION_FILE_COUNT = 256;
+static constexpr size_t MAX_SESSIONS = 8;
+static constexpr size_t MAX_SESSION_FILE_COUNT = 256;
 
-static std::vector<content_line_t> marked_session_lines;
-static std::vector<content_line_t> offset_session_lines;
+struct session_line {
+    session_line(struct timeval tv,
+                 intern_string_t format_name,
+                 std::string line_hash)
+        : sl_time(tv), sl_format_name(format_name),
+          sl_line_hash(std::move(line_hash))
+    {
+    }
+
+    struct timeval sl_time;
+    intern_string_t sl_format_name;
+    std::string sl_line_hash;
+};
+
+static std::vector<session_line> marked_session_lines;
+static std::vector<session_line> offset_session_lines;
+
+static std::optional<std::string>
+get_text_line_hash(logfile* lf, int line_number)
+{
+    auto res = lf->find_line(line_number) | lnav::itertools::to_result([&] {
+                   return fmt::format(
+                       FMT_STRING("could not find line {} in file {}"),
+                       line_number,
+                       lf->get_filename_as_string());
+               })
+        | lnav::itertools::map(&logfile::get_msg_range, lf)
+        | lnav::itertools::map(&logfile::read_range, lf)
+        | lnav::itertools::map(hash_string_for<shared_buffer_ref>);
+
+    if (res.isErr()) {
+        log_error("could not read line %d from file %s -- %s",
+                  line_number,
+                  lf->get_filename_as_string().c_str(),
+                  res.unwrapErr().c_str());
+        return std::nullopt;
+    }
+
+    return res.unwrap();
+}
 
 static bool
 bind_line(sqlite3* db,
@@ -139,7 +229,7 @@ bind_line(sqlite3* db,
           content_line_t cl,
           time_t session_time)
 {
-    logfile_sub_source& lss = lnav_data.ld_log_source;
+    auto& lss = lnav_data.ld_log_source;
     auto lf = lss.find(cl);
 
     if (lf == nullptr) {
@@ -149,7 +239,8 @@ bind_line(sqlite3* db,
     sqlite3_clear_bindings(stmt);
 
     auto line_iter = lf->begin() + cl;
-    auto read_result = lf->read_line(line_iter);
+    auto fr = lf->get_file_range(line_iter, false);
+    auto read_result = lf->read_range(fr);
 
     if (read_result.isErr()) {
         return false;
@@ -175,7 +266,9 @@ bind_line(sqlite3* db,
 struct session_file_info {
     session_file_info(int timestamp, std::string id, std::string path)
         : sfi_timestamp(timestamp), sfi_id(std::move(id)),
-          sfi_path(std::move(path)){};
+          sfi_path(std::move(path))
+    {
+    }
 
     bool operator<(const session_file_info& other) const
     {
@@ -186,7 +279,7 @@ struct session_file_info {
             return true;
         }
         return false;
-    };
+    }
 
     int sfi_timestamp;
     std::string sfi_id;
@@ -197,7 +290,7 @@ static void
 cleanup_session_data()
 {
     static_root_mem<glob_t, globfree> session_file_list;
-    std::list<struct session_file_info> session_info_list;
+    std::list<session_file_info> session_info_list;
     std::map<std::string, int> session_count;
     auto session_file_pattern = lnav::paths::dotlnav() / "*-*.ts*.json";
 
@@ -279,9 +372,10 @@ init_session()
 {
     lnav_data.ld_session_time = time(nullptr);
     lnav_data.ld_session_id.clear();
+    session_data.sd_view_states[LNV_LOG].vs_top = -1;
 }
 
-static nonstd::optional<std::string>
+static std::optional<std::string>
 compute_session_id()
 {
     bool has_files = false;
@@ -294,14 +388,25 @@ compute_session_id()
         has_files = true;
         h.update(ld_file_name.first);
     }
+    for (const auto& lf : lnav_data.ld_active_files.fc_files) {
+        if (lf->is_valid_filename()) {
+            continue;
+        }
+        if (!lf->get_open_options().loo_include_in_session) {
+            continue;
+        }
+
+        has_files = true;
+        h.update(lf->get_content_id());
+    }
     if (!has_files) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     return h.to_string();
 }
 
-nonstd::optional<session_pair_t>
+std::optional<session_pair_t>
 scan_sessions()
 {
     static_root_mem<glob_t, globfree> view_info_list;
@@ -310,11 +415,9 @@ scan_sessions()
 
     const auto session_id = compute_session_id();
     if (!session_id) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
-    std::list<session_pair_t>& session_file_names
-        = lnav_data.ld_session_id[session_id.value()];
-
+    auto& session_file_names = lnav_data.ld_session_id[session_id.value()];
     session_file_names.clear();
 
     auto view_info_pattern_base
@@ -362,21 +465,61 @@ scan_sessions()
     }
 
     if (session_file_names.empty()) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
-    return nonstd::make_optional(session_file_names.back());
+    return std::make_optional(session_file_names.back());
 }
+
+static void load_text_bookmarks(sqlite3* db);
+static void load_timeline_bookmarks(sqlite3* db);
 
 void
 load_time_bookmarks()
 {
-    logfile_sub_source& lss = lnav_data.ld_log_source;
+    static const char* const BOOKMARK_STMT = R"(
+       SELECT
+         log_time,
+         log_format,
+         log_hash,
+         session_time,
+         part_name,
+         access_time,
+         comment,
+         tags,
+         annotations,
+         log_opid,
+         sticky,
+         session_time=? AS same_session
+       FROM bookmarks WHERE
+         log_time BETWEEN ? AND ? AND
+         log_format = ?
+       ORDER BY same_session DESC, session_time DESC
+)";
+
+    static const char* const TIME_OFFSET_STMT = R"(
+       SELECT
+         *,
+         session_time=? AS same_session
+       FROM time_offset
+       WHERE
+         log_hash = ? AND
+         log_time BETWEEN ? AND ? AND
+         log_format = ?
+       ORDER BY
+         same_session DESC,
+         session_time DESC
+)";
+
+    static auto op = lnav_operation{__FUNCTION__};
+
+    auto op_guard = lnav_opid_guard::internal(op);
+    auto& lss = lnav_data.ld_log_source;
     auto_sqlite3 db;
     auto db_path = lnav::paths::dotlnav() / LOG_METADATA_NAME;
     auto_mem<sqlite3_stmt> stmt(sqlite3_finalize);
-    logfile_sub_source::iterator file_iter;
     bool reload_needed = false;
+    bool meta_loaded = false;
     auto_mem<char, sqlite3_free> errmsg;
 
     log_info("loading bookmark db: %s", db_path.c_str());
@@ -412,7 +555,7 @@ load_time_bookmarks()
         while (!done) {
             done = netloc_stmt.fetch_row<std::string>().match(
                 [](const std::string& netloc) {
-                    session_data.sd_recent_netlocs.insert(netloc);
+                    recent_refs.rr_netlocs.insert(netloc);
                     return false;
                 },
                 [](const prepared_stmt::fetch_error& fe) {
@@ -424,16 +567,8 @@ load_time_bookmarks()
         }
     }
 
-    if (sqlite3_prepare_v2(
-            db.in(),
-            "SELECT log_time, log_format, log_hash, session_time, part_name, "
-            "access_time, comment,"
-            " tags, session_time=? as same_session FROM bookmarks WHERE "
-            " log_time between ? and ? and log_format = ? "
-            " ORDER BY same_session DESC, session_time DESC",
-            -1,
-            stmt.out(),
-            nullptr)
+    log_info("BEGIN select bookmarks");
+    if (sqlite3_prepare_v2(db.in(), BOOKMARK_STMT, -1, stmt.out(), nullptr)
         != SQLITE_OK)
     {
         log_error("could not prepare bookmark select statement -- %s",
@@ -441,16 +576,19 @@ load_time_bookmarks()
         return;
     }
 
-    for (file_iter = lnav_data.ld_log_source.begin();
+    for (auto file_iter = lnav_data.ld_log_source.begin();
          file_iter != lnav_data.ld_log_source.end();
          ++file_iter)
     {
         auto lf = (*file_iter)->get_file();
-        content_line_t base_content_line;
-
         if (lf == nullptr) {
             continue;
         }
+        if (lf->size() == 0) {
+            continue;
+        }
+        const auto* format = lf->get_format_ptr();
+        content_line_t base_content_line;
 
         base_content_line = lss.get_file_base_content_line(file_iter);
 
@@ -471,8 +609,9 @@ load_time_bookmarks()
 
         date_time_scanner dts;
         bool done = false;
-        std::string line;
         int64_t last_mark_time = -1;
+        size_t marked_count = 0;
+        size_t sticky_count = 0;
 
         while (!done) {
             int rc = sqlite3_step(stmt.in());
@@ -488,15 +627,18 @@ load_time_bookmarks()
                         = (const char*) sqlite3_column_text(stmt.in(), 0);
                     const char* log_hash
                         = (const char*) sqlite3_column_text(stmt.in(), 2);
+                    int64_t mark_time = sqlite3_column_int64(stmt.in(), 3);
                     const char* part_name
                         = (const char*) sqlite3_column_text(stmt.in(), 4);
                     const char* comment
                         = (const char*) sqlite3_column_text(stmt.in(), 6);
                     const char* tags
                         = (const char*) sqlite3_column_text(stmt.in(), 7);
-                    int64_t mark_time = sqlite3_column_int64(stmt.in(), 3);
-                    struct timeval log_tv;
-                    struct exttm log_tm;
+                    const auto annotations = sqlite3_column_text(stmt.in(), 8);
+                    const auto log_opid = sqlite3_column_text(stmt.in(), 9);
+                    int sticky = sqlite3_column_int(stmt.in(), 10);
+                    timeval log_tv;
+                    exttm log_tm;
 
                     if (last_mark_time == -1) {
                         last_mark_time = mark_time;
@@ -505,30 +647,43 @@ load_time_bookmarks()
                         continue;
                     }
 
-                    if (part_name == nullptr) {
+                    if (part_name == nullptr && !sticky) {
                         continue;
                     }
 
-                    if (!dts.scan(
-                            log_time, strlen(log_time), NULL, &log_tm, log_tv))
+                    if (dts.scan(log_time,
+                                 strlen(log_time),
+                                 nullptr,
+                                 &log_tm,
+                                 log_tv)
+                        == nullptr)
                     {
+                        log_warning("bad log time: %s", log_time);
                         continue;
                     }
 
-                    auto line_iter
-                        = lower_bound(lf->begin(), lf->end(), log_tv);
+                    auto line_iter = format->lf_time_ordered
+                        ? std::lower_bound(lf->begin(), lf->end(), log_tv)
+                        : lf->begin();
                     while (line_iter != lf->end()) {
-                        struct timeval line_tv = line_iter->get_timeval();
+                        const auto line_tv = line_iter->get_timeval();
 
-                        if ((line_tv.tv_sec != log_tv.tv_sec)
-                            || (line_tv.tv_usec != log_tv.tv_usec))
+                        // NB: only milliseconds were stored in the DB, but the
+                        // internal rep stores micros now.
+                        if (line_tv.tv_sec != log_tv.tv_sec
+                            || line_tv.tv_usec / 1000 != log_tv.tv_usec / 1000)
                         {
-                            break;
+                            if (format->lf_time_ordered) {
+                                break;
+                            }
+                            ++line_iter;
+                            continue;
                         }
 
                         auto cl = content_line_t(
                             std::distance(lf->begin(), line_iter));
-                        auto read_result = lf->read_line(line_iter);
+                        auto fr = lf->get_file_range(line_iter, false);
+                        auto read_result = lf->read_range(fr);
 
                         if (read_result.isErr()) {
                             break;
@@ -542,65 +697,147 @@ load_time_bookmarks()
                                   .update(cl)
                                   .to_string();
 
-                        if (line_hash == log_hash) {
-                            auto& bm_meta = lf->get_bookmark_metadata();
-                            auto line_number = static_cast<uint32_t>(
-                                std::distance(lf->begin(), line_iter));
-                            content_line_t line_cl = content_line_t(
-                                base_content_line + line_number);
-                            bool meta = false;
+                        if (line_hash != log_hash) {
+                            // Using the formatted line for JSON-lines logs was
+                            // a mistake in earlier versions. To carry forward
+                            // older bookmarks, we need to replicate the bad
+                            // behavior.
+                            auto hack_read_res
+                                = lf->read_line(line_iter, {false, true});
+                            if (hack_read_res.isErr()) {
+                                break;
+                            }
+                            auto hack_sbr = hack_read_res.unwrap();
+                            auto hack_hash = hasher()
+                                                 .update(hack_sbr.get_data(),
+                                                         hack_sbr.length())
+                                                 .update(cl)
+                                                 .to_string();
+                            if (hack_hash == log_hash) {
+                                log_trace("needed hack to match line: %s:%d",
+                                          lf->get_filename_as_string().c_str(),
+                                          (int) cl);
+                            } else {
+                                ++line_iter;
+                                continue;
+                            }
+                        }
+                        auto& bm_meta = lf->get_bookmark_metadata();
+                        auto line_number = static_cast<uint32_t>(
+                            std::distance(lf->begin(), line_iter));
+                        content_line_t line_cl
+                            = content_line_t(base_content_line + line_number);
+                        bool meta = false;
 
-                            if (part_name != nullptr && part_name[0] != '\0') {
+                        if (part_name != nullptr && part_name[0] != '\0') {
+                            lss.set_user_mark(&textview_curses::BM_PARTITION,
+                                              line_cl);
+                            bm_meta[line_number].bm_name = part_name;
+                            if (!meta) {
+                                log_debug("  loaded partition bookmark");
+                            }
+                            meta = true;
+                        }
+                        if (comment != nullptr && comment[0] != '\0') {
+                            lss.set_user_mark(&textview_curses::BM_META,
+                                              line_cl);
+                            bm_meta[line_number].bm_comment = comment;
+                            if (!meta) {
+                                log_debug("  loaded message comment");
+                            }
+                            meta = true;
+                        }
+                        if (tags != nullptr && tags[0] != '\0') {
+                            auto_mem<yajl_val_s> tag_list(yajl_tree_free);
+                            char error_buffer[1024];
+
+                            tag_list = yajl_tree_parse(
+                                tags, error_buffer, sizeof(error_buffer));
+                            if (!YAJL_IS_ARRAY(tag_list.in())) {
+                                log_error("invalid tags column: %s", tags);
+                            } else {
                                 lss.set_user_mark(&textview_curses::BM_META,
                                                   line_cl);
-                                bm_meta[line_number].bm_name = part_name;
-                                meta = true;
-                            }
-                            if (comment != nullptr && comment[0] != '\0') {
-                                lss.set_user_mark(&textview_curses::BM_META,
-                                                  line_cl);
-                                bm_meta[line_number].bm_comment = comment;
-                                meta = true;
-                            }
-                            if (tags != nullptr && tags[0] != '\0') {
-                                auto_mem<yajl_val_s> tag_list(yajl_tree_free);
-                                char error_buffer[1024];
+                                for (size_t lpc = 0;
+                                     lpc < tag_list.in()->u.array.len;
+                                     lpc++)
+                                {
+                                    yajl_val elem
+                                        = tag_list.in()->u.array.values[lpc];
 
-                                tag_list = yajl_tree_parse(
-                                    tags, error_buffer, sizeof(error_buffer));
-                                if (!YAJL_IS_ARRAY(tag_list.in())) {
-                                    log_error("invalid tags column: %s", tags);
-                                } else {
-                                    lss.set_user_mark(&textview_curses::BM_META,
-                                                      line_cl);
-                                    for (size_t lpc = 0;
-                                         lpc < tag_list.in()->u.array.len;
-                                         lpc++)
-                                    {
-                                        yajl_val elem
-                                            = tag_list.in()
-                                                  ->u.array.values[lpc];
-
-                                        if (!YAJL_IS_STRING(elem)) {
-                                            continue;
-                                        }
-                                        bookmark_metadata::KNOWN_TAGS.insert(
-                                            elem->u.string);
-                                        bm_meta[line_number].add_tag(
-                                            elem->u.string);
+                                    if (!YAJL_IS_STRING(elem)) {
+                                        continue;
                                     }
+                                    bookmark_metadata::KNOWN_TAGS.insert(
+                                        elem->u.string);
+                                    bm_meta[line_number].add_tag(
+                                        elem->u.string);
                                 }
-                                meta = true;
                             }
                             if (!meta) {
-                                marked_session_lines.push_back(line_cl);
-                                lss.set_user_mark(&textview_curses::BM_USER,
-                                                  line_cl);
+                                log_debug("  loaded tags");
                             }
-                            reload_needed = true;
+                            meta = true;
                         }
+                        if (annotations != nullptr && annotations[0] != '\0') {
+                            static const intern_string_t SRC
+                                = intern_string::lookup("annotations");
 
-                        ++line_iter;
+                            const auto anno_sf
+                                = string_fragment::from_c_str(annotations);
+                            auto parse_res
+                                = logmsg_annotations_handlers.parser_for(SRC)
+                                      .of(anno_sf);
+                            if (!meta) {
+                                log_debug("  loaded message annotation");
+                            }
+                            if (parse_res.isErr()) {
+                                log_error(
+                                    "unable to parse annotations JSON -- "
+                                    "%s",
+                                    parse_res.unwrapErr()[0]
+                                        .to_attr_line()
+                                        .get_string()
+                                        .c_str());
+                            } else if (bm_meta.find(line_number)
+                                       == bm_meta.end())
+                            {
+                                lss.set_user_mark(&textview_curses::BM_META,
+                                                  line_cl);
+                                bm_meta[line_number].bm_annotations
+                                    = parse_res.unwrap();
+                                meta = true;
+                            } else {
+                                meta = true;
+                            }
+                        }
+                        if (log_opid != nullptr && log_opid[0] != '\0') {
+                            auto opid_sf
+                                = string_fragment::from_c_str(log_opid);
+                            lf->set_logline_opid(line_number, opid_sf);
+                            if (!meta) {
+                                log_debug("  loaded user opid");
+                            }
+                            meta = true;
+                        }
+                        if (meta) {
+                            meta_loaded = true;
+                        } else if (part_name != nullptr) {
+                            marked_session_lines.emplace_back(
+                                lf->original_line_time(line_iter),
+                                format->get_name(),
+                                line_hash);
+                            lss.set_user_mark(&textview_curses::BM_USER,
+                                              line_cl);
+                            marked_count += 1;
+                        }
+                        if (sticky) {
+                            lss.set_user_mark(&textview_curses::BM_STICKY,
+                                              line_cl);
+                            sticky_count += 1;
+                        }
+                        reload_needed = true;
+                        break;
                     }
                     break;
                 }
@@ -616,17 +853,18 @@ load_time_bookmarks()
             }
         }
 
+        if (marked_count > 0 || sticky_count > 0) {
+            log_info("  loaded %zu marked and %zu sticky lines from %s",
+                     marked_count,
+                     sticky_count,
+                     lf->get_filename_as_string().c_str());
+        }
         sqlite3_reset(stmt.in());
     }
+    log_info("END select bookmarks");
 
-    if (sqlite3_prepare_v2(
-            db.in(),
-            "SELECT *,session_time=? as same_session FROM time_offset WHERE "
-            " log_time between ? and ? and log_format = ? "
-            " ORDER BY same_session DESC, session_time DESC",
-            -1,
-            stmt.out(),
-            nullptr)
+    log_info("BEGIN select time_offset");
+    if (sqlite3_prepare_v2(db.in(), TIME_OFFSET_STMT, -1, stmt.out(), nullptr)
         != SQLITE_OK)
     {
         log_error("could not prepare time_offset select statement -- %s",
@@ -634,7 +872,7 @@ load_time_bookmarks()
         return;
     }
 
-    for (file_iter = lnav_data.ld_log_source.begin();
+    for (auto file_iter = lnav_data.ld_log_source.begin();
          file_iter != lnav_data.ld_log_source.end();
          ++file_iter)
     {
@@ -644,8 +882,11 @@ load_time_bookmarks()
         if (lf == nullptr) {
             continue;
         }
+        if (lf->size() == 0) {
+            continue;
+        }
 
-        lss.find(lf->get_filename().c_str(), base_content_line);
+        lss.find(lf->get_filename_as_string().c_str(), base_content_line);
 
         auto low_line_iter = lf->begin();
         auto high_line_iter = lf->end();
@@ -654,6 +895,7 @@ load_time_bookmarks()
 
         if (bind_values(stmt.in(),
                         lnav_data.ld_session_load_time,
+                        lf->get_content_id(),
                         lf->original_line_time(low_line_iter),
                         lf->original_line_time(high_line_iter),
                         lf->get_format()->get_name())
@@ -663,12 +905,11 @@ load_time_bookmarks()
         }
 
         date_time_scanner dts;
-        bool done = false;
-        std::string line;
+        auto done = false;
         int64_t last_mark_time = -1;
 
         while (!done) {
-            int rc = sqlite3_step(stmt.in());
+            const auto rc = sqlite3_step(stmt.in());
 
             switch (rc) {
                 case SQLITE_OK:
@@ -677,13 +918,11 @@ load_time_bookmarks()
                     break;
 
                 case SQLITE_ROW: {
-                    const char* log_time
+                    const auto* log_time
                         = (const char*) sqlite3_column_text(stmt.in(), 0);
-                    const char* log_hash
-                        = (const char*) sqlite3_column_text(stmt.in(), 2);
                     int64_t mark_time = sqlite3_column_int64(stmt.in(), 3);
-                    struct timeval log_tv;
-                    struct exttm log_tm;
+                    timeval log_tv;
+                    exttm log_tm;
 
                     if (last_mark_time == -1) {
                         last_mark_time = mark_time;
@@ -708,28 +947,27 @@ load_time_bookmarks()
                     auto line_iter
                         = lower_bound(lf->begin(), lf->end(), log_tv);
                     while (line_iter != lf->end()) {
-                        struct timeval line_tv = line_iter->get_timeval();
+                        auto line_tv = line_iter->get_timeval();
 
                         if ((line_tv.tv_sec != log_tv.tv_sec)
-                            || (line_tv.tv_usec != log_tv.tv_usec))
+                            || (line_tv.tv_usec / 1000
+                                != log_tv.tv_usec / 1000))
                         {
                             break;
                         }
 
-                        if (lf->get_content_id() == log_hash) {
-                            int file_line
-                                = std::distance(lf->begin(), line_iter);
-                            content_line_t line_cl
-                                = content_line_t(base_content_line + file_line);
-                            struct timeval offset;
+                        int file_line = std::distance(lf->begin(), line_iter);
+                        timeval offset;
 
-                            offset_session_lines.push_back(line_cl);
-                            offset.tv_sec = sqlite3_column_int64(stmt.in(), 4);
-                            offset.tv_usec = sqlite3_column_int64(stmt.in(), 5);
-                            lf->adjust_content_time(file_line, offset);
+                        offset_session_lines.emplace_back(
+                            lf->original_line_time(line_iter),
+                            lf->get_format_ptr()->get_name(),
+                            lf->get_content_id());
+                        offset.tv_sec = sqlite3_column_int64(stmt.in(), 4);
+                        offset.tv_usec = sqlite3_column_int64(stmt.in(), 5);
+                        lf->adjust_content_time(file_line, offset);
 
-                            reload_needed = true;
-                        }
+                        reload_needed = true;
 
                         ++line_iter;
                     }
@@ -737,161 +975,108 @@ load_time_bookmarks()
                 }
 
                 default: {
-                    const char* errmsg;
-
-                    errmsg = sqlite3_errmsg(lnav_data.ld_db);
+                    const auto* errmsg = sqlite3_errmsg(lnav_data.ld_db);
                     log_error(
                         "bookmark select error: code %d -- %s", rc, errmsg);
                     done = true;
-                } break;
+                    break;
+                }
             }
         }
 
         sqlite3_reset(stmt.in());
     }
+    log_info("END select time_offset");
 
     if (reload_needed) {
+        if (meta_loaded) {
+            lss.set_line_meta_changed();
+            lss.text_filters_changed();
+        }
         lnav_data.ld_views[LNV_LOG].reload_data();
     }
+
+    load_text_bookmarks(db.in());
+    load_timeline_bookmarks(db.in());
 }
 
 static int
-read_files(yajlpp_parse_context* ypc, const unsigned char* str, size_t len)
+read_files(yajlpp_parse_context* ypc,
+           const unsigned char* str,
+           size_t len,
+           yajl_string_props_t*)
 {
     return 1;
 }
 
-static int
-read_current_search(yajlpp_parse_context* ypc,
-                    const unsigned char* str,
-                    size_t len)
-{
-    const auto regex = std::string((const char*) str, len);
-    const char** view_name;
-    int view_index;
+const json_path_handler_base::enum_value_t LEVEL_ENUM[] = {
+    {level_names[LEVEL_TRACE], LEVEL_TRACE},
+    {level_names[LEVEL_DEBUG5], LEVEL_DEBUG5},
+    {level_names[LEVEL_DEBUG4], LEVEL_DEBUG4},
+    {level_names[LEVEL_DEBUG3], LEVEL_DEBUG3},
+    {level_names[LEVEL_DEBUG2], LEVEL_DEBUG2},
+    {level_names[LEVEL_DEBUG], LEVEL_DEBUG},
+    {level_names[LEVEL_INFO], LEVEL_INFO},
+    {level_names[LEVEL_STATS], LEVEL_STATS},
+    {level_names[LEVEL_NOTICE], LEVEL_NOTICE},
+    {level_names[LEVEL_WARNING], LEVEL_WARNING},
+    {level_names[LEVEL_ERROR], LEVEL_ERROR},
+    {level_names[LEVEL_CRITICAL], LEVEL_CRITICAL},
+    {level_names[LEVEL_FATAL], LEVEL_FATAL},
 
-    view_name = find(lnav_view_strings,
-                     lnav_view_strings + LNV__MAX,
-                     ypc->get_path_fragment(-2));
-    view_index = view_name - lnav_view_strings;
-
-    if (view_index < LNV__MAX && !regex.empty()) {
-        lnav_data.ld_views[view_index].execute_search(regex);
-        lnav_data.ld_views[view_index].set_follow_search_for(-1, {});
-    }
-
-    return 1;
-}
-
-static int
-read_top_line(yajlpp_parse_context* ypc, long long value)
-{
-    const char** view_name;
-    int view_index;
-
-    view_name = find(lnav_view_strings,
-                     lnav_view_strings + LNV__MAX,
-                     ypc->get_path_fragment(-2));
-    view_index = view_name - lnav_view_strings;
-    if (view_index < LNV__MAX) {
-        session_data.sd_view_states[view_index].vs_top = value;
-    }
-
-    return 1;
-}
-
-static int
-read_word_wrap(yajlpp_parse_context* ypc, int value)
-{
-    const char** view_name;
-    int view_index;
-
-    view_name = find(lnav_view_strings,
-                     lnav_view_strings + LNV__MAX,
-                     ypc->get_path_fragment(-2));
-    view_index = view_name - lnav_view_strings;
-    if (view_index == LNV_HELP) {
-    } else if (view_index < LNV__MAX) {
-        textview_curses& tc = lnav_data.ld_views[view_index];
-
-        tc.set_word_wrap(value);
-    }
-
-    return 1;
-}
-
-static int
-read_filtering(yajlpp_parse_context* ypc, int value)
-{
-    const char** view_name;
-    int view_index;
-
-    view_name = find(lnav_view_strings,
-                     lnav_view_strings + LNV__MAX,
-                     ypc->get_path_fragment(-2));
-    view_index = view_name - lnav_view_strings;
-    if (view_index == LNV_HELP) {
-    } else if (view_index < LNV__MAX) {
-        textview_curses& tc = lnav_data.ld_views[view_index];
-
-        if (tc.get_sub_source() != nullptr) {
-            tc.get_sub_source()->tss_apply_filters = value;
-        }
-    }
-
-    return 1;
-}
-
-static int
-read_commands(yajlpp_parse_context* ypc, const unsigned char* str, size_t len)
-{
-    std::string cmdline = std::string((const char*) str, len);
-    const char** view_name;
-    int view_index;
-
-    view_name = find(lnav_view_strings,
-                     lnav_view_strings + LNV__MAX,
-                     ypc->get_path_fragment(-3));
-    view_index = view_name - lnav_view_strings;
-    bool active = ensure_view(&lnav_data.ld_views[view_index]);
-    execute_command(lnav_data.ld_exec_context, cmdline);
-    if (!active) {
-        lnav_data.ld_view_stack.pop_back();
-    }
-
-    return 1;
-}
-
-static const struct json_path_container view_def_handlers = {
-    json_path_handler("top_line", read_top_line),
-    json_path_handler("search", read_current_search),
-    json_path_handler("word_wrap", read_word_wrap),
-    json_path_handler("filtering", read_filtering),
-    json_path_handler("commands#", read_commands),
+    json_path_handler_base::ENUM_TERMINATOR,
 };
 
-static const struct json_path_container view_handlers = {
-    yajlpp::pattern_property_handler("([^/]+)").with_children(
-        view_def_handlers),
+static const json_path_container view_def_handlers = {
+    json_path_handler("top_line").for_field(&view_state::vs_top),
+    json_path_handler("focused_line").for_field(&view_state::vs_selection),
+    json_path_handler("anchor").for_field(&view_state::vs_anchor),
+    json_path_handler("anchor_offset").for_field(&view_state::vs_anchor_offset),
+    json_path_handler("search").for_field(&view_state::vs_search),
+    json_path_handler("word_wrap").for_field(&view_state::vs_word_wrap),
+    json_path_handler("filtering").for_field(&view_state::vs_filtering),
+    json_path_handler("min_level")
+        .with_enum_values(LEVEL_ENUM)
+        .for_field(&view_state::vs_min_log_level),
+    json_path_handler("commands#").for_field(&view_state::vs_commands),
 };
 
-static const struct json_path_container file_state_handlers = {
+static const json_path_container view_handlers = {
+    yajlpp::pattern_property_handler("(?<view_name>[\\w\\-]+)")
+        .with_obj_provider<view_state, session_data_t>(
+            +[](const yajlpp_provider_context& ypc, session_data_t* root) {
+                auto view_index_opt
+                    = view_from_string(ypc.get_substr("view_name").c_str());
+                if (view_index_opt) {
+                    return &root->sd_view_states[view_index_opt.value()];
+                }
+
+                log_error("unknown view name: %s",
+                          ypc.get_substr("view_name").c_str());
+                static view_state dummy;
+                return &dummy;
+            })
+        .with_children(view_def_handlers),
+};
+
+static const json_path_container file_state_handlers = {
     yajlpp::property_handler("visible")
         .with_description("Indicates whether the file is visible or not")
         .for_field(&file_state::fs_is_visible),
 };
 
-static const struct json_path_container file_states_handlers = {
+static const json_path_container file_states_handlers = {
     yajlpp::pattern_property_handler(R"((?<filename>[^/]+))")
         .with_description("Map of file names to file state objects")
-        .with_obj_provider<file_state, void>([](const auto& ypc, auto* root) {
-            auto fn = ypc.get_substr("filename");
-            return &session_data.sd_file_states[fn];
-        })
+        .with_obj_provider<file_state, session_data_t>(
+            [](const auto& ypc, session_data_t* root) {
+                auto fn = ypc.get_substr("filename");
+                return &root->sd_file_states[fn];
+            })
         .with_children(file_state_handlers),
 };
 
-static const struct json_path_container view_info_handlers = {
+static const typed_json_path_container<session_data_t> view_info_handlers = {
     yajlpp::property_handler("save-time")
         .for_field(&session_data_t::sd_save_time),
     yajlpp::property_handler("time-offset")
@@ -904,37 +1089,56 @@ static const struct json_path_container view_info_handlers = {
 void
 load_session()
 {
-    load_time_bookmarks();
+    static auto op = lnav_operation{"load_session"};
+
+    auto op_guard = lnav_opid_guard::internal(op);
+    log_info("BEGIN load_session");
     scan_sessions() | [](const auto pair) {
-        yajl_handle handle;
-        auto_fd fd;
-
         lnav_data.ld_session_load_time = pair.first.second;
-        session_data.sd_save_time = pair.first.second;
         const auto& view_info_path = pair.second;
+        auto view_info_src = intern_string::lookup(view_info_path.string());
 
-        yajlpp_parse_context ypc(intern_string::lookup(view_info_path.string()),
-                                 &view_info_handlers);
-        ypc.with_obj(session_data);
-        handle = yajl_alloc(&ypc.ypc_callbacks, nullptr, &ypc);
-
-        load_time_bookmarks();
-
-        if ((fd = lnav::filesystem::openp(view_info_path, O_RDONLY)) < 0) {
-            perror("cannot open session file");
-        } else {
-            unsigned char buffer[1024];
-            ssize_t rc;
-
-            log_info("loading session file: %s", view_info_path.c_str());
-            while ((rc = read(fd, buffer, sizeof(buffer))) > 0) {
-                yajl_parse(handle, buffer, rc);
-            }
-            yajl_complete_parse(handle);
+        auto open_res = lnav::filesystem::open_file(view_info_path, O_RDONLY);
+        if (open_res.isErr()) {
+            log_error("cannot open session file: %s -- %s",
+                      view_info_path.c_str(),
+                      open_res.unwrapErr().c_str());
+            return;
         }
-        yajl_free(handle);
 
-        bool log_changes = false, text_changes = false;
+        auto fd = open_res.unwrap();
+        unsigned char buffer[1024];
+        ssize_t rc;
+
+        log_info("loading session file: %s", view_info_path.c_str());
+        auto parser = view_info_handlers.parser_for(view_info_src);
+        while ((rc = read(fd, buffer, sizeof(buffer))) > 0) {
+            auto buf_frag = string_fragment::from_bytes(buffer, rc);
+            auto parse_res = parser.consume(buf_frag);
+            if (parse_res.isErr()) {
+                log_error("failed to load session: %s -- %s",
+                          view_info_path.c_str(),
+                          parse_res.unwrapErr()[0]
+                              .to_attr_line()
+                              .get_string()
+                              .c_str());
+                return;
+            }
+        }
+
+        auto complete_res = parser.complete();
+        if (complete_res.isErr()) {
+            log_error("failed to load session: %s -- %s",
+                      view_info_path.c_str(),
+                      complete_res.unwrapErr()[0]
+                          .to_attr_line()
+                          .get_string()
+                          .c_str());
+            return;
+        }
+        session_data = complete_res.unwrap();
+
+        bool log_changes = false;
 
         for (auto& lf : lnav_data.ld_active_files.fc_files) {
             auto iter = session_data.sd_file_states.find(lf->get_filename());
@@ -943,31 +1147,30 @@ load_session()
                 continue;
             }
 
-            log_debug("found state for file: %s %d",
+            log_debug("found state for file: %s %d (%s)",
                       lf->get_content_id().c_str(),
-                      iter->second.fs_is_visible);
-            lnav_data.ld_log_source.find_data(lf) | [iter](auto ld) {
-                ld->set_visibility(iter->second.fs_is_visible);
-            };
-            if (!iter->second.fs_is_visible) {
-                if (lf->get_format() != nullptr) {
-                    log_changes = true;
-                } else {
-                    text_changes = true;
-                }
-            }
+                      iter->second.fs_is_visible,
+                      lf->get_filename_as_string().c_str());
+            lnav_data.ld_log_source.find_data(lf) |
+                [iter, &log_changes](auto ld) {
+                    if (ld->ld_visible != iter->second.fs_is_visible) {
+                        ld->get_file_ptr()->set_indexing(
+                            iter->second.fs_is_visible);
+                        ld->set_visibility(iter->second.fs_is_visible);
+                        log_changes = true;
+                    }
+                };
         }
 
         if (log_changes) {
             lnav_data.ld_log_source.text_filters_changed();
         }
-        if (text_changes) {
-            lnav_data.ld_text_source.text_filters_changed();
-        }
     };
 
     lnav::events::publish(lnav_data.ld_db.in(),
                           lnav::events::session::loaded{});
+
+    log_info("END load_session");
 }
 
 static void
@@ -981,31 +1184,131 @@ yajl_writer(void* context, const char* str, size_t len)
 static void
 save_user_bookmarks(sqlite3* db,
                     sqlite3_stmt* stmt,
-                    bookmark_vector<content_line_t>& user_marks)
+                    bookmark_vector<content_line_t>& user_marks,
+                    bookmark_vector<content_line_t>& sticky_marks)
 {
-    logfile_sub_source& lss = lnav_data.ld_log_source;
-    bookmark_vector<content_line_t>::iterator iter;
+    auto& lss = lnav_data.ld_log_source;
 
-    for (iter = user_marks.begin(); iter != user_marks.end(); ++iter) {
-        content_line_t cl = *iter;
-        auto line_meta_opt = lss.find_bookmark_metadata(cl);
-        if (!bind_line(db, stmt, cl, lnav_data.ld_session_time)) {
+    // Collect all lines that are either user-marked or sticky
+    tlx::btree_set<content_line_t> all_lines;
+    for (const auto& cl : user_marks.bv_tree) {
+        all_lines.insert(cl);
+    }
+    for (const auto& cl : sticky_marks.bv_tree) {
+        all_lines.insert(cl);
+    }
+
+    for (const auto& cl_const : all_lines) {
+        auto cl = cl_const;
+        auto lf = lss.find(cl);
+        if (lf == nullptr) {
             continue;
         }
 
-        if (!line_meta_opt) {
+        sqlite3_clear_bindings(stmt);
+
+        const auto line_iter = lf->begin() + cl;
+        auto fr = lf->get_file_range(line_iter, false);
+        auto read_result = lf->read_range(fr);
+
+        if (read_result.isErr()) {
+            continue;
+        }
+
+        auto line_hash = read_result
+                             .map([cl](auto sbr) {
+                                 return hasher()
+                                     .update(sbr.get_data(), sbr.length())
+                                     .update(cl)
+                                     .to_string();
+                             })
+                             .unwrap();
+
+        if (bind_values(stmt,
+                        lf->original_line_time(line_iter),
+                        lf->get_format()->get_name(),
+                        line_hash,
+                        lnav_data.ld_session_time)
+            != SQLITE_OK)
+        {
+            continue;
+        }
+
+        auto is_user = user_marks.bv_tree.find(cl) != user_marks.bv_tree.end();
+        auto is_sticky
+            = sticky_marks.bv_tree.find(cl) != sticky_marks.bv_tree.end();
+
+        // Use part_name "" for user marks, null for sticky-only
+        if (is_user) {
             if (sqlite3_bind_text(stmt, 5, "", 0, SQLITE_TRANSIENT)
                 != SQLITE_OK)
             {
-                log_error("could not bind log hash -- %s", sqlite3_errmsg(db));
+                log_error("could not bind part name -- %s", sqlite3_errmsg(db));
                 return;
             }
         } else {
-            bookmark_metadata& line_meta = *(line_meta_opt.value());
-            if (line_meta.empty()) {
-                continue;
-            }
+            sqlite3_bind_null(stmt, 5);
+        }
 
+        if (sqlite3_bind_int(stmt, 10, is_sticky ? 1 : 0) != SQLITE_OK) {
+            log_error("could not bind sticky -- %s", sqlite3_errmsg(db));
+            return;
+        }
+
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            log_error("could not execute bookmark insert statement -- %s",
+                      sqlite3_errmsg(db));
+            return;
+        }
+
+        marked_session_lines.emplace_back(lf->original_line_time(line_iter),
+                                          lf->get_format_ptr()->get_name(),
+                                          line_hash);
+
+        sqlite3_reset(stmt);
+    }
+}
+
+static void
+save_meta_bookmarks(sqlite3* db, sqlite3_stmt* stmt, logfile* lf)
+{
+    for (const auto& bm_pair : lf->get_bookmark_metadata()) {
+        auto cl = content_line_t(bm_pair.first);
+        sqlite3_clear_bindings(stmt);
+
+        auto line_iter = lf->begin() + cl;
+        auto fr = lf->get_file_range(line_iter, false);
+        auto read_result = lf->read_range(fr);
+
+        if (read_result.isErr()) {
+            continue;
+        }
+
+        auto line_hash = read_result
+                             .map([cl](auto sbr) {
+                                 return hasher()
+                                     .update(sbr.get_data(), sbr.length())
+                                     .update(cl)
+                                     .to_string();
+                             })
+                             .unwrap();
+
+        if (bind_values(stmt,
+                        lf->original_line_time(line_iter),
+                        lf->get_format()->get_name(),
+                        line_hash,
+                        lnav_data.ld_session_time)
+            != SQLITE_OK)
+        {
+            continue;
+        }
+
+        const auto& line_meta = bm_pair.second;
+        if (line_meta.empty(bookmark_metadata::categories::session)) {
+            continue;
+        }
+
+        if (line_meta.bm_name_source == bookmark_metadata::meta_source::user) {
             if (sqlite3_bind_text(stmt,
                                   5,
                                   line_meta.bm_name.c_str(),
@@ -1016,44 +1319,78 @@ save_user_bookmarks(sqlite3* db,
                 log_error("could not bind part name -- %s", sqlite3_errmsg(db));
                 return;
             }
+        }
+
+        if (sqlite3_bind_text(stmt,
+                              6,
+                              line_meta.bm_comment.c_str(),
+                              line_meta.bm_comment.length(),
+                              SQLITE_TRANSIENT)
+            != SQLITE_OK)
+        {
+            log_error("could not bind comment -- %s", sqlite3_errmsg(db));
+            return;
+        }
+
+        std::string tags;
+
+        {
+            yajlpp_gen gen;
+
+            yajl_gen_config(gen, yajl_gen_beautify, false);
+
+            {
+                yajlpp_array arr(gen);
+
+                for (const auto& entry : line_meta.bm_tags) {
+                    if (entry.te_source == bookmark_metadata::meta_source::user)
+                    {
+                        arr.gen(entry.te_tag);
+                    }
+                }
+            }
+
+            tags = gen.to_string_fragment().to_string();
+
+            if (tags == "[]") {
+                tags.clear();
+            }
+        }
+
+        if (sqlite3_bind_text(
+                stmt, 7, tags.c_str(), tags.length(), SQLITE_TRANSIENT)
+            != SQLITE_OK)
+        {
+            log_error("could not bind tags -- %s", sqlite3_errmsg(db));
+            return;
+        }
+
+        if (!line_meta.bm_annotations.la_pairs.empty()) {
+            auto anno_str = logmsg_annotations_handlers.to_string(
+                line_meta.bm_annotations);
 
             if (sqlite3_bind_text(stmt,
-                                  6,
-                                  line_meta.bm_comment.c_str(),
-                                  line_meta.bm_comment.length(),
+                                  8,
+                                  anno_str.c_str(),
+                                  anno_str.length(),
                                   SQLITE_TRANSIENT)
                 != SQLITE_OK)
             {
-                log_error("could not bind comment -- %s", sqlite3_errmsg(db));
+                log_error("could not bind annotations -- %s",
+                          sqlite3_errmsg(db));
                 return;
             }
-
-            std::string tags;
-
-            if (!line_meta.bm_tags.empty()) {
-                yajlpp_gen gen;
-
-                yajl_gen_config(gen, yajl_gen_beautify, false);
-
-                {
-                    yajlpp_array arr(gen);
-
-                    for (const auto& str : line_meta.bm_tags) {
-                        arr.gen(str);
-                    }
-                }
-
-                tags = gen.to_string_fragment().to_string();
-            }
-
-            if (sqlite3_bind_text(
-                    stmt, 7, tags.c_str(), tags.length(), SQLITE_TRANSIENT)
-                != SQLITE_OK)
-            {
-                log_error("could not bind tags -- %s", sqlite3_errmsg(db));
-                return;
-            }
+        } else {
+            sqlite3_bind_null(stmt, 8);
         }
+
+        if (line_meta.bm_opid.empty()) {
+            sqlite3_bind_null(stmt, 9);
+        } else {
+            bind_to_sqlite(stmt, 9, line_meta.bm_opid);
+        }
+
+        sqlite3_bind_int(stmt, 10, 0);
 
         if (sqlite3_step(stmt) != SQLITE_DONE) {
             log_error("could not execute bookmark insert statement -- %s",
@@ -1061,9 +1398,452 @@ save_user_bookmarks(sqlite3* db,
             return;
         }
 
-        marked_session_lines.push_back(cl);
+        marked_session_lines.emplace_back(lf->original_line_time(line_iter),
+                                          lf->get_format_ptr()->get_name(),
+                                          line_hash);
 
         sqlite3_reset(stmt);
+    }
+}
+
+static void
+save_text_bookmarks(sqlite3* db)
+{
+    auto& tss = lnav_data.ld_text_source;
+
+    if (tss.empty()) {
+        return;
+    }
+
+    tss.copy_bookmarks_to_current_file();
+
+    auto_mem<sqlite3_stmt> stmt(sqlite3_finalize);
+
+    if (sqlite3_prepare_v2(db,
+                           "DELETE FROM text_bookmarks2 WHERE session_time = ?",
+                           -1,
+                           stmt.out(),
+                           nullptr)
+        != SQLITE_OK)
+    {
+        log_error("could not prepare text_bookmarks delete -- %s",
+                  sqlite3_errmsg(db));
+        return;
+    }
+    sqlite3_bind_int64(stmt.in(), 1, lnav_data.ld_session_load_time);
+    if (sqlite3_step(stmt.in()) != SQLITE_DONE) {
+        log_error("could not execute text_bookmarks delete -- %s",
+                  sqlite3_errmsg(db));
+        return;
+    }
+
+    if (sqlite3_prepare_v2(db,
+                           "REPLACE INTO text_bookmarks2"
+                           " (file_path, line_number, line_hash, mark_type,"
+                           "  session_time, anchor, anchor_offset)"
+                           " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           -1,
+                           stmt.out(),
+                           nullptr)
+        != SQLITE_OK)
+    {
+        log_error("could not prepare text_bookmarks replace statement -- %s",
+                  sqlite3_errmsg(db));
+        return;
+    }
+
+    for (const auto& fvs : tss.get_file_states()) {
+        auto& lf = fvs->fvs_file;
+        if (lf == nullptr || lf->size() == 0) {
+            continue;
+        }
+
+        auto file_path = lf->get_path_for_key().string();
+        auto line_count = static_cast<int>(lf->size());
+
+        static const bookmark_type_t* SAVE_TYPES[] = {
+            &textview_curses::BM_USER,
+            &textview_curses::BM_STICKY,
+        };
+
+        for (const auto* bm_type : SAVE_TYPES) {
+            auto& bv = fvs->fvs_content_marks[bm_type];
+            if (bv.empty()) {
+                continue;
+            }
+
+            for (const auto& vl : bv.bv_tree) {
+                if (static_cast<int>(vl) >= line_count) {
+                    continue;
+                }
+
+                auto line_hash_opt
+                    = get_text_line_hash(lf.get(), static_cast<int>(vl));
+                if (!line_hash_opt) {
+                    continue;
+                }
+                auto line_hash = line_hash_opt.value();
+
+                auto anchor_opt = fvs->anchor_for_row(
+                    tss.get_view_mode(), vis_line_t(static_cast<int>(vl)));
+                std::optional<int64_t> anchor_offset_opt;
+                if (anchor_opt.has_value()) {
+                    auto anchor_row_opt = fvs->row_for_anchor(
+                        tss.get_view_mode(), anchor_opt.value());
+                    if (anchor_row_opt.has_value()) {
+                        anchor_offset_opt = static_cast<int64_t>(vl)
+                            - static_cast<int64_t>(anchor_row_opt.value());
+                    }
+                }
+
+                sqlite3_clear_bindings(stmt.in());
+                bind_to_sqlite(stmt.in(), 1, file_path);
+                sqlite3_bind_int(stmt.in(), 2, static_cast<int>(vl));
+                bind_to_sqlite(stmt.in(), 3, line_hash);
+                bind_to_sqlite(stmt.in(), 4, bm_type->get_name());
+                sqlite3_bind_int64(stmt.in(), 5, lnav_data.ld_session_time);
+                bind_to_sqlite(stmt.in(), 6, anchor_opt);
+                bind_to_sqlite(stmt.in(), 7, anchor_offset_opt);
+
+                if (sqlite3_step(stmt.in()) != SQLITE_DONE) {
+                    log_error("could not execute text_bookmarks insert -- %s",
+                              sqlite3_errmsg(db));
+                    return;
+                }
+
+                sqlite3_reset(stmt.in());
+            }
+        }
+    }
+}
+
+static void
+load_text_bookmarks(sqlite3* db)
+{
+    static const char* const TEXT_BOOKMARK_STMT = R"(
+        SELECT line_number, line_hash, mark_type, session_time,
+               session_time=? AS same_session, anchor, anchor_offset
+        FROM text_bookmarks2
+        WHERE file_path = ?
+        ORDER BY same_session DESC, session_time DESC
+    )";
+
+    auto& tss = lnav_data.ld_text_source;
+    auto& tc = lnav_data.ld_views[LNV_TEXT];
+
+    if (tss.empty()) {
+        return;
+    }
+
+    auto_mem<sqlite3_stmt> stmt(sqlite3_finalize);
+    if (sqlite3_prepare_v2(db, TEXT_BOOKMARK_STMT, -1, stmt.out(), nullptr)
+        != SQLITE_OK)
+    {
+        log_error("could not prepare text_bookmarks select -- %s",
+                  sqlite3_errmsg(db));
+        return;
+    }
+
+    for (const auto& fvs : tss.get_file_states()) {
+        auto& lf = fvs->fvs_file;
+        if (lf == nullptr || lf->size() == 0) {
+            continue;
+        }
+
+        auto file_path = lf->get_path_for_key().string();
+        auto line_count = static_cast<int>(lf->size());
+        sqlite3_reset(stmt.in());
+        sqlite3_clear_bindings(stmt.in());
+        sqlite3_bind_int64(stmt.in(), 1, lnav_data.ld_session_load_time);
+        bind_to_sqlite(stmt.in(), 2, file_path);
+
+        size_t marked_count = 0;
+        size_t sticky_count = 0;
+        int64_t last_session_time = -1;
+        bool done = false;
+        while (!done) {
+            auto rc = sqlite3_step(stmt.in());
+
+            switch (rc) {
+                case SQLITE_OK:
+                case SQLITE_DONE:
+                    done = true;
+                    break;
+
+                case SQLITE_ROW: {
+                    auto line_number = sqlite3_column_int(stmt.in(), 0);
+                    const auto stored_hash
+                        = from_stmt<string_fragment>(stmt.in(), 1);
+                    const auto mark_type
+                        = from_stmt<string_fragment>(stmt.in(), 2);
+                    auto session_time = sqlite3_column_int64(stmt.in(), 3);
+                    const auto stored_anchor
+                        = from_stmt<string_fragment>(stmt.in(), 5);
+                    auto stored_anchor_offset
+                        = from_stmt<std::optional<int64_t>>(stmt.in(), 6);
+
+                    if (last_session_time == -1) {
+                        last_session_time = session_time;
+                    } else if (last_session_time != session_time) {
+                        done = true;
+                        continue;
+                    }
+
+                    auto bm_type_opt = bookmark_type_t::find_type(mark_type);
+                    if (!bm_type_opt) {
+                        log_warning(
+                            "unknown bookmark type '%.*s' in file %s -- "
+                            "skipping",
+                            mark_type.length(),
+                            mark_type.data(),
+                            file_path.c_str());
+                        continue;
+                    }
+
+                    // Pick a pivot line: prefer the anchor's current
+                    // position plus the saved offset if the anchor
+                    // resolves; otherwise the stored line number.
+                    int pivot = line_number;
+                    if (!stored_anchor.empty()) {
+                        auto anchor_row_opt = fvs->row_for_anchor(
+                            tss.get_view_mode(), stored_anchor.to_string());
+                        if (anchor_row_opt.has_value()) {
+                            pivot = anchor_row_opt.value()
+                                + stored_anchor_offset.value_or(0);
+                        }
+                    }
+
+                    // Scan outward from the pivot for a line whose hash
+                    // matches the stored hash.
+                    auto matched_line
+                        = lf.get()
+                        | lnav::itertools::middle_out(
+                              pivot, get_text_line_hash, stored_hash);
+
+                    int final_line;
+                    if (matched_line) {
+                        final_line = matched_line.value();
+                    } else if (pivot >= 0 && pivot < line_count) {
+                        // Best effort: land on the pivot even though
+                        // the content has changed.
+                        log_warning(
+                            "text bookmark hash mismatch at %s:%d -- "
+                            "falling back to pivot line",
+                            file_path.c_str(),
+                            pivot);
+                        final_line = pivot;
+                    } else {
+                        continue;
+                    }
+
+                    auto vl = vis_line_t(final_line);
+                    fvs->fvs_bookmarks[bm_type_opt.value()].insert_once(vl);
+                    fvs->fvs_content_marks[bm_type_opt.value()].insert_once(
+                        static_cast<uint32_t>(final_line));
+                    if (bm_type_opt.value() == &textview_curses::BM_STICKY) {
+                        sticky_count += 1;
+                    } else {
+                        marked_count += 1;
+                    }
+                    break;
+                }
+
+                default:
+                    log_error("text bookmark select error: %d -- %s",
+                              rc,
+                              sqlite3_errmsg(db));
+                    done = true;
+                    break;
+            }
+        }
+        if (marked_count > 0 || sticky_count > 0) {
+            log_info("  loaded %zu marked and %zu sticky lines from %s",
+                     marked_count,
+                     sticky_count,
+                     file_path.c_str());
+        }
+    }
+
+    // Copy the front file's bookmarks into the textview
+    if (!tss.get_file_states().empty()) {
+        auto& front = tss.get_file_states().front();
+        tc.get_bookmarks()[&textview_curses::BM_USER]
+            = front->fvs_bookmarks[&textview_curses::BM_USER];
+        tc.get_bookmarks()[&textview_curses::BM_STICKY]
+            = front->fvs_bookmarks[&textview_curses::BM_STICKY];
+    }
+
+    tc.reload_data();
+}
+
+static void
+save_timeline_bookmarks(sqlite3* db)
+{
+    auto& tc = lnav_data.ld_views[LNV_TIMELINE];
+    auto* tss = static_cast<timeline_source*>(tc.get_sub_source());
+
+    if (tss == nullptr) {
+        return;
+    }
+
+    auto_mem<sqlite3_stmt> stmt(sqlite3_finalize);
+
+    if (sqlite3_prepare_v2(db,
+                           "DELETE FROM timeline_bookmarks"
+                           " WHERE session_time = ?",
+                           -1,
+                           stmt.out(),
+                           nullptr)
+        != SQLITE_OK)
+    {
+        log_error("could not prepare timeline_bookmarks delete -- %s",
+                  sqlite3_errmsg(db));
+        return;
+    }
+    sqlite3_bind_int64(stmt.in(), 1, lnav_data.ld_session_load_time);
+    if (sqlite3_step(stmt.in()) != SQLITE_DONE) {
+        log_error("could not execute timeline_bookmarks delete -- %s",
+                  sqlite3_errmsg(db));
+        return;
+    }
+
+    if (sqlite3_prepare_v2(db,
+                           "REPLACE INTO timeline_bookmarks"
+                           " (row_type, row_name, mark_type, session_time)"
+                           " VALUES (?, ?, ?, ?)",
+                           -1,
+                           stmt.out(),
+                           nullptr)
+        != SQLITE_OK)
+    {
+        log_error(
+            "could not prepare timeline_bookmarks replace statement -- %s",
+            sqlite3_errmsg(db));
+        return;
+    }
+
+    static const bookmark_type_t* SAVE_TYPES[] = {
+        &textview_curses::BM_USER,
+        &textview_curses::BM_STICKY,
+    };
+
+    for (const auto* bm_type : SAVE_TYPES) {
+        const auto& bv = tc.get_bookmarks()[bm_type];
+        if (bv.empty()) {
+            continue;
+        }
+
+        for (const auto& vl : bv.bv_tree) {
+            auto line = static_cast<size_t>(vl);
+            if (line >= tss->ts_time_order.size()) {
+                continue;
+            }
+
+            const auto& row = *tss->ts_time_order[line];
+
+            sqlite3_clear_bindings(stmt.in());
+            bind_to_sqlite(
+                stmt.in(), 1, timeline_source::row_type_to_string(row.or_type));
+            bind_to_sqlite(stmt.in(), 2, row.or_name.to_string());
+            bind_to_sqlite(stmt.in(), 3, bm_type->get_name());
+            sqlite3_bind_int64(stmt.in(), 4, lnav_data.ld_session_time);
+
+            if (sqlite3_step(stmt.in()) != SQLITE_DONE) {
+                log_error("could not execute timeline_bookmarks insert -- %s",
+                          sqlite3_errmsg(db));
+                return;
+            }
+
+            sqlite3_reset(stmt.in());
+        }
+    }
+}
+
+static void
+load_timeline_bookmarks(sqlite3* db)
+{
+    static const char* const TIMELINE_BOOKMARK_STMT = R"(
+        SELECT row_type, row_name, mark_type, session_time,
+               session_time=? AS same_session
+        FROM timeline_bookmarks
+        ORDER BY same_session DESC, session_time DESC
+    )";
+
+    auto* tss = static_cast<timeline_source*>(
+        lnav_data.ld_views[LNV_TIMELINE].get_sub_source());
+
+    if (tss == nullptr) {
+        return;
+    }
+
+    auto_mem<sqlite3_stmt> stmt(sqlite3_finalize);
+    if (sqlite3_prepare_v2(db, TIMELINE_BOOKMARK_STMT, -1, stmt.out(), nullptr)
+        != SQLITE_OK)
+    {
+        log_debug("could not prepare timeline_bookmarks select -- %s",
+                  sqlite3_errmsg(db));
+        return;
+    }
+
+    sqlite3_bind_int64(stmt.in(), 1, lnav_data.ld_session_load_time);
+
+    int64_t last_session_time = -1;
+    bool done = false;
+    while (!done) {
+        auto rc = sqlite3_step(stmt.in());
+
+        switch (rc) {
+            case SQLITE_OK:
+            case SQLITE_DONE:
+                done = true;
+                break;
+
+            case SQLITE_ROW: {
+                auto* row_type_str
+                    = (const char*) sqlite3_column_text(stmt.in(), 0);
+                auto* row_name
+                    = (const char*) sqlite3_column_text(stmt.in(), 1);
+                auto mark_type = from_stmt<string_fragment>(stmt.in(), 2);
+                auto session_time = sqlite3_column_int64(stmt.in(), 3);
+
+                if (last_session_time == -1) {
+                    last_session_time = session_time;
+                } else if (last_session_time != session_time) {
+                    done = true;
+                    continue;
+                }
+
+                if (row_type_str == nullptr || row_name == nullptr) {
+                    continue;
+                }
+
+                auto bm_type_opt = bookmark_type_t::find_type(mark_type);
+                if (!bm_type_opt) {
+                    continue;
+                }
+
+                auto rt_opt
+                    = timeline_source::row_type_from_string(row_type_str);
+                if (!rt_opt) {
+                    continue;
+                }
+
+                tss->ts_pending_bookmarks.emplace_back(
+                    timeline_source::pending_bookmark{
+                        rt_opt.value(),
+                        row_name,
+                        bm_type_opt.value(),
+                    });
+                break;
+            }
+
+            default:
+                log_error("timeline bookmark select error: %d -- %s",
+                          rc,
+                          sqlite3_errmsg(db));
+                done = true;
+                break;
+        }
     }
 }
 
@@ -1124,11 +1904,11 @@ save_time_bookmarks()
 
             sqlite3_reset(stmt.in());
         }
-        session_data.sd_recent_netlocs.insert(netlocs.begin(), netlocs.end());
+        recent_refs.rr_netlocs.insert(netlocs.begin(), netlocs.end());
     }
 
-    logfile_sub_source& lss = lnav_data.ld_log_source;
-    bookmarks<content_line_t>::type& bm = lss.get_user_bookmarks();
+    auto& lss = lnav_data.ld_log_source;
+    auto& bm = lss.get_user_bookmarks();
 
     if (sqlite3_prepare_v2(db.in(),
                            "DELETE FROM bookmarks WHERE "
@@ -1145,10 +1925,14 @@ save_time_bookmarks()
     }
 
     for (auto& marked_session_line : marked_session_lines) {
-        if (!bind_line(db.in(),
-                       stmt.in(),
-                       marked_session_line,
-                       lnav_data.ld_session_time))
+        sqlite3_clear_bindings(stmt.in());
+
+        if (bind_values(stmt,
+                        marked_session_line.sl_time,
+                        marked_session_line.sl_format_name,
+                        marked_session_line.sl_line_hash,
+                        lnav_data.ld_session_time)
+            != SQLITE_OK)
         {
             continue;
         }
@@ -1167,8 +1951,9 @@ save_time_bookmarks()
     if (sqlite3_prepare_v2(db.in(),
                            "REPLACE INTO bookmarks"
                            " (log_time, log_format, log_hash, session_time, "
-                           "part_name, comment, tags)"
-                           " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           "part_name, comment, tags, annotations, log_opid,"
+                           " sticky)"
+                           " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                            -1,
                            stmt.out(),
                            nullptr)
@@ -1180,15 +1965,16 @@ save_time_bookmarks()
     }
 
     {
-        logfile_sub_source::iterator file_iter;
-
-        for (file_iter = lnav_data.ld_log_source.begin();
+        for (auto file_iter = lnav_data.ld_log_source.begin();
              file_iter != lnav_data.ld_log_source.end();
              ++file_iter)
         {
             auto lf = (*file_iter)->get_file();
 
             if (lf == nullptr) {
+                continue;
+            }
+            if (lf->size() == 0) {
                 continue;
             }
 
@@ -1211,6 +1997,8 @@ save_time_bookmarks()
                 return;
             }
 
+            sqlite3_bind_int(stmt.in(), 10, 0);
+
             if (sqlite3_step(stmt.in()) != SQLITE_DONE) {
                 log_error("could not execute bookmark insert statement -- %s",
                           sqlite3_errmsg(db));
@@ -1221,8 +2009,18 @@ save_time_bookmarks()
         }
     }
 
-    save_user_bookmarks(db.in(), stmt.in(), bm[&textview_curses::BM_USER]);
-    save_user_bookmarks(db.in(), stmt.in(), bm[&textview_curses::BM_META]);
+    save_user_bookmarks(db.in(),
+                        stmt.in(),
+                        bm[&textview_curses::BM_USER],
+                        bm[&textview_curses::BM_STICKY]);
+    for (const auto& ldd : lss) {
+        auto* lf = ldd->get_file_ptr();
+        if (lf == nullptr) {
+            continue;
+        }
+
+        save_meta_bookmarks(db.in(), stmt.in(), lf);
+    }
 
     if (sqlite3_prepare_v2(db.in(),
                            "DELETE FROM time_offset WHERE "
@@ -1239,10 +2037,14 @@ save_time_bookmarks()
     }
 
     for (auto& offset_session_line : offset_session_lines) {
-        if (!bind_line(db.in(),
-                       stmt.in(),
-                       offset_session_line,
-                       lnav_data.ld_session_time))
+        sqlite3_clear_bindings(stmt.in());
+
+        if (bind_values(stmt,
+                        offset_session_line.sl_time,
+                        offset_session_line.sl_format_name,
+                        offset_session_line.sl_line_hash,
+                        lnav_data.ld_session_time)
+            != SQLITE_OK)
         {
             continue;
         }
@@ -1265,7 +2067,7 @@ save_time_bookmarks()
                            " VALUES (?, ?, ?, ?, ?, ?)",
                            -1,
                            stmt.out(),
-                           NULL)
+                           nullptr)
         != SQLITE_OK)
     {
         log_error("could not prepare time_offset replace statement -- %s",
@@ -1274,26 +2076,24 @@ save_time_bookmarks()
     }
 
     {
-        logfile_sub_source::iterator file_iter;
-
-        for (file_iter = lnav_data.ld_log_source.begin();
+        for (auto file_iter = lnav_data.ld_log_source.begin();
              file_iter != lnav_data.ld_log_source.end();
              ++file_iter)
         {
             auto lf = (*file_iter)->get_file();
-            content_line_t base_content_line;
-
             if (lf == nullptr) {
                 continue;
             }
+            if (lf->size() == 0) {
+                continue;
+            }
 
-            base_content_line = lss.get_file_base_content_line(file_iter);
-
-            if (!bind_values(stmt,
-                             lf->original_line_time(lf->begin()),
-                             lf->get_format()->get_name(),
-                             lf->get_content_id(),
-                             lnav_data.ld_session_time))
+            if (bind_values(stmt,
+                            lf->original_line_time(lf->begin()),
+                            lf->get_format()->get_name(),
+                            lf->get_content_id(),
+                            lnav_data.ld_session_time)
+                != SQLITE_OK)
             {
                 continue;
             }
@@ -1320,25 +2120,18 @@ save_time_bookmarks()
         }
     }
 
-    for (auto& ls : lss) {
+    for (const auto& ls : lss) {
         if (ls->get_file() == nullptr) {
             continue;
         }
 
-        auto lf = ls->get_file();
-
+        const auto lf = ls->get_file();
         if (!lf->is_time_adjusted()) {
             continue;
         }
 
         auto line_iter = lf->begin() + lf->get_time_offset_line();
-        struct timeval offset = lf->get_time_offset();
-
-        auto read_result = lf->read_line(line_iter);
-
-        if (read_result.isErr()) {
-            return;
-        }
+        auto offset = lf->get_time_offset();
 
         bind_values(stmt.in(),
                     lf->original_line_time(line_iter),
@@ -1357,6 +2150,12 @@ save_time_bookmarks()
         sqlite3_reset(stmt.in());
     }
 
+    log_info("saved %d log bookmarks", sqlite3_changes(db.in()));
+    save_text_bookmarks(db.in());
+    log_info("saved %d text bookmarks", sqlite3_changes(db.in()));
+    save_timeline_bookmarks(db.in());
+    log_info("saved %d timeline bookmarks", sqlite3_changes(db.in()));
+
     if (sqlite3_exec(db.in(), "COMMIT", nullptr, nullptr, errmsg.out())
         != SQLITE_OK)
     {
@@ -1370,12 +2169,44 @@ save_time_bookmarks()
         log_error("unable to delete old bookmarks -- %s", errmsg.in());
         return;
     }
+    auto bookmark_changes = sqlite3_changes(db.in());
+    if (bookmark_changes > 0) {
+        log_info("deleted %d old bookmarks", bookmark_changes);
+    }
 
     if (sqlite3_exec(db.in(), NETLOC_LRU_STMT, nullptr, nullptr, errmsg.out())
         != SQLITE_OK)
     {
         log_error("unable to delete old netlocs -- %s", errmsg.in());
         return;
+    }
+    auto netloc_changes = sqlite3_changes(db.in());
+    if (netloc_changes > 0) {
+        log_info("deleted %d old netlocs", netloc_changes);
+    }
+
+    if (sqlite3_exec(
+            db.in(), TEXT_BOOKMARK_LRU_STMT, nullptr, nullptr, errmsg.out())
+        != SQLITE_OK)
+    {
+        log_error("unable to delete old text bookmarks -- %s", errmsg.in());
+        return;
+    }
+    auto text_bm_changes = sqlite3_changes(db.in());
+    if (text_bm_changes > 0) {
+        log_info("deleted %d old text bookmarks", text_bm_changes);
+    }
+
+    if (sqlite3_exec(
+            db.in(), TIMELINE_BOOKMARK_LRU_STMT, nullptr, nullptr, errmsg.out())
+        != SQLITE_OK)
+    {
+        log_error("unable to delete old timeline bookmarks -- %s", errmsg.in());
+        return;
+    }
+    auto timeline_bm_changes = sqlite3_changes(db.in());
+    if (timeline_bm_changes > 0) {
+        log_info("deleted %d old timeline bookmarks", timeline_bm_changes);
     }
 }
 
@@ -1434,7 +2265,7 @@ save_session_with_id(const std::string& session_id)
                 for (auto& lf : lnav_data.ld_active_files.fc_files) {
                     auto ld_opt = lnav_data.ld_log_source.find_data(lf);
 
-                    file_states.gen(lf->get_filename());
+                    file_states.gen(lf->get_filename().native());
 
                     {
                         yajlpp_map file_state(handle);
@@ -1451,9 +2282,8 @@ save_session_with_id(const std::string& session_id)
                 yajlpp_map top_view_map(handle);
 
                 for (int lpc = 0; lpc < LNV__MAX; lpc++) {
-                    textview_curses& tc = lnav_data.ld_views[lpc];
-                    unsigned long width;
-                    vis_line_t height;
+                    auto& tc = lnav_data.ld_views[lpc];
+                    auto* ta = dynamic_cast<text_anchors*>(tc.get_sub_source());
 
                     top_view_map.gen(lnav_view_strings[lpc]);
 
@@ -1461,11 +2291,39 @@ save_session_with_id(const std::string& session_id)
 
                     view_map.gen("top_line");
 
-                    tc.get_dimensions(height, width);
                     if (tc.get_top() >= tc.get_top_for_last_row()) {
                         view_map.gen(-1LL);
                     } else {
                         view_map.gen((long long) tc.get_top());
+                    }
+
+                    if (tc.is_selectable() && tc.get_selection() >= 0_vl
+                        && tc.get_inner_height() > 0_vl
+                        && tc.get_selection() != tc.get_inner_height() - 1)
+                    {
+                        auto sel = tc.get_selection();
+                        if (sel) {
+                            view_map.gen("focused_line");
+                            view_map.gen((long long) sel.value());
+
+                            if (ta != nullptr) {
+                                auto anchor_opt
+                                    = ta->anchor_for_row(sel.value());
+                                if (anchor_opt) {
+                                    view_map.gen("anchor");
+                                    view_map.gen(anchor_opt.value());
+                                    auto anchor_row_opt = ta->row_for_anchor(
+                                        anchor_opt.value());
+                                    if (anchor_row_opt) {
+                                        view_map.gen("anchor_offset");
+                                        view_map.gen(
+                                            (long long) (sel.value()
+                                                         - anchor_row_opt
+                                                               .value()));
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     view_map.gen("search");
@@ -1474,7 +2332,7 @@ save_session_with_id(const std::string& session_id)
                     view_map.gen("word_wrap");
                     view_map.gen(tc.get_word_wrap());
 
-                    auto tss = tc.get_sub_source();
+                    auto* tss = tc.get_sub_source();
                     if (tss == nullptr) {
                         continue;
                     }
@@ -1482,81 +2340,16 @@ save_session_with_id(const std::string& session_id)
                     view_map.gen("filtering");
                     view_map.gen(tss->tss_apply_filters);
 
-                    filter_stack& fs = tss->get_filters();
+                    if (tss->get_min_log_level() != LEVEL_UNKNOWN) {
+                        view_map.gen("min_level");
+                        view_map.gen(level_names[tss->get_min_log_level()]);
+                    }
 
                     view_map.gen("commands");
                     yajlpp_array cmd_array(handle);
 
-                    for (const auto& filter : fs) {
-                        auto cmd = filter->to_command();
-
-                        if (cmd.empty()) {
-                            continue;
-                        }
-
-                        cmd_array.gen(cmd);
-
-                        if (!filter->is_enabled()) {
-                            cmd_array.gen("disable-filter " + filter->get_id());
-                        }
-                    }
-
-                    auto& hmap = lnav_data.ld_views[lpc].get_highlights();
-
-                    for (auto& hl : hmap) {
-                        if (hl.first.first != highlight_source_t::INTERACTIVE) {
-                            continue;
-                        }
-                        cmd_array.gen("highlight " + hl.first.second);
-                    }
-
-                    if (lpc == LNV_LOG) {
-                        for (const auto& format :
-                             log_format::get_root_formats())
-                        {
-                            auto* elf = dynamic_cast<external_log_format*>(
-                                format.get());
-
-                            if (elf == nullptr) {
-                                continue;
-                            }
-
-                            for (const auto& vd : elf->elf_value_defs) {
-                                if (!vd.second->vd_meta.lvm_user_hidden) {
-                                    continue;
-                                }
-
-                                cmd_array.gen("hide-fields "
-                                              + elf->get_name().to_string()
-                                              + "." + vd.first.to_string());
-                            }
-                        }
-
-                        logfile_sub_source& lss = lnav_data.ld_log_source;
-
-                        struct timeval min_time, max_time;
-                        bool have_min_time = lss.get_min_log_time(min_time);
-                        bool have_max_time = lss.get_max_log_time(max_time);
-                        char min_time_str[32], max_time_str[32];
-
-                        sql_strftime(
-                            min_time_str, sizeof(min_time_str), min_time);
-                        if (have_min_time) {
-                            cmd_array.gen("hide-lines-before "
-                                          + std::string(min_time_str));
-                        }
-                        if (have_max_time) {
-                            sql_strftime(
-                                max_time_str, sizeof(max_time_str), max_time);
-                            cmd_array.gen("hide-lines-after "
-                                          + std::string(max_time_str));
-                        }
-
-                        auto mark_expr = lss.get_sql_marker_text();
-                        if (!mark_expr.empty()) {
-                            cmd_array.gen("mark-expr " + mark_expr);
-                        }
-                    }
+                    tss->add_commands_for_session(
+                        [&](auto& cmd) { cmd_array.gen(cmd); });
                 }
             }
         }
@@ -1575,10 +2368,14 @@ save_session_with_id(const std::string& session_id)
 void
 save_session()
 {
-    if (lnav_data.ld_flags & LNF_SECURE_MODE) {
+    if (lnav_data.ld_flags.is_set<lnav_flags::secure_mode>()) {
         log_info("secure mode is enabled, not saving session");
         return;
     }
+
+    static auto op = lnav_operation{"save_session"};
+
+    auto op_guard = lnav_opid_guard::internal(op);
 
     log_debug("BEGIN save_session");
     save_time_bookmarks();
@@ -1597,7 +2394,7 @@ save_session()
 void
 reset_session()
 {
-    log_info("reset session: time=%d", lnav_data.ld_session_time);
+    log_info("reset session: time=%lld", lnav_data.ld_session_time);
 
     save_session();
 
@@ -1605,6 +2402,7 @@ reset_session()
     session_data.sd_file_states.clear();
 
     for (auto& tc : lnav_data.ld_views) {
+        auto* ttt = dynamic_cast<text_time_translator*>(tc.get_sub_source());
         auto& hmap = tc.get_highlights();
         auto hl_iter = hmap.begin();
 
@@ -1615,34 +2413,61 @@ reset_session()
                 hmap.erase(hl_iter++);
             }
         }
+
+        tc.clear_named_searches();
+
+        if (ttt != nullptr) {
+            ttt->clear_min_max_row_times();
+        }
     }
 
     for (const auto& lf : lnav_data.ld_active_files.fc_files) {
         lf->reset_state();
     }
+    // Drop format-level user state (e.g. `:hide-fields` choices) so a
+    // fresh session starts without inherited hide state.
+    for (const auto& format : log_format::get_root_formats()) {
+        format->reset_user_field_state();
+    }
 
+    lnav_data.ld_log_source.get_breakpoints().clear();
+    lnav_data.ld_log_source.lss_highlighters.clear();
+    lnav_data.ld_log_source.set_force_rebuild();
     lnav_data.ld_log_source.set_marked_only(false);
-    lnav_data.ld_log_source.clear_min_max_log_times();
     lnav_data.ld_log_source.set_min_log_level(LEVEL_UNKNOWN);
     lnav_data.ld_log_source.set_sql_filter("", nullptr);
     lnav_data.ld_log_source.set_sql_marker("", nullptr);
-
     lnav_data.ld_log_source.clear_bookmark_metadata();
+    rebuild_indexes(std::nullopt);
+
+    lnav_data.ld_db_row_source.reset_user_state();
+
+    auto* tss = static_cast<timeline_source*>(
+        lnav_data.ld_views[LNV_TIMELINE].get_sub_source());
+    if (tss != nullptr) {
+        tss->ts_hidden_row_types.clear();
+        tss->ts_pending_bookmarks.clear();
+        tss->clear_metrics();
+    }
 
     for (auto& tc : lnav_data.ld_views) {
-        text_sub_source* tss = tc.get_sub_source();
+        auto* tss = tc.get_sub_source();
 
         if (tss == nullptr) {
             continue;
         }
         tss->get_filters().clear_filters();
         tss->tss_apply_filters = true;
-        tss->text_filters_changed();
         tss->text_clear_marks(&textview_curses::BM_USER);
+        tss->text_clear_marks(&textview_curses::BM_STICKY);
         tc.get_bookmarks()[&textview_curses::BM_USER].clear();
-        tss->text_clear_marks(&textview_curses::BM_META);
-        tc.get_bookmarks()[&textview_curses::BM_META].clear();
+        tc.get_bookmarks()[&textview_curses::BM_STICKY].clear();
+        tss->text_filters_changed();
         tc.reload_data();
+    }
+
+    for (auto& fvs : lnav_data.ld_text_source.get_file_states()) {
+        fvs->fvs_bookmarks.clear();
     }
 
     lnav_data.ld_filter_view.reload_data();
@@ -1654,9 +2479,204 @@ reset_session()
             continue;
         }
 
+        bool changed = false;
         for (const auto& vd : elf->elf_value_defs) {
-            vd.second->vd_meta.lvm_user_hidden = false;
+            if (vd.second->vd_meta.lvm_user_hidden) {
+                vd.second->vd_meta.lvm_user_hidden = std::nullopt;
+                changed = true;
+            }
         }
+        if (changed) {
+            elf->elf_value_defs_state->vds_generation += 1;
+        }
+    }
+}
+
+/**
+ * @return The key to compare a session command against the ones a view has
+ * already applied.  Commands that hold a single value for the view are keyed
+ * by their name so that the session does not overwrite a value that is
+ * already set; the rest are keyed by the whole command line, since a view can
+ * hold any number of them.
+ */
+static std::string
+session_command_key(const std::string& cmdline)
+{
+    static const auto SINGLETON_CMDS = std::set<std::string>{
+        "filter-context",
+        "hide-lines-after",
+        "hide-lines-before",
+        "mark-expr",
+    };
+
+    auto cmd = string_fragment::from_str(cmdline)
+                   .split_when(string_fragment::tag1{' '})
+                   .first.to_string();
+
+    if (SINGLETON_CMDS.count(cmd) > 0) {
+        return cmd;
+    }
+
+    return cmdline;
+}
+
+void
+lnav::session::apply_view_commands()
+{
+    static auto op = lnav_operation{__FUNCTION__};
+
+    auto op_guard = lnav_opid_guard::internal(op);
+
+    log_debug("applying view commands");
+    for (size_t view_index = 0; view_index < LNV__MAX; view_index++) {
+        const auto& vs = session_data.sd_view_states[view_index];
+        auto& tview = lnav_data.ld_views[view_index];
+
+        log_debug("  view: %s", tview.get_title().c_str());
+        // The commands that the view would save right now.  A saved command
+        // that is already in here has nothing to add, so it is skipped.  Most
+        // of them can be applied several times over -- a view can have any
+        // number of filters, highlights, or named searches -- so they are
+        // matched in full.  The settings in SINGLETON_CMDS hold a single
+        // value instead, and re-applying one would overwrite the value that
+        // is already in place, so those match on the command name alone.  See
+        // text_sub_source::add_commands_for_session() and its overrides for
+        // where these come from.
+        lnav::set::small<std::string> curr_cmds;
+        auto* tss = tview.get_sub_source();
+        if (tview.get_sub_source() != nullptr) {
+            tss->tss_apply_filters = vs.vs_filtering;
+            if (vs.vs_min_log_level) {
+                tss->set_min_log_level(vs.vs_min_log_level.value());
+            }
+            tss->add_commands_for_session([&](auto& cmd) {
+                curr_cmds.insert(session_command_key(cmd));
+            });
+        }
+        if (vs.vs_commands.empty()) {
+            continue;
+        }
+        auto pop_view = false;
+        if (lnav_data.ld_view_stack.top() != &tview) {
+            toggle_view(&tview);
+            pop_view = true;
+        }
+        // The searches created below are scanned for in a single pass when
+        // this goes out of scope instead of one pass apiece.
+        auto search_guard = textview_curses::search_defer_guard{tview};
+        for (const auto& cmdline : vs.vs_commands) {
+            if (curr_cmds.contains(session_command_key(cmdline))) {
+                log_debug("view %s command '%s' already active",
+                          tview.get_title().c_str(),
+                          cmdline.c_str());
+                continue;
+            }
+            auto exec_cmd_res
+                = execute_command(lnav_data.ld_exec_context, cmdline);
+            if (exec_cmd_res.isOk()) {
+                log_info("Result: %s", exec_cmd_res.unwrap().c_str());
+            } else {
+                log_error("Result: %s",
+                          exec_cmd_res.unwrapErr()
+                              .to_attr_line()
+                              .get_string()
+                              .c_str());
+            }
+        }
+        if (pop_view) {
+            lnav_data.ld_view_stack.pop_back();
+            lnav_data.ld_view_stack.top() | [](auto* tc) {
+                // XXX
+                if (tc == &lnav_data.ld_views[LNV_TIMELINE]) {
+                    auto tss = tc->get_sub_source();
+                    tss->text_filters_changed();
+                    tc->reload_data();
+                }
+            };
+        }
+    }
+}
+
+void
+lnav::session::restore_view_states()
+{
+    static auto op = lnav_operation{__FUNCTION__};
+
+    auto op_guard = lnav_opid_guard::internal(op);
+
+    log_debug("restoring view states");
+    for (size_t view_index = 0; view_index < LNV__MAX; view_index++) {
+        const auto& vs = session_data.sd_view_states[view_index];
+        auto& tview = lnav_data.ld_views[view_index];
+        auto* ta = dynamic_cast<text_anchors*>(tview.get_sub_source());
+
+        if (!vs.vs_search.empty()) {
+            tview.execute_search(vs.vs_search);
+            tview.set_follow_search_for(-1, {});
+        }
+        tview.set_word_wrap(vs.vs_word_wrap);
+        auto has_loc = tview.get_selection().has_value();
+        if (!has_loc && vs.vs_top >= 0
+            && (view_index == LNV_LOG || tview.get_top() == 0_vl
+                || tview.get_top() == tview.get_top_for_last_row()))
+        {
+            log_info("restoring %s view top: %d",
+                     lnav_view_strings[view_index].data(),
+                     (int) vs.vs_top);
+            tview.set_top(vis_line_t(vs.vs_top), true);
+        }
+        if (!has_loc && vs.vs_selection) {
+            // Prefer the anchor + offset if one was saved and still
+            // resolves in the current document; otherwise fall back
+            // to the saved absolute line number.
+            auto target = vis_line_t(vs.vs_selection.value());
+            if (ta != nullptr && vs.vs_anchor && !vs.vs_anchor->empty()) {
+                auto row_opt = ta->row_for_anchor(vs.vs_anchor.value());
+                if (row_opt) {
+                    auto offset = vs.vs_anchor_offset.value_or(0);
+                    target = row_opt.value()
+                        + vis_line_t(static_cast<int>(offset));
+                }
+            }
+            auto max_line = std::max(tview.get_inner_height() - 1_vl, 0_vl);
+            target = std::clamp(target, 0_vl, max_line);
+            log_info("restoring %s view selection: %d",
+                     lnav_view_strings[view_index].data(),
+                     (int) target);
+            tview.set_selection(target);
+        }
+        auto sel = tview.get_selection();
+        if (!sel) {
+            auto height = tview.get_inner_height();
+            if (height == 0) {
+            } else if (view_index == LNV_TEXT) {
+                auto lf = lnav_data.ld_text_source.current_file();
+                if (lf != nullptr) {
+                    switch (lf->get_text_format().value_or(
+                        text_format_t::TF_BINARY))
+                    {
+                        case text_format_t::TF_PLAINTEXT:
+                        case text_format_t::TF_LOG: {
+                            if (height > 0_vl) {
+                                tview.set_selection(height - 1_vl);
+                            }
+                            break;
+                        }
+                        default:
+                            tview.set_selection(0_vl);
+                            break;
+                    }
+                }
+            } else if (view_index == LNV_LOG) {
+                tview.set_selection(height - 1_vl);
+            } else {
+                tview.set_selection(0_vl);
+            }
+        }
+        log_info("%s view actual top/selection: %d/%d",
+                 lnav_view_strings[view_index].data(),
+                 (int) tview.get_top(),
+                 (int) tview.get_selection().value_or(-1_vl));
     }
 }
 
@@ -1701,16 +2721,15 @@ lnav::session::regex101::insert_entry(const lnav::session::regex101::entry& ei)
 }
 
 template<>
-struct from_sqlite<lnav::session::regex101::entry> {
-    inline lnav::session::regex101::entry operator()(int argc,
-                                                     sqlite3_value** argv,
-                                                     int argi)
+struct from_column<lnav::session::regex101::entry> {
+    lnav::session::regex101::entry operator()(sqlite3_stmt* stmt,
+                                              int argi) const
     {
         return {
-            from_sqlite<std::string>()(argc, argv, argi + 0),
-            from_sqlite<std::string>()(argc, argv, argi + 1),
-            from_sqlite<std::string>()(argc, argv, argi + 2),
-            from_sqlite<std::string>()(argc, argv, argi + 3),
+            from_column<std::string>()(stmt, argi + 0),
+            from_column<std::string>()(stmt, argi + 1),
+            from_column<std::string>()(stmt, argi + 2),
+            from_column<std::string>()(stmt, argi + 3),
         };
     }
 };

@@ -29,48 +29,21 @@
 
 #include "plain_text_source.hh"
 
+#include "base/intern_string.hh"
 #include "base/itertools.hh"
+#include "base/string_util.hh"
 #include "config.h"
+#include "document.sections.hh"
+#include "scn/scan.h"
 
-static std::vector<plain_text_source::text_line>
-to_text_line(const std::vector<attr_line_t>& lines)
+plain_text_source::plain_text_source(const string_fragment& text)
 {
-    file_off_t off = 0;
+    size_t start = 0;
 
-    return lines | lnav::itertools::map([&off](const auto& elem) {
-               auto retval = plain_text_source::text_line{
-                   off,
-                   elem,
-               };
-
-               off += elem.length() + 1;
-               return retval;
-           });
-}
-
-plain_text_source::plain_text_source(const std::string& text)
-{
-    size_t start = 0, end;
-
-    while ((end = text.find('\n', start)) != std::string::npos) {
-        size_t len = (end - start);
-        this->tds_lines.emplace_back(start, text.substr(start, len));
-        start = end + 1;
+    for (const auto& line : text.split_lines()) {
+        this->tds_lines.emplace_back(start, attr_line_t::from_ansi_frag(line));
+        start += line.length();
     }
-    if (start < text.length()) {
-        this->tds_lines.emplace_back(start, text.substr(start));
-    }
-    this->tds_longest_line = this->compute_longest_line();
-}
-
-plain_text_source::plain_text_source(const std::vector<std::string>& text_lines)
-{
-    this->replace_with(text_lines);
-}
-
-plain_text_source::plain_text_source(const std::vector<attr_line_t>& text_lines)
-    : tds_lines(to_text_line(text_lines))
-{
     this->tds_longest_line = this->compute_longest_line();
 }
 
@@ -79,14 +52,54 @@ plain_text_source::replace_with(const attr_line_t& text_lines)
 {
     this->tds_lines.clear();
     this->tds_doc_sections = lnav::document::discover_metadata(text_lines);
-
     file_off_t off = 0;
-    for (auto& line : text_lines.split_lines()) {
+    auto lines = text_lines.split_lines();
+    while (!lines.empty() && lines.back().empty()) {
+        lines.pop_back();
+    }
+    for (auto& line : lines) {
+        auto line_len = line.al_string.size() + 1;
+        this->tds_lines.emplace_back(off, std::move(line));
+        off += line_len;
+    }
+    this->tds_longest_line = this->compute_longest_line();
+    if (this->tss_view != nullptr) {
+        if (this->tss_view->get_selection()) {
+            this->tss_view->set_selection(0_vl);
+        }
+        this->tss_view->set_needs_update();
+    }
+    return *this;
+}
+
+plain_text_source&
+plain_text_source::replace_with_mutable(attr_line_t& text_lines,
+                                        std::optional<text_format_t> tf)
+{
+    this->tds_text_format = tf;
+    this->tds_lines.clear();
+    if (tf) {
+        this->tds_doc_sections = lnav::document::discover(text_lines)
+                                     .with_text_format(tf.value())
+                                     .perform();
+    }
+    file_off_t off = 0;
+    auto lines = text_lines.split_lines();
+    while (!lines.empty() && lines.back().empty()) {
+        lines.pop_back();
+    }
+    for (auto& line : lines) {
         auto line_len = line.length() + 1;
         this->tds_lines.emplace_back(off, std::move(line));
         off += line_len;
     }
     this->tds_longest_line = this->compute_longest_line();
+    if (this->tss_view != nullptr) {
+        if (this->tss_view->get_selection()) {
+            this->tss_view->set_selection(0_vl);
+        }
+        this->tss_view->set_needs_update();
+    }
     return *this;
 }
 
@@ -95,10 +108,35 @@ plain_text_source::replace_with(const std::vector<std::string>& text_lines)
 {
     file_off_t off = 0;
     for (const auto& str : text_lines) {
-        this->tds_lines.emplace_back(off, str);
+        this->tds_lines.emplace_back(off, attr_line_t::from_ansi_str(str));
         off += str.length() + 1;
     }
     this->tds_longest_line = this->compute_longest_line();
+    if (this->tss_view != nullptr) {
+        if (this->tss_view->get_selection()) {
+            this->tss_view->set_selection(0_vl);
+        }
+        this->tss_view->set_needs_update();
+    }
+    return *this;
+}
+
+plain_text_source&
+plain_text_source::replace_with(const std::vector<attr_line_t>& text_lines)
+{
+    file_off_t off = 0;
+    this->tds_lines.clear();
+    for (const auto& al : text_lines) {
+        this->tds_lines.emplace_back(off, al);
+        off += al.length() + 1;
+    }
+    this->tds_longest_line = this->compute_longest_line();
+    if (this->tss_view != nullptr) {
+        if (this->tss_view->get_selection()) {
+            this->tss_view->set_selection(0_vl);
+        }
+        this->tss_view->set_needs_update();
+    }
     return *this;
 }
 
@@ -107,7 +145,10 @@ plain_text_source::clear()
 {
     this->tds_lines.clear();
     this->tds_longest_line = 0;
-    this->tds_text_format = text_format_t::TF_UNKNOWN;
+    this->tds_text_format = text_format_t::TF_PLAINTEXT;
+    if (this->tss_view != nullptr) {
+        this->tss_view->set_needs_update();
+    }
 }
 
 plain_text_source&
@@ -115,6 +156,9 @@ plain_text_source::truncate_to(size_t max_lines)
 {
     while (this->tds_lines.size() > max_lines) {
         this->tds_lines.pop_back();
+    }
+    if (this->tss_view != nullptr) {
+        this->tss_view->set_needs_update();
     }
     return *this;
 }
@@ -125,13 +169,25 @@ plain_text_source::text_line_width(textview_curses& curses)
     return this->tds_longest_line;
 }
 
-void
+line_info
 plain_text_source::text_value_for_line(textview_curses& tc,
                                        int row,
                                        std::string& value_out,
                                        text_sub_source::line_flags_t flags)
 {
     value_out = this->tds_lines[row].tl_value.get_string();
+    this->tds_line_indent_size = compute_indent_size(value_out);
+    if (this->tds_line_indent_size == 0 && value_out.empty()) {
+        for (auto next = row + 1; next < (int) this->tds_lines.size(); ++next) {
+            const auto& next_str = this->tds_lines[next].tl_value.get_string();
+            this->tds_line_indent_size = compute_indent_size(next_str) + 1;
+            if (!next_str.empty()) {
+                break;
+            }
+        }
+    }
+
+    return {};
 }
 
 void
@@ -144,7 +200,19 @@ plain_text_source::text_attrs_for_line(textview_curses& tc,
         && tc.get_selection() == line)
     {
         value_out.emplace_back(line_range{0, -1},
-                               VC_STYLE.value(text_attrs{A_REVERSE}));
+                               VC_STYLE.value(text_attrs::with_reverse()));
+    }
+    for (const auto& indent : this->tds_doc_sections.m_indents) {
+        if (indent < this->tds_line_indent_size) {
+            auto guide_lr = line_range{
+                (int) indent,
+                (int) (indent + 1),
+                line_range::unit::codepoint,
+            };
+            value_out.emplace_back(guide_lr,
+                                   VC_BLOCK_ELEM.value(block_elem_t{
+                                       L'\u258f', role_t::VCR_INDENT_GUIDE}));
+        }
     }
 }
 
@@ -156,7 +224,7 @@ plain_text_source::text_size_for_line(textview_curses& tc,
     return this->tds_lines[row].tl_value.length();
 }
 
-text_format_t
+std::optional<text_format_t>
 plain_text_source::get_text_format() const
 {
     return this->tds_text_format;
@@ -172,41 +240,45 @@ plain_text_source::compute_longest_line()
     return retval;
 }
 
-nonstd::optional<vis_line_t>
+std::optional<vis_line_t>
 plain_text_source::line_for_offset(file_off_t off) const
 {
     struct cmper {
-        bool operator()(const file_off_t& lhs, const text_line& rhs)
+        bool operator()(const file_off_t& lhs, const text_line& rhs) const
         {
             return lhs < rhs.tl_offset;
         }
 
-        bool operator()(const text_line& lhs, const file_off_t& rhs)
+        bool operator()(const text_line& lhs, const file_off_t& rhs) const
         {
             return lhs.tl_offset < rhs;
         }
     };
 
     if (this->tds_lines.empty()) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
+    log_trace("line_for_offset(%lld)", off);
     auto iter = std::lower_bound(
         this->tds_lines.begin(), this->tds_lines.end(), off, cmper{});
     if (iter == this->tds_lines.end()) {
         if (this->tds_lines.back().contains_offset(off)) {
-            return nonstd::make_optional(
+            return std::make_optional(
                 vis_line_t(std::distance(this->tds_lines.end() - 1, iter)));
         }
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     if (!iter->contains_offset(off) && iter != this->tds_lines.begin()) {
+        log_trace("  lower_bound (%lld) does not contain offset",
+                  iter->tl_offset);
         --iter;
     }
 
-    return nonstd::make_optional(
-        vis_line_t(std::distance(this->tds_lines.begin(), iter)));
+    auto retval = vis_line_t(std::distance(this->tds_lines.begin(), iter));
+    log_trace("  retval=%d", (int) retval);
+    return retval;
 }
 
 void
@@ -218,14 +290,17 @@ plain_text_source::text_crumbs_for_line(int line,
 
     this->tds_doc_sections.m_sections_tree.visit_overlapping(
         tl.tl_offset,
+        tl.tl_offset + tl.tl_value.length(),
         [&crumbs, initial_size, meta = &this->tds_doc_sections, this](
             const auto& iv) {
             auto path = crumbs | lnav::itertools::skip(initial_size)
                 | lnav::itertools::map(&breadcrumb::crumb::c_key)
                 | lnav::itertools::append(iv.value);
-            crumbs.template emplace_back(
+            crumbs.emplace_back(
                 iv.value,
-                [meta, path]() { return meta->possibility_provider(path); },
+                [meta, path](string_fragment) {
+                    return meta->possibility_provider(path);
+                },
                 [this, meta, path](const auto& key) {
                     auto curr_node = lnav::document::hier_node::lookup_path(
                         meta->m_sections_root.get(), path);
@@ -237,7 +312,7 @@ plain_text_source::text_crumbs_for_line(int line,
                     if (parent_node == nullptr) {
                         return;
                     }
-                    key.template match(
+                    key.match(
                         [this, parent_node](const std::string& str) {
                             auto sib_iter
                                 = parent_node->hn_named_children.find(str);
@@ -247,7 +322,11 @@ plain_text_source::text_crumbs_for_line(int line,
                             }
                             this->line_for_offset(sib_iter->second->hn_start) |
                                 [this](const auto new_top) {
-                                    this->tss_view->set_top(new_top);
+                                    this->tss_view->set_selection(new_top);
+                                    if (this->tss_view->is_selectable()) {
+                                        this->tss_view->set_top(new_top - 2_vl,
+                                                                false);
+                                    }
                                 };
                         },
                         [this, parent_node](size_t index) {
@@ -257,7 +336,11 @@ plain_text_source::text_crumbs_for_line(int line,
                             auto sib = parent_node->hn_children[index].get();
                             this->line_for_offset(sib->hn_start) |
                                 [this](const auto new_top) {
-                                    this->tss_view->set_top(new_top);
+                                    this->tss_view->set_selection(new_top);
+                                    if (this->tss_view->is_selectable()) {
+                                        this->tss_view->set_top(new_top - 2_vl,
+                                                                false);
+                                    }
                                 };
                         });
                 });
@@ -269,22 +352,22 @@ plain_text_source::text_crumbs_for_line(int line,
         this->tds_doc_sections.m_sections_root.get(), path);
 
     if (node && !node.value()->hn_children.empty()) {
-        auto poss_provider = [curr_node = node.value()]() {
+        auto poss_provider = [curr_node = node.value()](string_fragment) {
             std::vector<breadcrumb::possibility> retval;
             for (const auto& child : curr_node->hn_named_children) {
-                retval.template emplace_back(child.first);
+                retval.emplace_back(child.first);
             }
             return retval;
         };
         auto path_performer = [this, curr_node = node.value()](
                                   const breadcrumb::crumb::key_t& value) {
-            value.template match(
+            value.match(
                 [this, curr_node](const std::string& str) {
                     auto child_iter = curr_node->hn_named_children.find(str);
                     if (child_iter != curr_node->hn_named_children.end()) {
                         this->line_for_offset(child_iter->second->hn_start) |
                             [this](const auto new_top) {
-                                this->tss_view->set_top(new_top);
+                                this->tss_view->set_selection(new_top);
                             };
                     }
                 },
@@ -292,7 +375,7 @@ plain_text_source::text_crumbs_for_line(int line,
                     auto* child = curr_node->hn_children[index].get();
                     this->line_for_offset(child->hn_start) |
                         [this](const auto new_top) {
-                            this->tss_view->set_top(new_top);
+                            this->tss_view->set_selection(new_top);
                         };
                 });
         };
@@ -304,25 +387,57 @@ plain_text_source::text_crumbs_for_line(int line,
     }
 }
 
-nonstd::optional<vis_line_t>
+std::optional<vis_line_t>
 plain_text_source::row_for_anchor(const std::string& id)
 {
-    nonstd::optional<vis_line_t> retval;
+    std::optional<vis_line_t> retval;
 
     if (this->tds_doc_sections.m_sections_root == nullptr) {
         return retval;
     }
 
+    const auto& meta = this->tds_doc_sections;
+
+    auto is_ptr = startswith(id, "#/");
+    if (is_ptr) {
+        auto hier_sf = string_fragment::from_str(id).consume_n(2).value();
+        std::vector<lnav::document::section_key_t> path;
+
+        while (!hier_sf.empty()) {
+            auto comp_pair = hier_sf.split_when(string_fragment::tag1{'/'});
+            auto scan_res
+                = scn::scan_value<int64_t>(comp_pair.first.to_string_view());
+            if (scan_res && scan_res->range().empty()) {
+                path.emplace_back(scan_res->value());
+            } else {
+                stack_buf allocator;
+                path.emplace_back(
+                    json_ptr::decode(comp_pair.first, allocator).to_string());
+            }
+            hier_sf = comp_pair.second;
+        }
+
+        auto lookup_res = lnav::document::hier_node::lookup_path(
+            meta.m_sections_root.get(), path);
+        if (lookup_res) {
+            retval = this->line_for_offset(lookup_res.value()->hn_start);
+        }
+
+        return retval;
+    }
+
     lnav::document::hier_node::depth_first(
-        this->tds_doc_sections.m_sections_root.get(),
+        meta.m_sections_root.get(),
         [this, &id, &retval](const lnav::document::hier_node* node) {
             for (const auto& child_pair : node->hn_named_children) {
-                auto child_anchor
-                    = text_anchors::to_anchor_string(child_pair.first);
+                const auto& child_anchor = to_anchor_string(child_pair.first);
 
-                if (child_anchor == id) {
-                    retval = this->line_for_offset(child_pair.second->hn_start);
+                if (child_anchor != id) {
+                    continue;
                 }
+
+                retval = this->line_for_offset(child_pair.second->hn_start);
+                break;
             }
         });
 
@@ -338,36 +453,159 @@ plain_text_source::get_anchors()
         this->tds_doc_sections.m_sections_root.get(),
         [&retval](const lnav::document::hier_node* node) {
             for (const auto& child_pair : node->hn_named_children) {
-                retval.emplace(
-                    text_anchors::to_anchor_string(child_pair.first));
+                retval.emplace(to_anchor_string(child_pair.first));
             }
         });
 
     return retval;
 }
 
-nonstd::optional<std::string>
+std::optional<std::string>
 plain_text_source::anchor_for_row(vis_line_t vl)
 {
-    nonstd::optional<std::string> retval;
+    std::optional<std::string> retval;
 
-    if (vl > this->tds_lines.size()
+    if (vl > (ssize_t) this->tds_lines.size()
         || this->tds_doc_sections.m_sections_root == nullptr)
     {
         return retval;
     }
 
     const auto& tl = this->tds_lines[vl];
+    auto& md = this->tds_doc_sections;
+    auto path_for_line = md.path_for_range(
+        tl.tl_offset, tl.tl_offset + tl.tl_value.al_string.length());
 
-    this->tds_doc_sections.m_sections_tree.visit_overlapping(
-        tl.tl_offset, [&retval](const lnav::document::section_interval_t& iv) {
-            retval = iv.value.match(
-                [](const std::string& str) {
-                    return nonstd::make_optional(
-                        text_anchors::to_anchor_string(str));
-                },
-                [](size_t) { return nonstd::nullopt; });
-        });
+    if (path_for_line.empty()) {
+        return std::nullopt;
+    }
 
-    return retval;
+    if ((path_for_line.size() == 1
+         || this->tds_text_format == text_format_t::TF_MARKDOWN)
+        && path_for_line.back().is<std::string>())
+    {
+        return to_anchor_string(path_for_line.back().get<std::string>());
+    }
+
+    auto comps
+        = path_for_line | lnav::itertools::map([](const auto& elem) {
+              return elem.match(
+                  [](const std::string& str) {
+                      stack_buf allocator;
+                      return json_ptr::encode(str, allocator).to_string();
+                  },
+                  [](size_t index) { return fmt::to_string(index); });
+          });
+
+    return fmt::format(FMT_STRING("#/{}"),
+                       fmt::join(comps.begin(), comps.end(), "/"));
+}
+
+std::optional<vis_line_t>
+plain_text_source::adjacent_anchor(vis_line_t vl, direction dir)
+{
+    if (vl > (ssize_t) this->tds_lines.size()
+        || this->tds_doc_sections.m_sections_root == nullptr)
+    {
+        return std::nullopt;
+    }
+
+    const auto& tl = this->tds_lines[vl];
+    auto path_for_line = this->tds_doc_sections.path_for_range(
+        tl.tl_offset, tl.tl_offset + tl.tl_value.al_string.length());
+
+    log_trace("adjacent_anchor: curr path = %s",
+              fmt::to_string(path_for_line).c_str());
+    const auto& md = this->tds_doc_sections;
+    if (path_for_line.empty()) {
+        auto neighbors_res = md.m_sections_root->line_neighbors(vl);
+        if (!neighbors_res) {
+            return std::nullopt;
+        }
+
+        switch (dir) {
+            case direction::prev: {
+                if (neighbors_res->cnr_previous) {
+                    return this->line_for_offset(
+                        neighbors_res->cnr_previous.value()->hn_start);
+                }
+                break;
+            }
+            case direction::next: {
+                if (neighbors_res->cnr_next) {
+                    return this->line_for_offset(
+                        neighbors_res->cnr_next.value()->hn_start);
+                }
+                if (!md.m_sections_root->hn_children.empty()) {
+                    return this->line_for_offset(
+                        md.m_sections_root->hn_children[0]->hn_start);
+                }
+                break;
+            }
+        }
+        return std::nullopt;
+    }
+
+    auto last_key = path_for_line.back();
+    path_for_line.pop_back();
+
+    auto parent_opt = lnav::document::hier_node::lookup_path(
+        md.m_sections_root.get(), path_for_line);
+    if (!parent_opt) {
+        log_trace("  no parent");
+        return std::nullopt;
+    }
+    const auto* parent = parent_opt.value();
+
+    auto child_hn = parent->lookup_child(last_key);
+    if (!child_hn) {
+        // XXX "should not happen"
+        return std::nullopt;
+    }
+
+    auto neighbors_res = parent->child_neighbors(
+        child_hn.value(), tl.tl_offset + tl.tl_value.al_string.length() + 1);
+    if (!neighbors_res) {
+        log_trace("no neighbors");
+        return std::nullopt;
+    }
+
+    if (neighbors_res->cnr_previous && last_key.is<std::string>()) {
+        auto neighbor_sub
+            = neighbors_res->cnr_previous.value()->lookup_child(last_key);
+        if (neighbor_sub) {
+            log_trace("  loading previous child");
+            neighbors_res->cnr_previous = neighbor_sub;
+        }
+    }
+
+    if (neighbors_res->cnr_next && last_key.is<std::string>()) {
+        auto neighbor_sub
+            = neighbors_res->cnr_next.value()->lookup_child(last_key);
+        if (neighbor_sub) {
+            log_trace("  loading next child");
+            neighbors_res->cnr_next = neighbor_sub;
+        }
+    }
+
+    switch (dir) {
+        case direction::prev: {
+            if (neighbors_res->cnr_previous) {
+                return this->line_for_offset(
+                    neighbors_res->cnr_previous.value()->hn_start);
+            }
+            break;
+        }
+        case direction::next: {
+            if (neighbors_res->cnr_next) {
+                log_trace("  next offset %lld",
+                          neighbors_res->cnr_next.value()->hn_start);
+                return this->line_for_offset(
+                    neighbors_res->cnr_next.value()->hn_start);
+            }
+            break;
+        }
+    }
+
+    return std::nullopt;
 }

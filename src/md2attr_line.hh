@@ -30,17 +30,43 @@
 #ifndef lnav_md2attr_line_hh
 #define lnav_md2attr_line_hh
 
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <vector>
+
 #include "base/attr_line.hh"
-#include "ghc/filesystem.hpp"
+#include "base/intern_string.hh"
+#include "base/result.h"
+#include "mapbox/variant.hpp"
 #include "md4cpp.hh"
+
+namespace pugi {
+class xml_node;
+}
 
 class md2attr_line : public md4cpp::typed_event_handler<attr_line_t> {
 public:
     md2attr_line() { this->ml_blocks.resize(1); }
 
-    md2attr_line& with_source_path(nonstd::optional<ghc::filesystem::path> path)
+    md2attr_line& with_source_path(std::optional<std::filesystem::path> path)
     {
         this->ml_source_path = path;
+        if (path) {
+            this->ml_source_id = intern_string::lookup(path->c_str());
+        }
+        return *this;
+    }
+
+    md2attr_line& with_source_id(intern_string_t id)
+    {
+        this->ml_source_id = id;
+        return *this;
+    }
+
+    md2attr_line& add_lnav_script_icons()
+    {
+        this->ml_add_lnav_script_icons = true;
         return *this;
     }
 
@@ -56,8 +82,17 @@ public:
 
 private:
     struct table_t {
+        struct cell_t {
+            cell_t(MD_ALIGN align, const attr_line_t& contents)
+                : c_align(align), c_contents(contents)
+            {
+            }
+
+            MD_ALIGN c_align;
+            attr_line_t c_contents;
+        };
         struct row_t {
-            std::vector<attr_line_t> r_columns;
+            std::vector<cell_t> r_columns;
         };
 
         std::vector<attr_line_t> t_headers;
@@ -65,27 +100,42 @@ private:
     };
 
     struct cell_lines {
-        cell_lines(std::vector<attr_line_t> lines) : cl_lines(std::move(lines))
+        cell_lines(MD_ALIGN align, std::vector<attr_line_t> lines)
+            : cl_align(align), cl_lines(std::move(lines))
         {
         }
 
+        MD_ALIGN cl_align;
         std::vector<attr_line_t> cl_lines;
     };
 
     using list_block_t
         = mapbox::util::variant<MD_BLOCK_UL_DETAIL*, MD_BLOCK_OL_DETAIL>;
 
-    void append_url_footnote(std::string href);
+    std::string append_url_footnote(std::string href);
     void flush_footnotes();
+    attr_line_t to_attr_line(const pugi::xml_node& doc,
+                             const attr_line_t& orig);
 
-    nonstd::optional<ghc::filesystem::path> ml_source_path;
+    std::optional<std::filesystem::path> ml_source_path;
+    intern_string_t ml_source_id;
+    bool ml_add_lnav_script_icons{false};
+
     std::vector<attr_line_t> ml_blocks;
     std::vector<list_block_t> ml_list_stack;
+    bool ml_in_html_block{false};
     std::vector<table_t> ml_tables;
     std::vector<size_t> ml_span_starts;
-    std::vector<size_t> ml_html_span_starts;
+    struct html_start {
+        std::string hs_name;
+        size_t hs_offset;
+        size_t hs_depth;
+    };
+
+    std::vector<html_start> ml_html_starts;
     std::vector<attr_line_t> ml_footnotes;
     int32_t ml_code_depth{0};
+    ssize_t ml_last_superscript_index{-1};
 };
 
 #endif

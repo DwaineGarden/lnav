@@ -33,6 +33,7 @@
 
 #include "log_accel.hh"
 
+#include "base/lnav_log.hh"
 #include "config.h"
 
 const double log_accel::MIN_RANGE = 5.0;
@@ -95,11 +96,11 @@ log_accel::get_direction() const
     direction_t retval;
 
     if (std::fabs(avg_accel) <= THRESHOLD) {
-        retval = A_STEADY;
+        retval = direction_t::A_STEADY;
     } else if (avg_accel < 0.0) {
-        retval = A_ACCEL;
+        retval = direction_t::A_ACCEL;
     } else {
-        retval = A_DECEL;
+        retval = direction_t::A_DECEL;
     }
 
     return retval;

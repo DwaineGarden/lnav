@@ -7,10 +7,7 @@
 // you can do whatever you want with this stuff.  If we meet some day, and you
 // think this stuff is worth it, you can buy me a beer in return.  Sandro Sigala
 
-#ifdef __CYGWIN__
-#    include <alloca.h>
-#endif
-
+#include <assert.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -41,6 +38,7 @@ static const char* HEADER_FMT
 
 struct file_meta {
     const char* fm_name;
+    const char* fm_internal_path;
     unsigned int fm_compressed_size;
     unsigned int fm_size;
 };
@@ -67,7 +65,7 @@ process(struct file_meta* fm, FILE* ofile)
     }
 
     unsigned char* buf = malloc(st.st_size);
-    unsigned char* dest = malloc(st.st_size);
+    unsigned char* dest = malloc(st.st_size + 1024);
 
     int fd = open(fm->fm_name, O_RDONLY);
     if (fd == -1) {
@@ -80,14 +78,15 @@ process(struct file_meta* fm, FILE* ofile)
         fm->fm_size += rc;
     }
 
-    uLongf destLen = st.st_size;
-    compress(dest, &destLen, buf, st.st_size);
+    uLongf destLen = st.st_size + 1024;
+    int cres = compress2(dest, &destLen, buf, st.st_size, Z_BEST_COMPRESSION);
+    assert(cres == Z_OK);
     fm->fm_compressed_size = destLen;
 
     int c, col = 1;
     char sym[1024];
 
-    symname(sym, basename((char*) fm->fm_name));
+    symname(sym, fm->fm_internal_path);
     fprintf(ofile, "static const unsigned char %s_data[] = {\n", sym);
     for (int lpc = 0; lpc < destLen; lpc++) {
         c = dest[lpc];
@@ -108,19 +107,23 @@ process(struct file_meta* fm, FILE* ofile)
 void
 usage()
 {
-    fprintf(stderr, "usage: bin2c [-n name] <output_file> [input_file1 ...]\n");
+    fprintf(stderr, "usage: bin2c [-n name] [-p prefix] <output_file> [input_file1 ...]\n");
     exit(1);
 }
 
 int
 main(int argc, char** argv)
 {
+    const char* prefix = NULL;
     int c;
 
-    while ((c = getopt(argc, argv, "hn:")) != -1) {
+    while ((c = getopt(argc, argv, "hn:p:")) != -1) {
         switch (c) {
             case 'n':
                 name = optarg;
+                break;
+            case 'p':
+                prefix = optarg;
                 break;
             default:
                 usage();
@@ -217,11 +220,18 @@ main(int argc, char** argv)
     fprintf(cfile, "#include \"bin2c.hh\"\n");
     fprintf(cfile, "\n");
 
-    struct file_meta* meta = alloca(sizeof(struct file_meta) * argc);
+    struct file_meta* meta = malloc(sizeof(struct file_meta) * argc);
 
     memset(meta, 0, sizeof(struct file_meta) * argc);
     for (int lpc = 0; lpc < argc; lpc++) {
         meta[lpc].fm_name = argv[lpc];
+        const char* slash = strrchr(meta[lpc].fm_name, '/');
+        const char* bin_name = slash ? slash + 1 : meta[lpc].fm_name;
+        if (prefix != NULL && strstr(meta[lpc].fm_name, prefix)) {
+            bin_name = meta[lpc].fm_name + strlen(prefix);
+        }
+        meta[lpc].fm_internal_path = bin_name;
+
         process(&meta[lpc], cfile);
     }
 
@@ -229,14 +239,14 @@ main(int argc, char** argv)
     for (int lpc = 0; lpc < argc; lpc++) {
         char sym[1024];
 
-        symname(sym, basename((char*) meta[lpc].fm_name));
+        symname(sym, meta[lpc].fm_internal_path);
         fprintf(cfile, "    ");
         if (array) {
             fprintf(cfile, "{ ");
         }
         fprintf(cfile,
                 "\"%s\", %s_data, %d, %d",
-                basename((char*) meta[lpc].fm_name),
+                meta[lpc].fm_internal_path,
                 sym,
                 meta[lpc].fm_compressed_size,
                 meta[lpc].fm_size);
@@ -247,6 +257,7 @@ main(int argc, char** argv)
     }
     fprintf(cfile, "};\n");
     fclose(cfile);
+    free(meta);
 
     return 0;
 }

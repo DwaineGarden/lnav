@@ -1,5 +1,6 @@
 .deps
 .lnav
+.DS_Store
 *.dat
 *.diff
 test/*.err
@@ -11,6 +12,7 @@ test/*.err
 *.tmp
 *.trs
 *~
+.claude
 .idea/
 Makefile
 Makefile.in
@@ -31,6 +33,9 @@ missing
 mkinstalldirs
 test-driver
 docs/build
+docs/screenshots/.venv
+docs/source/format-table.csv
+release/lnav.spec
 release/release-NEWS.md
 release/linux-pkg/
 release/osx-build-dir/
@@ -54,6 +59,7 @@ src/ptimec
 src/spookyhash/.dirstamp
 src/stamp-h1
 src/static-libs/
+src/third-party/lnav-rs-ext/target
 src/time_fmts.cc
 src/yajl/.dirstamp
 test/drive_data_scanner
@@ -102,3 +108,4 @@ conan/
 prefix/
 CMakeLists.txt.user
 CMakeUserPresets.json
+vcpkg_installed/

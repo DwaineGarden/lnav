@@ -28,23 +28,27 @@
  */
 
 #include <string>
+#include <vector>
 
 #include "styling.hh"
 
 #include "ansi-palette-json.h"
+#include "base/from_trait.hh"
+#include "base/string_util.hh"
 #include "config.h"
+#include "css-color-names-json.h"
 #include "fmt/format.h"
 #include "xterm-palette-json.h"
 #include "yajlpp/yajlpp.hh"
 #include "yajlpp/yajlpp_def.hh"
 
-static const struct json_path_container term_color_rgb_handler = {
+static const json_path_container term_color_rgb_handler = {
     yajlpp::property_handler("r").for_field(&rgb_color::rc_r),
     yajlpp::property_handler("g").for_field(&rgb_color::rc_g),
     yajlpp::property_handler("b").for_field(&rgb_color::rc_b),
 };
 
-static const struct json_path_container term_color_handler = {
+static const json_path_container term_color_handler = {
     yajlpp::property_handler("colorId").for_field(&term_color::xc_id),
     yajlpp::property_handler("name").for_field(&term_color::xc_name),
     yajlpp::property_handler("hexString").for_field(&term_color::xc_hex),
@@ -53,24 +57,103 @@ static const struct json_path_container term_color_handler = {
         .with_children(term_color_rgb_handler),
 };
 
-static const struct json_path_container root_color_handler = {
-    yajlpp::property_handler("#")
-        .with_obj_provider<term_color, std::vector<term_color>>(
-            [](const yajlpp_provider_context& ypc,
-               std::vector<term_color>* palette) {
-                if (ypc.ypc_index >= palette->size()) {
-                    palette->resize(ypc.ypc_index + 1);
-                }
-                return &((*palette)[ypc.ypc_index]);
-            })
-        .with_children(term_color_handler),
+static constexpr json_path_handler_base::enum_value_t _align_values[] = {
+    {"start"_frag, text_align_t::start},
+    {"center"_frag, text_align_t::center},
+    {"end"_frag, text_align_t::end},
+
+    json_path_handler_base::ENUM_TERMINATOR,
 };
+
+const json_path_container style_config_handlers =
+    json_path_container{
+        yajlpp::property_handler("text-align")
+        .with_synopsis("start|center|end")
+        .with_enum_values(_align_values)
+        .with_description("How to align text within a cell")
+        .for_field(&style_config::sc_text_align),
+        yajlpp::property_handler("color")
+            .with_synopsis("#hex|color_name|semantic()")
+            .with_description(
+                "The foreground color value for this style. The value can be "
+                "the name of an xterm color, the hexadecimal value, a theme "
+                "variable reference, or 'semantic()' to derive the color from "
+                "a hash of the matched text.")
+            .with_example("#fff"_frag)
+            .with_example("Green"_frag)
+            .with_example("$black"_frag)
+            .with_example("semantic()"_frag)
+            .for_field(&style_config::sc_color),
+        yajlpp::property_handler("background-color")
+            .with_synopsis("#hex|color_name|semantic()")
+            .with_description(
+                "The background color value for this style. The value can be "
+                "the name of an xterm color, the hexadecimal value, a theme "
+                "variable reference, or 'semantic()' to derive the color from "
+                "a hash of the matched text.")
+            .with_example("#2d2a2e"_frag)
+            .with_example("Green"_frag)
+            .for_field(&style_config::sc_background_color),
+        yajlpp::property_handler("underline")
+            .with_description("Indicates that the text should be underlined.")
+            .for_field(&style_config::sc_underline),
+        yajlpp::property_handler("bold")
+            .with_description("Indicates that the text should be bolded.")
+            .for_field(&style_config::sc_bold),
+        yajlpp::property_handler("italic")
+            .with_description("Indicates that the text should be italicized.")
+            .for_field(&style_config::sc_italic),
+        yajlpp::property_handler("strike")
+            .with_description("Indicates that the text should be struck.")
+            .for_field(&style_config::sc_strike),
+        yajlpp::property_handler("nestable")
+            .with_description("This highlight can be nested in another highlight.")
+            .for_field(&style_config::sc_nestable),
+    }
+.with_definition_id("style");
+
+static const typed_json_path_container<std::vector<term_color>>
+    root_color_handler = {
+        yajlpp::property_handler("#")
+            .with_obj_provider<term_color, std::vector<term_color>>(
+                [](const yajlpp_provider_context& ypc,
+                   std::vector<term_color>* palette) {
+                    if (ypc.ypc_index >= palette->size()) {
+                        palette->resize(ypc.ypc_index + 1);
+                    }
+                    return &((*palette)[ypc.ypc_index]);
+                })
+            .with_children(term_color_handler),
+};
+
+struct css_color_names {
+    std::map<std::string, std::string> ccn_name_to_color;
+};
+
+static const typed_json_path_container<css_color_names> css_color_names_handlers
+    = {
+        yajlpp::pattern_property_handler("(?<css_color_name>.*)")
+            .for_field(&css_color_names::ccn_name_to_color),
+};
+
+static const css_color_names&
+get_css_color_names()
+{
+    static const auto INSTANCE
+        = css_color_names_handlers
+              .parser_for(intern_string::lookup(css_color_names_json.get_name()))
+              .of(*css_color_names_json.to_string_fragment_producer())
+              .unwrap();
+
+    return INSTANCE;
+}
 
 term_color_palette*
 xterm_colors()
 {
-    static term_color_palette retval(xterm_palette_json.get_name(),
-                                     xterm_palette_json.to_string_fragment());
+    static term_color_palette retval(
+        xterm_palette_json.get_name(),
+        *xterm_palette_json.to_string_fragment_producer());
 
     return &retval;
 }
@@ -78,17 +161,33 @@ xterm_colors()
 term_color_palette*
 ansi_colors()
 {
-    static term_color_palette retval(ansi_palette_json.get_name(),
-                                     ansi_palette_json.to_string_fragment());
+    static term_color_palette retval(
+        ansi_palette_json.get_name(),
+        *ansi_palette_json.to_string_fragment_producer());
 
     return &retval;
 }
 
+template<>
 Result<rgb_color, std::string>
-rgb_color::from_str(const string_fragment& sf)
+from(string_fragment sf)
 {
     if (sf.empty()) {
         return Ok(rgb_color());
+    }
+
+    if (sf[0] != '#') {
+        const auto& css_colors = get_css_color_names();
+        // The names in the table are all lower-case.  Matched without regard
+        // to case because the xterm palette lookup that runs ahead of this
+        // one is, and the error below sends the reader to a list of names
+        // that are capitalized.
+        const auto& iter
+            = css_colors.ccn_name_to_color.find(tolower(sf.to_string()));
+
+        if (iter != css_colors.ccn_name_to_color.end()) {
+            sf = string_fragment::from_str(iter->second);
+        }
     }
 
     rgb_color rgb_out;
@@ -125,12 +224,6 @@ rgb_color::from_str(const string_fragment& sf)
         return Err(fmt::format(FMT_STRING("Could not parse color: {}"), sf));
     }
 
-    for (const auto& xc : xterm_colors()->tc_palette) {
-        if (sf.iequal(xc.xc_name)) {
-            return Ok(xc.xc_color);
-        }
-    }
-
     return Err(fmt::format(
         FMT_STRING(
             "Unknown color: '{}'.  "
@@ -139,80 +232,35 @@ rgb_color::from_str(const string_fragment& sf)
         sf));
 }
 
-bool
-rgb_color::operator<(const rgb_color& rhs) const
+term_color_palette::term_color_palette(const string_fragment& name,
+                                       string_fragment_producer& json)
 {
-    if (rc_r < rhs.rc_r)
-        return true;
-    if (rhs.rc_r < rc_r)
-        return false;
-    if (rc_g < rhs.rc_g)
-        return true;
-    if (rhs.rc_g < rc_g)
-        return false;
-    return rc_b < rhs.rc_b;
-}
+    intern_string_t iname = intern_string::lookup(name);
+    auto parse_res
+        = root_color_handler.parser_for(iname).with_ignore_unused(true).of(
+            json);
 
-bool
-rgb_color::operator>(const rgb_color& rhs) const
-{
-    return rhs < *this;
-}
+    if (parse_res.isErr()) {
+        log_error("failed to parse palette: %s -- %s",
+                  iname.c_str(),
+                  parse_res.unwrapErr()[0].to_attr_line().get_string().c_str());
+    }
+    require(parse_res.isOk());
 
-bool
-rgb_color::operator<=(const rgb_color& rhs) const
-{
-    return !(rhs < *this);
-}
-
-bool
-rgb_color::operator>=(const rgb_color& rhs) const
-{
-    return !(*this < rhs);
-}
-
-bool
-rgb_color::operator==(const rgb_color& rhs) const
-{
-    return rc_r == rhs.rc_r && rc_g == rhs.rc_g && rc_b == rhs.rc_b;
-}
-
-bool
-rgb_color::operator!=(const rgb_color& rhs) const
-{
-    return !(rhs == *this);
-}
-
-term_color_palette::term_color_palette(const char* name,
-                                       const string_fragment& json)
-{
-    yajlpp_parse_context ypc_xterm(intern_string::lookup(name),
-                                   &root_color_handler);
-    yajl_handle handle;
-
-    handle = yajl_alloc(&ypc_xterm.ypc_callbacks, nullptr, &ypc_xterm);
-    ypc_xterm.with_ignore_unused(true)
-        .with_obj(this->tc_palette)
-        .with_handle(handle);
-    yajl_status st = ypc_xterm.parse(json);
-    ensure(st == yajl_status_ok);
-    st = ypc_xterm.complete_parse();
-    ensure(st == yajl_status_ok);
-    yajl_free(handle);
-
+    this->tc_palette = parse_res.unwrap();
     for (auto& xc : this->tc_palette) {
         xc.xc_lab_color = lab_color(xc.xc_color);
     }
 }
 
-short
-term_color_palette::match_color(const lab_color& to_match)
+uint8_t
+term_color_palette::match_color(const lab_color& to_match) const
 {
     double lowest = 1000.0;
     short lowest_id = -1;
 
-    for (auto& xc : this->tc_palette) {
-        double xc_delta = xc.xc_lab_color.deltaE(to_match);
+    for (const auto& xc : this->tc_palette) {
+        const double xc_delta = xc.xc_lab_color.deltaE(to_match);
 
         if (lowest_id == -1) {
             lowest = xc_delta;
@@ -226,7 +274,33 @@ term_color_palette::match_color(const lab_color& to_match)
         }
     }
 
+    require_ge(lowest_id, -100);
+
     return lowest_id;
+}
+
+std::optional<lab_color>
+term_color_palette::to_lab_color(const styling::color_unit& color) const
+{
+    return std::visit(
+        styling::overload{
+            [](styling::transparent) -> std::optional<lab_color> {
+                return std::nullopt;
+            },
+            [](styling::semantic) -> std::optional<lab_color> {
+                return std::nullopt;
+            },
+            [this](const palette_color& pc) -> std::optional<lab_color> {
+                if (pc < this->tc_palette.size()) {
+                    return this->tc_palette[pc].xc_lab_color;
+                }
+                return std::nullopt;
+            },
+            [](const rgb_color& rc) -> std::optional<lab_color> {
+                return lab_color{rc};
+            },
+        },
+        color.cu_value);
 }
 
 namespace styling {
@@ -238,7 +312,17 @@ color_unit::from_str(const string_fragment& sf)
         return Ok(color_unit{semantic{}});
     }
 
-    auto retval = TRY(rgb_color::from_str(sf));
+    if (!sf.startswith("#")) {
+        for (const auto& xc : xterm_colors()->tc_palette) {
+            if (sf.iequal(xc.xc_name)) {
+                return Ok(from_palette(xc.xc_id));
+            }
+        }
+    }
+    auto retval = TRY(from<rgb_color>(sf));
+    if (retval.empty()) {
+        return Ok(EMPTY);
+    }
 
     return Ok(color_unit{retval});
 }

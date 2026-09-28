@@ -36,8 +36,10 @@
 
 #include <sys/types.h>
 
+#include "base/result.h"
+#include "json_ptr.hh"
 #include "yajl/api/yajl_parse.h"
-#include "yajlpp/json_ptr.hh"
+#include "yajlpp.hh"
 
 class json_op {
     static int handle_null(void* ctx);
@@ -47,9 +49,13 @@ class json_op {
                              size_t numberLen);
     static int handle_string(void* ctx,
                              const unsigned char* stringVal,
-                             size_t len);
+                             size_t len,
+                             yajl_string_props_t* props);
     static int handle_start_map(void* ctx);
-    static int handle_map_key(void* ctx, const unsigned char* key, size_t len);
+    static int handle_map_key(void* ctx,
+                              const unsigned char* key,
+                              size_t len,
+                              yajl_string_props_t* prop);
     static int handle_end_map(void* ctx);
     static int handle_start_array(void* ctx);
     static int handle_end_array(void* ctx);
@@ -65,8 +71,13 @@ public:
 
     bool check_index(bool primitive = true)
     {
-        return this->jo_ptr.at_index(
+        auto retval = this->jo_ptr.at_index(
             this->jo_depth, this->jo_array_index, primitive);
+
+        if (retval) {
+            this->jo_found = true;
+        }
+        return retval;
     }
 
     int jo_depth{0};
@@ -77,6 +88,11 @@ public:
     void* jo_ptr_data{nullptr};
     std::string jo_ptr_error;
     int jo_ptr_error_code{0};
+    bool jo_found{false};
 };
+
+Result<bool, yajl_status> extract_json_from(yajl_gen gen,
+                                            string_fragment in,
+                                            const char* ptr);
 
 #endif

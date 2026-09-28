@@ -7,9 +7,11 @@ AM_CPPFLAGS = \
     -I$(top_srcdir)/src/ \
     -I$(top_srcdir)/src/third-party \
     -I$(top_srcdir)/src/fmtlib \
+	-I$(top_srcdir)/src/third-party/date/include \
+	-I$(top_srcdir)/src/third-party/notcurses/include \
+	-I$(top_srcdir)/src/third-party/parallel_hashmap \
 	-I$(top_srcdir)/src/third-party/scnlib/include \
     $(LIBARCHIVE_CFLAGS) \
-    $(READLINE_CFLAGS) \
     $(SQLITE3_CFLAGS) \
     $(PCRE_CFLAGS) \
     $(LIBCURL_CPPFLAGS)
@@ -22,18 +24,26 @@ noinst_LIBRARIES = libbase.a
 
 noinst_HEADERS = \
     ansi_scrubber.hh \
+    ansi_vars.hh \
     attr_line.hh \
     attr_line.builder.hh \
     auto_fd.hh \
     auto_mem.hh \
     auto_pid.hh \
     bus.hh \
+    cell_container.hh \
+    color_spaces.hh \
+    date_time_scanner.cfg.hh \
     date_time_scanner.hh \
+    distributed_slice.hh \
     enum_util.hh \
     file_range.hh \
+    from_trait.hh \
     fs_util.hh \
+    fts_fuzzy_match.hh \
     func_util.hh \
     future_util.hh \
+    guard_util.hh \
 	humanize.hh \
 	humanize.network.hh \
 	humanize.time.hh \
@@ -43,30 +53,54 @@ noinst_HEADERS = \
     is_utf8.hh \
     isc.hh \
     itertools.hh \
+    itertools.enumerate.hh \
+    itertools.similar.hh \
+    keycodes.hh \
+    line_range.hh \
     lnav_log.hh \
     lnav.console.hh \
     lnav.console.into.hh \
     lnav.gzip.hh \
+    lnav.resolver.hh \
+    lnav.ryml.hh \
+    lnav.tz.hh \
     log_level_enum.hh \
     lrucache.hpp \
+    lazy_vector.hh \
+    map_util.hh \
+    gallop.hh \
     math_util.hh \
     network.tcp.hh \
+    parallel_for.hh \
     opt_util.hh \
     paths.hh \
+    piper.file.hh \
+    progress.hh \
+    relative_time.hh \
     result.h \
+    separated_string.hh \
+    short_alloc.h \
+    small_string_map.hh \
     snippet_highlighters.hh \
+    sparse_cursor_container.hh \
     string_attr_type.hh \
     string_util.hh \
     strnatcmp.h \
-    time_util.hh
+    text_format_enum.hh \
+    time_util.hh \
+    types.hh
 
 libbase_a_SOURCES = \
     ansi_scrubber.cc \
     attr_line.cc \
     attr_line.builder.cc \
+    auto_fd.cc \
     auto_pid.cc \
+    cell_container.cc \
+    color_spaces.cc \
     date_time_scanner.cc \
     fs_util.cc \
+    fts_fuzzy_match.cc \
 	humanize.cc \
 	humanize.network.cc \
 	humanize.time.cc \
@@ -74,10 +108,18 @@ libbase_a_SOURCES = \
     is_utf8.cc \
     isc.cc \
     lnav.console.cc \
+    lnav.console.win.cc \
     lnav.gzip.cc \
+    lnav.tz.cc \
     lnav_log.cc \
     network.tcp.cc \
+    parallel_for.cc \
     paths.cc \
+    piper.file.cc \
+    progress.cc \
+    relative_time.cc \
+    separated_string.cc \
+    small_string_map.cc \
     snippet_highlighters.cc \
     string_attr_type.cc \
     string_util.cc \
@@ -91,20 +133,33 @@ check_PROGRAMS = \
 
 test_base_SOURCES = \
     attr_line.tests.cc \
+    cell_container.tests.cc \
+    color_spaces.tests.cc \
     fs_util.tests.cc \
+    future_util.tests.cc \
+    gallop.tests.cc \
     humanize.file_size.tests.cc \
     humanize.network.tests.cc \
     humanize.time.tests.cc \
     intern_string.tests.cc \
+    is_utf8.tests.cc \
+    lnav.console.tests.cc \
     lnav.gzip.tests.cc \
+    math_util.tests.cc \
+    separated_string.tests.cc \
+    small_string_map.tests.cc \
+    sparse_cursor_container.tests.cc \
+    parallel_for.tests.cc \
     string_util.tests.cc \
     test_base.cc
 
 test_base_LDADD = \
     libbase.a \
     ../fmtlib/libcppfmt.a \
+    ../third-party/date/src/libdatepp.a \
     ../third-party/scnlib/src/libscnlib.a \
-    ../pcrepp/libpcrepp.a
+    ../pcrepp/libpcrepp.a \
+    -lunistring
 
 TESTS = \
     test_base

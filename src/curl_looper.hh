@@ -70,94 +70,43 @@ public:
 
 #    include "base/auto_mem.hh"
 #    include "base/lnav_log.hh"
+
+/**
+ * Initialize libcurl, if it has not been already.
+ *
+ * The global initialization pulls in the TLS library and its algorithm
+ * tables, which is the bulk of what loading libcurl costs.  Doing it on the
+ * way to the first handle keeps a session that never goes over the network
+ * from paying for it.
+ */
+void ensure_curl_global_init();
 #    include "base/time_util.hh"
 
 class curl_request {
 public:
-    curl_request(std::string name)
-        : cr_name(std::move(name)), cr_handle(curl_easy_cleanup)
-    {
-        this->cr_handle.reset(curl_easy_init());
-        curl_easy_setopt(this->cr_handle, CURLOPT_NOSIGNAL, 1);
-        curl_easy_setopt(
-            this->cr_handle, CURLOPT_ERRORBUFFER, this->cr_error_buffer);
-        curl_easy_setopt(this->cr_handle, CURLOPT_DEBUGFUNCTION, debug_cb);
-        curl_easy_setopt(this->cr_handle, CURLOPT_DEBUGDATA, this);
-        curl_easy_setopt(this->cr_handle, CURLOPT_VERBOSE, 1);
-        if (getenv("SSH_AUTH_SOCK") != nullptr) {
-            curl_easy_setopt(this->cr_handle,
-                             CURLOPT_SSH_AUTH_TYPES,
-#    ifdef CURLSSH_AUTH_AGENT
-                             CURLSSH_AUTH_AGENT |
-#    endif
-                                 CURLSSH_AUTH_PASSWORD);
-        }
-    }
+    explicit curl_request(std::string name);
+
+    curl_request(const curl_request&) = delete;
+    curl_request(curl_request&&) = delete;
+    void operator=(curl_request&&) = delete;
 
     virtual ~curl_request() = default;
 
-    const std::string& get_name() const
-    {
-        return this->cr_name;
-    }
+    const std::string& get_name() const { return this->cr_name; }
 
-    virtual void close()
-    {
-        this->cr_open = false;
-    }
+    virtual void close() { this->cr_open = false; }
 
-    bool is_open() const
-    {
-        return this->cr_open;
-    }
+    bool is_open() const { return this->cr_open; }
 
-    CURL* get_handle() const
-    {
-        return this->cr_handle;
-    }
+    CURL* get_handle() const { return this->cr_handle; }
 
-    operator CURL*() const
-    {
-        return this->cr_handle;
-    }
+    operator CURL*() const { return this->cr_handle; }
 
-    int get_completions() const
-    {
-        return this->cr_completions;
-    }
+    int get_completions() const { return this->cr_completions; }
 
-    virtual long complete(CURLcode result)
-    {
-        double total_time = 0, download_size = 0, download_speed = 0;
+    virtual long complete(CURLcode result);
 
-        this->cr_completions += 1;
-        curl_easy_getinfo(this->cr_handle, CURLINFO_TOTAL_TIME, &total_time);
-        log_debug("%s: total_time=%f", this->cr_name.c_str(), total_time);
-        curl_easy_getinfo(
-            this->cr_handle, CURLINFO_SIZE_DOWNLOAD, &download_size);
-        log_debug("%s: download_size=%f", this->cr_name.c_str(), download_size);
-        curl_easy_getinfo(
-            this->cr_handle, CURLINFO_SPEED_DOWNLOAD, &download_speed);
-        log_debug(
-            "%s: download_speed=%f", this->cr_name.c_str(), download_speed);
-
-        return -1;
-    }
-
-    Result<std::string, CURLcode> perform()
-    {
-        std::string response;
-
-        curl_easy_setopt(this->get_handle(), CURLOPT_WRITEFUNCTION, string_cb);
-        curl_easy_setopt(this->get_handle(), CURLOPT_WRITEDATA, &response);
-
-        auto rc = curl_easy_perform(this->get_handle());
-        if (rc == CURLE_OK) {
-            return Ok(response);
-        }
-
-        return Err(rc);
-    }
+    Result<std::string, CURLcode> perform() const;
 
     long get_response_code() const
     {
@@ -182,10 +131,7 @@ protected:
 
 class curl_looper : public isc::service<curl_looper> {
 public:
-    curl_looper() : cl_curl_multi(curl_multi_cleanup)
-    {
-        this->cl_curl_multi.reset(curl_multi_init());
-    }
+    curl_looper();
 
     void process_all();
 
@@ -206,11 +152,14 @@ protected:
     void loop_body() override;
 
 private:
+    /** Create the multi handle on first use, see ensure_curl_global_init(). */
+    CURLM* get_multi();
+
     void perform_io();
     void check_for_new_requests();
     void check_for_finished_requests();
     void requeue_requests(mstime_t up_to_time);
-    std::chrono::milliseconds compute_timeout(
+    std::optional<std::chrono::milliseconds> compute_timeout(
         mstime_t current_time) const override;
 
     auto_mem<CURLM> cl_curl_multi;

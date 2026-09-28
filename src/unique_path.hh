@@ -32,12 +32,11 @@
 #ifndef LNAV_UNIQUE_PATH_HH
 #define LNAV_UNIQUE_PATH_HH
 
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
-
-#include "ghc/filesystem.hpp"
 
 /**
  * A source of a path for the unique_path_generator.
@@ -51,23 +50,26 @@ public:
         this->ups_unique_path = path;
     }
 
-    const std::string& get_unique_path() const { return this->ups_unique_path; }
+    const std::filesystem::path& get_unique_path() const
+    {
+        return this->ups_unique_path;
+    }
 
-    virtual ghc::filesystem::path get_path() const = 0;
+    virtual std::filesystem::path get_path() const = 0;
 
-    ghc::filesystem::path& get_path_prefix()
+    const std::filesystem::path& get_path_prefix() const
     {
         return this->ups_prefix;
     }
 
-    void set_path_prefix(const ghc::filesystem::path& prefix)
+    void set_path_prefix(const std::filesystem::path& prefix)
     {
         this->ups_prefix = prefix;
     }
 
 private:
-    ghc::filesystem::path ups_prefix;
-    std::string ups_unique_path;
+    std::filesystem::path ups_prefix;
+    std::filesystem::path ups_unique_path;
 };
 
 /**

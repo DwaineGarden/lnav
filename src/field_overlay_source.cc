@@ -29,27 +29,45 @@
 
 #include "field_overlay_source.hh"
 
-#include "base/ansi_scrubber.hh"
+#include <curl/curl.h>
+
+#include "base/attr_line.builder.hh"
+#include "base/auto_mem.hh"
+#include "base/humanize.hh"
 #include "base/humanize.time.hh"
+#include "base/injector.hh"
 #include "base/snippet_highlighters.hh"
+#include "command_executor.hh"
 #include "config.h"
+#include "lnav.exec-phase.hh"
+#include "log.annotate.hh"
 #include "log_format_ext.hh"
 #include "log_vtab_impl.hh"
+#include "logline_window.hh"
 #include "md2attr_line.hh"
+#include "msg.text.hh"
+#include "pretty_printer.hh"
+#include "ptimec.hh"
 #include "readline_highlighters.hh"
-#include "relative_time.hh"
+#include "sql_util.hh"
 #include "vtab_module.hh"
 #include "vtab_module_json.hh"
+
+using namespace md4cpp::literals;
+using namespace lnav::roles::literals;
 
 json_string extract(const char* str);
 
 void
-field_overlay_source::build_field_lines(const listview_curses& lv)
+field_overlay_source::build_field_lines(const listview_curses& lv,
+                                        vis_line_t row)
 {
+    auto* vtab_manager = injector::get<log_vtab_manager*>();
     auto& lss = this->fos_lss;
     auto& vc = view_colors::singleton();
 
     this->fos_lines.clear();
+    this->fos_row_to_field_meta.clear();
 
     if (lss.text_line_count() == 0) {
         this->fos_log_helper.clear();
@@ -57,33 +75,63 @@ field_overlay_source::build_field_lines(const listview_curses& lv)
         return;
     }
 
-    content_line_t cl = lss.at(lv.get_selection());
-    std::shared_ptr<logfile> file = lss.find(cl);
+    auto cl = lss.at(row);
+    auto file = lss.find(cl);
     auto ll = file->begin() + cl;
     auto format = file->get_format();
     bool display = false;
 
     if (ll->is_time_skewed()
-        || ll->get_msg_level() == log_level_t::LEVEL_INVALID)
+        || ll->get_msg_level() == log_level_t::LEVEL_INVALID || ll->has_ansi())
     {
         display = true;
     }
     if (!this->fos_contexts.empty()) {
         display = display || this->fos_contexts.top().c_show;
     }
+    // Metric rows always get an overlay showing the file stem for
+    // each column, independent of the details toggle.
+    if (format->lf_is_metric) {
+        display = true;
+    }
 
-    this->build_meta_line(lv, this->fos_lines, lv.get_top());
+    if (!ll->is_valid_utf()) {
+        auto sub_opts = subline_options{};
+        sub_opts.scrub_invalid_utf8 = false;
+        auto read_res = file->read_line(ll, sub_opts);
+        if (read_res.isOk()) {
+            auto sbr = read_res.unwrap();
+            attr_line_t al;
+            attr_line_builder alb(al);
+
+            alb.append_as_hexdump(sbr.to_string_fragment());
+            this->fos_lines.emplace_back(
+                attr_line_t("  ")
+                    .append(
+                        "Hex dump of line with invalid UTF-8 content"_table_header)
+                    .move());
+            al.split_lines(this->fos_lines);
+            auto first_line = true;
+            for (auto& al_line : this->fos_lines) {
+                if (first_line) {
+                    first_line = false;
+                    continue;
+                }
+                al_line.insert(0, 4, ' ');
+            }
+        }
+    }
 
     if (!display) {
         return;
     }
 
-    if (!this->fos_log_helper.parse_line(lv.get_selection())) {
+    if (!this->fos_log_helper.load_line(row)) {
         return;
     }
 
     if (ll->get_msg_level() == LEVEL_INVALID) {
-        for (const auto& sattr : this->fos_log_helper.ldh_line_attrs) {
+        for (const auto& sattr : this->fos_log_helper.ldh_attr_line.al_attrs) {
             if (sattr.sa_type != &SA_INVALID) {
                 continue;
             }
@@ -91,33 +139,73 @@ field_overlay_source::build_field_lines(const listview_curses& lv)
             auto emsg = fmt::format(
                 FMT_STRING("   Invalid log message: {}"),
                 sattr.sa_value.get<decltype(SA_INVALID)::value_type>());
-            auto al = attr_line_t(emsg)
-                          .with_attr(string_attr(
-                              line_range{1, 2}, VC_GRAPHIC.value(ACS_LLCORNER)))
-                          .with_attr(string_attr(
-                              line_range{0, 22},
-                              VC_ROLE.value(role_t::VCR_INVALID_MSG)));
+            auto al
+                = attr_line_t(emsg)
+                      .with_attr(string_attr(line_range{1, 2},
+                                             VC_GRAPHIC.value(NCACS_LLCORNER)))
+                      .with_attr(
+                          string_attr(line_range{0, 22},
+                                      VC_ROLE.value(role_t::VCR_INVALID_MSG)))
+                      .move();
             this->fos_lines.emplace_back(al);
         }
     }
 
     char old_timestamp[64], curr_timestamp[64], orig_timestamp[64];
-    struct timeval curr_tv, offset_tv, orig_tv, diff_tv = {0, 0};
+    timeval curr_tv, offset_tv, orig_tv;
+    std::chrono::microseconds diff{0};
     attr_line_t time_line;
     auto& time_str = time_line.get_string();
-    struct line_range time_lr;
+    line_range time_lr;
+    off_t ts_len = sql_strftime(
+        curr_timestamp, sizeof(curr_timestamp), ll->get_time<>(), 'T');
+    {
+        exttm tmptm;
 
-    sql_strftime(curr_timestamp,
-                 sizeof(curr_timestamp),
-                 ll->get_time(),
-                 ll->get_millis(),
-                 'T');
+        tmptm.et_flags |= ETF_ZONE_SET;
+        tmptm.et_gmtoff
+            = lnav::local_time_to_info(
+                  date::local_seconds{ll->get_time<std::chrono::seconds>()})
+                  .first.offset.count();
+        ftime_z(curr_timestamp, ts_len, sizeof(curr_timestamp), tmptm);
+        curr_timestamp[ts_len] = '\0';
+    }
+
+    auto first_nl = this->fos_log_helper.ldh_attr_line.al_string.find('\n');
+    for (const auto& attr : this->fos_log_helper.ldh_attr_line.al_attrs) {
+        if (attr.sa_type != &SAT_UNSUPPORTED) {
+            continue;
+        }
+        if (first_nl != std::string::npos && attr.sa_range.lr_start >= first_nl)
+        {
+            continue;
+        }
+
+        const auto& msg
+            = attr.sa_value.get<decltype(SAT_UNSUPPORTED)::value_type>();
+        auto msg_al
+            = attr_line_t()
+                  .pad_to(this->fos_lss.get_filename_offset()
+                          + attr.sa_range.lr_start)
+                  .append(ui_icon_t::warning)
+                  .append(" ")
+                  .append("Unsupported:"_h2)
+                  .append(" ")
+                  .append(msg)
+                  .with_attr_for_all(VC_ROLE.value(role_t::VCR_WARNING));
+        this->fos_lines.emplace_back(msg_al);
+    }
+
+    if (ll->is_continued()) {
+        // only need to display unsupported escapes for a continued line
+        return;
+    }
 
     if (ll->is_time_skewed()) {
         time_lr.lr_start = 1;
         time_lr.lr_end = 2;
         time_line.with_attr(
-            string_attr(time_lr, VC_GRAPHIC.value(ACS_LLCORNER)));
+            string_attr(time_lr, VC_GRAPHIC.value(NCACS_LLCORNER)));
         time_str.append("   Out-Of-Time-Order Message");
         time_lr.lr_start = 3;
         time_lr.lr_end = time_str.length();
@@ -131,38 +219,38 @@ field_overlay_source::build_field_lines(const listview_curses& lv)
     time_str.append(curr_timestamp);
     time_lr.lr_end = time_str.length();
     time_line.with_attr(
-        string_attr(time_lr, VC_STYLE.value(text_attrs{A_BOLD})));
-    time_str.append(" -- ");
+        string_attr(time_lr, VC_STYLE.value(text_attrs::with_bold())));
+    time_str.append(" \u2014 ");
     time_lr.lr_start = time_str.length();
     time_str.append(humanize::time::point::from_tv(ll->get_timeval())
                         .with_convert_to_local(true)
                         .as_precise_time_ago());
     time_lr.lr_end = time_str.length();
     time_line.with_attr(
-        string_attr(time_lr, VC_STYLE.value(text_attrs{A_BOLD})));
+        string_attr(time_lr, VC_STYLE.value(text_attrs::with_bold())));
 
-    struct line_range time_range = find_string_attr_range(
-        this->fos_log_helper.ldh_line_attrs, &logline::L_TIMESTAMP);
+    auto ts_sf = this->fos_log_helper.ldh_line_values.lvv_time_value;
+    auto& file_dts = this->fos_log_helper.ldh_file->get_time_scanner();
 
     curr_tv = this->fos_log_helper.ldh_line->get_timeval();
-    if (ll->is_time_skewed() && time_range.lr_end != -1) {
-        const char* time_src
-            = this->fos_log_helper.ldh_line_values.lvv_sbr.get_data()
-            + time_range.lr_start;
-        struct timeval actual_tv;
-        date_time_scanner dts;
-        struct exttm tm;
+    if (ll->is_time_skewed() && ts_sf) {
+        timeval actual_tv;
+        exttm tm;
+        // Try the format's own timestamp patterns first, then fall back to a
+        // scanner that carries the file's settings but is free to lock onto
+        // any of the built-in formats.
+        auto any_fmt_dts = date_time_scanner{};
 
-        dts.set_base_time(format->lf_date_time.dts_base_time,
-                          format->lf_date_time.dts_base_tm.et_tm);
-        if (format->lf_date_time.scan(time_src,
-                                      time_range.length(),
-                                      format->get_timestamp_formats(),
-                                      &tm,
-                                      actual_tv,
-                                      false)
-            || dts.scan(
-                time_src, time_range.length(), nullptr, &tm, actual_tv, false))
+        any_fmt_dts.set_base_time(file_dts.dts_base_time,
+                                  file_dts.dts_base_tm.et_tm);
+        any_fmt_dts.dts_zoned_to_local = file_dts.dts_zoned_to_local;
+        if (file_dts.scan(ts_sf->data(),
+                          ts_sf->length(),
+                          format->get_timestamp_formats(),
+                          &tm,
+                          actual_tv)
+            || any_fmt_dts.scan(
+                ts_sf->data(), ts_sf->length(), nullptr, &tm, actual_tv))
         {
             sql_strftime(
                 orig_timestamp, sizeof(orig_timestamp), actual_tv, 'T');
@@ -173,24 +261,19 @@ field_overlay_source::build_field_lines(const listview_curses& lv)
             time_line.with_attr(
                 string_attr(time_lr, VC_ROLE.value(role_t::VCR_SKEWED_TIME)));
 
-            timersub(&curr_tv, &actual_tv, &diff_tv);
+            diff = to_us(curr_tv) - to_us(actual_tv);
             time_str.append(";  Diff: ");
             time_lr.lr_start = time_str.length();
-            time_str.append(
-                humanize::time::duration::from_tv(diff_tv).to_string());
+            time_str.append(humanize::time::duration::from(diff).to_string());
             time_lr.lr_end = time_str.length();
             time_line.with_attr(
-                string_attr(time_lr, VC_STYLE.value(text_attrs{A_BOLD})));
+                string_attr(time_lr, VC_STYLE.value(text_attrs::with_bold())));
         }
     }
 
     offset_tv = this->fos_log_helper.ldh_file->get_time_offset();
     timersub(&curr_tv, &offset_tv, &orig_tv);
-    sql_strftime(old_timestamp,
-                 sizeof(old_timestamp),
-                 orig_tv.tv_sec,
-                 orig_tv.tv_usec / 1000,
-                 'T');
+    sql_strftime(old_timestamp, sizeof(old_timestamp), to_us(orig_tv), 'T');
     if (offset_tv.tv_sec || offset_tv.tv_usec) {
         time_str.append("  Pre-adjust Time: ");
         time_str.append(old_timestamp);
@@ -202,24 +285,154 @@ field_overlay_source::build_field_lines(const listview_curses& lv)
                            .count());
     }
 
-    if (format->lf_date_time.dts_fmt_lock != -1) {
+    if (file_dts.dts_fmt_lock != -1) {
         const auto* ts_formats = format->get_timestamp_formats();
         if (ts_formats == nullptr) {
             ts_formats = PTIMEC_FORMAT_STR;
         }
         time_line.append("  Format: ")
-            .append(lnav::roles::symbol(
-                ts_formats[format->lf_date_time.dts_fmt_lock]));
+            .append(lnav::roles::symbol(ts_formats[file_dts.dts_fmt_lock]))
+            .append("  Default Zone: ");
+        if (file_dts.dts_default_zone != nullptr) {
+            time_line.append(
+                lnav::roles::symbol(file_dts.dts_default_zone->name()));
+        } else {
+            time_line.append("none"_comment);
+        }
+
+        auto file_opts = file->get_file_options();
+        if (file_opts) {
+            time_line.append("  File Options: ")
+                .append(lnav::roles::file(file_opts->first));
+        }
     }
 
     if ((!this->fos_contexts.empty() && this->fos_contexts.top().c_show)
-        || diff_tv.tv_sec > 0)
+        || diff >= std::chrono::seconds{1} || ll->is_time_skewed())
     {
         this->fos_lines.emplace_back(time_line);
     }
 
-    if (this->fos_contexts.empty() || !this->fos_contexts.top().c_show) {
+    // For a focused metric row, render an overlay line above the
+    // column area showing each column's source file stem.  Consecutive
+    // columns from the same file are collapsed into one span so a
+    // single stem sits above its run of metrics.
+    if (format->lf_is_metric) {
+        // listview_value_for_rows fetches every visible row in a
+        // batch before overlays render, so lss_token_al holds the
+        // last-rendered row's state by the time we get here.  Force a
+        // fresh render for the focused row so the L_METRIC_SOURCE
+        // spans we rely on actually describe it.
+        std::vector<attr_line_t> rows(1);
+        lv.get_data_source()->listview_value_for_rows(lv, row, rows);
+        auto& al = rows[0];
+        attr_line_t stem_line;
+        stem_line.append(" ").append("Sources:"_h2).append(" ");
+        logfile* last_lf = nullptr;
+        int run_start = -1;
+        int run_end = -1;
+        auto flush_run = [&]() {
+            if (!last_lf || run_start < 0) {
+                return;
+            }
+            const auto stem = last_lf->get_unique_path().stem().string();
+            const auto width = static_cast<size_t>(run_end - run_start);
+            stem_line.pad_to(run_start);
+            auto cell = attr_line_t::from_table_cell_content(
+                string_fragment::from_str(stem), width);
+            cell.with_attr_for_all(
+                VC_STYLE.value(view_colors::singleton().attrs_for_ident(
+                    last_lf->get_filename())));
+            stem_line.append(cell);
+        };
+        for (const auto& attr : al.al_attrs) {
+            if (attr.sa_type != &L_METRIC_SOURCE) {
+                continue;
+            }
+            const auto& cell_lf = attr.sa_value.get<logfile*>();
+            const auto col_start = attr.sa_range.lr_start;
+            const auto col_end = attr.sa_range.lr_end;
+            if (cell_lf == last_lf && run_end == col_start) {
+                run_end = col_end;
+                continue;
+            }
+            flush_run();
+            last_lf = cell_lf;
+            run_start = col_start;
+            run_end = col_end;
+        }
+        flush_run();
+        if (!stem_line.empty()) {
+            this->fos_lines.emplace_back(std::move(stem_line));
+        }
+    }
+
+    if (this->fos_contexts.empty() || !this->fos_contexts.top().c_show
+        || row != lv.get_selection())
+    {
         return;
+    }
+
+    this->fos_log_helper.parse_body();
+    // For metric rows, append values from every suppressed sibling so
+    // the overlay's "Known message fields" list includes columns that
+    // live in other files sharing this timestamp.  `parse_body` only
+    // annotates the lead, so without this the overlay shows a subset
+    // of what the composed line renders.
+    if (format->lf_is_metric) {
+        logline_window::logmsg_info lead_msg{this->fos_lss, vis_line_t(row)};
+        bool first = true;
+        for (const auto& sib : lead_msg.metric_siblings()) {
+            if (first) {
+                // The lead's values are already in `ldh_line_values`
+                // from `parse_body` above.
+                first = false;
+                continue;
+            }
+            auto& target = this->fos_log_helper.ldh_line_values.lvv_values;
+            const auto& sib_values = sib.get_values().lvv_values;
+            target.insert(target.end(), sib_values.begin(), sib_values.end());
+        }
+    }
+    auto anchor_opt = this->fos_lss.anchor_for_row(row);
+    if (anchor_opt) {
+        auto permalink
+            = attr_line_t(" ")
+                  .append("Permalink:"_h2)
+                  .append("    ")
+                  .append(lnav::roles::hyperlink(anchor_opt.value()));
+        this->fos_row_to_field_meta.emplace(
+            this->fos_lines.size(), row_info{std::nullopt, anchor_opt.value()});
+        this->fos_lines.emplace_back(permalink);
+    }
+
+    {
+        const auto& actual_path
+            = this->fos_log_helper.ldh_file->get_actual_path();
+        const auto& filename = actual_path
+            ? actual_path->string()
+            : this->fos_log_helper.ldh_file->get_filename_as_string();
+        auto file_line_number
+            = fmt::to_string(this->fos_log_helper.ldh_file->get_line_number(
+                this->fos_log_helper.ldh_line));
+        auto file_link
+            = attr_line_t()
+                  .append(lnav::roles::file(filename))
+                  .append(":")
+                  .append(lnav::roles::number(file_line_number))
+                  .with_attr_for_all(VC_ROLE.value(role_t::VCR_HYPERLINK))
+                  .with_attr_for_all(VC_HYPERLINK.value(
+                      fmt::format(FMT_STRING("file://{}#L{}"),
+                                  filename,
+                                  file_line_number)));
+        auto file_al
+            = attr_line_t(" ").append("File:"_h2).pad_to(15).append(file_link);
+
+        auto file_line_pair
+            = fmt::format(FMT_STRING("{}:{}"), filename, file_line_number);
+        this->fos_row_to_field_meta.emplace(
+            this->fos_lines.size(), row_info{std::nullopt, file_line_pair});
+        this->fos_lines.emplace_back(file_al);
     }
 
     this->fos_known_key_size = LOG_BODY.length();
@@ -228,10 +441,15 @@ field_overlay_source::build_field_lines(const listview_curses& lv)
     }
     this->fos_unknown_key_size = 0;
 
-    for (auto& ldh_line_value : this->fos_log_helper.ldh_line_values.lvv_values)
+    for (const auto& ldh_line_value :
+         this->fos_log_helper.ldh_line_values.lvv_values)
     {
         auto& meta = ldh_line_value.lv_meta;
         int this_key_size = meta.lvm_name.size();
+
+        if (!meta.lvm_column.is<logline_value_meta::table_column>()) {
+            continue;
+        }
 
         if (!this->fos_contexts.empty()) {
             this_key_size += this->fos_contexts.top().c_prefix.length();
@@ -246,33 +464,66 @@ field_overlay_source::build_field_lines(const listview_curses& lv)
             = std::max(this->fos_known_key_size, this_key_size);
     }
 
-    for (auto iter = this->fos_log_helper.ldh_parser->dp_pairs.begin();
-         iter != this->fos_log_helper.ldh_parser->dp_pairs.end();
-         ++iter)
-    {
-        std::string colname
-            = this->fos_log_helper.ldh_parser->get_element_string(
+    if (this->fos_log_helper.ldh_parser) {
+        for (auto iter = this->fos_log_helper.ldh_parser->dp_pairs.begin();
+             iter != this->fos_log_helper.ldh_parser->dp_pairs.end();
+             ++iter)
+        {
+            auto colname = this->fos_log_helper.ldh_parser->get_element_string(
                 iter->e_sub_elements->front());
 
-        colname
-            = this->fos_log_helper.ldh_namer->add_column(colname).to_string();
-        this->fos_unknown_key_size
-            = std::max(this->fos_unknown_key_size, (int) colname.length());
+            colname = this->fos_log_helper.ldh_namer->add_column(colname)
+                          .to_string();
+            this->fos_unknown_key_size
+                = std::max(this->fos_unknown_key_size, (int) colname.length());
+        }
     }
 
     auto lf = this->fos_log_helper.ldh_file->get_format();
-    if (!lf->get_pattern_regex(cl).empty()) {
-        attr_line_t pattern_al;
-        std::string& pattern_str = pattern_al.get_string();
-        pattern_str = " Pattern: " + lf->get_pattern_path(cl) + " = ";
+    auto lffs = this->fos_log_helper.ldh_file->get_format_file_state();
+    if (!lf->get_pattern_regex(lffs.lffs_pattern_locks, cl).empty()) {
+        auto pattern_al
+            = attr_line_t(" ")
+                  .append("Pattern:"_h2)
+                  .append("      ")
+                  .append(lf->get_pattern_path(lffs.lffs_pattern_locks, cl))
+                  .append(" = ");
+        auto& pattern_str = pattern_al.get_string();
         int skip = pattern_str.length();
-        pattern_str += lf->get_pattern_regex(cl);
+        pattern_str += lf->get_pattern_regex(lffs.lffs_pattern_locks, cl);
         lnav::snippets::regex_highlighter(
             pattern_al,
             pattern_al.length(),
             line_range{skip, (int) pattern_al.length()});
-        this->fos_lines.emplace_back(pattern_al);
+        for (const auto& pattern_line_al : pattern_al.split_lines()) {
+            this->fos_row_to_field_meta.emplace(
+                this->fos_lines.size(), row_info{std::nullopt, pattern_str});
+            this->fos_lines.emplace_back(pattern_line_al);
+        }
     }
+
+    if (this->fos_log_helper.ldh_line_values.lvv_opid_value) {
+        auto opid_al = attr_line_t(" ").append("Operation ID:"_h2).append(" ");
+
+        auto opid_str
+            = this->fos_log_helper.ldh_line_values.lvv_opid_value.value();
+        opid_al.append(opid_str);
+        switch (this->fos_log_helper.ldh_line_values.lvv_opid_provenance) {
+            case logline_value_vector::opid_provenance::none:
+                break;
+            case logline_value_vector::opid_provenance::file:
+                opid_al.append(" (extracted from log message)"_comment);
+                break;
+            case logline_value_vector::opid_provenance::user:
+                opid_al.append(" (user-provided)"_comment);
+                break;
+        }
+        this->fos_row_to_field_meta.emplace(this->fos_lines.size(),
+                                            row_info{std::nullopt, opid_str});
+        this->fos_lines.emplace_back(opid_al);
+    }
+
+    this->build_search_lines(lv, row);
 
     if (this->fos_log_helper.ldh_line_values.lvv_values.empty()) {
         this->fos_lines.emplace_back(" No known message fields");
@@ -280,16 +531,21 @@ field_overlay_source::build_field_lines(const listview_curses& lv)
 
     const log_format* last_format = nullptr;
 
-    for (auto& lv : this->fos_log_helper.ldh_line_values.lvv_values) {
-        if (!lv.lv_meta.lvm_format) {
+    for (const auto& lv : this->fos_log_helper.ldh_line_values.lvv_values) {
+        const auto& meta = lv.lv_meta;
+        if (!meta.lvm_format) {
             continue;
         }
 
-        auto* curr_format = lv.lv_meta.lvm_format.value();
+        if (!meta.lvm_column.is<logline_value_meta::table_column>()) {
+            continue;
+        }
+
+        auto* curr_format = meta.lvm_format.value();
         auto* curr_elf = dynamic_cast<external_log_format*>(curr_format);
         const auto format_name = curr_format->get_name().to_string();
         attr_line_t al;
-        std::string str, value_str = lv.to_string();
+        auto value_str = lv.to_humanized_string();
 
         if (curr_format != last_format) {
             this->fos_lines.emplace_back(" Known message fields for table "
@@ -297,91 +553,227 @@ field_overlay_source::build_field_lines(const listview_curses& lv)
             this->fos_lines.back().with_attr(
                 string_attr(line_range(32, 32 + format_name.length()),
                             VC_STYLE.value(vc.attrs_for_ident(format_name)
-                                           | text_attrs{A_BOLD})));
+                                           | text_attrs::style::bold)));
             last_format = curr_format;
         }
 
         std::string field_name, orig_field_name;
-        if (lv.lv_meta.lvm_struct_name.empty()) {
-            if (curr_elf && curr_elf->elf_body_field == lv.lv_meta.lvm_name) {
+        line_range hl_range;
+        size_t prefix_len = 0;
+        al.append(" ").append("|", VC_GRAPHIC.value(NCACS_LTEE)).append(" ");
+        if (meta.lvm_struct_name.empty()) {
+            if (curr_elf && curr_elf->elf_body_field == meta.lvm_name) {
                 field_name = LOG_BODY;
             } else if (curr_elf
-                       && curr_elf->lf_timestamp_field == lv.lv_meta.lvm_name)
+                       && curr_elf->lf_timestamp_field == meta.lvm_name)
             {
                 field_name = LOG_TIME;
             } else {
-                field_name = lv.lv_meta.lvm_name.to_string();
+                field_name = meta.lvm_name.to_string();
             }
             orig_field_name = field_name;
             if (!this->fos_contexts.empty()) {
                 field_name = this->fos_contexts.top().c_prefix + field_name;
             }
-            str = "   " + field_name;
-        } else {
-            auto_mem<char, sqlite3_free> jgetter;
+            if (meta.is_hidden()) {
+                al.append("\u25c7"_comment);
+            } else {
+                al.append("\u25c6"_ok);
+            }
+            al.append(" ");
 
-            jgetter = sqlite3_mprintf("   jget(%s, '/%q')",
-                                      lv.lv_meta.lvm_struct_name.get(),
-                                      lv.lv_meta.lvm_name.get());
-            str = jgetter;
+            switch (meta.to_chart_type()) {
+                case chart_type_t::none:
+                    al.append("   ");
+                    break;
+                case chart_type_t::hist:
+                case chart_type_t::spectro:
+                    al.append(":bar_chart:"_emoji).append(" ");
+                    break;
+            }
+            prefix_len = al.column_width() + this->fos_known_key_size;
+            hl_range.lr_start = al.get_string().length();
+            al.append(field_name);
+            hl_range.lr_end = al.get_string().length();
+            al.pad_to(prefix_len);
+
+            this->fos_row_to_field_meta.emplace(this->fos_lines.size(),
+                                                row_info{meta, value_str});
+        } else {
+            auto jget_str = lnav::sql::mprintf("jget(%s, '/%q')",
+                                               meta.lvm_struct_name.get(),
+                                               meta.lvm_name.get());
+            hl_range.lr_start = al.get_string().length();
+            al.append(jget_str.in());
+            prefix_len = al.column_width();
+            hl_range.lr_end = al.get_string().length();
+
+            this->fos_row_to_field_meta.emplace(
+                this->fos_lines.size(), row_info{std::nullopt, value_str});
         }
-        str.append(this->fos_known_key_size - (str.length() - 3), ' ');
-        str += " = " + value_str;
+        readline_sql_highlighter_int(
+            al, lnav::sql::dialect::sqlite, std::nullopt, hl_range);
 
-        al.with_string(str);
-        if (lv.lv_meta.lvm_struct_name.empty()) {
-            auto prefix_len = field_name.length() - orig_field_name.length();
-            al.with_attr(string_attr(
-                line_range(3 + prefix_len, 3 + prefix_len + field_name.size()),
-                VC_STYLE.value(vc.attrs_for_ident(orig_field_name))));
-        } else {
-            al.with_attr(string_attr(
-                line_range(8, 8 + lv.lv_meta.lvm_struct_name.size()),
-                VC_STYLE.value(
-                    vc.attrs_for_ident(lv.lv_meta.lvm_struct_name))));
+        if (meta.lvm_kind == value_kind_t::VALUE_TIMESTAMP) {
+            auto dts = curr_format->build_time_scanner(
+                this->fos_log_helper.ldh_file->get_time_scanner());
+            exttm tm;
+            timeval tv;
+
+            if (dts.scan(value_str.c_str(),
+                         value_str.size(),
+                         curr_format->get_timestamp_formats(),
+                         &tm,
+                         tv,
+                         true))
+            {
+                char ts[64];
+                tm.et_gmtoff = tm.et_orig_gmtoff;
+                auto len = dts.ftime(
+                    ts, sizeof(ts), curr_format->get_timestamp_formats(), tm);
+                ts[len] = '\0';
+                value_str = ts;
+            }
+        }
+
+        al.append(" = ").append(scrub_ws(value_str.c_str()));
+
+        // Per-column stats summary: numeric columns get a min..max
+        // range and total count; text columns get an HLL-estimated
+        // distinct count.  Both render in the column's unit if one is
+        // declared, mirroring the value's own formatting above.
+        const logline_value_stats* stats = nullptr;
+        const auto* curr_lf = this->fos_log_helper.ldh_file.get();
+        if (curr_lf != nullptr) {
+            stats = curr_lf->stats_for_value(meta.lvm_name);
+        }
+
+        if (stats != nullptr) {
+            std::string summary;
+            if (stats->lvs_count > 0) {
+                summary
+                    = fmt::format(FMT_STRING("  {}..{} of {:L}"),
+                                  meta.to_humanized_value(stats->lvs_min_value),
+                                  meta.to_humanized_value(stats->lvs_max_value),
+                                  stats->lvs_count);
+            } else if (auto est = stats->distinct_estimate(); est) {
+                summary = fmt::format(FMT_STRING("  ~{:L} distinct of {:L}"),
+                                      std::llround(est.value()),
+                                      stats->lvs_text_count);
+            }
+            if (!summary.empty()) {
+                al.append(attr_line_t(summary).with_attr_for_all(
+                    VC_ROLE.value(role_t::VCR_COMMENT)));
+            }
         }
 
         this->fos_lines.emplace_back(al);
-        this->add_key_line_attrs(this->fos_known_key_size);
 
-        if (lv.lv_meta.lvm_kind == value_kind_t::VALUE_STRUCT) {
+        // Numeric percentile sub-line: typical / tail / extreme.
+        // Suppressed when the sample is too small to be statistically
+        // meaningful, when the distribution is degenerate (single
+        // value), or when the upper percentiles all collapse to the
+        // max — in those cases the inline `min..max of N` already
+        // tells the whole story.
+        if (stats != nullptr && stats->lvs_tdigest && stats->lvs_count >= 20
+            && stats->lvs_min_value < stats->lvs_max_value)
+        {
+            const auto p50 = stats->lvs_tdigest->quantile(50);
+            const auto p90 = stats->lvs_tdigest->quantile(90);
+            const auto p99 = stats->lvs_tdigest->quantile(99);
+            if (!(p50 == p99 && p99 == stats->lvs_max_value)) {
+                attr_line_t pct_line;
+                pct_line.append("    ")
+                    .with_attr(string_attr(line_range{1, 2},
+                                           VC_GRAPHIC.value(NCACS_VLINE)))
+                    .with_attr(string_attr(line_range{1, 2},
+                                           VC_ROLE.value(role_t::VCR_COMMENT)))
+                    .pad_to(prefix_len + 5)
+                    .append(fmt::format(FMT_STRING("p50={}  p90={}  p99={}"),
+                                        meta.to_humanized_value(p50),
+                                        meta.to_humanized_value(p90),
+                                        meta.to_humanized_value(p99)));
+                pct_line.with_attr_for_all(VC_ROLE.value(role_t::VCR_COMMENT));
+                this->fos_lines.emplace_back(pct_line);
+            }
+        }
+
+        if (meta.lvm_kind == value_kind_t::VALUE_STRUCT) {
             json_string js = extract(value_str.c_str());
 
             al.clear()
                 .append("   extract(")
-                .append(lv.lv_meta.lvm_name.get(),
-                        VC_STYLE.value(vc.attrs_for_ident(lv.lv_meta.lvm_name)))
+                .append(meta.lvm_name.get(),
+                        VC_STYLE.value(vc.attrs_for_ident(meta.lvm_name)))
                 .append(")")
-                .append(this->fos_known_key_size - lv.lv_meta.lvm_name.size()
-                            - 9 + 3,
+                .append(this->fos_known_key_size - meta.lvm_name.size() - 9 + 3,
                         ' ')
                 .append(" = ")
-                .append(
-                    string_fragment::from_bytes(js.js_content.in(), js.js_len));
+                .append(scrub_ws(string_fragment::from_bytes(js.js_content.in(),
+                                                             js.js_len)));
             this->fos_lines.emplace_back(al);
             this->add_key_line_attrs(this->fos_known_key_size);
         }
     }
 
-    std::map<const intern_string_t, json_ptr_walk::walk_list_t>::iterator
-        json_iter;
-
-    if (!this->fos_log_helper.ldh_json_pairs.empty()) {
-        this->fos_lines.emplace_back(" JSON fields:");
+    if (!this->fos_log_helper.ldh_extra_json.empty()
+        || !this->fos_log_helper.ldh_json_pairs.empty())
+    {
+        auto read_res = this->fos_log_helper.ldh_file->read_raw_message(
+            this->fos_log_helper.ldh_line);
+        if (read_res.isOk()) {
+            auto sbr = read_res.unwrap();
+            this->fos_row_to_field_meta.emplace(this->fos_lines.size(),
+                                                row_info{
+                                                    std::nullopt,
+                                                    to_string(sbr),
+                                                });
+        }
+        this->fos_lines.emplace_back(
+            attr_line_t(" JSON fields: ")
+                .append("(press 'c' to copy raw JSON log message)"_comment));
     }
 
-    for (json_iter = this->fos_log_helper.ldh_json_pairs.begin();
-         json_iter != this->fos_log_helper.ldh_json_pairs.end();
-         ++json_iter)
-    {
-        json_ptr_walk::walk_list_t& jpairs = json_iter->second;
+    for (const auto& extra_pair : this->fos_log_helper.ldh_extra_json) {
+        auto qname = lnav::sql::mprintf("%Q", extra_pair.first.c_str());
+        auto key_line = attr_line_t("   jget(")
+                            .append(extra_pair.second.first)
+                            .append(", ")
+                            .append(qname.in())
+                            .append(")")
+                            .move();
+        readline_sql_highlighter(
+            key_line, lnav::sql::dialect::sqlite, std::nullopt);
+        auto key_size = key_line.length();
+        key_line.append(" = ").append(scrub_ws(extra_pair.second.second));
+        this->fos_row_to_field_meta.emplace(this->fos_lines.size(),
+                                            row_info{
+                                                std::nullopt,
+                                                extra_pair.second.second,
+                                            });
+        this->fos_lines.emplace_back(key_line);
+        this->add_key_line_attrs(key_size - 3);
+    }
 
-        for (size_t lpc = 0; lpc < jpairs.size(); lpc++) {
-            this->fos_lines.emplace_back(
-                "   "
-                + this->fos_log_helper.format_json_getter(json_iter->first, lpc)
-                + " = " + jpairs[lpc].wt_value);
-            this->add_key_line_attrs(0);
+    for (const auto& jpairs_map : this->fos_log_helper.ldh_json_pairs) {
+        const auto& jpairs = jpairs_map.second;
+
+        for (size_t lpc = 0; lpc < jpairs.jwc_values.size(); lpc++) {
+            auto key_line = attr_line_t("   ")
+                                .append(this->fos_log_helper.format_json_getter(
+                                    jpairs_map.first, lpc))
+                                .move();
+            readline_sql_highlighter(
+                key_line, lnav::sql::dialect::sqlite, std::nullopt);
+            auto key_size = key_line.length();
+            key_line.append(" = ").append(
+                scrub_ws(fmt::to_string(jpairs.jwc_values[lpc].second)));
+            this->fos_row_to_field_meta.emplace(
+                this->fos_lines.size(),
+                row_info{std::nullopt,
+                         fmt::to_string(jpairs.jwc_values[lpc].second)});
+            this->fos_lines.emplace_back(key_line);
+            this->add_key_line_attrs(key_size - 3);
         }
     }
 
@@ -390,28 +782,91 @@ field_overlay_source::build_field_lines(const listview_curses& lv)
     }
 
     for (const auto& xml_pair : this->fos_log_helper.ldh_xml_pairs) {
-        auto_mem<char, sqlite3_free> qname;
-        auto_mem<char, sqlite3_free> xp_call;
+        auto qname = sql_quote_ident(xml_pair.first.first.get());
+        auto xp_call = lnav::sql::mprintf(
+            "xpath(%Q, %s.%s)",
+            xml_pair.first.second.c_str(),
+            this->fos_log_helper.ldh_file->get_format()->get_name().c_str(),
+            qname.in());
+        auto key_line = attr_line_t("   ").append(xp_call.in()).move();
+        readline_sql_highlighter(
+            key_line, lnav::sql::dialect::sqlite, std::nullopt);
+        auto key_size = key_line.length();
+        key_line.append(" = ").append(scrub_ws(xml_pair.second));
+        this->fos_row_to_field_meta.emplace(
+            this->fos_lines.size(), row_info{std::nullopt, xml_pair.second});
+        this->fos_lines.emplace_back(key_line);
+        this->add_key_line_attrs(key_size - 3);
+    }
 
-        qname = sql_quote_ident(xml_pair.first.first.get());
-        xp_call = sqlite3_mprintf(
-            "xpath(%Q, %s)", xml_pair.first.second.c_str(), qname.in());
+    if (this->fos_log_helper.ldh_src_ref) {
+        auto src_link
+            = attr_line_t()
+                  .append(lnav::roles::file(
+                      this->fos_log_helper.ldh_src_ref->sr_path.string()))
+                  .append(":")
+                  .append(lnav::roles::number(fmt::to_string(
+                      this->fos_log_helper.ldh_src_ref->sr_line_number)));
+        auto_mem<char> src_href(curl_free);
+        {
+            auto frag
+                = fmt::format(FMT_STRING("L{}"),
+                              this->fos_log_helper.ldh_src_ref->sr_line_number);
+            auto_mem<CURLU> cu(curl_url_cleanup);
+            cu = curl_url();
+
+            curl_url_set(cu, CURLUPART_SCHEME, "file", CURLU_URLENCODE);
+            curl_url_set(cu,
+                         CURLUPART_PATH,
+                         this->fos_log_helper.ldh_src_ref->sr_path.c_str(),
+                         CURLU_URLENCODE);
+            curl_url_set(cu, CURLUPART_FRAGMENT, frag.c_str(), CURLU_URLENCODE);
+            curl_url_get(cu, CURLUPART_URL, src_href.out(), 0);
+        }
+        auto src_link_with_href = attr_line_t().append(
+            lnav::string::attrs::href(src_link, src_href.in()));
         this->fos_lines.emplace_back(
-            fmt::format(FMT_STRING("   {} = {}"), xp_call, xml_pair.second));
-        this->add_key_line_attrs(0);
-    }
-
-    if (!this->fos_contexts.empty()
-        && !this->fos_contexts.top().c_show_discovered)
+            attr_line_t(" Variables from ")
+                .append(lnav::roles::hyperlink(src_link_with_href)));
+        for (const auto& [name, value] : this->fos_log_helper.ldh_src_vars) {
+            attr_line_t pretty_value;
+            data_scanner ds(value);
+            pretty_printer pp(&ds, string_attrs_t{});
+            pp.append_to(pretty_value);
+            auto tf_opt = detect_text_format(value);
+            if (tf_opt) {
+                highlight_syntax(tf_opt.value(), pretty_value, std::nullopt);
+            }
+            auto pretty_lines = pretty_value.rtrim().split_lines();
+            auto prefix = attr_line_t("   ")
+                              .append(lnav::roles::variable(name))
+                              .append(" = ");
+            if (pretty_lines.size() == 1) {
+                pretty_lines[0].insert(0, prefix);
+            } else {
+                pretty_lines.insert(pretty_lines.begin(), prefix);
+            }
+            for (size_t lpc = 0; lpc < pretty_lines.size(); lpc++) {
+                if (lpc > 0) {
+                    pretty_lines[lpc].insert(0, "     ");
+                }
+                this->fos_row_to_field_meta.emplace(this->fos_lines.size(),
+                                                    row_info{
+                                                        std::nullopt,
+                                                        value,
+                                                    });
+                this->fos_lines.emplace_back(pretty_lines[lpc]);
+            }
+        }
+    } else if (!this->fos_log_helper.ldh_parser
+               || this->fos_log_helper.ldh_parser->dp_pairs.empty())
     {
-        return;
-    }
-
-    if (this->fos_log_helper.ldh_parser->dp_pairs.empty()) {
-        this->fos_lines.emplace_back(" No discovered message fields");
+        this->fos_lines.emplace_back(
+            attr_line_t(" ").append("No discovered message fields"_comment));
     } else {
         this->fos_lines.emplace_back(
-            " Discovered fields for logline table from message format: ");
+            " Discovered fields for logline table from message "
+            "format: ");
         this->fos_lines.back().with_attr(
             string_attr(line_range(23, 23 + 7),
                         VC_STYLE.value(vc.attrs_for_ident("logline"))));
@@ -419,27 +874,176 @@ field_overlay_source::build_field_lines(const listview_curses& lv)
         auto& disc_str = al.get_string();
 
         al.with_attr(string_attr(line_range(disc_str.length(), -1),
-                                 VC_STYLE.value(text_attrs{A_BOLD})));
+                                 VC_STYLE.value(text_attrs::with_bold())));
         disc_str.append(this->fos_log_helper.ldh_msg_format);
+
+        auto iter = this->fos_log_helper.ldh_parser->dp_pairs.begin();
+        for (size_t lpc = 0;
+             lpc < this->fos_log_helper.ldh_parser->dp_pairs.size();
+             lpc++, ++iter)
+        {
+            auto name = this->fos_log_helper.ldh_namer->cn_names[lpc];
+            auto val = this->fos_log_helper.ldh_parser->get_element_string(
+                iter->e_sub_elements->back());
+            attr_line_t al(fmt::format(FMT_STRING("   {} = {}"), name, val));
+
+            al.with_attr(string_attr(
+                line_range(3, 3 + name.length()),
+                VC_STYLE.value(vc.attrs_for_ident(name.to_string()))));
+
+            this->fos_row_to_field_meta.emplace(this->fos_lines.size(),
+                                                row_info{std::nullopt, val});
+            this->fos_lines.emplace_back(al);
+            this->add_key_line_attrs(
+                this->fos_unknown_key_size,
+                lpc == (this->fos_log_helper.ldh_parser->dp_pairs.size() - 1));
+        }
     }
 
-    auto iter = this->fos_log_helper.ldh_parser->dp_pairs.begin();
-    for (size_t lpc = 0; lpc < this->fos_log_helper.ldh_parser->dp_pairs.size();
-         lpc++, ++iter)
+    std::set<std::string> matching_tables;
+    for (const auto& [name_sf, vt] : *vtab_manager) {
+        if (vt->matches(this->fos_log_helper.ldh_line_values)) {
+            matching_tables.emplace(name_sf.to_string());
+        }
+    }
+    if (!matching_tables.empty()) {
+        this->fos_lines.emplace_back(
+            attr_line_t()
+                .append(
+                    matching_tables.size() == 1
+                        ? " The following SQL table contains this line: "_comment
+                        : " The following SQL tables contains this line: "_comment)
+                .join(matching_tables,
+                      VC_ROLE.value(role_t::VCR_VARIABLE),
+                      ", "));
+    }
+}
+
+void
+field_overlay_source::build_search_lines(const listview_curses& lv,
+                                         vis_line_t row)
+{
+    static constexpr size_t MAX_MATCH_TEXTS = 5;
+
+    const auto* tc = dynamic_cast<const textview_curses*>(&lv);
+
+    if (tc == nullptr || tc->get_named_searches().empty()) {
+        return;
+    }
+
+    // A message that spans several lines belongs to a search when any of its
+    // lines match, so the whole extent has to be tested.  The hit may well be
+    // on a continuation line rather than the first one.
+    auto msg_lines = 1_vl;
+    for (auto next = std::next(this->fos_log_helper.ldh_line);
+         next != this->fos_log_helper.ldh_file->end() && next->is_continued();
+         ++next)
     {
-        auto name = this->fos_log_helper.ldh_namer->cn_names[lpc];
-        auto val = this->fos_log_helper.ldh_parser->get_element_string(
-            iter->e_sub_elements->back());
-        attr_line_t al(fmt::format(FMT_STRING("   {} = {}"), name, val));
+        msg_lines += 1_vl;
+    }
 
+    auto matches = tc->named_search_matches(row, row + msg_lines);
+    if (matches == 0) {
+        return;
+    }
+
+    struct search_row {
+        const textview_curses::named_search* sr_search;
+        attr_line_t sr_value;
+        std::string sr_copy_value;
+    };
+
+    // The search machinery works on the rendered view lines while this panel
+    // only has the message text, so a search can be marked here without the
+    // pattern finding anything to show.  The name is still listed: the panel
+    // must not disagree with the search marks.
+    const auto& msg_str = this->fos_log_helper.ldh_attr_line.al_string;
+    const auto msg_sf = string_fragment::from_str_range(
+        msg_str, 0, std::min(size_t{8192}, msg_str.size()));
+    std::vector<search_row> rows;
+    size_t name_size = 0;
+
+    for (const auto& ns : tc->get_named_searches()) {
+        if (!(matches & grep_pattern_bit(ns.ns_slot))) {
+            continue;
+        }
+
+        std::vector<std::string> texts;
+        auto truncated = false;
+        if (ns.ns_code != nullptr && msg_sf.is_valid()) {
+            ns.ns_code->capture_from(msg_sf).for_each<PCRE2_NO_UTF_CHECK>(
+                [&texts, &truncated](lnav::pcre2pp::match_data& md) {
+                    auto text = md[0]->to_string();
+
+                    if (std::find(texts.begin(), texts.end(), text)
+                        != texts.end())
+                    {
+                        return;
+                    }
+                    if (texts.size() == MAX_MATCH_TEXTS) {
+                        truncated = true;
+                        return;
+                    }
+                    texts.emplace_back(text);
+                });
+        }
+
+        attr_line_t value_al;
+        std::string copy_value;
+        if (texts.empty()) {
+            value_al.append("(matched elsewhere in the line)"_comment);
+        } else {
+            for (const auto& text : texts) {
+                if (!copy_value.empty()) {
+                    value_al.append(", ");
+                    copy_value.append(", ");
+                }
+                auto scrubbed = scrub_ws(text);
+                value_al.append(scrubbed);
+                copy_value.append(scrubbed);
+            }
+            if (truncated) {
+                value_al.append(" …"_comment);
+            }
+        }
+
+        name_size = std::max(name_size, ns.ns_name.size());
+        rows.emplace_back(search_row{&ns, value_al, copy_value});
+    }
+
+    this->fos_lines.emplace_back(" Searches:");
+
+    for (size_t lpc = 0; lpc < rows.size(); lpc++) {
+        const auto& sr = rows[lpc];
+        const auto* graphic = (lpc == rows.size() - 1) ? NCACS_LLCORNER
+                                                       : NCACS_LTEE;
+        // The prefix is all ASCII apart from the icon, which reserves two
+        // spaces, so byte offsets and column widths agree here.
+        auto al = attr_line_t(" ")
+                      .append("|", VC_GRAPHIC.value(graphic))
+                      .append(" ")
+                      .append(ui_icon_t::search)
+                      .append(" ");
+        auto name_start = al.get_string().length();
+        al.append(sr.sr_search->ns_name);
+        auto name_end = al.get_string().length();
+
+        // The name is drawn in the color the search picked for itself, which
+        // ties this row to the highlighting of the matched text out in the log
+        // message.  It goes in the foreground rather than the background used
+        // out there: the readable() pass that keeps highlighted text legible
+        // only has something to work with when the text has a foreground of
+        // its own, which these overlay rows do not.
         al.with_attr(
-            string_attr(line_range(3, 3 + name.length()),
-                        VC_STYLE.value(vc.attrs_for_ident(name.to_string()))));
+            string_attr(line_range{(int) name_start, (int) name_end},
+                        VC_STYLE.value(view_colors::singleton().attrs_for_ident(
+                            sr.sr_search->ns_name))));
 
+        al.pad_to(name_start + name_size).append(" = ").append(sr.sr_value);
+
+        this->fos_row_to_field_meta.emplace(
+            this->fos_lines.size(), row_info{std::nullopt, sr.sr_copy_value});
         this->fos_lines.emplace_back(al);
-        this->add_key_line_attrs(
-            this->fos_unknown_key_size,
-            lpc == (this->fos_log_helper.ldh_parser->dp_pairs.size() - 1));
     }
 }
 
@@ -450,19 +1054,102 @@ field_overlay_source::build_meta_line(const listview_curses& lv,
 {
     auto line_meta_opt = this->fos_lss.find_bookmark_metadata(row);
 
+    if (!this->fos_contexts.empty()
+        && this->fos_contexts.top().c_show_applicable_annotations)
+    {
+        if (this->fos_index_generation != this->fos_lss.lss_index_generation) {
+            this->fos_anno_cache.clear();
+            this->fos_index_generation = this->fos_lss.lss_index_generation;
+        }
+
+        auto file_and_line = this->fos_lss.find_line_with_file(row);
+
+        if (file_and_line && !file_and_line->second->is_continued()) {
+            auto get_res = this->fos_anno_cache.get(row);
+            if (get_res) {
+                auto anno_val = get_res.value();
+                if (anno_val) {
+                    dst.emplace_back(anno_val.value());
+                }
+            } else {
+                auto applicable_anno = lnav::log::annotate::applicable(row);
+                if (!applicable_anno.empty()
+                    && (!line_meta_opt
+                        || line_meta_opt.value()
+                               ->bm_annotations.la_pairs.empty()))
+                {
+                    auto anno_msg
+                        = attr_line_t(" ")
+                              .append(":memo:"_emoji)
+                              .append(" Annotations available, ")
+                              .append(lv.get_selection() == row
+                                          ? "use "
+                                          : "focus on this line and use ")
+                              .append(":annotate"_quoted_code)
+                              .append(" to apply them")
+                              .append(lv.get_selection() == row
+                                          ? " to this line"
+                                          : "")
+                              .with_attr_for_all(
+                                  VC_ROLE.value(role_t::VCR_COMMENT))
+                              .move();
+
+                    this->fos_anno_cache.put(row, anno_msg);
+                    dst.emplace_back(anno_msg);
+                } else {
+                    this->fos_anno_cache.put(row, std::nullopt);
+                }
+            }
+        }
+    }
+
     if (!line_meta_opt) {
         return;
     }
+    const auto* tc = dynamic_cast<const textview_curses*>(&lv);
     auto& vc = view_colors::singleton();
     const auto& line_meta = *(line_meta_opt.value());
     size_t filename_width = this->fos_lss.get_filename_offset();
-    const auto* tc = dynamic_cast<const textview_curses*>(&lv);
+
+    auto file_and_line = this->fos_lss.find_line_with_file(row);
+    if (!file_and_line) {
+        return;
+    }
+    auto* format = file_and_line->first->get_format_ptr();
+    auto field_states = format->get_field_states();
+    auto show_opid = false;
+    auto field_iter = field_states.find(log_format::LOG_OPID_STR);
+    if (field_iter != field_states.end() && !field_iter->second.is_hidden()) {
+        show_opid = true;
+    }
+    if (row == tc->get_selection() && !this->fos_contexts.empty()
+        && this->fos_contexts.top().c_show)
+    {
+        show_opid = true;
+    }
+    if (show_opid && !line_meta.bm_opid.empty()) {
+        auto al = attr_line_t()
+                      .append(" Op ID: "_table_header)
+                      .append(lnav::roles::identifier(line_meta.bm_opid))
+                      .move();
+
+        dst.emplace_back(al);
+    }
 
     if (!line_meta.bm_comment.empty()) {
         const auto* lead = line_meta.bm_tags.empty() ? " \u2514 " : " \u251c ";
         md2attr_line mdal;
         attr_line_t al;
 
+        auto comment_id = intern_string::lookup(fmt::format(
+            FMT_STRING("{}-line{}-comment"),
+            file_and_line->first->get_filename().filename().string(),
+            std::distance(file_and_line->first->begin(),
+                          file_and_line->second)));
+        mdal.with_source_id(comment_id);
+        if (tc->tc_interactive) {
+            mdal.add_lnav_script_icons();
+        }
         auto parse_res = md4cpp::parse(line_meta.bm_comment, mdal);
         if (parse_res.isOk()) {
             al = parse_res.unwrap();
@@ -474,6 +1161,9 @@ field_overlay_source::build_meta_line(const listview_curses& lv,
         }
 
         auto comment_lines = al.rtrim().split_lines();
+        if (comment_lines.back().empty()) {
+            comment_lines.pop_back();
+        }
         for (size_t lpc = 0; lpc < comment_lines.size(); lpc++) {
             auto& comment_line = comment_lines[lpc];
 
@@ -485,11 +1175,12 @@ field_overlay_source::build_meta_line(const listview_curses& lv,
                 0, lpc == comment_lines.size() - 1 ? lead : " \u2502 ");
             comment_line.insert(0, filename_width, ' ');
             if (tc != nullptr) {
-                auto hl = tc->get_highlights();
+                const auto& hl = tc->get_highlights();
                 auto hl_iter = hl.find({highlight_source_t::PREVIEW, "search"});
 
                 if (hl_iter != hl.end()) {
-                    hl_iter->second.annotate(comment_line, filename_width);
+                    hl_iter->second.annotate(comment_line,
+                                             line_range{(int) filename_width});
                 }
             }
 
@@ -500,75 +1191,449 @@ field_overlay_source::build_meta_line(const listview_curses& lv,
         attr_line_t al;
 
         al.with_string(" \u2514");
-        for (const auto& str : line_meta.bm_tags) {
-            al.append(1, ' ').append(str,
-                                     VC_STYLE.value(vc.attrs_for_ident(str)));
+        for (const auto& entry : line_meta.bm_tags) {
+            al.append(1, ' ').append(
+                entry.te_tag, VC_STYLE.value(vc.attrs_for_ident(entry.te_tag)));
         }
 
-        if (tc != nullptr) {
-            const auto& hm = tc->get_highlights();
-            auto hl_iter = hm.find({highlight_source_t::PREVIEW, "search"});
-
-            if (hl_iter != hm.end()) {
-                hl_iter->second.annotate(al, 2);
-            }
-        }
         al.insert(0, filename_width, ' ');
         if (tc != nullptr) {
-            auto hl = tc->get_highlights();
+            const auto& hl = tc->get_highlights();
             auto hl_iter = hl.find({highlight_source_t::PREVIEW, "search"});
 
             if (hl_iter != hl.end()) {
-                hl_iter->second.annotate(al, filename_width);
+                hl_iter->second.annotate(al, line_range{(int) filename_width});
             }
         }
         dst.emplace_back(al);
+    }
+    if (!line_meta.bm_annotations.la_pairs.empty()) {
+        for (const auto& anno_pair : line_meta.bm_annotations.la_pairs) {
+            attr_line_t al;
+            md2attr_line mdal;
+
+            mdal.add_lnav_script_icons();
+            dst.push_back(
+                attr_line_t()
+                    .append(filename_width, ' ')
+                    .appendf(FMT_STRING(" \u251c {}:"), anno_pair.first)
+                    .with_attr_for_all(VC_ROLE.value(role_t::VCR_COMMENT)));
+
+            auto parse_res = md4cpp::parse(anno_pair.second, mdal);
+            if (parse_res.isOk()) {
+                al.append(parse_res.unwrap());
+            } else {
+                log_error("%d: cannot convert annotation to markdown: %s",
+                          (int) row,
+                          parse_res.unwrapErr().c_str());
+                al.append(anno_pair.second);
+            }
+
+            auto anno_lines = al.rtrim().split_lines();
+            if (anno_lines.back().empty()) {
+                anno_lines.pop_back();
+            }
+            for (size_t lpc = 0; lpc < anno_lines.size(); lpc++) {
+                auto& anno_line = anno_lines[lpc];
+
+                if (lpc == 0 && anno_line.empty()) {
+                    continue;
+                }
+                // anno_line.with_attr_for_all(VC_ROLE.value(role_t::VCR_COMMENT));
+                anno_line.insert(0,
+                                 lpc == anno_lines.size() - 1
+                                     ? " \u2570 "_comment
+                                     : " \u2502 "_comment);
+                anno_line.insert(0, filename_width, ' ');
+                if (tc != nullptr) {
+                    const auto& hl = tc->get_highlights();
+                    auto hl_iter
+                        = hl.find({highlight_source_t::PREVIEW, "search"});
+
+                    if (hl_iter != hl.end()) {
+                        hl_iter->second.annotate(
+                            anno_line, line_range{(int) filename_width});
+                    }
+                }
+
+                dst.emplace_back(anno_line);
+            }
+        }
     }
 }
 
 void
 field_overlay_source::add_key_line_attrs(int key_size, bool last_line)
 {
-    string_attrs_t& sa = this->fos_lines.back().get_attrs();
-    struct line_range lr(1, 2);
-    int64_t graphic = (int64_t) (last_line ? ACS_LLCORNER : ACS_LTEE);
+    auto& sa = this->fos_lines.back().get_attrs();
+    auto lr = line_range{1, 2};
+
+    const auto* graphic = (last_line ? NCACS_LLCORNER : NCACS_LTEE);
     sa.emplace_back(lr, VC_GRAPHIC.value(graphic));
 
     lr.lr_start = 3 + key_size + 3;
     lr.lr_end = -1;
-    sa.emplace_back(lr, VC_STYLE.value(text_attrs{A_BOLD}));
+    sa.emplace_back(lr, VC_STYLE.value(text_attrs::with_bold()));
+}
+
+void
+field_overlay_source::reset()
+{
+    this->fos_anno_cache.clear();
+    this->fos_static_lines.clear();
+    this->fos_lines.clear();
+    this->fos_meta_lines.clear();
+}
+
+void
+field_overlay_source::list_value_for_overlay(
+    const listview_curses& lv,
+    vis_line_t row,
+    std::vector<attr_line_t>& value_out)
+{
+    auto line_pair_opt = this->fos_lss.find_line_with_file(row);
+    if (row == lv.get_selection()
+        || (line_pair_opt && line_pair_opt->second->has_ansi()))
+    {
+        this->build_field_lines(lv, row);
+        value_out = this->fos_lines;
+    }
+    this->build_meta_line(lv, value_out, row);
+}
+
+static void
+apply_status_attrs(std::vector<attr_line_t>& lines)
+{
+    for (auto& al : lines) {
+        al.with_attr_for_all(VC_ROLE.value(role_t::VCR_STATUS));
+    }
+    lines.back().with_attr_for_all(
+        VC_STYLE.value(text_attrs::with_underline()));
 }
 
 bool
-field_overlay_source::list_value_for_overlay(const listview_curses& lv,
-                                             int y,
-                                             int bottom,
-                                             vis_line_t row,
-                                             attr_line_t& value_out)
+field_overlay_source::list_static_overlay(const listview_curses& lv,
+                                          media_t media,
+                                          int y,
+                                          int bottom,
+                                          attr_line_t& value_out)
 {
-    if (y == 0) {
-        this->build_field_lines(lv);
+    auto& exec_phase = injector::get<lnav::exec_phase&>();
+    if (media != media_t::display) {
+        auto& tc
+            = dynamic_cast<textview_curses&>(const_cast<listview_curses&>(lv));
+        const auto& sticky_bv = tc.get_bookmarks()[&textview_curses::BM_STICKY];
+        if (!sticky_bv.empty()) {
+            auto top = lv.get_top();
+            int sticky_index = 0;
+            for (auto iter = sticky_bv.bv_tree.begin();
+                 iter != sticky_bv.bv_tree.end();
+                 ++iter)
+            {
+                if (*iter >= top) {
+                    break;
+                }
+                if (y == sticky_index) {
+                    tc.textview_value_for_row(*iter, value_out);
+                    value_out.with_attr_for_all(
+                        VC_ROLE.value(role_t::VCR_STATUS));
+                    auto next_iter = std::next(iter);
+                    if (next_iter == sticky_bv.bv_tree.end()
+                        || *next_iter >= top)
+                    {
+                        value_out.with_attr_for_all(
+                            VC_STYLE.value(text_attrs::with_underline()));
+                    }
+                    return true;
+                }
+                sticky_index++;
+            }
+        }
         return false;
     }
 
-    if (1 <= y && y <= (int) this->fos_lines.size()) {
-        value_out = this->fos_lines[y - 1];
-        return true;
+    const std::vector<attr_line_t>* lines = nullptr;
+    if (exec_phase.spinning_up() && this->fos_discovery_stats) {
+        if (y == 0) {
+            const auto scanning = !exec_phase.scan_completed();
+            const auto stats = this->fos_discovery_stats();
+            auto msg = lnav::console::user_message::info(
+                scanning ? attr_line_t("Discovering files... ")
+                               .append(lnav::roles::number(
+                                   fmt::to_string(stats.ds_files)))
+                               .append(" found so far")
+                         : attr_line_t("Files are being indexed..."));
+            auto counts = attr_line_t()
+                              .append(lnav::roles::number(
+                                  fmt::to_string(stats.ds_log_files)))
+                              .append(" log files, ")
+                              .append(lnav::roles::number(
+                                  fmt::to_string(stats.ds_text_files)))
+                              .append(" text files");
+            if (stats.ds_errors > 0) {
+                counts.append(", ")
+                    .append(
+                        lnav::roles::number(fmt::to_string(stats.ds_errors)))
+                    .append(" errors");
+            }
+            msg.with_note(counts);
+            if (!stats.ds_formats.empty()) {
+                auto formats = attr_line_t("formats: ");
+                for (size_t lpc = 0; lpc < stats.ds_formats.size(); lpc++) {
+                    const auto& [name, count] = stats.ds_formats[lpc];
+                    if (lpc > 0) {
+                        formats.append(", ");
+                    }
+                    formats.append(lnav::roles::symbol(name))
+                        .append(" ")
+                        .append(lnav::roles::number(fmt::to_string(count)));
+                }
+                msg.with_note(formats);
+            }
+            this->fos_static_lines = msg.to_attr_line().split_lines();
+            this->fos_static_lines_state.clear();
+            apply_status_attrs(this->fos_static_lines);
+        }
+        lines = &this->fos_static_lines;
+    } else if (this->fos_lss.text_line_count() == 0) {
+        if (this->fos_lss.is_indexing_in_progress()
+            || this->fos_lss.is_rebuild_forced())
+        {
+            auto msg = lnav::console::user_message::info(
+                "Log messages are being indexed...");
+            this->fos_static_lines = msg.to_attr_line().split_lines();
+            this->fos_static_lines_state.clear();
+        } else if (this->fos_lss.file_count() > 0) {
+            hasher h;
+            this->fos_lss.update_filter_hash_state(h);
+            auto curr_state = h.to_array();
+            if (this->fos_static_lines.empty()
+                || curr_state != this->fos_static_lines_state)
+            {
+                auto msg = lnav::console::user_message::info(
+                    "All log messages are currently hidden");
+                auto hidden_file_count = size_t{0};
+                for (const auto& ld : this->fos_lss) {
+                    if (ld->get_file_ptr() == nullptr) {
+                        continue;
+                    }
+                    if (!ld->is_visible()) {
+                        hidden_file_count += 1;
+                    }
+                }
+                if (hidden_file_count > 0) {
+                    msg.with_note(attr_line_t()
+                                      .append(lnav::roles::number(
+                                          fmt::to_string(hidden_file_count)))
+                                      .append(" file(s) are hidden"));
+                }
+                auto min_time = this->fos_lss.get_min_row_time();
+                if (min_time) {
+                    msg.with_note(attr_line_t("Logs before ")
+                                      .append_quoted(lnav::to_rfc3339_string(
+                                          min_time.value()))
+                                      .append(" are not being shown"));
+                }
+                auto max_time = this->fos_lss.get_max_row_time();
+                if (max_time) {
+                    msg.with_note(attr_line_t("Logs after ")
+                                      .append_quoted(lnav::to_rfc3339_string(
+                                          max_time.value()))
+                                      .append(" are not being shown"));
+                }
+                if (this->fos_lss.get_min_log_level()
+                    > log_level_t::LEVEL_UNKNOWN)
+                {
+                    msg.with_note(
+                        attr_line_t("Logs with a level below ")
+                            .append_quoted(
+                                level_names[this->fos_lss.get_min_log_level()])
+                            .append(" are not being shown"));
+                }
+                auto& fs = this->fos_lss.get_filters();
+                for (const auto& filt : fs) {
+                    auto hits = this->fos_lss.get_filtered_count_for(
+                        filt->get_index());
+                    if (filt->get_type() == text_filter::EXCLUDE && hits == 0) {
+                        continue;
+                    }
+                    auto cmd = attr_line_t(":" + filt->to_command());
+                    readline_command_highlighter(cmd, std::nullopt);
+                    msg.with_note(
+                        attr_line_t("Filter ")
+                            .append_quoted(cmd)
+                            .append(" matched ")
+                            .append(lnav::roles::number(fmt::to_string(hits)))
+                            .append(" message(s) "));
+                }
+                if (this->fos_lss.get_marked_only()) {
+                    msg.with_note(attr_line_t("The ")
+                                      .append_quoted(lnav::roles::keyword(
+                                          ":hide-unmarked-lines"))
+                                      .append(" command was used and no "
+                                              "unfiltered lines are marked"));
+                }
+                this->fos_static_lines = msg.to_attr_line().split_lines();
+                this->fos_static_lines_state = curr_state;
+            }
+
+        } else if (this->fos_tss.empty()) {
+            this->fos_static_lines = *lnav::messages::view::no_files();
+        } else {
+            this->fos_static_lines = *lnav::messages::view::only_text_files();
+        }
+        apply_status_attrs(this->fos_static_lines);
+        lines = &this->fos_static_lines;
+    } else if (y == 0) {
+        lines = &this->fos_static_lines;
+        auto top = lv.get_top();
+        if (top < vis_line_t(this->fos_lss.text_line_count())) {
+            auto cl = this->fos_lss.at(top);
+            auto& tc = dynamic_cast<textview_curses&>(
+                const_cast<listview_curses&>(lv));
+            auto has_sticky
+                = !tc.get_bookmarks()[&textview_curses::BM_STICKY].empty();
+            if (has_sticky || !this->fos_header_line
+                || this->fos_header_line.value() != cl
+                || !this->fos_header_line_context
+                || this->fos_header_line_context.value()
+                    != this->fos_lss.get_line_context()
+                || this->fos_header_has_time_offset
+                    != this->fos_lss.is_time_offset_enabled()
+                || this->fos_header_has_hidden_fields != tc.get_hide_fields()
+                || this->fos_header_has_time_preview
+                    != (this->fos_lss.ttt_preview_min_time.has_value()
+                        || this->fos_lss.ttt_preview_max_time.has_value()))
+            {
+                auto file_and_line_pair
+                    = this->fos_lss.find_line_with_file(top);
+                if (file_and_line_pair) {
+                    const auto& [lf, line] = file_and_line_pair.value();
+                    auto first_line = line;
+                    auto header_top = top;
+                    while (first_line->is_continued()) {
+                        --first_line;
+                        header_top -= 1_vl;
+                    }
+                    if (header_top == top) {
+                        header_top -= 1_vl;
+                    }
+                    this->fos_static_lines.clear();
+
+                    // Add sticky header lines that are above the viewport
+                    const auto& sticky_bv
+                        = tc.get_bookmarks()[&textview_curses::BM_STICKY];
+                    for (const auto& sticky_vl : sticky_bv.bv_tree) {
+                        if (sticky_vl >= top) {
+                            break;
+                        }
+                        auto al = attr_line_t();
+                        tc.textview_value_for_row(sticky_vl, al);
+                        this->fos_static_lines.emplace_back(al);
+                    }
+
+                    if (header_top < 0_vl) {
+                        auto al = attr_line_t();
+                        auto filtered_before
+                            = this->fos_lss.get_filtered_before();
+                        if (filtered_before > 0) {
+                            al.append(" ")
+                                .append(lnav::roles::number(
+                                    fmt::to_string(filtered_before)))
+                                .append(
+                                    " message(s) above here have been filtered "
+                                    "out");
+                        } else {
+                            al.append(" No messages above here");
+                        }
+                        al.with_attr_for_all(
+                            VC_STYLE.value(text_attrs::with_italic()));
+                        this->fos_static_lines.emplace_back(al);
+                        apply_status_attrs(this->fos_static_lines);
+                    } else {
+                        auto do_apply
+                            = (top - header_top) > 1 && line->is_continued();
+                        if (has_sticky && !do_apply
+                            && !this->fos_static_lines.empty())
+                        {
+                            apply_status_attrs(this->fos_static_lines);
+                        }
+                        auto al = attr_line_t();
+                        tc.textview_value_for_row(header_top, al);
+                        this->fos_static_lines.emplace_back(al);
+                        if (do_apply) {
+                            apply_status_attrs(this->fos_static_lines);
+                        }
+                    }
+                    this->fos_header_line = cl;
+                    this->fos_header_line_context
+                        = this->fos_lss.get_line_context();
+                    this->fos_header_has_time_offset
+                        = this->fos_lss.is_time_offset_enabled();
+                    this->fos_header_has_hidden_fields = tc.get_hide_fields();
+                    this->fos_header_has_time_preview
+                        = (this->fos_lss.ttt_preview_min_time.has_value()
+                           || this->fos_lss.ttt_preview_max_time.has_value());
+                }
+            }
+        } else {
+            this->fos_static_lines.resize(1);
+            this->fos_static_lines[0].clear();
+        }
+    } else {
+        lines = &this->fos_static_lines;
     }
 
-    if (!this->fos_meta_lines.empty() && this->fos_meta_lines_row == row - 1_vl)
-    {
-        value_out = this->fos_meta_lines.front();
-        this->fos_meta_lines.erase(this->fos_meta_lines.begin());
-
+    if (lines != nullptr && y < (ssize_t) lines->size()) {
+        value_out = lines->at(y);
         return true;
-    }
-
-    if (row < lv.get_inner_height()) {
-        this->fos_meta_lines.clear();
-        this->build_meta_line(lv, this->fos_meta_lines, row);
-        this->fos_meta_lines_row = row;
     }
 
     return false;
+}
+
+std::optional<attr_line_t>
+field_overlay_source::list_header_for_overlay(const listview_curses& lv,
+                                              media_t media,
+                                              vis_line_t vl)
+{
+    attr_line_t retval;
+
+    retval.append(this->fos_lss.get_filename_offset(), ' ');
+    if (lv.get_selection() == vl && this->fos_contexts.top().c_show) {
+        retval.appendf(FMT_STRING("\u258C Line {:L} parser details."),
+                       (int) vl);
+        if (media == media_t::display) {
+            retval.append("  Press ")
+                .append("p"_hotkey)
+                .append(" to hide this panel.");
+        }
+    } else if (this->fos_lss.find_bookmark_metadata(vl)) {
+        retval.append("\u258C Line ")
+            .append(
+                lnav::roles::number(fmt::format(FMT_STRING("{:L}"), (int) vl)))
+            .append(" metadata");
+    }
+
+    if (!retval.empty() && media == media_t::display) {
+        if (lv.get_overlay_selection()) {
+            retval.append("  ")
+                .append("SPC"_hotkey)
+                .append(": hide/show field  ")
+                .append("c"_hotkey)
+                .append(": copy field value  ")
+                .append("Esc"_hotkey)
+                .append(": exit this panel");
+        } else {
+            retval.append("  Press ")
+                .append("CTRL-]"_hotkey)
+                .append(" to focus on this panel");
+        }
+    }
+
+    if (retval.empty()) {
+        return std::nullopt;
+    }
+
+    return retval;
 }

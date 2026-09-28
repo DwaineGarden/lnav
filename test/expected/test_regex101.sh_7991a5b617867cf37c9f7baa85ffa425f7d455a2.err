@@ -1,5 +1,5 @@
-[1m[31m✘ error[0m: expecting an operation to perform on the [1mstd[0m regex using regex101.com
+[1m[31m✘[0m [1m[31merror[0m: expecting an operation to perform on the [1mstd[0m regex using regex101.com
 [36m =[0m [36mhelp[0m: the available subcommands are:
-          • [1m[36mpush[0m: create/update an entry for this regex on regex101.com
-          • [1m[36mpull[0m: create a patch format file for this regular expression based on the entry in regex101.com
-          • [1m[36mdelete[0m: delete the entry regex101.com that was created by a push operation
+          [33m•[0m [1m[36mpush[0m: create/update an entry for this regex on regex101.com
+          [33m•[0m [1m[36mpull[0m: create a patch format file for this regular expression based on the entry in regex101.com
+          [33m•[0m [1m[36mdelete[0m: delete the entry regex101.com that was created by a push operation

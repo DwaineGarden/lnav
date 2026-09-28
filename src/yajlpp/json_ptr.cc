@@ -29,21 +29,21 @@
  * @file json_ptr.cc
  */
 
-#ifdef __CYGWIN__
-#    include <alloca.h>
-#endif
+#include "yajlpp/json_ptr.hh"
 
+#include "base/intern_string.hh"
+#include "base/lnav_log.hh"
+#include "base/short_alloc.h"
 #include "config.h"
 #include "fmt/format.h"
 #include "yajl/api/yajl_gen.h"
-#include "yajlpp/json_ptr.hh"
 
 static int
 handle_null(void* ctx)
 {
-    json_ptr_walk* jpw = (json_ptr_walk*) ctx;
+    auto* jpw = (json_ptr_walk*) ctx;
 
-    jpw->jpw_values.emplace_back(jpw->current_ptr(), yajl_t_null, "null");
+    jpw->jpw_callback(jpw->jpw_ptr_str.c_str(), null_value_t{});
     jpw->inc_array_index();
 
     return 1;
@@ -52,23 +52,31 @@ handle_null(void* ctx)
 static int
 handle_boolean(void* ctx, int boolVal)
 {
-    json_ptr_walk* jpw = (json_ptr_walk*) ctx;
+    auto* jpw = (json_ptr_walk*) ctx;
 
-    jpw->jpw_values.emplace_back(jpw->current_ptr(),
-                                 boolVal ? yajl_t_true : yajl_t_false,
-                                 boolVal ? "true" : "false");
+    jpw->jpw_callback(jpw->jpw_ptr_str.c_str(), static_cast<bool>(boolVal));
     jpw->inc_array_index();
 
     return 1;
 }
 
 static int
-handle_number(void* ctx, const char* numberVal, size_t numberLen)
+handle_integer(void* ctx, long long int integerVal)
 {
-    json_ptr_walk* jpw = (json_ptr_walk*) ctx;
+    auto jpw = (json_ptr_walk*) ctx;
 
-    jpw->jpw_values.emplace_back(
-        jpw->current_ptr(), yajl_t_number, std::string(numberVal, numberLen));
+    jpw->jpw_callback(jpw->jpw_ptr_str.c_str(), int64_t{integerVal});
+    jpw->inc_array_index();
+
+    return 1;
+}
+
+static int
+handle_float(void* ctx, double floatVal)
+{
+    auto jpw = (json_ptr_walk*) ctx;
+
+    jpw->jpw_callback(jpw->jpw_ptr_str.c_str(), floatVal);
     jpw->inc_array_index();
 
     return 1;
@@ -77,22 +85,25 @@ handle_number(void* ctx, const char* numberVal, size_t numberLen)
 static void
 appender(void* ctx, const char* strVal, size_t strLen)
 {
-    std::string& str = *(std::string*) ctx;
+    auto& str = *(std::string*) ctx;
 
     str.append(strVal, strLen);
 }
 
 static int
-handle_string(void* ctx, const unsigned char* stringVal, size_t len)
+handle_string(void* ctx,
+              const unsigned char* stringVal,
+              size_t len,
+              yajl_string_props_t*)
 {
-    json_ptr_walk* jpw = (json_ptr_walk*) ctx;
+    auto jpw = (json_ptr_walk*) ctx;
     auto_mem<yajl_gen_t> gen(yajl_gen_free);
     std::string str;
 
     gen = yajl_gen_alloc(nullptr);
     yajl_gen_config(gen.in(), yajl_gen_print_callback, appender, &str);
     yajl_gen_string(gen.in(), stringVal, len);
-    jpw->jpw_values.emplace_back(jpw->current_ptr(), yajl_t_string, str);
+    jpw->jpw_callback(jpw->current_ptr(), str);
     jpw->inc_array_index();
 
     return 1;
@@ -101,36 +112,27 @@ handle_string(void* ctx, const unsigned char* stringVal, size_t len)
 static int
 handle_start_map(void* ctx)
 {
-    json_ptr_walk* jpw = (json_ptr_walk*) ctx;
+    auto jpw = (json_ptr_walk*) ctx;
 
-    jpw->jpw_keys.emplace_back("");
+    jpw->push_component_verbatim("/"_frag);
+    jpw->push_component_verbatim(""_frag);
     jpw->jpw_array_indexes.push_back(-1);
 
     return 1;
 }
 
 static int
-handle_map_key(void* ctx, const unsigned char* key, size_t len)
+handle_map_key(void* ctx,
+               const unsigned char* key,
+               size_t len,
+               yajl_string_props_t* props)
 {
-    json_ptr_walk* jpw = (json_ptr_walk*) ctx;
-    char partially_encoded_key[len + 32];
-    size_t required_len;
+    auto frag = string_fragment::from_bytes(key, len);
+    auto jpw = (json_ptr_walk*) ctx;
+    stack_buf allocator;
 
-    jpw->jpw_keys.pop_back();
-
-    required_len = json_ptr::encode(partially_encoded_key,
-                                    sizeof(partially_encoded_key),
-                                    (const char*) key,
-                                    len);
-    if (required_len < sizeof(partially_encoded_key)) {
-        jpw->jpw_keys.emplace_back(&partially_encoded_key[0], required_len);
-    } else {
-        auto fully_encoded_key = (char*) alloca(required_len);
-
-        json_ptr::encode(
-            fully_encoded_key, required_len, (const char*) key, len);
-        jpw->jpw_keys.emplace_back(&fully_encoded_key[0], required_len);
-    }
+    jpw->pop_component();
+    jpw->push_component(frag);
 
     return 1;
 }
@@ -138,11 +140,11 @@ handle_map_key(void* ctx, const unsigned char* key, size_t len)
 static int
 handle_end_map(void* ctx)
 {
-    json_ptr_walk* jpw = (json_ptr_walk*) ctx;
+    auto jpw = (json_ptr_walk*) ctx;
 
-    jpw->jpw_keys.pop_back();
+    jpw->pop_component();  // last key
+    jpw->pop_component();  // slash
     jpw->jpw_array_indexes.pop_back();
-
     jpw->inc_array_index();
 
     return 1;
@@ -151,10 +153,14 @@ handle_end_map(void* ctx)
 static int
 handle_start_array(void* ctx)
 {
-    json_ptr_walk* jpw = (json_ptr_walk*) ctx;
+    auto jpw = (json_ptr_walk*) ctx;
 
-    jpw->jpw_keys.emplace_back("");
+    jpw->push_component_verbatim("/"_frag);
     jpw->jpw_array_indexes.push_back(0);
+    fmt::format_to(std::back_inserter(jpw->jpw_ptr_str),
+                   FMT_STRING("{}"),
+                   jpw->jpw_array_indexes.back());
+    jpw->jpw_components.emplace_back(jpw->jpw_ptr_str.size());
 
     return 1;
 }
@@ -162,110 +168,126 @@ handle_start_array(void* ctx)
 static int
 handle_end_array(void* ctx)
 {
-    json_ptr_walk* jpw = (json_ptr_walk*) ctx;
+    auto jpw = (json_ptr_walk*) ctx;
 
-    jpw->jpw_keys.pop_back();
+    jpw->pop_component();  // last key
+    jpw->pop_component();  // slash
     jpw->jpw_array_indexes.pop_back();
     jpw->inc_array_index();
 
     return 1;
 }
 
-const yajl_callbacks json_ptr_walk::callbacks = {handle_null,
-                                                 handle_boolean,
-                                                 nullptr,
-                                                 nullptr,
-                                                 handle_number,
-                                                 handle_string,
-                                                 handle_start_map,
-                                                 handle_map_key,
-                                                 handle_end_map,
-                                                 handle_start_array,
-                                                 handle_end_array};
+const yajl_callbacks json_ptr_walk::callbacks = {
+    handle_null,
+    handle_boolean,
+    handle_integer,
+    handle_float,
+    nullptr,
+    handle_string,
+    handle_start_map,
+    handle_map_key,
+    handle_end_map,
+    handle_start_array,
+    handle_end_array,
+};
 
-size_t
-json_ptr::encode(char* dst, size_t dst_len, const char* src, size_t src_len)
+string_fragment
+json_ptr::encode(string_fragment in, stack_buf& buf)
 {
-    size_t retval = 0;
+    auto outlen = in.length();
 
-    if (src_len == (size_t) -1) {
-        src_len = strlen(src);
-    }
-
-    for (size_t lpc = 0; lpc < src_len; lpc++) {
-        switch (src[lpc]) {
+    for (const auto ch : in) {
+        switch (ch) {
             case '/':
             case '~':
             case '#':
-                if (retval < dst_len) {
-                    dst[retval] = '~';
-                    retval += 1;
-                    if (src[lpc] == '~') {
-                        dst[retval] = '0';
-                    } else if (src[lpc] == '#') {
-                        dst[retval] = '2';
-                    } else {
-                        dst[retval] = '1';
-                    }
-                } else {
-                    retval += 1;
-                }
-                break;
-            default:
-                if (retval < dst_len) {
-                    dst[retval] = src[lpc];
-                }
+                outlen += 1;
                 break;
         }
-        retval += 1;
-    }
-    if (retval < dst_len) {
-        dst[retval] = '\0';
     }
 
-    return retval;
+    auto* outbuf = buf.allocate(outlen);
+    auto out_index = std::size_t{0};
+
+    for (const auto ch : in) {
+        switch (ch) {
+            case '~':
+                outbuf[out_index++] = '~';
+                outbuf[out_index++] = '0';
+                break;
+            case '/':
+                outbuf[out_index++] = '~';
+                outbuf[out_index++] = '1';
+                break;
+            case '#':
+                outbuf[out_index++] = '~';
+                outbuf[out_index++] = '2';
+                break;
+            default:
+                outbuf[out_index++] = ch;
+                break;
+        }
+    }
+
+    return string_fragment::from_bytes(outbuf, outlen);
 }
 
-size_t
-json_ptr::decode(char* dst, const char* src, ssize_t src_len)
+void
+json_ptr::encode_to(string_fragment in, std::string& out)
 {
-    size_t retval = 0;
-
-    if (src_len == -1) {
-        src_len = strlen(src);
-    }
-
-    for (int lpc = 0; lpc < src_len; lpc++) {
-        switch (src[lpc]) {
+    for (const auto ch : in) {
+        switch (ch) {
             case '~':
-                if ((lpc + 1) < src_len) {
-                    switch (src[lpc + 1]) {
-                        case '0':
-                            dst[retval++] = '~';
-                            lpc += 1;
-                            break;
-                        case '1':
-                            dst[retval++] = '/';
-                            lpc += 1;
-                            break;
-                        case '2':
-                            dst[retval++] = '#';
-                            lpc += 1;
-                            break;
-                        default:
-                            break;
-                    }
-                }
+                out.push_back('~');
+                out.push_back('0');
+                break;
+            case '/':
+                out.push_back('~');
+                out.push_back('1');
+                break;
+            case '#':
+                out.push_back('~');
+                out.push_back('2');
                 break;
             default:
-                dst[retval++] = src[lpc];
+                out.push_back(ch);
                 break;
         }
     }
+}
 
-    dst[retval] = '\0';
+string_fragment
+json_ptr::decode(string_fragment sf, stack_buf& allocator)
+{
+    auto* outbuf = allocator.allocate(sf.length());
+    auto in_escape = false;
+    auto out_index = std::size_t{0};
 
-    return retval;
+    for (const auto ch : sf) {
+        if (in_escape) {
+            switch (ch) {
+                case '0':
+                    outbuf[out_index++] = '~';
+                    break;
+                case '1':
+                    outbuf[out_index++] = '/';
+                    break;
+                case '2':
+                    outbuf[out_index++] = '#';
+                    break;
+                default:
+                    break;
+            }
+            in_escape = false;
+        } else if (ch == '~') {
+            in_escape = true;
+        } else {
+            outbuf[out_index++] = ch;
+        }
+    }
+
+    return string_fragment::from_bytes(outbuf, out_index);
 }
 
 bool
@@ -457,30 +479,31 @@ json_ptr::error_msg() const
     return "";
 }
 
-std::string
+void
+json_ptr_walk::push_component(const string_fragment& in)
+{
+    json_ptr::encode_to(in, this->jpw_ptr_str);
+    this->jpw_components.emplace_back(this->jpw_ptr_str.size());
+}
+
+void
+json_ptr_walk::push_component_verbatim(const string_fragment& in)
+{
+    this->jpw_ptr_str += in;
+    this->jpw_components.emplace_back(this->jpw_ptr_str.size());
+}
+
+const std::string&
 json_ptr_walk::current_ptr()
 {
-    std::string retval;
-
-    for (size_t lpc = 0; lpc < this->jpw_array_indexes.size(); lpc++) {
-        retval.append("/");
-        if (this->jpw_array_indexes[lpc] == -1) {
-            retval.append(this->jpw_keys[lpc]);
-        } else {
-            fmt::format_to(std::back_inserter(retval),
-                           FMT_STRING("{}"),
-                           this->jpw_array_indexes[lpc]);
-        }
-    }
-
-    this->jpw_max_ptr_len = std::max(this->jpw_max_ptr_len, retval.size());
-
-    return retval;
+    this->jpw_max_ptr_len
+        = std::max(this->jpw_max_ptr_len, this->jpw_ptr_str.size());
+    return this->jpw_ptr_str;
 }
 
 void
 json_ptr_walk::update_error_msg(yajl_status status,
-                                const char* buffer,
+                                const unsigned char* buffer,
                                 ssize_t len)
 {
     switch (status) {
@@ -490,8 +513,7 @@ json_ptr_walk::update_error_msg(yajl_status status,
             this->jpw_error_msg = "internal error";
             break;
         case yajl_status_error: {
-            auto* msg = yajl_get_error(
-                this->jpw_handle, 1, (const unsigned char*) buffer, len);
+            auto* msg = yajl_get_error(this->jpw_handle, 1, buffer, len);
             this->jpw_error_msg = std::string((const char*) msg);
 
             yajl_free_error(this->jpw_handle, msg);
@@ -500,22 +522,33 @@ json_ptr_walk::update_error_msg(yajl_status status,
     }
 }
 
+void
+json_ptr_walk::inc_array_index()
+{
+    if (!this->jpw_array_indexes.empty()
+        && this->jpw_array_indexes.back() != -1)
+    {
+        this->jpw_array_indexes.back() += 1;
+        this->pop_component();
+        fmt::format_to(std::back_inserter(this->jpw_ptr_str),
+                       FMT_STRING("{}"),
+                       this->jpw_array_indexes.back());
+        this->jpw_components.emplace_back(this->jpw_ptr_str.size());
+    }
+}
+
 yajl_status
 json_ptr_walk::complete_parse()
 {
-    yajl_status retval;
-
-    retval = yajl_complete_parse(this->jpw_handle);
-    this->update_error_msg(retval, nullptr, -1);
+    auto retval = yajl_complete_parse(this->jpw_handle);
+    this->update_error_msg(retval, nullptr, 0);
     return retval;
 }
 
 yajl_status
-json_ptr_walk::parse(const char* buffer, ssize_t len)
+json_ptr_walk::parse(const unsigned char* buffer, ssize_t len)
 {
-    yajl_status retval;
-
-    retval = yajl_parse(this->jpw_handle, (const unsigned char*) buffer, len);
+    auto retval = yajl_parse(this->jpw_handle, buffer, len);
     this->update_error_msg(retval, buffer, len);
     return retval;
 }

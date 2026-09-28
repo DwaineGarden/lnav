@@ -65,13 +65,14 @@ log_level_t string2level(const char *levelstr, ssize_t len, bool exact)
     /*!stags:re2c format = 'const unsigned char *@@;'; */
     loop:
     /*!re2c
+     re2c:tags = 1;
      re2c:yyfill:enable = 0;
      re2c:flags:input = custom;
 
      EOF = "\x00";
 
      EOF { RET(LEVEL_UNKNOWN); }
-     'trace' { RET(LEVEL_TRACE); }
+     'trace'|'verbose' { RET(LEVEL_TRACE); }
      'debug' [2-5]? @debug_level {
          if (debug_level == nullptr) {
              RET(LEVEL_DEBUG);
@@ -89,14 +90,14 @@ log_level_t string2level(const char *levelstr, ssize_t len, bool exact)
              RET(LEVEL_DEBUG);
          }
      }
-     'info' { RET(LEVEL_INFO); }
-     'notice' { RET(LEVEL_NOTICE); }
+     'info'|'system' { RET(LEVEL_INFO); }
+     'notice'|'note'|'log' { RET(LEVEL_NOTICE); }
      'stats' { RET(LEVEL_STATS); }
-     'warn'|'warning' { RET(LEVEL_WARNING); }
-     'err'|'error' { RET(LEVEL_ERROR); }
-     'critical' { RET(LEVEL_CRITICAL); }
-     'severe' { RET(LEVEL_CRITICAL); }
-     'fatal' { RET(LEVEL_FATAL); }
+     'warn'|'warning'|'deprecation' { RET(LEVEL_WARNING); }
+     'err'|'error'|'fail' { RET(LEVEL_ERROR); }
+     'critical'|'severe'|'alert' { RET(LEVEL_CRITICAL); }
+     'fatal'|'emergency' { RET(LEVEL_FATAL); }
+     'invalid' { RET(LEVEL_INVALID); }
      * { goto loop; }
 
      */

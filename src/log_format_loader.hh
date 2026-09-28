@@ -32,6 +32,8 @@
 #ifndef log_format_loader_hh
 #define log_format_loader_hh
 
+#include <filesystem>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -39,43 +41,47 @@
 
 #include "base/intern_string.hh"
 #include "base/lnav.console.hh"
-#include "ghc/filesystem.hpp"
-#include "shlex.resolver.hh"
+#include "base/lnav.resolver.hh"
+#include "yajlpp/yajlpp.hh"
 
 class log_vtab_manager;
 
 std::vector<intern_string_t> load_format_file(
-    const ghc::filesystem::path& filename,
+    const std::filesystem::path& filename,
     std::vector<lnav::console::user_message>& errors);
 
-void load_formats(const std::vector<ghc::filesystem::path>& extra_paths,
+/**
+ * Parse the format definitions in a file and run the semantic checks that
+ * build() performs.  The formats are parsed into an empty registry that is
+ * thrown away afterwards, so the result does not depend on, and cannot
+ * disturb, the formats that have already been loaded.
+ *
+ * @return the names of the formats defined in the file
+ */
+std::vector<intern_string_t> validate_format_file(
+    const std::filesystem::path& filename,
+    std::vector<lnav::console::user_message>& errors);
+
+void load_formats(const std::vector<std::filesystem::path>& extra_paths,
                   std::vector<lnav::console::user_message>& errors);
 
 void load_format_vtabs(log_vtab_manager* vtab_manager,
                        std::vector<lnav::console::user_message>& errors);
 
+/**
+ * Execute the SQL scripts that have been installed.
+ *
+ * @param skip_paths scripts to leave alone.  Installing a script means
+ *   running the copy that is being installed, so the copy that is already
+ *   in place has to be passed over or the two collide.
+ */
 void load_format_extra(sqlite3* db,
                        const std::map<std::string, scoped_value_t>& global_vars,
-                       const std::vector<ghc::filesystem::path>& extra_paths,
+                       const std::vector<std::filesystem::path>& extra_paths,
+                       const std::set<std::filesystem::path>& skip_paths,
                        std::vector<lnav::console::user_message>& errors);
 
-struct script_metadata {
-    ghc::filesystem::path sm_path;
-    std::string sm_name;
-    std::string sm_synopsis;
-    std::string sm_description;
-};
-
-void extract_metadata_from_file(struct script_metadata& meta_inout);
-
-struct available_scripts {
-    std::map<std::string, std::vector<script_metadata>> as_scripts;
-};
-
-void find_format_scripts(const std::vector<ghc::filesystem::path>& extra_paths,
-                         available_scripts& scripts);
-
-extern const struct json_path_container format_handlers;
-extern const struct json_path_container root_format_handler;
+extern const json_path_container format_handlers;
+extern const json_path_container root_format_handler;
 
 #endif

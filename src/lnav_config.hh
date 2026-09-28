@@ -32,27 +32,34 @@
 #ifndef lnav_config_hh
 #define lnav_config_hh
 
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <set>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
+#include "apps.cfg.hh"
 #include "archive_manager.cfg.hh"
+#include "base/date_time_scanner.cfg.hh"
 #include "base/file_range.hh"
+#include "base/intern_string.hh"
 #include "base/lnav.console.hh"
 #include "base/result.h"
+#include "external_opener.cfg.hh"
+#include "external_editor.cfg.hh"
 #include "file_vtab.cfg.hh"
-#include "ghc/filesystem.hpp"
 #include "lnav_config_fwd.hh"
-#include "log_level.hh"
+#include "log.annotate.cfg.hh"
 #include "logfile.cfg.hh"
 #include "logfile_sub_source.cfg.hh"
+#include "piper.looper.cfg.hh"
 #include "styling.hh"
 #include "sysclip.cfg.hh"
 #include "tailer/tailer.looper.cfg.hh"
+#include "textfile_sub_source.cfg.hh"
 #include "top_status_source.cfg.hh"
+#include "url_handler.cfg.hh"
 
 /**
  * Check if an experimental feature should be enabled by
@@ -77,7 +84,8 @@ bool update_installs_from_git();
 void install_extra_formats();
 
 struct key_command {
-    std::string kc_cmd;
+    std::string kc_id;
+    positioned_property<std::string> kc_cmd;
     std::string kc_alt_msg;
 };
 
@@ -91,7 +99,12 @@ enum class config_movement_mode : unsigned int {
 };
 
 struct movement_config {
-    config_movement_mode mode;
+    config_movement_mode mode{config_movement_mode::TOP};
+};
+
+enum class lnav_mouse_mode {
+    disabled,
+    enabled,
 };
 
 struct _lnav_config {
@@ -101,7 +114,8 @@ struct _lnav_config {
     std::string lc_ui_keymap;
     std::string lc_ui_theme;
     movement_config lc_ui_movement;
-    std::unordered_map<std::string, key_map> lc_ui_keymaps;
+    lnav_mouse_mode lc_mouse_mode{lnav_mouse_mode::disabled};
+    std::map<std::string, key_map> lc_ui_keymaps;
     std::map<std::string, std::string> lc_ui_key_overrides;
     std::map<std::string, std::string> lc_global_vars;
     std::map<std::string, lnav_theme> lc_ui_theme_defs;
@@ -109,18 +123,26 @@ struct _lnav_config {
     key_map lc_active_keymap;
 
     archive_manager::config lc_archive_manager;
+    date_time_scanner_ns::config lc_log_date_time;
+    lnav::piper::config lc_piper;
     file_vtab::config lc_file_vtab;
     lnav::logfile::config lc_logfile;
     tailer::config lc_tailer;
     sysclip::config lc_sysclip;
+    lnav::url_handler::config lc_url_handlers;
     logfile_sub_source_ns::config lc_log_source;
+    lnav::log::annotate::config lc_log_annotations;
+    lnav::external_opener::config lc_opener;
+    lnav::external_editor::config lc_external_editor;
+    lnav::textfile::config lc_textfile;
+    lnav::apps::config lc_apps;
 };
 
-extern struct _lnav_config lnav_config;
-extern struct _lnav_config rollback_lnav_config;
+extern _lnav_config lnav_config;
+extern _lnav_config rollback_lnav_config;
 extern std::map<intern_string_t, source_location> lnav_config_locations;
 
-extern const struct json_path_container lnav_config_handlers;
+extern const json_path_container lnav_config_handlers;
 
 enum class config_file_type {
     FORMAT,
@@ -128,18 +150,28 @@ enum class config_file_type {
 };
 
 Result<config_file_type, std::string> detect_config_file_type(
-    const ghc::filesystem::path& path);
+    const std::filesystem::path& path);
 
-void load_config(const std::vector<ghc::filesystem::path>& extra_paths,
+void load_config(const std::vector<std::filesystem::path>& extra_paths,
                  std::vector<lnav::console::user_message>& errors);
 
 void reset_config(const std::string& path);
 
 void reload_config(std::vector<lnav::console::user_message>& errors);
 
+/**
+ * Check a configuration file for problems without changing the
+ * configuration this process is running with.
+ */
+void validate_config_file(const std::filesystem::path& path,
+                          std::vector<lnav::console::user_message>& errors);
+
 std::string save_config();
 
-extern const char* DEFAULT_FORMAT_SCHEMA;
-extern const std::set<std::string> SUPPORTED_FORMAT_SCHEMAS;
+std::string dump_config();
+
+extern const string_fragment DEFAULT_CONFIG_SCHEMA;
+extern const string_fragment DEFAULT_FORMAT_SCHEMA;
+extern const std::set<string_fragment> SUPPORTED_FORMAT_SCHEMAS;
 
 #endif

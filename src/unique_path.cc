@@ -30,12 +30,13 @@
 #include "unique_path.hh"
 
 #include "config.h"
+#include "fmt/format.h"
 
 void
 unique_path_generator::add_source(
     const std::shared_ptr<unique_path_source>& path_source)
 {
-    ghc::filesystem::path path = path_source->get_path();
+    const auto path = path_source->get_path();
 
     path_source->set_unique_path(path.filename());
     path_source->set_path_prefix(path.parent_path());
@@ -53,21 +54,22 @@ unique_path_generator::generate()
         for (const auto& pair : this->upg_unique_paths) {
             if (pair.second.size() == 1) {
                 if (loop_count > 0) {
-                    std::shared_ptr<unique_path_source> src = pair.second[0];
-
-                    src->set_unique_path("[" + src->get_unique_path());
+                    const auto src = pair.second[0];
+                    auto lsquare = fmt::format(FMT_STRING("[{}"),
+                                               src->get_unique_path().native());
+                    src->set_unique_path(lsquare);
                 }
 
-                this->upg_max_len
-                    = std::max(this->upg_max_len,
-                               pair.second[0]->get_unique_path().size());
+                this->upg_max_len = std::max(
+                    this->upg_max_len,
+                    pair.second[0]->get_unique_path().native().size());
             } else {
                 bool all_common = true;
 
                 do {
                     std::string common;
 
-                    for (auto& src : pair.second) {
+                    for (const auto& src : pair.second) {
                         auto& path = src->get_path_prefix();
 
                         if (common.empty()) {
@@ -81,7 +83,7 @@ unique_path_generator::generate()
                     }
 
                     if (all_common) {
-                        for (auto& src : pair.second) {
+                        for (const auto& src : pair.second) {
                             auto& path = src->get_path_prefix();
                             auto par = path.parent_path();
 
@@ -103,22 +105,24 @@ unique_path_generator::generate()
 
         for (auto& src : collisions) {
             const auto unique_path = src->get_unique_path();
-            auto& prefix = src->get_path_prefix();
+            const auto& prefix = src->get_path_prefix();
 
             if (loop_count == 0) {
                 src->set_unique_path(prefix.filename().string() + "]/"
-                                     + unique_path);
+                                     + unique_path.string());
             } else {
                 src->set_unique_path(prefix.filename().string() + "/"
-                                     + unique_path);
+                                     + unique_path.string());
             }
 
-            ghc::filesystem::path parent = prefix.parent_path();
+            const auto parent = prefix.parent_path();
 
             src->set_path_prefix(parent);
 
             if (parent.empty() || parent == prefix) {
-                src->set_unique_path("[" + src->get_unique_path());
+                auto lsquare = fmt::format(FMT_STRING("[{}"),
+                                           src->get_unique_path().native());
+                src->set_unique_path(lsquare);
             } else {
                 this->upg_unique_paths[src->get_unique_path()].push_back(src);
             }

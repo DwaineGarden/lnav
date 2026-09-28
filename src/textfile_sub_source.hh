@@ -31,41 +31,44 @@
 #define textfile_sub_source_hh
 
 #include <deque>
+#include <memory>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
+#include "base/attr_line.hh"
+#include "base/file_range.hh"
+#include "document.sections.hh"
 #include "filter_observer.hh"
+#include "hasher.hh"
 #include "logfile.hh"
 #include "plain_text_source.hh"
+#include "text_overlay_menu.hh"
 #include "textview_curses.hh"
+
+class textfile_header_overlay;
 
 class textfile_sub_source
     : public text_sub_source
     , public vis_location_history
+    , public text_time_translator
+    , public text_accel_source
     , public text_anchors {
 public:
-    using file_iterator = std::deque<std::shared_ptr<logfile>>::iterator;
-
     textfile_sub_source() { this->tss_supports_filtering = true; }
 
-    ~textfile_sub_source() override = default;
-
-    bool empty() const { return this->tss_files.empty(); }
+    bool empty() const override { return this->tss_files.empty(); }
 
     size_t size() const { return this->tss_files.size(); }
 
     size_t text_line_count() override;
 
-    size_t text_line_width(textview_curses& curses) override
-    {
-        return this->tss_files.empty()
-            ? 0
-            : this->current_file()->get_longest_line_length();
-    }
+    size_t text_line_width(textview_curses& curses) override;
 
-    void text_value_for_line(textview_curses& tc,
-                             int line,
-                             std::string& value_out,
-                             line_flags_t flags) override;
+    line_info text_value_for_line(textview_curses& tc,
+                                  int line,
+                                  std::string& value_out,
+                                  line_flags_t flags) override;
 
     void text_attrs_for_line(textview_curses& tc,
                              int row,
@@ -81,16 +84,7 @@ public:
             return nullptr;
         }
 
-        return this->tss_files.front();
-    }
-
-    std::string text_source_name(const textview_curses& tv) override
-    {
-        if (this->tss_files.empty()) {
-            return "";
-        }
-
-        return this->tss_files.front()->get_filename();
+        return this->tss_files.front()->fvs_file;
     }
 
     void to_front(const std::shared_ptr<logfile>& lf);
@@ -109,26 +103,64 @@ public:
 
     class scan_callback {
     public:
+        virtual ~scan_callback() = default;
+
         virtual void closed_files(
-            const std::vector<std::shared_ptr<logfile>>& files)
-            = 0;
+            const std::vector<std::shared_ptr<logfile>>& files) = 0;
         virtual void promote_file(const std::shared_ptr<logfile>& lf) = 0;
         virtual void scanned_file(const std::shared_ptr<logfile>& lf) = 0;
+        virtual void renamed_file(const std::shared_ptr<logfile>& lf) = 0;
+
+        /**
+         * Called on the calling thread while a parallel scan is in flight so
+         * the UI keeps moving.  `off` and `total` are summed over the files
+         * being scanned.
+         *
+         * The workers are writing those files while this runs, so an
+         * implementation must not read them -- the numbers handed in here
+         * are all it gets.  `in_flight` carries a per-file breakdown of the
+         * same reading for the files that have not finished, so the file
+         * list can be drawn without touching them either.
+         *
+         * @return interrupt to have the scan stop as soon as the workers
+         * notice.
+         */
+        virtual lnav::progress_result_t scan_progress(
+            file_off_t off,
+            file_ssize_t total,
+            const std::vector<index_progress_report>& in_flight)
+        {
+            return lnav::progress_result_t::ok;
+        }
     };
 
-    bool rescan_files(scan_callback& callback,
-                      nonstd::optional<ui_clock::time_point> deadline
-                      = nonstd::nullopt);
+    struct rescan_result_t {
+        size_t rr_new_data{0};
+        bool rr_scan_completed{true};
+        bool rr_rescan_needed{false};
+    };
+
+    rescan_result_t rescan_files(scan_callback& callback,
+                                 std::optional<ui_clock::time_point> deadline
+                                 = std::nullopt);
 
     void text_filters_changed() override;
+
+    void text_mark(const bookmark_type_t* bm,
+                   vis_line_t line,
+                   bool added) override;
+
+    void text_clear_marks(const bookmark_type_t* bm) override;
+
+    void text_update_marks(vis_bookmarks& bm) override;
 
     int get_filtered_count() const override;
 
     int get_filtered_count_for(size_t filter_index) const override;
 
-    text_format_t get_text_format() const override;
+    std::optional<text_format_t> get_text_format() const override;
 
-    nonstd::optional<location_history*> get_location_history() override
+    std::optional<location_history*> get_location_history() override
     {
         return this;
     }
@@ -136,15 +168,208 @@ public:
     void text_crumbs_for_line(int line,
                               std::vector<breadcrumb::crumb>& crumbs) override;
 
-    nonstd::optional<vis_line_t> row_for_anchor(const std::string& id) override;
+    std::optional<vis_line_t> row_for_anchor(const std::string& id) override;
 
-    nonstd::optional<std::string> anchor_for_row(vis_line_t vl) override;
+    std::optional<std::string> anchor_for_row(vis_line_t vl) override;
+
+    std::optional<vis_line_t> adjacent_anchor(vis_line_t vl,
+                                              direction dir) override;
 
     std::unordered_set<std::string> get_anchors() override;
 
+    std::optional<vis_line_t> row_for_time(timeval time_bucket) override;
+
+    std::optional<row_info> time_for_row(vis_line_t row) override;
+
     void quiesce() override;
 
+    bool is_time_offset_supported() const override
+    {
+        const auto lf = this->current_file();
+        if (lf != nullptr && lf->has_line_metadata()) {
+            return true;
+        }
+
+        return false;
+    }
+
+    logline* text_accel_get_line(vis_line_t vl) override;
+
+    void scroll_invoked(textview_curses* tc) override;
+
+    enum class view_mode {
+        raw,
+        rendered,
+    };
+
+    void set_view_mode(view_mode vm);
+
+    view_mode get_effective_view_mode() const;
+
+    view_mode get_view_mode() const { return this->tss_view_mode; }
+
+    bool tss_apply_default_init_location{false};
+
+    struct file_view_state {
+        explicit file_view_state(const std::shared_ptr<logfile>& f)
+            : fvs_file(f)
+        {
+        }
+
+        bool operator==(const std::shared_ptr<logfile>& lf) const
+        {
+            return this->fvs_file == lf;
+        }
+
+        void save_from(textview_curses& tc)
+        {
+            this->fvs_top = tc.get_top();
+            this->fvs_selection = tc.get_selection();
+            this->fvs_bookmarks.swap(tc.get_bookmarks());
+        }
+
+        void load_into(textview_curses& tc)
+        {
+            tc.get_bookmarks().swap(this->fvs_bookmarks);
+            if (this->fvs_selection.has_value()) {
+                tc.set_selection(this->fvs_selection.value());
+            }
+            tc.set_top(this->fvs_top);
+        }
+
+        size_t text_line_count(view_mode mode) const;
+
+        size_t text_line_width(view_mode mode, textview_curses& tc) const;
+
+        std::optional<vis_line_t> row_for_anchor(view_mode mode,
+                                                 const std::string& id);
+
+        std::optional<std::string> anchor_for_row(view_mode mode,
+                                                  vis_line_t vl);
+
+        std::shared_ptr<logfile> fvs_file;
+        vis_line_t fvs_top{0};
+        std::optional<vis_line_t> fvs_selection;
+        vis_bookmarks fvs_bookmarks{vis_bookmarks_t::create_array()};
+
+        bookmarks<uint32_t>::type fvs_content_marks{
+            bookmarks<uint32_t>::create_array()};
+
+        time_t fvs_mtime{0};
+        file_ssize_t fvs_file_size{0};
+        file_off_t fvs_file_indexed_size{0};
+        /**
+         * How many of this file's lines have been folded into
+         * `tfs_index` -- the analogue of logfile_sub_source's
+         * ld_lines_indexed.  Not the file's size: the pre-scan advances
+         * that for files a deadline-shortened pass never gets to, and
+         * deriving the resume point from it would skip their lines
+         * forever.
+         */
+        uint32_t fvs_lines_indexed{0};
+        std::string fvs_error;
+        std::unique_ptr<plain_text_source> fvs_text_source;
+        lnav::document::metadata fvs_metadata;
+        std::optional<file_location_t> fvs_applied_init_location;
+    };
+
+    using file_iterator
+        = std::deque<std::shared_ptr<file_view_state>>::iterator;
+    using const_file_iterator
+        = std::deque<std::shared_ptr<file_view_state>>::const_iterator;
+
+    std::deque<std::shared_ptr<file_view_state>>& get_file_states()
+    {
+        return this->tss_files;
+    }
+
+    void copy_bookmarks_to_current_file()
+    {
+        if (!this->tss_files.empty() && this->tss_view != nullptr) {
+            auto& front = this->tss_files.front();
+            front->fvs_bookmarks[&textview_curses::BM_USER]
+                = this->tss_view->get_bookmarks()[&textview_curses::BM_USER];
+            front->fvs_bookmarks[&textview_curses::BM_STICKY]
+                = this->tss_view->get_bookmarks()[&textview_curses::BM_STICKY];
+        }
+    }
+
 private:
+    friend textfile_header_overlay;
+
+    /** What a parallel pre-scan worked out about one file. */
+    struct prescan_result {
+        logfile::rebuild_result_t psr_result{
+            logfile::rebuild_result_t::NO_NEW_LINES};
+        /** The scan threw; the caller closes the file, as an inline one would. */
+        bool psr_failed{false};
+    };
+
+    using prescan_map = std::unordered_map<const logfile*, prescan_result>;
+
+    /**
+     * Index every open file, up front and across several threads.
+     *
+     * rebuild_index() writes only its own logfile, so the files are
+     * independent of each other; everything the rescan loop then does with
+     * the results -- the promotion, the callbacks, the view -- stays on the
+     * calling thread.
+     */
+    prescan_map prescan_files(scan_callback& callback,
+                              std::optional<ui_clock::time_point> deadline);
+
+    /** A markdown rendering done up front.  @see prescan_markdown() */
+    struct md_prescan_result {
+        std::string mpr_read_error;
+        std::string mpr_content;
+        std::string mpr_frontmatter;
+        text_format_t mpr_frontmatter_format{text_format_t::TF_PLAINTEXT};
+        std::optional<attr_line_t> mpr_rendered;
+        std::string mpr_parse_error;
+    };
+
+    using md_prescan_map
+        = std::unordered_map<const logfile*, md_prescan_result>;
+
+    /**
+     * Render the markdown files that are about to be shown for the first
+     * time, up front and across several threads.
+     *
+     * Reading and rendering are pure functions of the file's bytes, so they
+     * parallelize; installing the result -- the text source, the view, the
+     * event -- stays on the calling thread.
+     *
+     * Only a file with no rendering yet is done here.  One that already has
+     * a rendering either does not need a new one, or needs one the loop
+     * decides on from stamps the metadata step may rewrite first, so
+     * speculating on it would mostly throw the work away.
+     */
+    md_prescan_map prescan_markdown();
+
+    /** Metadata discovered up front.  @see prescan_metadata() */
+    struct meta_prescan_result {
+        std::string mps_read_error;
+        /** The read threw; the caller closes the file. */
+        bool mps_failed{false};
+        /** Unset when the file has no text format to discover with. */
+        std::optional<lnav::document::metadata> mps_metadata;
+        std::optional<text_format_meta_t> mps_text_meta;
+    };
+
+    using meta_prescan_map
+        = std::unordered_map<const logfile*, meta_prescan_result>;
+
+    /**
+     * Read the given files and discover their metadata, across several
+     * threads.
+     *
+     * Reading and discovery depend only on the file's bytes, so they
+     * parallelize; installing the result -- the stamps, the new name, the
+     * callback -- stays on the calling thread.
+     */
+    meta_prescan_map prescan_metadata(
+        const std::vector<std::shared_ptr<file_view_state>>& work);
+
     void detach_observer(std::shared_ptr<logfile> lf)
     {
         auto* lfo = (line_filter_observer*) lf->get_logline_observer();
@@ -152,22 +377,47 @@ private:
         delete lfo;
     }
 
-    struct rendered_file {
-        time_t rf_mtime;
-        file_ssize_t rf_file_size;
-        std::unique_ptr<plain_text_source> rf_text_source;
-    };
+    void move_to_init_location(file_iterator& iter);
 
-    struct metadata_state {
-        time_t ms_mtime;
-        file_ssize_t ms_file_size;
-        lnav::document::metadata ms_metadata;
-    };
+    file_iterator current_file_state() { return this->tss_files.begin(); }
 
-    std::deque<std::shared_ptr<logfile>> tss_files;
-    std::deque<std::shared_ptr<logfile>> tss_hidden_files;
-    std::unordered_map<std::string, rendered_file> tss_rendered_files;
-    std::unordered_map<std::string, metadata_state> tss_doc_metadata;
+    const_file_iterator current_file_state() const
+    {
+        return this->tss_files.cbegin();
+    }
+
+    std::deque<std::shared_ptr<file_view_state>> tss_files;
+    size_t tss_line_indent_size{0};
+    attr_line_t tss_hex_line;
+    string_attrs_t tss_plain_line_attrs;
+    int64_t tss_content_line{0};
+    view_mode tss_view_mode{view_mode::rendered};
+};
+
+class textfile_header_overlay : public text_overlay_menu {
+public:
+    explicit textfile_header_overlay(textfile_sub_source* src,
+                                     text_sub_source* log_src);
+
+    bool list_static_overlay(const listview_curses& lv,
+                             media_t media,
+                             int y,
+                             int bottom,
+                             attr_line_t& value_out) override;
+
+    std::optional<attr_line_t> list_header_for_overlay(
+        const listview_curses& lv, media_t media, vis_line_t line) override;
+
+    void list_value_for_overlay(const listview_curses& lv,
+                                vis_line_t line,
+                                std::vector<attr_line_t>& value_out) override;
+
+private:
+    textfile_sub_source* tho_src;
+    text_sub_source* tho_log_src;
+    std::vector<attr_line_t> tho_static_lines;
+    hasher::array_t tho_filter_state;
+    attr_line_t tho_hex_line_header;
 };
 
 #endif

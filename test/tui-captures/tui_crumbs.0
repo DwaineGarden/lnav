@@ -1,0 +1,515 @@
+CSI Use alternate screen buffer
+CSI DSR cursor position
+XTVERSION
+S  -1 ┋                                                                                ┋
+A      └ [>u, [=27u, [?u, [?2026$p, [?1016$p, [?1;3;256S, [?1;3;1024S
+CTRL _
+S  -1 ┋Gi=1,a=q;                                                                       ┋
+CTRL \
+CSI [14t
+CSI [18t
+CSI send device attributes
+S  -1 ┋                                                                                ┋
+A      ·········└ [?2;1;0S, [?1;1;0S
+CSI Application cursor keys
+CTRL =
+S  -1 ┋                                                                                ┋
+A      ·········└ normal, normal, [39;49m
+CTRL (B
+S  -1 ┋                                                                                ┋
+A      ·········└ normal
+CSI Hide cursor
+CSI Erase all
+S   1 ┋                                                                                ┋
+A      └ [?2004h
+OSC Set window title: LOG
+S   1 ┋ 2013-06-06T12:13:20 PDT                                                        ┋
+A      └ fg(#585858), bg(#303030)
+S   2 ┋ LOG ▼  ：                                                                       ┋
+A      └ bold, fg(#5f87d7), bg(#3a3a3a)
+A      ·······└ fg(#ff875f), bg(#303030)
+A      ·········└ [22m, fg(#585858)
+S   3 ┋ⓘ info: Log messages are being indexed...                                       ┋
+A      └ bold, underline, fg(#af87ff), bg(#3a3a3a)
+A      ·└ [22m, fg(#eeeeee)
+A      ··└ bold, fg(#af87ff)
+A      ······└ [22m, fg(#eeeeee)
+CTRL (0
+S   3 ┋                                                                               x┋
+A      ···············································································└ [24m, fg(#e4e4e4), bg(#262626)
+CTRL (B
+S   4 ┋                                                                                ┋
+CTRL (0
+S   4 ┋                                                                               x┋
+CTRL (B
+S   5 ┋                                                                                ┋
+CTRL (0
+S   5 ┋                                                                               x┋
+CTRL (B
+S   6 ┋                                                                                ┋
+CTRL (0
+S   6 ┋                                                                               x┋
+CTRL (B
+S   7 ┋                                                                                ┋
+CTRL (0
+S   7 ┋                                                                               x┋
+CTRL (B
+S   8 ┋                                                                                ┋
+CTRL (0
+S   8 ┋                                                                               x┋
+CTRL (B
+S   9 ┋                                                                                ┋
+CTRL (0
+S   9 ┋                                                                               x┋
+CTRL (B
+S  10 ┋                                                                                ┋
+CTRL (0
+S  10 ┋                                                                               x┋
+CTRL (B
+S  11 ┋                                                                                ┋
+CTRL (0
+S  11 ┋                                                                               x┋
+CTRL (B
+S  12 ┋                                                                                ┋
+CTRL (0
+S  12 ┋                                                                               x┋
+CTRL (B
+S  13 ┋                                                                                ┋
+CTRL (0
+S  13 ┋                                                                               x┋
+CTRL (B
+S  14 ┋                                                                                ┋
+CTRL (0
+S  14 ┋                                                                               x┋
+CTRL (B
+S  15 ┋                                                                                ┋
+CTRL (0
+S  15 ┋                                                                               x┋
+S  16 ┋                                                                                ┋
+A      └ bold
+CTRL (B
+S  16 ┋ Files :: Text Filters ::                                     Press ESC to exit ┋
+A      └ fg(#eeeeee), bg(#5f87d7)                                          │  │
+A      ·└ underline, fg(#262626)                                           │  │
+A      ··└ [24m, fg(#eeeeee)  │                                            │  │
+A      ·······└ [22m, fg(#3a3a3a)                                          │  │
+A      ········└ fg(#5f87d7), bg(#3a3a3a)                                  │  │
+A      ·········└ bold        │                                            │  │
+A      ··········└ underline, [97m                                         │  │
+A      ···········└ [24m, fg(#5f87d7)                                      │  │
+A      ·······················└ [22m, fg(#eeeeee)                          │  │
+A      ····································································└ bold
+A      ·······································································└ [22m
+S  17 ┋                                                                                ┋
+S  23 ┋ L0          0%                                         ?:View Help             ┋
+A      └ fg(#585858), bg(#303030)
+S  24 ┋                       Press e/E to move forward/backward through error messages┋
+A      └ fg(#e4e4e4), bg(#262626)   ││││                                 │    │
+A      ·····························└ bold                               │    │
+A      ······························└ [22m                              │    │
+A      ·······························└ bold                             │    │
+A      ································└ [22m                            │    │
+A      ··································································└ bold, fg(#ff005f)
+A      ·······································································└ [22m, fg(#e4e4e4)
+S   1 ┋                                              Press  F2 to enable mouse support ┋
+A      ··············································└ fg(#585858), bg(#303030)
+S   3 ┋ⓘ info: No log or text files are currently loaded                               ┋
+A      └ bold, fg(#af87ff), bg(#3a3a3a)
+A      ·└ [22m, fg(#eeeeee)
+A      ··└ bold, fg(#af87ff)
+A      ······└ [22m, fg(#eeeeee)
+S   4 ┋ = help: Use the :open command to open a file or directory                      ┋
+A      └ underline, fg(#00d7ff)
+A      ··└ fg(#eeeeee)  │    │
+A      ···└ fg(#00d7ff) │    │
+A      ·······└ fg(#eeeeee)  │
+A      ·················└ bold, fg(#ff5f87)
+A      ······················└ [22m, fg(#eeeeee)
+S  18 ┋                                                                                ┋
+A      └ [24m, fg(#e4e4e4), bg(#262626)
+CTRL (0
+S  18 ┋                                               x                                ┋
+CTRL (B
+S  18 ┋                                                                                ┋
+CTRL (0
+S  18 ┋                                                                               x┋
+CTRL (B
+S  19 ┋                                                                                ┋
+CTRL (0
+S  19 ┋                                               x                                ┋
+CTRL (B
+S  19 ┋                                                                                ┋
+CTRL (0
+S  19 ┋                                                                               x┋
+CTRL (B
+S  20 ┋                                                                                ┋
+CTRL (0
+S  20 ┋                                               x                                ┋
+CTRL (B
+S  20 ┋                                                                                ┋
+CTRL (0
+S  20 ┋                                                                               x┋
+CTRL (B
+S  21 ┋                                                                                ┋
+CTRL (0
+S  21 ┋                                               x                                ┋
+CTRL (B
+S  21 ┋                                                                                ┋
+CTRL (0
+S  21 ┋                                                                               x┋
+CTRL (B
+S  22 ┋                                                                                ┋
+CTRL (0
+S  22 ┋                                               x                                ┋
+CTRL (B
+S  22 ┋                                                                                ┋
+CTRL (0
+S  22 ┋                                                                               x┋
+S   2 ┋                                                                                ┋
+A      └ bold
+CTRL (B
+S   2 ┋ LOG ▼  ：                                                                       ┋
+A      └ fg(#eeeeee), bg(#5f87d7)
+A      ·······└ fg(#ff875f), bg(#3a3a3a)
+A      ·········└ [22m, fg(#eeeeee)
+S  16 ┋                                                                                ┋
+A      └ fg(#e4e4e4), bg(#262626)
+CTRL (0
+S  16 ┋                                                                               x┋
+CTRL (B
+S  17 ┋                                                                                ┋
+CTRL (0
+S  17 ┋                                                                               x┋
+CTRL (B
+S  18 ┋                                                                                ┋
+S  19 ┋                                                                                ┋
+S  20 ┋                                                                                ┋
+S  21 ┋                                                                                ┋
+K 3f
+# Key: ?
+S  22 ┋ Files :: Text Filters ::                                     Press TAB to edit ┋
+A      └ fg(#585858), bg(#303030)                                          │  │
+A      ····································································└ bold
+A      ·······································································└ [22m
+S  23 ┋ L0          0%                                         ?:View Help             ┋
+A      └ fg(#eeeeee), bg(#3a3a3a)
+OSC Set window title: HELP
+S   2 ┋ HELP ▼  ：⋯ ：                                                                   ┋
+A      ·└ bold, bg(#5f87d7)
+A      ········└ fg(#ff875f), bg(#3a3a3a)
+A      ··········└ [22m, fg(#eeeeee)
+A      ···········└ bold, fg(#ff875f)
+S   3 ┋                                                                                ┋
+A      └ [22m, fg(#e4e4e4), bg(#262626)
+CTRL (0
+S   3 ┋                                                                               x┋
+A      ···············································································└ fg(#262626), bg(#878787)
+S   4 ┋                                                                                ┋
+A      └ bold
+CTRL (B
+S   4 ┋lnav 0.14.0                                                                     ┋
+A      └ fg(#af87ff), bg(#262626)
+A      ···········└ [22m, fg(#e4e4e4)
+S   6 ┋A  fancy log file viewer for the terminal.                                      ┋
+S   8 ┋Overview                                                                        ┋
+A      └ underline, fg(#af87ff)
+S  10 ┋The  Logfile Navigator, lnav, is an enhanced log file viewer that takes         ┋
+A      └ [24m, fg(#e4e4e4)     │   │
+A      ························└ bold
+A      ····························└ [22m
+S  11 ┋advantage  of any semantic information that can be gleaned from the             ┋
+S  12 ┋files  being viewed, such as timestamps and log levels. Using this              ┋
+S  13 ┋extra  semantic information, lnav can do things like interleaving               ┋
+S  14 ┋messages  from different files, generate histograms of messages over            ┋
+S  15 ┋time,  and providing hotkeys for navigating through the file. It is             ┋
+S  16 ┋hoped  that these features will allow the user to quickly and                   ┋
+S  17 ┋efficiently  zero in on problems.                                               ┋
+S  19 ┋Opening Paths/URLs                                                              ┋
+A      └ underline, fg(#af87ff)
+S  21 ┋The  main arguments to lnav are the local/remote files, directories,            ┋
+A      └ [24m, fg(#e4e4e4)
+S  22 ┋glob patterns, or URLs to be viewed. If no arguments are given, the             ┋
+CTRL (0
+S  22 ┋                                                                               x┋
+CTRL (B
+S  24 ┋                                         Press 'q' to return t  t e previou  vi ┋
+A      ················································└ bold
+A      ·················································└ [22m
+K 60
+# Key: `
+S   2 ┋ HELP ▼                                                                         ┋
+A      └ bold, inverse, fg(#eeeeee), bg(#5f87d7)
+S   3 ┋HELP                                                                            ┋
+A      └ [22m, fg(#d0d0d0), bg(#303030)
+CTRL (0
+S   3 ┋                     x                                                          ┋
+A      ·····················└ [27m, fg(#262626), bg(#878787)
+CTRL (B
+S   4 ┋HIST                                                                            ┋
+A      └ fg(#d0d0d0), bg(#303030)
+CTRL (0
+S   4 ┋                     x                                                          ┋
+A      ·····················└ fg(#262626), bg(#878787)
+CTRL (B
+S   5 ┋LOG      (no files)                                                             ┋
+A      └ fg(#d0d0d0), bg(#303030)
+A      ··········└ bold
+A      ············└ [22m
+CTRL (0
+S   5 ┋                     x                                                          ┋
+CTRL (B
+S   6 ┋PRETTY                                                                          ┋
+CTRL (0
+S   6 ┋                     x                                                          ┋
+CTRL (B
+S  23 ┋ L0          0%                                         ?:View Help             ┋
+A      └ fg(#585858)
+K 1b4f43
+# Key: OC
+S   2 ┋ HELP ▼     ⋯                                                                   ┋
+A      └ bold, fg(#eeeeee), bg(#5f87d7)
+A      ············└ [22m, inverse, bg(#3a3a3a)
+S   3 ┋           lnav  0.14.0                                                         ┋
+A      └ [27m, fg(#e4e4e4), bg(#262626)
+A      ···········└ inverse, fg(#d0d0d0), bg(#303030)
+CTRL (0
+S   3 ┋                         x                                                      ┋
+A      ·························└ [27m, fg(#262626), bg(#878787)
+S   4 ┋                                                                                ┋
+A      └ bold
+CTRL (B
+S   4 ┋lnav 0.14.0                                                                     ┋
+A      └ fg(#af87ff), bg(#262626)
+A      ······················└ [22m, fg(#d0d0d0), bg(#303030)
+CTRL (0
+S   4 ┋                         x                                                      ┋
+A      ·························└ fg(#262626), bg(#878787)
+CTRL (B
+S   5 ┋                                                                                ┋
+A      └ fg(#e4e4e4), bg(#262626)
+S   6 ┋A fancy log file viewe                                                          ┋
+K 0d
+# Key: 
+S   2 ┋           lnav  0.14.0 ：⋯ ：                                                    ┋
+A      ···········└ fg(#eeeeee), bg(#3a3a3a)
+A      ·······················└ bold, fg(#ff875f)
+A      ·························└ [22m, fg(#eeeeee)
+A      ··························└ bold, fg(#ff875f)
+S   3 ┋lnav 0.14.0                                                                     ┋
+A      └ fg(#af87ff), bg(#262626)
+A      ···········└ [22m, fg(#e4e4e4)
+S   4 ┋                                                                                ┋
+S   5 ┋A  fancy log file viewer for the terminal.                                      ┋
+S   6 ┋                                                                                ┋
+S   7 ┋Overview                                                                        ┋
+A      └ underline, fg(#af87ff)
+S   8 ┋                                                                                ┋
+A      └ [24m, fg(#e4e4e4)
+S   9 ┋The  Logfile Navigator, lnav, is an enhanced log file viewer that takes         ┋
+A      ························└ bold
+A      ····························└ [22m
+S  10 ┋advantage of   ny semantic inform tio  that can be glean d from  he             ┋
+S  11 ┋files being viewed, such as times  amps and log l ve s. Using this              ┋
+S  12 ┋extra  s mantic information, lnav c n do things  ik  interleaving               ┋
+S  13 ┋mess  ges from d f e en  files, generate histograms of m ssages over            ┋
+S  14 ┋time, and providing ho  keys for navigating  hrough the file. It is             ┋
+S  15 ┋hop  d that these features will allow the user to quickly and                   ┋
+S  16 ┋efficiently z  ro in on problems.                                               ┋
+S  17 ┋                                                                                ┋
+S  18 ┋Opening Paths/URLs                                                              ┋
+A      └ underline, fg(#af87ff)
+S  19 ┋                                                                                ┋
+A      └ [24m, fg(#e4e4e4)
+S  20 ┋The  main arguments to lnav are the local/remote files, directories,            ┋
+S  21 ┋glob patte  ns, or URLs to be view d. If no arguments are given, the            ┋
+S  22 ┋default syslog  file for your syst m will be open d. These arguments            ┋
+S  23 ┋ L1          0%                                         ?:View Help             ┋
+A      └ fg(#eeeeee), bg(#3a3a3a)
+K 60
+# Key: `
+S   2 ┋ HELP ▼                                                                         ┋
+A      └ bold, inverse, bg(#5f87d7)
+S   3 ┋HELP                                                                            ┋
+A      └ [22m, fg(#d0d0d0), bg(#303030)
+CTRL (0
+S   3 ┋                     x                                                          ┋
+A      ·····················└ [27m, fg(#262626), bg(#878787)
+CTRL (B
+S   4 ┋HIST                                                                            ┋
+A      └ fg(#d0d0d0), bg(#303030)
+CTRL (0
+S   4 ┋                     x                                                          ┋
+A      ·····················└ fg(#262626), bg(#878787)
+CTRL (B
+S   5 ┋LOG      (no files)                                                             ┋
+A      └ fg(#d0d0d0), bg(#303030)
+A      ··········└ bold
+A      ············└ [22m
+CTRL (0
+S   5 ┋                     x                                                          ┋
+CTRL (B
+S   6 ┋PRETTY                                                                          ┋
+CTRL (0
+S   6 ┋                     x                                                          ┋
+CTRL (B
+S  23 ┋ L1          0%                                         ?:View Help             ┋
+A      └ fg(#585858)
+K 1b4f43
+# Key: OC
+S   2 ┋ HELP ▼     lnav 0.14.0                                                         ┋
+A      └ bold, fg(#eeeeee), bg(#5f87d7)
+A      ············└ [22m, inverse, bg(#3a3a3a)
+S   3 ┋lnav 0.14.0lnav  0.14.0                                                         ┋
+A      └ bold, [27m, fg(#af87ff), bg(#262626)
+A      ···········└ [22m, inverse, fg(#d0d0d0), bg(#303030)
+CTRL (0
+S   3 ┋                         x                                                      ┋
+A      ·························└ [27m, fg(#262626), bg(#878787)
+CTRL (B
+S   4 ┋                                                                                ┋
+A      └ fg(#e4e4e4), bg(#262626)
+A      ······················└ fg(#d0d0d0), bg(#303030)
+CTRL (0
+S   4 ┋                         x                                                      ┋
+A      ·························└ fg(#262626), bg(#878787)
+CTRL (B
+S   5 ┋A fancy log file viewe                                                          ┋
+A      └ fg(#e4e4e4), bg(#262626)
+S   6 ┋                                                                                ┋
+K 1b4f43
+# Key: OC
+S   2 ┋           lnav 0.14.0    ⋯                                                     ┋
+A      ···········└ fg(#eeeeee), bg(#3a3a3a)
+A      ··························└ inverse
+S   3 ┋                         Command Reference                                      ┋
+A      ···········└ [27m, fg(#e4e4e4), bg(#262626)
+A      ·························└ inverse, fg(#d0d0d0), bg(#303030)
+CTRL (0
+S   3 ┋                                                               x                ┋
+A      ·······························································└ [27m, fg(#262626), bg(#878787)
+CTRL (B
+S   4 ┋                         Contact                                                ┋
+A      ···········└ fg(#e4e4e4), bg(#262626)
+A      ·························└ fg(#d0d0d0), bg(#303030)
+CTRL (0
+S   4 ┋                                                               x                ┋
+A      ·······························································└ fg(#262626), bg(#878787)
+CTRL (B
+S   5 ┋                         Default Key Bindings                                   ┋
+A      ·························└ fg(#d0d0d0), bg(#303030)
+CTRL (0
+S   5 ┋                                                               x                ┋
+CTRL (B
+S   6 ┋                         Display                                                ┋
+CTRL (0
+S   6 ┋                                                               x                ┋
+K 1b4f42
+# Key: OB
+CTRL (B
+S   3 ┋                         Command Reference                                      ┋
+S   4 ┋                         Contact                                                ┋
+A      ·························└ inverse
+K 1b4f42
+# Key: OB
+S   4 ┋                         Contact                                                ┋
+A      ·························└ [27m
+S   5 ┋                         Default Key Bindings                                   ┋
+A      ·························└ inverse
+K 1b4f42
+# Key: OB
+S   3 ┋                           nt  ct                                               ┋
+A      ···························└ [27m
+S   4 ┋                         Defaul   Key Bindings                                  ┋
+S   5 ┋                          isplay                                                ┋
+A      ··························└ inverse
+S   6 ┋                          ynamic  logline Table (experimental)                  ┋
+A      ··························└ [27m
+K 0d
+# Key: 
+S   2 ┋                         Display ：                                              ┋
+A      ·························└ fg(#eeeeee), bg(#3a3a3a)
+A      ································└ bold, fg(#ff875f)
+S   3 ┋The main part  of the display shows the log lines from the files                ┋
+A      └ [22m, fg(#e4e4e4), bg(#262626)
+S   4 ┋interleaved  based on time-of-day. New lines are automatically loaded           ┋
+S   5 ┋as the   are app nded to the files and, if you are viewing the bottom           ┋
+S   6 ┋of  the files, lnav will scroll down to display the new lines, much             ┋
+S   7 ┋like  tail -f .                                                                 ┋
+A      ·····└ fg(#ff005f), bg(#121212)
+A      ··············└ fg(#e4e4e4), bg(#262626)
+S   9 ┋On color displays, the  lines will b   ighlighted as follows:                   ┋
+S  10 ┋                                                                                ┋
+S  11 ┋ • Errors will b   colored in red;                                              ┋
+A      ·└ fg(#ff8700)                │  │
+A      ··└ fg(#e4e4e4)               │  │
+A      ······························└ fg(#ff005f)
+A      ·································└ fg(#e4e4e4)
+S  12 ┋ • w  rnings will be yellow;                                                    ┋
+A      ·└ fg(#ff8700)       │     │
+A      ··└ fg(#e4e4e4)      │     │
+A      ·····················└ fg(#ff8700)
+A      ···························└ fg(#e4e4e4)
+S  13 ┋ • boundaries  betw en days will be underlined;  nd                             ┋
+A      ·└ fg(#ff8700)                      │         │
+A      ··└ fg(#e4e4e4)                     │         │
+A      ····································└ underline
+A      ··············································└ [24m
+S  14 ┋ • various c  lor hig light  will be applied to: IP                             ┋
+A      ·└ fg(#ff8700)
+A      ··└ fg(#e4e4e4)
+S  15 ┋   a  dresses, SQL keywords, XML tags, file and line numbers                    ┋
+S  16 ┋     n Java backtraces, and quoted strings.                                     ┋
+S  18 ┋To give you an idea  of where you are spatially, the right side of the          ┋
+S  19 ┋display  has a proportionally sized 'scroll bar' that indicates your            ┋
+S  20 ┋current positio   in the files. T   scro l bar will also show a ea  of          ┋
+S  21 ┋the file where  warnings  r  rrors are detected by colo in  the bar             ┋
+S  22 ┋y  llow or red, respectively. Tick  arks will also be add d to the left         ┋
+S  23 ┋ L96         2%                                         ?:View Help             ┋
+A      └ fg(#eeeeee), bg(#3a3a3a)
+K 71
+# Key: q
+OSC Set window title: LOG
+S   3 ┋ⓘ info: No log or text files are currently loaded                               ┋
+A      └ bold, fg(#af87ff)
+A      ·└ [22m, fg(#eeeeee)
+A      ··└ bold, fg(#af87ff)
+A      ······└ [22m, fg(#eeeeee)
+CTRL (0
+S   3 ┋                                                                               x┋
+A      ···············································································└ fg(#e4e4e4), bg(#262626)
+CTRL (B
+S   4 ┋ = help: Use the :open command to open a file or directory                      ┋
+A      └ underline, fg(#00d7ff), bg(#3a3a3a)
+A      ··└ fg(#eeeeee)  │    │
+A      ···└ fg(#00d7ff) │    │
+A      ·······└ fg(#eeeeee)  │
+A      ·················└ bold, fg(#ff5f87)
+A      ······················└ [22m, fg(#eeeeee)
+S   5 ┋                                                                                ┋
+A      └ [24m, fg(#e4e4e4), bg(#262626)
+S   6 ┋                                                                                ┋
+S   7 ┋                                                                                ┋
+S   9 ┋                                                                                ┋
+S  11 ┋                                                                                ┋
+S  12 ┋                                                                                ┋
+S  13 ┋                                                                                ┋
+S  14 ┋                                                                                ┋
+S  15 ┋                                                                                ┋
+S  16 ┋                                                                                ┋
+S  18 ┋                                                                                ┋
+S  19 ┋                                                                                ┋
+S  20 ┋                                                                                ┋
+S  21 ┋                                                                                ┋
+S  22 ┋                                                                                ┋
+S  23 ┋  0           0                                                                 ┋
+A      ··└ fg(#eeeeee), bg(#3a3a3a)
+S  24 ┋                                                                                ┋
+A      └ [39;49m
+CTRL (B
+S  24 ┋                                                                                ┋
+A      └ normal
+CSI Normal cursor keys
+CTRL Normal keypad
+CSI Show cursor
+S  24 ┋                                                                                ┋
+A      └ normal, normal

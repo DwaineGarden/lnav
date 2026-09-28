@@ -1,5 +1,7 @@
 #! /bin/bash
 
+export YES_COLOR=1
+
 run_cap_test ./drive_sql "select length(gzip(1))"
 
 run_cap_test ./drive_sql "select gunzip(gzip(1))"
@@ -23,6 +25,8 @@ run_cap_test ./drive_sql "select endswith('foo.', '.')"
 run_cap_test ./drive_sql "select endswith('foo.txt', '.txt')"
 
 run_cap_test ./drive_sql "select endswith('a', '.txt')"
+
+run_cap_test ./drive_sql "SELECT '' REGEXP '~x'"
 
 run_cap_test ./drive_sql "select regexp('abcd', 'abcd')"
 
@@ -68,6 +72,9 @@ run_cap_test ./drive_sql "select regexp_match('foo=(?<foo>\w+); (\w+)', 'foo=abc
 
 run_cap_test ./drive_sql "select regexp_match('foo=(?<foo>\w+); (\w+\.\w+)', 'foo=abc; 123.456') as result"
 
+# captures that only look like numbers stay strings, so the JSON is valid
+run_cap_test ./drive_sql "select regexp_match('(\w+) (\S+) (\S+) (\S+)', 'nan inf .5 1.50') as result"
+
 run_cap_test ${lnav_test} -nN \
    -c ";SELECT regexp_match('^(\w+)=([^;]+);', 'abc=def;ghi=jkl;')"
 
@@ -103,13 +110,41 @@ run_cap_test ./drive_sql "SELECT * FROM regexp_capture('foo foo', '^foo')"
 
 run_cap_test ./drive_sql "SELECT * FROM regexp_capture_into_json('foo=1 bar=2; foo=3 bar=4', 'foo=(\d+) bar=(\d+)')"
 
+# every capture in the pattern gets a row, even when this match did not set it
+run_cap_test ./drive_sql "SELECT match_index, capture_index, capture_count, content FROM regexp_capture('abc 12', '(?:([a-z]+)|(\d+))')"
+
+# numbers are read as decimal unless they start with 0x, and the JSON is valid
+run_cap_test ./drive_sql "SELECT content FROM regexp_capture_into_json('a=0755 b=08 c=nan d=0x1F e=1.50 f=12abc', '(\w)=(\S+)')"
+
 run_cap_test ./drive_sql "SELECT encode('foo', 'bar')"
 
 run_cap_test ./drive_sql "SELECT encode('foo', null)"
 
 run_cap_test ./drive_sql "SELECT encode(null, 'base64')"
 
+run_cap_test ./drive_sql "SELECT encode('hi' || char(10), 'hex')"
+
+run_cap_test ./drive_sql "SELECT decode(encode('Hello, World!', 'hex'), 'hex')"
+
+run_cap_test ./drive_sql "SELECT decode('123', 'hex')"
+
+run_cap_test ./drive_sql "SELECT decode('112g', 'hex')"
+
 run_cap_test ./drive_sql "SELECT gunzip(decode(encode(gzip('Hello, World!'), 'base64'), 'base64'))"
+
+run_cap_test ./drive_sql "SELECT encode('abc & def nl1 ' || char(0x1b) || ' eof', 'html')"
+
+run_cap_test ./drive_sql "SELECT decode('abc &amp; def nl1 &#10; nl2 &#x0a; eof', 'html')"
+
+# base64 output of every length, including those not a multiple of three
+run_cap_test ./drive_sql "SELECT encode('a', 'base64'), encode('ab', 'base64'), encode('abcd', 'base64'), encode('abcdefg', 'base64')"
+
+run_cap_test ./drive_sql "SELECT decode(encode('abcdefg', 'base64'), 'base64')"
+
+run_cap_test ./drive_sql "SELECT decode('!!!!', 'base64')"
+
+# numeric entities that are not valid code points are left as-is
+run_cap_test ./drive_sql "SELECT decode('&#0;x&#x110000;&#xD800;&#169;&#x2014;&amp;&bogus;', 'html')"
 
 #run_cap_test env TEST_COMMENT=invalid_url ./drive_sql <<'EOF'
 #SELECT parse_url('https://bad@[fe::')
@@ -143,6 +178,20 @@ run_cap_test env TEST_COMMENT=parse_url6 ./drive_sql <<'EOF'
 SELECT parse_url('https://example.com/sea%26rch?flag&flag2&=def#frag1%20space')
 EOF
 
+run_cap_test env TEST_COMMENT=parse_url7 ./drive_sql <<'EOF'
+SELECT parse_url('https://example.com/sea%26rch?flag&flag2&=def&flag3=abc+def#frag1%20space')
+EOF
+
+# a value that is not UTF-8 once decoded, and encoded '=' in a key and value
+run_cap_test env TEST_COMMENT=parse_url8 ./drive_sql <<'EOF'
+SELECT parse_url('https://example.com/?a=%ff&b=1&c%3Dd=e%3Df')
+EOF
+
+# keys without a value are decoded too
+run_cap_test env TEST_COMMENT=parse_url9 ./drive_sql <<'EOF'
+SELECT parse_url('https://example.com/?a%20b&x=')
+EOF
+
 
 run_cap_test env TEST_COMMENT=unparse_url3 ./drive_sql <<'EOF'
 SELECT unparse_url(parse_url('https://example.com/search?flag'))
@@ -160,6 +209,28 @@ run_cap_test env TEST_COMMENT=unparse_url6 ./drive_sql <<'EOF'
 SELECT unparse_url(parse_url('https://example.com/search?flag&flag2&=def#frag1%20space'))
 EOF
 
+run_cap_test env TEST_COMMENT=unparse_url7 ./drive_sql <<'EOF'
+SELECT unparse_url(NULL)
+EOF
+
+run_cap_test env TEST_COMMENT=unparse_url8 ./drive_sql <<'EOF'
+SELECT unparse_url(123)
+EOF
+
+run_cap_test env TEST_COMMENT=unparse_url9 ./drive_sql <<'EOF'
+SELECT unparse_url('[1, 2, 3]')
+EOF
+
+run_cap_test env TEST_COMMENT=unparse_url10 ./drive_sql <<'EOF'
+SELECT unparse_url(json_object('unknown', 'abc'))
+EOF
+
+run_cap_test env TEST_COMMENT=unparse_url11 ./drive_sql <<'EOF'
+SELECT unparse_url('{}')
+EOF
+
+run_cap_test ./drive_sql "SELECT pretty_print('{a: 1, b:2}')"
+
 run_cap_test ${lnav_test} -n \
     -c ';SELECT log_body, extract(log_body) from vmw_log' \
     -c ':write-json-to -' \
@@ -168,3 +239,11 @@ run_cap_test ${lnav_test} -n \
 run_cap_test ${lnav_test} -n \
     -c ';SELECT anonymize(bro_id_resp_h) FROM bro_http_log' \
     ${test_dir}/logfile_bro_http.log.0
+
+run_cap_test ${lnav_test} -nN \
+    -c ";SELECT humanize_id('foo'), humanize_id('bar')"
+
+# the bounds can be given in either order
+run_cap_test ./drive_sql "SELECT sparkline(value, 0, 100), sparkline(value, 100, 0) FROM json_each('[10, 50, 90]')"
+
+run_cap_test ./drive_sql "SELECT sparkline(value) FROM json_each('[10, 50, 90]')"

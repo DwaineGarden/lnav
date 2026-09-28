@@ -33,23 +33,21 @@
 #define logfile_sub_source_hh
 
 #include <array>
-#include <list>
+#include <atomic>
+#include <exception>
+#include <functional>
 #include <map>
-#include <sstream>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <limits.h>
 
-#include "base/lnav.console.hh"
-#include "base/lnav_log.hh"
 #include "base/time_util.hh"
 #include "big_array.hh"
 #include "bookmarks.hh"
 #include "document.sections.hh"
 #include "filter_observer.hh"
-#include "lnav_config_fwd.hh"
-#include "log_accel.hh"
 #include "log_format.hh"
 #include "logfile.hh"
 #include "strong_int.hh"
@@ -64,6 +62,17 @@ int sqlite3_finalize(sqlite3_stmt* pStmt);
 }
 
 class logfile_sub_source;
+
+struct breakpoint_info {
+    enum class source_type : int {
+        src_location,
+        message_schema,
+    };
+
+    std::string bp_description;
+    source_type bp_source{source_type::src_location};
+    bool bp_enabled{true};
+};
 
 class index_delegate {
 public:
@@ -80,39 +89,6 @@ public:
     virtual void index_complete(logfile_sub_source& lss) {}
 };
 
-class pcre_filter : public text_filter {
-public:
-    pcre_filter(type_t type,
-                const std::string& id,
-                size_t index,
-                std::shared_ptr<lnav::pcre2pp::code> code)
-        : text_filter(type, filter_lang_t::REGEX, id, index),
-          pf_pcre(std::move(code))
-    {
-    }
-
-    ~pcre_filter() override = default;
-
-    bool matches(const logfile& lf,
-                 logfile::const_iterator ll,
-                 shared_buffer_ref& line) override
-    {
-        return this->pf_pcre->find_in(line.to_string_fragment())
-            .ignore_error()
-            .has_value();
-    }
-
-    std::string to_command() const override
-    {
-        return (this->lf_type == text_filter::INCLUDE ? "filter-in "
-                                                      : "filter-out ")
-            + this->lf_id;
-    }
-
-protected:
-    std::shared_ptr<lnav::pcre2pp::code> pf_pcre;
-};
-
 class sql_filter : public text_filter {
 public:
     sql_filter(logfile_sub_source& lss,
@@ -124,14 +100,31 @@ public:
         this->sf_filter_stmt = stmt;
     }
 
-    bool matches(const logfile& lf,
-                 logfile::const_iterator ll,
-                 shared_buffer_ref& line) override;
+    /**
+     * Handed out in creation order and never reused, so a filter allocated
+     * where a freed one used to live is still told apart from it.
+     */
+    static uint64_t next_serial()
+    {
+        static std::atomic<uint64_t> counter{0};
+
+        return counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
+    bool matches(std::optional<line_source> ls,
+                 const shared_buffer_ref& line) override;
 
     std::string to_command() const override;
 
+    /**
+     * @return This thread's copy of the statement, prepared on first use, or
+     * null if it could not be prepared.
+     */
+    sqlite3_stmt* stmt_for_this_thread();
+
     auto_mem<sqlite3_stmt> sf_filter_stmt{sqlite3_finalize};
     logfile_sub_source& sf_log_source;
+    const uint64_t sf_serial{next_serial()};
 };
 
 class log_location_history : public location_history {
@@ -147,10 +140,9 @@ public:
 
     void loc_history_append(vis_line_t top) override;
 
-    nonstd::optional<vis_line_t> loc_history_back(
-        vis_line_t current_top) override;
+    std::optional<vis_line_t> loc_history_back(vis_line_t current_top) override;
 
-    nonstd::optional<vis_line_t> loc_history_forward(
+    std::optional<vis_line_t> loc_history_forward(
         vis_line_t current_top) override;
 
 private:
@@ -159,79 +151,7 @@ private:
     content_line_t llh_backing[MAX_SIZE];
 };
 
-class logline_window {
-public:
-    logline_window(logfile_sub_source& lss,
-                   vis_line_t start_vl,
-                   vis_line_t end_vl)
-        : lw_source(lss), lw_start_line(start_vl), lw_end_line(end_vl)
-    {
-    }
-
-    class iterator;
-
-    class logmsg_info {
-    public:
-        logmsg_info(logfile_sub_source& lss, vis_line_t vl);
-
-        vis_line_t get_vis_line() const { return this->li_line; }
-
-        const logline& get_logline() const { return *this->li_logline; }
-
-        const string_attrs_t& get_attrs() const
-        {
-            this->load_msg();
-            return this->li_string_attrs;
-        }
-
-        const logline_value_vector& get_values() const
-        {
-            this->load_msg();
-            return this->li_line_values;
-        }
-
-        std::string to_string(const struct line_range& lr) const;
-
-    private:
-        friend iterator;
-
-        void next_msg();
-        void load_msg() const;
-
-        logfile_sub_source& li_source;
-        vis_line_t li_line;
-        logfile* li_file{nullptr};
-        logfile::const_iterator li_logline;
-        mutable string_attrs_t li_string_attrs;
-        mutable logline_value_vector li_line_values;
-    };
-
-    class iterator {
-    public:
-        iterator(logfile_sub_source& lss, vis_line_t vl) : i_info(lss, vl) {}
-
-        iterator& operator++();
-
-        bool operator!=(const iterator& rhs) const
-        {
-            return this->i_info.get_vis_line() != rhs.i_info.get_vis_line();
-        }
-
-        const logmsg_info& operator*() const { return this->i_info; }
-
-    private:
-        logmsg_info i_info;
-    };
-
-    iterator begin();
-
-    iterator end();
-
-private:
-    logfile_sub_source& lw_source;
-    vis_line_t lw_start_line;
-    vis_line_t lw_end_line;
-};
+class logline_window;
 
 /**
  * Delegate class that merges the contents of multiple log files into a single
@@ -240,10 +160,13 @@ private:
 class logfile_sub_source
     : public text_sub_source
     , public text_time_translator
-    , public list_input_delegate {
+    , public text_accel_source
+    , public text_anchors
+    , public text_mark_scanner
+    , public text_delegate
+    , public text_detail_provider
+    , public lnav_config_listener {
 public:
-    const static bookmark_type_t BM_ERRORS;
-    const static bookmark_type_t BM_WARNINGS;
     const static bookmark_type_t BM_FILES;
 
     virtual void text_filters_changed();
@@ -252,142 +175,34 @@ public:
 
     ~logfile_sub_source() = default;
 
-    void toggle_time_offset()
-    {
-        this->lss_flags ^= F_TIME_OFFSET;
-        this->clear_line_size_cache();
-    }
+    enum class line_context_t : uint8_t {
+        filename,
+        basename,
+        none,
+        time_column,
+    };
 
-    void increase_line_context()
-    {
-        auto old_flags = this->lss_flags;
+    void increase_line_context();
 
-        if (this->lss_flags & F_FILENAME) {
-            // Nothing to do
-        } else if (this->lss_flags & F_BASENAME) {
-            this->lss_flags &= ~F_NAME_MASK;
-            this->lss_flags |= F_FILENAME;
-        } else {
-            this->lss_flags |= F_BASENAME;
-        }
-        if (old_flags != this->lss_flags) {
-            this->clear_line_size_cache();
-        }
-    }
+    bool decrease_line_context();
 
-    bool decrease_line_context()
-    {
-        auto old_flags = this->lss_flags;
+    size_t get_filename_offset() const;
 
-        if (this->lss_flags & F_FILENAME) {
-            this->lss_flags &= ~F_NAME_MASK;
-            this->lss_flags |= F_BASENAME;
-        } else if (this->lss_flags & F_BASENAME) {
-            this->lss_flags &= ~F_NAME_MASK;
-        }
-        if (old_flags != this->lss_flags) {
-            this->clear_line_size_cache();
-
-            return true;
-        }
-
-        return false;
-    }
-
-    size_t get_filename_offset() const
-    {
-        if (this->lss_flags & F_FILENAME) {
-            return this->lss_filename_width;
-        } else if (this->lss_flags & F_BASENAME) {
-            return this->lss_basename_width;
-        }
-
-        return 0;
-    }
-
-    void set_time_offset(bool enabled)
-    {
-        if (enabled)
-            this->lss_flags |= F_TIME_OFFSET;
-        else
-            this->lss_flags &= ~F_TIME_OFFSET;
-        this->clear_line_size_cache();
-    }
-
-    bool is_time_offset_enabled() const
-    {
-        return (bool) (this->lss_flags & F_TIME_OFFSET);
-    }
-
-    bool is_filename_enabled() const
-    {
-        return (bool) (this->lss_flags & F_FILENAME);
-    }
-
-    bool is_basename_enabled() const
-    {
-        return (bool) (this->lss_flags & F_BASENAME);
-    }
-
-    log_level_t get_min_log_level() const { return this->lss_min_log_level; }
+    line_context_t get_line_context() const { return this->lss_line_context; }
 
     void set_force_rebuild() { this->lss_force_rebuild = true; }
 
-    void set_min_log_level(log_level_t level)
-    {
-        if (this->lss_min_log_level != level) {
-            this->lss_min_log_level = level;
-            this->text_filters_changed();
-        }
-    }
+    bool is_rebuild_forced() const { return this->lss_force_rebuild; }
 
-    bool get_min_log_time(struct timeval& tv_out) const
-    {
-        tv_out = this->lss_min_log_time;
-        return (this->lss_min_log_time.tv_sec != 0
-                || this->lss_min_log_time.tv_usec != 0);
-    }
+    /**
+     * While set, rebuild_index() indexes the files but does not merge their
+     * lines into the combined index.
+     */
+    void set_merge_deferred(bool val) { this->lss_merge_deferred = val; }
 
-    void set_min_log_time(const struct timeval& tv)
-    {
-        if (this->lss_min_log_time != tv) {
-            this->lss_min_log_time = tv;
-            this->text_filters_changed();
-        }
-    }
+    bool is_merge_deferred() const { return this->lss_merge_deferred; }
 
-    bool get_max_log_time(struct timeval& tv_out) const
-    {
-        tv_out = this->lss_max_log_time;
-        return (this->lss_max_log_time.tv_sec
-                    != std::numeric_limits<time_t>::max()
-                || this->lss_max_log_time.tv_usec != 0);
-    }
-
-    void set_max_log_time(struct timeval& tv)
-    {
-        if (this->lss_max_log_time != tv) {
-            this->lss_max_log_time = tv;
-            this->text_filters_changed();
-        }
-    }
-
-    void clear_min_max_log_times()
-    {
-        if (this->lss_min_log_time.tv_sec != 0
-            || this->lss_min_log_time.tv_usec != 0
-            || this->lss_max_log_time.tv_sec
-                != std::numeric_limits<time_t>::max()
-            || this->lss_max_log_time.tv_usec != 0)
-        {
-            memset(&this->lss_min_log_time, 0, sizeof(this->lss_min_log_time));
-            this->lss_max_log_time.tv_sec = std::numeric_limits<time_t>::max();
-            this->lss_max_log_time.tv_usec = 0;
-            this->text_filters_changed();
-        }
-    }
-
-    bool list_input_handle_key(listview_curses& lv, int ch);
+    bool list_input_handle_key(listview_curses& lv, const ncinput& ch);
 
     void set_marked_only(bool val)
     {
@@ -396,6 +211,8 @@ public:
             this->text_filters_changed();
         }
     }
+
+    void update_filter_hash_state(hasher& h) const;
 
     bool get_marked_only() { return this->lss_marked_only; }
 
@@ -406,44 +223,25 @@ public:
         return this->lss_longest_line;
     }
 
-    size_t file_count() const
-    {
-        size_t retval = 0;
-        const_iterator iter;
-
-        for (iter = this->cbegin(); iter != this->cend(); ++iter) {
-            if (*iter != nullptr && (*iter)->get_file() != nullptr) {
-                retval += 1;
-            }
-        }
-
-        return retval;
-    }
+    size_t file_count() const;
 
     bool empty() const { return this->lss_filtered_index.empty(); }
 
-    void text_value_for_line(textview_curses& tc,
-                             int row,
-                             std::string& value_out,
-                             line_flags_t flags);
+    line_info text_value_for_line(textview_curses& tc,
+                                  int row,
+                                  std::string& value_out,
+                                  line_flags_t flags);
 
     void text_attrs_for_line(textview_curses& tc,
                              int row,
                              string_attrs_t& value_out);
 
-    size_t text_size_for_line(textview_curses& tc, int row, line_flags_t flags)
-    {
-        size_t index = row % LINE_SIZE_CACHE_SIZE;
+    void text_horiz_columns(textview_curses& tc,
+                            vis_line_t start_row,
+                            vis_line_t end_row,
+                            std::set<int>& columns_out);
 
-        if (this->lss_line_size_cache[index].first != row) {
-            std::string value;
-
-            this->text_value_for_line(tc, row, value, flags);
-            this->lss_line_size_cache[index].second = value.size();
-            this->lss_line_size_cache[index].first = row;
-        }
-        return this->lss_line_size_cache[index].second;
-    }
+    size_t text_size_for_line(textview_curses& tc, int row, line_flags_t flags);
 
     void text_mark(const bookmark_type_t* bm, vis_line_t line, bool added);
 
@@ -454,14 +252,15 @@ public:
     void remove_file(std::shared_ptr<logfile> lf);
 
     enum class rebuild_result {
+        rr_in_progress,
         rr_no_change,
         rr_appended_lines,
         rr_partial_rebuild,
         rr_full_rebuild,
     };
 
-    rebuild_result rebuild_index(nonstd::optional<ui_clock::time_point> deadline
-                                 = nonstd::nullopt);
+    rebuild_result rebuild_index(std::optional<ui_clock::time_point> deadline
+                                 = std::nullopt);
 
     void text_update_marks(vis_bookmarks& bm);
 
@@ -475,6 +274,16 @@ public:
         return this->lss_user_marks;
     }
 
+    std::map<std::string, breakpoint_info>& get_breakpoints()
+    {
+        return this->lss_breakpoints;
+    }
+
+    const std::map<std::string, breakpoint_info>& get_breakpoints() const
+    {
+        return this->lss_breakpoints;
+    }
+
     bookmark_metadata& get_bookmark_metadata(content_line_t cl);
 
     bookmark_metadata& get_bookmark_metadata(vis_line_t vl)
@@ -482,11 +291,26 @@ public:
         return this->get_bookmark_metadata(this->at(vl));
     }
 
-    nonstd::optional<bookmark_metadata*> find_bookmark_metadata(
-        content_line_t cl);
+    struct bookmark_metadata_context {
+        std::optional<vis_line_t> bmc_current;
+        std::optional<bookmark_metadata*> bmc_current_metadata;
+        std::optional<vis_line_t> bmc_next_line;
+    };
 
-    nonstd::optional<bookmark_metadata*> find_bookmark_metadata(vis_line_t vl)
+    bookmark_metadata_context get_bookmark_metadata_context(
+        vis_line_t vl,
+        bookmark_metadata::categories desired
+        = bookmark_metadata::categories::any) const;
+
+    std::optional<bookmark_metadata*> find_bookmark_metadata(
+        content_line_t cl) const;
+
+    std::optional<bookmark_metadata*> find_bookmark_metadata(
+        vis_line_t vl) const
     {
+        if (vl >= vis_line_t(this->lss_filtered_index.size())) {
+            return std::nullopt;
+        }
         return this->find_bookmark_metadata(this->at(vl));
     }
 
@@ -504,17 +328,36 @@ public:
         return this->lss_index.size() - this->lss_filtered_index.size();
     }
 
-    int get_filtered_count_for(size_t filter_index) const
+    // Full index size (includes sibling metric rows that are suppressed
+    // from lss_filtered_index).
+    size_t index_size() const { return this->lss_index.size(); }
+
+    content_line_t content_line_at(size_t idx) const
     {
-        int retval = 0;
-
-        for (const auto& ld : this->lss_files) {
-            retval += ld->ld_filter_state.lfo_filter_state
-                          .tfs_filter_hits[filter_index];
-        }
-
-        return retval;
+        return this->lss_index[idx].value();
     }
+
+    // True when the row at the given `lss_index` position is excluded
+    // by the active filters.  Lets callers walking `lss_index` directly
+    // (e.g. sibling fan-out) distinguish "in lss_index but suppressed
+    // by dedup" from "in lss_index but hidden by filter".  Callers
+    // that check many rows should cache the filter masks via
+    // `get_enabled_filter_mask()` and pass them in rather than letting
+    // this function re-walk the filter stack per call.
+    bool row_is_filtered_out(size_t idx,
+                             uint32_t filter_in_mask,
+                             uint32_t filter_out_mask);
+
+    // Snapshot the enabled filter masks.  Cheap but not free — walks
+    // the filter stack.  Safe to cache for the duration of a tight
+    // loop over rows.
+    void get_enabled_filter_mask(uint32_t& filter_in_mask,
+                                 uint32_t& filter_out_mask)
+    {
+        this->get_filters().get_enabled_mask(filter_in_mask, filter_out_mask);
+    }
+
+    int get_filtered_count_for(size_t filter_index) const;
 
     Result<void, lnav::console::user_message> set_sql_filter(
         std::string stmt_str, sqlite3_stmt* stmt);
@@ -522,8 +365,19 @@ public:
     Result<void, lnav::console::user_message> set_sql_marker(
         std::string stmt_str, sqlite3_stmt* stmt);
 
+    /**
+     * Whether the expression has to be one that depends only on the message.
+     * Required of a filter, whose result is evaluated once at index time and
+     * then remembered; not of a marker, which is re-evaluated over every
+     * message each time it is set.
+     */
+    enum class expr_purity {
+        required,
+        not_required,
+    };
+
     Result<void, lnav::console::user_message> set_preview_sql_filter(
-        sqlite3_stmt* stmt);
+        sqlite3_stmt* stmt, expr_purity purity = expr_purity::required);
 
     std::string get_sql_filter_text()
     {
@@ -535,7 +389,7 @@ public:
         return "";
     }
 
-    nonstd::optional<std::shared_ptr<text_filter>> get_sql_filter();
+    std::optional<std::shared_ptr<text_filter>> get_sql_filter();
 
     std::string get_sql_marker_text() const
     {
@@ -554,9 +408,9 @@ public:
         return retval;
     }
 
-    logfile* find_file_ptr(content_line_t& line)
+    logfile* find_file_ptr(content_line_t& line) const
     {
-        auto retval
+        auto* retval
             = this->lss_files[line / MAX_LINES_PER_FILE]->get_file_ptr();
         line = content_line_t(line % MAX_LINES_PER_FILE);
 
@@ -566,7 +420,7 @@ public:
     logline* find_line(content_line_t line) const
     {
         logline* retval = nullptr;
-        std::shared_ptr<logfile> lf = this->find(line);
+        auto lf = this->find_file_ptr(line);
 
         if (lf != nullptr) {
             auto ll_iter = lf->begin() + line;
@@ -577,7 +431,7 @@ public:
         return retval;
     }
 
-    nonstd::optional<std::pair<std::shared_ptr<logfile>, logfile::iterator>>
+    std::optional<std::pair<std::shared_ptr<logfile>, logfile::iterator>>
     find_line_with_file(content_line_t line) const
     {
         std::shared_ptr<logfile> lf = this->find(line);
@@ -588,69 +442,101 @@ public:
             return std::make_pair(lf, ll_iter);
         }
 
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
-    nonstd::optional<std::pair<std::shared_ptr<logfile>, logfile::iterator>>
-    find_line_with_file(vis_line_t vl) const
+    std::optional<std::pair<std::shared_ptr<logfile>, logfile::iterator>>
+    find_line_with_file(std::optional<vis_line_t> vl) const
     {
-        if (vl >= 0_vl && vl <= vis_line_t(this->lss_filtered_index.size())) {
-            return this->find_line_with_file(this->at(vl));
+        if (vl && vl.value() >= 0_vl
+            && vl.value() < vis_line_t(this->lss_filtered_index.size()))
+        {
+            return this->find_line_with_file(this->at(vl.value()));
         }
 
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
-    nonstd::optional<vis_line_t> find_from_time(
-        const struct timeval& start) const;
+    std::optional<vis_line_t> find_from_time(const timeval& start) const;
 
-    nonstd::optional<vis_line_t> find_from_time(time_t start) const
+    std::optional<vis_line_t> find_from_time(time_t start) const
     {
-        struct timeval tv = {start, 0};
+        const auto tv = timeval{start, 0};
 
         return this->find_from_time(tv);
     }
 
-    nonstd::optional<vis_line_t> find_from_time(const exttm& etm) const
+    std::optional<vis_line_t> find_from_time(const exttm& etm) const
     {
         return this->find_from_time(etm.to_timeval());
     }
 
-    nonstd::optional<vis_line_t> find_from_content(content_line_t cl);
+    std::optional<vis_line_t> find_from_content(content_line_t cl);
 
-    nonstd::optional<struct timeval> time_for_row(vis_line_t row)
+    std::optional<row_info> time_for_row(vis_line_t row)
     {
-        if (row < (ssize_t) this->text_line_count()) {
-            return this->find_line(this->at(row))->get_timeval();
+        if (row >= 0_vl && row < (ssize_t) this->lss_filtered_index.size()) {
+            auto cl = this->at(row);
+            return row_info{
+                this->find_line(cl)->get_timeval(),
+                (int64_t) cl,
+            };
         }
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
-    nonstd::optional<vis_line_t> row_for_time(struct timeval time_bucket)
+    std::optional<vis_line_t> row_for(const row_info& ri);
+
+    std::optional<vis_line_t> row_for_time(struct timeval time_bucket)
     {
         return this->find_from_time(time_bucket);
     }
 
     content_line_t at(vis_line_t vl) const
     {
-        return this->lss_index[this->lss_filtered_index[vl]];
+        return this->lss_index[this->lss_filtered_index[vl]].value();
+    }
+
+    // Position of a visible row within the raw `lss_index` — lets
+    // callers walk forward past the row to reach metric siblings
+    // that were suppressed from the filtered index.
+    size_t index_at(vis_line_t vl) const
+    {
+        return this->lss_filtered_index[vl];
+    }
+
+    size_t get_filtered_before() const
+    {
+        return this->lss_filtered_index.empty() ? 0
+                                                : this->lss_filtered_index[0];
+    }
+
+    size_t get_filtered_after() const
+    {
+        if (this->lss_filtered_index.empty()) {
+            return 0;
+        }
+
+        return this->lss_index.size() - this->lss_filtered_index.back() - 1;
     }
 
     content_line_t at_base(vis_line_t vl)
     {
-        while (this->find_line(this->at(vl))->get_sub_offset() != 0) {
+        while (vl > 0_vl
+               && this->find_line(this->at(vl))->get_sub_offset() != 0)
+        {
             --vl;
         }
 
         return this->at(vl);
     }
 
-    logline_window window_at(vis_line_t start_vl, vis_line_t end_vl)
-    {
-        return logline_window(*this, start_vl, end_vl);
-    }
+    std::unique_ptr<logline_window> window_at(vis_line_t start_vl,
+                                              vis_line_t end_vl);
 
-    log_accel::direction_t get_line_accel_direction(vis_line_t vl);
+    std::unique_ptr<logline_window> window_at(vis_line_t start_vl);
+
+    std::unique_ptr<logline_window> window_to_end(vis_line_t start_vl);
 
     /**
      * Container for logfile references that keeps of how many lines in the
@@ -664,13 +550,22 @@ public:
               ld_visible(lf->is_indexing())
         {
             lf->set_logline_observer(&this->ld_filter_state);
+            this->ld_file_ptr = lf.get();
         }
 
-        void clear() { this->ld_filter_state.lfo_filter_state.clear(); }
+        void clear()
+        {
+            this->ld_filter_state.lfo_filter_state.clear();
+            this->ld_file_ptr = nullptr;
+        }
 
         void set_file(const std::shared_ptr<logfile>& lf)
         {
             this->ld_filter_state.lfo_filter_state.tfs_logfile = lf;
+            this->ld_file_ptr = lf.get();
+            this->ld_lines_indexed = 0;
+            this->ld_lines_watched = 0;
+            this->ld_visible = lf->is_indexing();
             lf->set_logline_observer(&this->ld_filter_state);
         }
 
@@ -679,10 +574,7 @@ public:
             return this->ld_filter_state.lfo_filter_state.tfs_logfile;
         }
 
-        logfile* get_file_ptr() const
-        {
-            return this->ld_filter_state.lfo_filter_state.tfs_logfile.get();
-        }
+        logfile* get_file_ptr() const { return this->ld_file_ptr; }
 
         bool is_visible() const
         {
@@ -695,12 +587,15 @@ public:
         line_filter_observer ld_filter_state;
         size_t ld_lines_indexed{0};
         size_t ld_lines_watched{0};
+        logfile* ld_file_ptr{nullptr};
         bool ld_visible;
     };
 
     using iterator = std::vector<std::unique_ptr<logfile_data>>::iterator;
     using const_iterator
         = std::vector<std::unique_ptr<logfile_data>>::const_iterator;
+
+    size_t size() const { return this->lss_files.size(); }
 
     iterator begin() { return this->lss_files.begin(); }
 
@@ -728,15 +623,14 @@ public:
         return retval;
     }
 
-    nonstd::optional<logfile_data*> find_data(
-        const std::shared_ptr<logfile>& lf)
+    std::optional<logfile_data*> find_data(const std::shared_ptr<logfile>& lf)
     {
         for (auto& ld : *this) {
             if (ld->ld_filter_state.lfo_filter_state.tfs_logfile == lf) {
                 return ld.get();
             }
         }
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     iterator find_data_i(const std::shared_ptr<const logfile>& lf)
@@ -755,6 +649,33 @@ public:
         ssize_t index = std::distance(this->begin(), iter);
 
         return content_line_t(index * MAX_LINES_PER_FILE);
+    }
+
+    // The file a content line came from, as an index into lss_files.  The
+    // inverse of get_file_base_content_line().
+    static size_t file_index_for(content_line_t cl)
+    {
+        return cl / MAX_LINES_PER_FILE;
+    }
+
+    /**
+     * Called on the calling thread while a parallel scan is in flight so the
+     * UI keeps moving.  `off` and `total` are summed over the files being
+     * scanned.
+     *
+     * The workers are writing those files while this runs, so an
+     * implementation must not read them -- the numbers handed in here are all
+     * it gets.  `in_flight` carries a per-file breakdown of the same reading
+     * for the files that have not finished, so the file list can be drawn
+     * without touching them either.  Returning interrupt stops the scan as
+     * soon as the workers notice.
+     */
+    using scan_progress_fn = std::function<lnav::progress_result_t(
+        file_off_t, file_ssize_t, const std::vector<index_progress_report>&)>;
+
+    void set_scan_progress(scan_progress_fn fn)
+    {
+        this->lss_scan_progress = std::move(fn);
     }
 
     void set_index_delegate(index_delegate* id)
@@ -778,39 +699,49 @@ public:
     public:
         meta_grepper(logfile_sub_source& source) : lmg_source(source) {}
 
-        bool grep_value_for_line(vis_line_t line,
-                                 std::string& value_out) override;
+        std::optional<line_info> grep_value_for_line(
+            vis_line_t line, std::string& value_out) override;
 
-        vis_line_t grep_initial_line(vis_line_t start,
-                                     vis_line_t highest) override;
+        vis_line_t grep_initial_line(vis_line_t start) override;
 
         void grep_next_line(vis_line_t& line) override;
 
+        void grep_quiesce() override;
+
+        void grep_reset(grep_proc<vis_line_t>& gp,
+                        vis_line_t start,
+                        vis_line_t stop,
+                        grep_pattern_mask_t patterns) override;
+
         void grep_begin(grep_proc<vis_line_t>& gp,
                         vis_line_t start,
-                        vis_line_t stop) override;
+                        vis_line_t stop,
+                        grep_pattern_mask_t patterns) override;
 
         void grep_end(grep_proc<vis_line_t>& gp) override;
 
         void grep_match(grep_proc<vis_line_t>& gp,
                         vis_line_t line,
-                        int start,
-                        int end) override;
+                        grep_pattern_mask_t patterns) override;
 
         logfile_sub_source& lmg_source;
         bool lmg_done{false};
     };
 
-    nonstd::optional<
+    std::optional<
         std::pair<grep_proc_source<vis_line_t>*, grep_proc_sink<vis_line_t>*>>
     get_grepper();
 
-    nonstd::optional<location_history*> get_location_history()
+    std::optional<location_history*> get_location_history()
     {
         return &this->lss_location_history;
     }
 
     void text_crumbs_for_line(int line, std::vector<breadcrumb::crumb>& crumbs);
+
+    bool text_handle_mouse(textview_curses& tc,
+                           const listview_curses::display_line_content_t&,
+                           mouse_event& me);
 
     Result<bool, lnav::console::user_message> eval_sql_filter(
         sqlite3_stmt* stmt, iterator ld, logfile::const_iterator ll);
@@ -823,9 +754,13 @@ public:
 
     void set_exec_context(exec_context* ec) { this->lss_exec_context = ec; }
 
-    static const uint64_t MAX_CONTENT_LINES = (1ULL << 40) - 1;
-    static const uint64_t MAX_LINES_PER_FILE = 256 * 1024 * 1024;
-    static const uint64_t MAX_FILES = (MAX_CONTENT_LINES / MAX_LINES_PER_FILE);
+    exec_context* get_exec_context() const { return this->lss_exec_context; }
+
+    static constexpr unsigned CONTENT_LINE_BITS = 38;
+    static constexpr uint64_t MAX_CONTENT_LINES = 1ULL << CONTENT_LINE_BITS;
+    static constexpr uint64_t MAX_LINES_PER_FILE = logfile::MAX_LINES;
+    static constexpr uint64_t MAX_FILES
+        = (MAX_CONTENT_LINES / MAX_LINES_PER_FILE);
 
     std::function<void(logfile_sub_source&, file_off_t, file_size_t)>
         lss_sorting_observer;
@@ -834,134 +769,253 @@ public:
 
     void quiesce();
 
+    struct __attribute__((__packed__)) indexed_content {
+        enum class level_t : uint8_t {
+            normal,
+            warning,
+            error,
+        };
+
+        static level_t level_from_log(const logfile::const_iterator iter)
+        {
+            if (!iter->is_message()) {
+                return level_t::normal;
+            }
+            switch (iter->get_msg_level()) {
+                case log_level_t::LEVEL_WARNING:
+                    return level_t::warning;
+                case log_level_t::LEVEL_ERROR:
+                case log_level_t::LEVEL_FATAL:
+                case log_level_t::LEVEL_CRITICAL:
+                    return level_t::error;
+                default:
+                    return level_t::normal;
+            }
+        }
+
+        indexed_content() = default;
+
+        indexed_content(content_line_t cl, const logfile::const_iterator iter)
+            : ic_value(cl),
+              ic_level(lnav::enums::to_underlying(level_from_log(iter)))
+        {
+        }
+
+        content_line_t value() const { return content_line_t(this->ic_value); }
+
+        level_t level() const { return static_cast<level_t>(this->ic_level); }
+
+        uint64_t ic_value : CONTENT_LINE_BITS;
+        uint8_t ic_level : 2;
+    };
+
+    big_array<indexed_content> lss_index;
+
+    /**
+     * The marks that are a function of the index alone, and so can be counted
+     * once per region instead of being held per row.  The user marks are left
+     * out on purpose: they change without the index changing, which is the
+     * one thing this table cannot absorb.
+     */
+    enum class region_mark_t : uint8_t {
+        warning,
+        error,
+        file_start,
+
+        RM__MAX
+    };
+
+    static constexpr size_t REGION_MARK_MAX
+        = lnav::enums::to_underlying(region_mark_t::RM__MAX);
+
+    /**
+     * A running summary of a fixed-size window of rows.  Ruling a window out
+     * costs one comparison per SIZE rows, which is what lets a scan stand in
+     * for a set of marked rows that would otherwise have to be rebuilt in
+     * full every time the view reloads.
+     */
+    struct index_region {
+        // A power of two so the region for a row is a shift, and as large as
+        // a uint16_t count can describe, since the only scan whose length
+        // this bounds happens once per find_mark() call.
+        static constexpr size_t SIZE = 8192;
+
+        uint16_t ir_counts[REGION_MARK_MAX]{};
+
+        uint16_t& count_for(region_mark_t rm)
+        {
+            return this->ir_counts[lnav::enums::to_underlying(rm)];
+        }
+
+        uint16_t count_for(region_mark_t rm) const
+        {
+            return this->ir_counts[lnav::enums::to_underlying(rm)];
+        }
+    };
+
+    static_assert(index_region::SIZE <= UINT16_MAX,
+                  "a region's counts have to fit in ir_counts");
+
+    static size_t region_for_row(vis_line_t vl)
+    {
+        return static_cast<size_t>(vl) / index_region::SIZE;
+    }
+
+    size_t region_count() const { return this->lss_regions.size(); }
+
+    const index_region& region_at(size_t region_index) const
+    {
+        return this->lss_regions[region_index];
+    }
+
+    /**
+     * The number of marks of the given kind in the half-open row range
+     * [start, stop).  Whole regions are taken from the summary table, so only
+     * the rows at either end that fall inside a partially covered region are
+     * actually looked at.
+     */
+    size_t count_marks(vis_line_t start,
+                       vis_line_t stop,
+                       region_mark_t rm) const;
+
+    /**
+     * The nearest row carrying the given mark, searching strictly after (or
+     * before) `from` so that a caller can walk hit to hit the way
+     * bookmark_vector::next() does.
+     *
+     * Regions whose count for the mark is zero are skipped without looking at
+     * any of their rows.
+     */
+    std::optional<vis_line_t> find_mark(vis_line_t from,
+                                        direction dir,
+                                        region_mark_t rm) const;
+
+    indexed_content::level_t level_for_row(vis_line_t vl) const
+    {
+        return this->lss_index[this->lss_filtered_index[vl]].level();
+    }
+
+    /**
+     * Is this the first row that is displayed from its file?
+     *
+     * The file is the top bits of the row's content line, so this is two
+     * loads and a shift against the preceding row -- no summary table and no
+     * walk out to the logfile.  A row past the end of the view is not a
+     * start, which is what keeps the last row of the last file rendering
+     * without a bottom corner.
+     */
+    bool is_file_start(vis_line_t vl) const;
+
+    bool row_has_mark(vis_line_t vl, region_mark_t rm) const;
+
+    // Whether any row in the half-open range [start, stop) carries the mark.
+    // The regions wholly inside the range are checked by count first, so a
+    // wide range normally answers without looking at a single row -- which is
+    // what the gutter needs, since it asks about a range per visible row on
+    // every repaint.
+    bool any_mark_in_range(vis_line_t start,
+                           vis_line_t stop,
+                           region_mark_t rm) const;
+
+    // The mark types this source answers from `lss_regions` instead of from
+    // the view's bookmark vectors.
+    static std::optional<region_mark_t> region_mark_for(
+        const bookmark_type_t* bt);
+
+    bool text_scans_mark(const bookmark_type_t* bt) const
+    {
+        return region_mark_for(bt).has_value();
+    }
+
+    std::optional<vis_line_t> text_adjacent_mark(
+        const bookmark_type_t* bt,
+        vis_line_t from,
+        text_anchors::direction dir) const
+    {
+        return this->find_mark(from, dir, region_mark_for(bt).value());
+    }
+
+    bool text_mark_at_row(const bookmark_type_t* bt,
+                          vis_line_t vl) const
+    {
+        return this->row_has_mark(vl, region_mark_for(bt).value());
+    }
+
+    bool text_any_mark_in_range(const bookmark_type_t* bt,
+                                vis_line_t start,
+                                vis_line_t stop) const
+    {
+        return this->any_mark_in_range(
+            start, stop, region_mark_for(bt).value());
+    }
+
+    std::optional<vis_line_t> row_for_anchor(const std::string& id);
+
+    std::optional<vis_line_t> adjacent_anchor(vis_line_t vl, direction dir);
+
+    std::optional<std::string> anchor_for_row(vis_line_t vl);
+
+    std::unordered_set<std::string> get_anchors();
+
+    std::optional<json_string> text_row_details(const textview_curses& tc);
+
+    void reload_config(error_reporter& reporter);
+
+    bool is_indexing_in_progress() const
+    {
+        return this->lss_indexing_in_progress;
+    }
+
+    void clear_preview();
+
+    void add_commands_for_session(
+        const std::function<void(const std::string&)>& receiver);
+
+    std::vector<highlighter> lss_highlighters;
+
+protected:
+    void text_accel_display_changed() { this->clear_line_size_cache(); }
+
+    logline* text_accel_get_line(vis_line_t vl)
+    {
+        return this->find_line(this->at(vl));
+    }
+
 private:
     static const size_t LINE_SIZE_CACHE_SIZE = 512;
 
-    enum {
-        B_SCRUB,
-        B_TIME_OFFSET,
-        B_FILENAME,
-        B_BASENAME,
+    /** What a parallel pre-scan worked out about one file. */
+    struct prescan_result {
+        logfile::rebuild_result_t psr_result{
+            logfile::rebuild_result_t::NO_NEW_LINES};
+        /**
+         * The format's timestamp flags as they stood *before* the scan.  The
+         * loop OR's these in ahead of the file's own scan, so caching them
+         * here is what keeps lss_all_timestamp_flags exactly one pass behind,
+         * as it has always been.
+         */
+        uint32_t psr_timestamp_flags{0};
+        /**
+         * Set when the scan threw.  The loop rethrows this in place of the
+         * file's result, so the failure still comes out of the spot the scan
+         * runs in on this thread.
+         */
+        std::exception_ptr psr_exception;
     };
 
-    enum {
-        F_SCRUB = (1UL << B_SCRUB),
-        F_TIME_OFFSET = (1UL << B_TIME_OFFSET),
-        F_FILENAME = (1UL << B_FILENAME),
-        F_BASENAME = (1UL << B_BASENAME),
-
-        F_NAME_MASK = (F_FILENAME | F_BASENAME),
-    };
-
-    struct __attribute__((__packed__)) indexed_content {
-        indexed_content() = default;
-
-        indexed_content(content_line_t cl) : ic_value(cl) {}
-
-        operator content_line_t() const
-        {
-            return content_line_t(this->ic_value);
-        }
-
-        uint64_t ic_value : 40;
-    };
-
-    struct logline_cmp {
-        logline_cmp(logfile_sub_source& lc) : llss_controller(lc) {}
-
-        bool operator()(const content_line_t& lhs,
-                        const content_line_t& rhs) const
-        {
-            logline* ll_lhs = this->llss_controller.find_line(lhs);
-            logline* ll_rhs = this->llss_controller.find_line(rhs);
-
-            return (*ll_lhs) < (*ll_rhs);
-        }
-
-        bool operator()(const uint32_t& lhs, const uint32_t& rhs) const
-        {
-            content_line_t cl_lhs
-                = (content_line_t) llss_controller.lss_index[lhs];
-            content_line_t cl_rhs
-                = (content_line_t) llss_controller.lss_index[rhs];
-            logline* ll_lhs = this->llss_controller.find_line(cl_lhs);
-            logline* ll_rhs = this->llss_controller.find_line(cl_rhs);
-
-            return (*ll_lhs) < (*ll_rhs);
-        }
-#if 0
-        bool operator()(const indexed_content &lhs, const indexed_content &rhs)
-        {
-            logline *ll_lhs = this->llss_controller.find_line(lhs.ic_value);
-            logline *ll_rhs = this->llss_controller.find_line(rhs.ic_value);
-
-            return (*ll_lhs) < (*ll_rhs);
-        }
-#endif
-
-        bool operator()(const content_line_t& lhs, const time_t& rhs) const
-        {
-            logline* ll_lhs = this->llss_controller.find_line(lhs);
-
-            return *ll_lhs < rhs;
-        }
-
-        bool operator()(const content_line_t& lhs,
-                        const struct timeval& rhs) const
-        {
-            logline* ll_lhs = this->llss_controller.find_line(lhs);
-
-            return *ll_lhs < rhs;
-        }
-
-        logfile_sub_source& llss_controller;
-    };
-
-    struct filtered_logline_cmp {
-        filtered_logline_cmp(const logfile_sub_source& lc) : llss_controller(lc)
-        {
-        }
-
-        bool operator()(const uint32_t& lhs, const uint32_t& rhs) const
-        {
-            content_line_t cl_lhs
-                = (content_line_t) llss_controller.lss_index[lhs];
-            content_line_t cl_rhs
-                = (content_line_t) llss_controller.lss_index[rhs];
-            logline* ll_lhs = this->llss_controller.find_line(cl_lhs);
-            logline* ll_rhs = this->llss_controller.find_line(cl_rhs);
-
-            return (*ll_lhs) < (*ll_rhs);
-        }
-
-        bool operator()(const uint32_t& lhs, const struct timeval& rhs) const
-        {
-            content_line_t cl_lhs
-                = (content_line_t) llss_controller.lss_index[lhs];
-            logline* ll_lhs = this->llss_controller.find_line(cl_lhs);
-
-            return (*ll_lhs) < rhs;
-        }
-
-        const logfile_sub_source& llss_controller;
-    };
+    using prescan_map = std::unordered_map<const logfile*, prescan_result>;
 
     /**
-     * Functor for comparing the ld_file field of the logfile_data struct.
+     * Index this round's files up front and across several threads.
+     *
+     * rebuild_index() writes only its own logfile, so the files are
+     * independent; the merge, the sort, and everything else the loop does
+     * with the results stays on the calling thread and in file_order.
+     * Returns an empty map when there is nothing to gain, or when part of
+     * the scan has to run on this thread -- see the two gates inside.
      */
-    struct logfile_data_eq {
-        explicit logfile_data_eq(std::shared_ptr<logfile> lf)
-            : lde_file(std::move(lf))
-        {
-        }
-
-        bool operator()(const std::unique_ptr<logfile_data>& ld) const
-        {
-            return this->lde_file == ld->get_file();
-        }
-
-        std::shared_ptr<logfile> lde_file;
-    };
+    prescan_map prescan_files(const std::vector<size_t>& file_order,
+                              std::optional<ui_clock::time_point> deadline);
 
     void clear_line_size_cache()
     {
@@ -973,42 +1027,77 @@ private:
 
     size_t lss_basename_width = 0;
     size_t lss_filename_width = 0;
-    unsigned long lss_flags{0};
+    line_context_t lss_line_context{line_context_t::none};
     bool lss_force_rebuild{false};
+    bool lss_merge_deferred{false};
     std::vector<std::unique_ptr<logfile_data>> lss_files;
+    unsigned int lss_all_timestamp_flags{0};
 
-    big_array<indexed_content> lss_index;
     std::vector<uint32_t> lss_filtered_index;
+
+    // Summaries of fixed-size windows of `lss_filtered_index`, maintained by
+    // update_regions().
+    std::vector<index_region> lss_regions;
+    // How many rows the summary table accounts for.  The trailing region is
+    // usually partial, so its counts cannot be worked out from
+    // lss_regions.size().
+    size_t lss_regions_rows{0};
+
+    /**
+     * Bring `lss_regions` back into agreement with `lss_filtered_index`.
+     *
+     * @param valid_rows The number of rows at the front of the filtered index
+     * that have not moved since the last call.  Regions covering anything
+     * past that are dropped and recounted.
+     */
+    void update_regions(size_t valid_rows);
+
+    void validate_regions() const;
+
+    // Persistent state for incremental context expansion in rebuild_index()
+    struct ctx_msg_range {
+        size_t cmr_start{0};
+        size_t cmr_count{0};
+    };
+    std::deque<ctx_msg_range> lss_ctx_before_msgs;
+    size_t lss_ctx_after_msgs_remaining{0};
+    bool lss_ctx_in_after{false};
+
+    void flush_context_before_msgs();
+
     auto_mem<sqlite3_stmt> lss_preview_filter_stmt{sqlite3_finalize};
 
-    bookmarks<content_line_t>::type lss_user_marks;
+    std::map<std::string, breakpoint_info> lss_breakpoints;
+    bookmarks<content_line_t>::type lss_user_marks{
+        bookmarks<content_line_t>::create_array()};
     auto_mem<sqlite3_stmt> lss_marker_stmt{sqlite3_finalize};
     std::string lss_marker_stmt_text;
 
     line_flags_t lss_token_flags{0};
     iterator lss_token_file_data;
     std::shared_ptr<logfile> lss_token_file;
-    std::string lss_token_value;
-    string_attrs_t lss_token_attrs;
+    attr_line_t lss_token_al;
     lnav::document::metadata lss_token_meta;
     int lss_token_meta_line{-1};
     int lss_token_meta_size{0};
+    // the byte length of the time column that was prepended to the row that
+    // was rendered last.  it is zeroed at the start of every render and only
+    // refilled for a row that carries a timestamp.
+    size_t lss_time_column_size{0};
+    size_t lss_time_column_padding{0};
+    // the display width of the time column.  unlike lss_time_column_size,
+    // this is kept across renders so that callers outside of the render path
+    // can find the indent without depending on which row came last.
+    size_t lss_time_column_width{0};
     logline_value_vector lss_token_values;
-    int lss_token_shift_start{0};
-    int lss_token_shift_size{0};
+    std::vector<std::pair<int, int>> lss_token_shifts;
     shared_buffer lss_share_manager;
     logfile::iterator lss_token_line;
     std::array<std::pair<int, size_t>, LINE_SIZE_CACHE_SIZE>
         lss_line_size_cache;
-    log_level_t lss_min_log_level{LEVEL_UNKNOWN};
-    struct timeval lss_min_log_time {
-        0, 0
-    };
-    struct timeval lss_max_log_time {
-        std::numeric_limits<time_t>::max(), 0
-    };
     bool lss_marked_only{false};
     index_delegate* lss_index_delegate{nullptr};
+    scan_progress_fn lss_scan_progress;
     size_t lss_longest_line{0};
     meta_grepper lss_meta_grepper;
     log_location_history lss_location_history;
@@ -1016,6 +1105,8 @@ private:
 
     bool lss_in_value_for_line{false};
     bool lss_line_meta_changed{false};
+
+    bool lss_indexing_in_progress{false};
 };
 
 #endif

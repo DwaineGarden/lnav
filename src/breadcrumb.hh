@@ -30,9 +30,12 @@
 #ifndef lnav_breadcrumb_hh
 #define lnav_breadcrumb_hh
 
+#include <functional>
 #include <string>
+#include <vector>
 
 #include "base/attr_line.hh"
+#include "base/intern_string.hh"
 #include "fmt/format.h"
 #include "mapbox/variant.hpp"
 
@@ -53,11 +56,77 @@ struct possibility {
     bool operator<=(const possibility& rhs) const { return !(rhs < *this); }
     bool operator>=(const possibility& rhs) const { return !(*this < rhs); }
 
+    static bool sort_cmp(const possibility& lhs, const possibility& rhs)
+    {
+        static constexpr const char* TOKENS = "[](){}";
+
+        auto lhsf = string_fragment::from_str(lhs.p_key).trim(TOKENS);
+        auto rhsf = string_fragment::from_str(rhs.p_key).trim(TOKENS);
+
+        return strnatcasecmp(
+                   lhsf.length(), lhsf.data(), rhsf.length(), rhsf.data())
+            < 0;
+    }
+
     std::string p_key;
     attr_line_t p_display_value;
 };
 
-using crumb_possibilities = std::function<std::vector<possibility>()>;
+/**
+ * Gathers the possibilities that match a search out of a key set too large to
+ * turn into possibilities wholesale.  It applies the same rules the
+ * breadcrumb view does when it narrows the list: with no search, the first
+ * `max_count` keys; otherwise, the `max_count` keys with the best fuzzy-match
+ * score.  Keys are only copied into strings once they make the cut.  A key
+ * added more than once is returned once, but its copies take up room while
+ * collecting, so the result can come up short when duplicates are common.
+ */
+class possibility_collector {
+public:
+    explicit possibility_collector(string_fragment search,
+                                   size_t max_count = 128);
+
+    void add(string_fragment key);
+
+    /**
+     * @return The kept possibilities, best match first, or in the order they
+     *   were added when there is no search.
+     */
+    std::vector<possibility> release();
+
+private:
+    struct scored_key {
+        int sk_score;
+        size_t sk_order;
+        std::string sk_key;
+    };
+
+    struct worse_first {
+        bool operator()(const scored_key& lhs, const scored_key& rhs) const
+        {
+            if (lhs.sk_score != rhs.sk_score) {
+                return lhs.sk_score > rhs.sk_score;
+            }
+            return lhs.sk_order < rhs.sk_order;
+        }
+    };
+
+    std::string pc_search;
+    size_t pc_max_count;
+    std::string pc_key_buf;
+    std::vector<scored_key> pc_kept;
+    size_t pc_added{0};
+};
+
+/**
+ * Returns the possibilities for a crumb.
+ *
+ * @param search The text the user has typed so far.  A provider may use it to
+ *   return only the possibilities that match; the caller still ranks and
+ *   trims what comes back, so returning more is fine.
+ */
+using crumb_possibilities
+    = std::function<std::vector<possibility>(string_fragment search)>;
 
 struct crumb {
     using key_t = mapbox::util::variant<std::string, size_t>;
@@ -124,7 +193,7 @@ struct crumb {
     attr_line_t c_display_value;
     crumb_possibilities c_possibility_provider;
     perform c_performer;
-    nonstd::optional<size_t> c_possible_range;
+    std::optional<size_t> c_possible_range;
     expected_input_t c_expected_input{expected_input_t::exact};
     std::string c_search_placeholder;
 };

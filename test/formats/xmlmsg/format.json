@@ -20,7 +20,15 @@
                 "kind": "string",
                 "identifier": true,
                 "description": "Python source module which emitted log entry",
-                "rewriter": ";SELECT ''"
+                "rewriter": ";SELECT ''",
+                "highlights": {
+                    "m": {
+                        "pattern": "^m$",
+                        "base-style": {
+                            "color": "#f0f"
+                        }
+                    }
+                }
             },
             "line": {
                 "kind": "integer",

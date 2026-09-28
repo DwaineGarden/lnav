@@ -1,8 +1,8 @@
 
 include $(top_srcdir)/aminclude_static.am
 
-TESTS_ENVIRONMENT = $(SHELL) $(top_builddir)/TESTS_ENVIRONMENT
-LOG_COMPILER = $(SHELL) $(top_builddir)/TESTS_ENVIRONMENT
+TESTS_ENVIRONMENT = $(BASH) $(top_builddir)/TESTS_ENVIRONMENT
+LOG_COMPILER = $(BASH) $(top_builddir)/TESTS_ENVIRONMENT
 
 AM_CPPFLAGS = \
 	$(CODE_COVERAGE_CPPFLAGS) \
@@ -11,6 +11,8 @@ AM_CPPFLAGS = \
 	$(PCRE_CFLAGS) \
     -I$(top_srcdir)/src/ \
     -I$(top_srcdir)/src/fmtlib \
+	-I$(top_srcdir)/src/third-party/ \
+	-I$(top_srcdir)/src/third-party/date/include \
 	-I$(top_srcdir)/src/third-party/scnlib/include
 
 AM_LDFLAGS = \
@@ -53,9 +55,11 @@ LDADD = \
     libyajlpp.a \
     $(top_builddir)/src/base/libbase.a \
     $(top_builddir)/src/fmtlib/libcppfmt.a \
+    $(top_builddir)/src/third-party/date/src/libdatepp.a \
     $(top_builddir)/src/third-party/scnlib/src/libscnlib.a \
     $(top_builddir)/src/pcrepp/libpcrepp.a \
-    $(top_builddir)/src/yajl/libyajl.a
+    $(top_builddir)/src/yajl/libyajl.a \
+    -lunistring
 
 dist_noinst_SCRIPTS = \
 	test_json_op.sh \

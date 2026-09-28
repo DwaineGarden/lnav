@@ -34,11 +34,26 @@
 
 #include <string>
 
+#include <sys/time.h>
+
 #include "auto_mem.hh"
+#include "intern_string.hh"
 #include "result.h"
 
-namespace lnav {
-namespace gzip {
+namespace lnav::gzip {
+
+struct header {
+    timeval h_mtime{};
+    auto_buffer h_extra{auto_buffer::alloc(0)};
+    std::string h_name;
+    std::string h_comment;
+
+    bool empty() const
+    {
+        return this->h_mtime.tv_sec == 0 && this->h_extra.empty()
+            && this->h_name.empty() && this->h_comment.empty();
+    }
+};
 
 bool is_gzipped(const char* buffer, size_t len);
 
@@ -48,7 +63,12 @@ Result<auto_buffer, std::string> uncompress(const std::string& src,
                                             const void* buffer,
                                             size_t size);
 
-}  // namespace gzip
-}  // namespace lnav
+Result<std::unique_ptr<string_fragment_producer>, std::string>
+uncompress_stream(const string_fragment& src,
+                  const unsigned char* buffer,
+                  size_t compressed_size,
+                  size_t uncompressed_size);
+
+}  // namespace lnav::gzip
 
 #endif

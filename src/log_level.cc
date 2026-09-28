@@ -27,30 +27,31 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <array>
+#include <cctype>
+
 #include "log_level.hh"
 
-#include <ctype.h>
-
+#include "base/intern_string.hh"
+#include "base/log_level_enum.hh"
 #include "config.h"
 
-const char* level_names[LEVEL__MAX + 1] = {
-    "unknown",
-    "trace",
-    "debug5",
-    "debug4",
-    "debug3",
-    "debug2",
-    "debug",
-    "info",
-    "stats",
-    "notice",
-    "warning",
-    "error",
-    "critical",
-    "fatal",
-    "invalid",
-
-    nullptr,
+constexpr std::array<string_fragment, LEVEL__MAX> level_names = {
+    "unknown"_frag,
+    "trace"_frag,
+    "debug5"_frag,
+    "debug4"_frag,
+    "debug3"_frag,
+    "debug2"_frag,
+    "debug"_frag,
+    "info"_frag,
+    "stats"_frag,
+    "notice"_frag,
+    "warning"_frag,
+    "error"_frag,
+    "critical"_frag,
+    "fatal"_frag,
+    "invalid"_frag,
 };
 
 log_level_t
@@ -107,5 +108,5 @@ abbrev2level(const char* levelstr, ssize_t len)
 int
 levelcmp(const char* l1, ssize_t l1_len, const char* l2, ssize_t l2_len)
 {
-    return abbrev2level(l1, l1_len) - abbrev2level(l2, l2_len);
+    return string2level(l1, l1_len) - string2level(l2, l2_len);
 }

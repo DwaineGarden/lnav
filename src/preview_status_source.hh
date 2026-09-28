@@ -30,8 +30,6 @@
 #ifndef lnav_preview_status_source_hh
 #define lnav_preview_status_source_hh
 
-#include <string>
-
 #include "statusview_curses.hh"
 
 class preview_status_source : public status_data_source {
@@ -45,37 +43,21 @@ public:
         TSF__MAX
     } field_t;
 
-    preview_status_source()
-    {
-        static const char TOGGLE_MSG[] = "Press CTRL+P to show/hide";
+    preview_status_source();
 
-        this->tss_fields[TSF_TITLE].set_width(14);
-        this->tss_fields[TSF_TITLE].set_role(role_t::VCR_STATUS_TITLE);
-        this->tss_fields[TSF_TITLE].set_value(" Preview Data ");
-        this->tss_fields[TSF_STITCH_TITLE].set_width(2);
-        this->tss_fields[TSF_STITCH_TITLE].set_stitch_value(
-            role_t::VCR_STATUS_STITCH_TITLE_TO_NORMAL,
-            role_t::VCR_STATUS_STITCH_NORMAL_TO_TITLE);
-        this->tss_fields[TSF_DESCRIPTION].set_share(1);
-        this->tss_fields[TSF_TOGGLE].set_width(strlen(TOGGLE_MSG) + 1);
-        this->tss_fields[TSF_TOGGLE].set_value(TOGGLE_MSG);
-        this->tss_fields[TSF_TOGGLE].right_justify(true);
-    };
-
-    size_t statusview_fields() override
-    {
-        return TSF__MAX;
-    };
+    size_t statusview_fields() override { return TSF__MAX; }
 
     status_field& statusview_value_for_field(int field) override
     {
         return this->tss_fields[field];
-    };
+    }
 
     status_field& get_description()
     {
         return this->tss_fields[TSF_DESCRIPTION];
-    };
+    }
+
+    void update_toggle_msg(bool shown);
 
 private:
     status_field tss_fields[TSF__MAX];

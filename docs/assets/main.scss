@@ -4,6 +4,7 @@
 @import "{{ site.theme }}";
 
 #playground-box {
+  margin-left: 0.5em;
   font-size: x-large;
   border-radius: 25px;
   background: #8d8;
@@ -29,3 +30,59 @@
 #playground-box .prompt {
   color: #4f4;
 }
+
+figcaption {
+  font-style: italic;
+  text-align: center;
+}
+
+pre.highlight {
+  padding: 8px 12px;
+  position: relative;
+
+  // override skeleton styles
+  > code {
+    border: 0;
+    overflow-x: auto;
+    padding-right: 0;
+    padding-left: 0;
+  }
+
+  &.highlight {
+    border-left: 15px solid #35383c;
+    color: #c1c2c3;
+    overflow: auto;
+    white-space: pre;
+    word-wrap: normal;
+
+    &,
+    code {
+      background-color: #222;
+      font-size: 14px;
+    }
+  }
+
+  //   code to clipboard
+  .copy {
+    color: #4AF626;
+    position: absolute;
+    right: 1.2rem;
+    top: 1.2rem;
+    opacity: 0;
+
+    &:active,
+    &:focus,
+    &:hover {
+      background: rgba(0, 0, 0, 0.7);
+      opacity: 1;
+    }
+  }
+
+  &:active .copy,
+  &:focus .copy,
+  &:hover .copy {
+    background: rgba(0, 0, 0, 0.7);
+    opacity: 1;
+  }
+}
+

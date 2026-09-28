@@ -27,18 +27,33 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <future>
+#include <memory>
 #include <regex>
+#include <string>
 
 #include "tailer.looper.hh"
 
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+
+#include "base/auto_fd.hh"
+#include "base/auto_pid.hh"
+#include "base/file_range.hh"
 #include "base/fs_util.hh"
 #include "base/humanize.network.hh"
 #include "base/lnav_log.hh"
 #include "base/paths.hh"
+#include "base/result.h"
 #include "config.h"
 #include "line_buffer.hh"
 #include "lnav.hh"
 #include "lnav.indexing.hh"
+#include "lnav.prompt.hh"
 #include "service_tags.hh"
 #include "tailer.h"
 #include "tailer.looper.cfg.hh"
@@ -52,7 +67,7 @@ static const auto HOST_RETRY_DELAY = 1min;
 static void
 read_err_pipe(const std::string& netloc,
               auto_fd& err,
-              std::vector<std::string>& eq)
+              tailer::safe_error_queue& eq)
 {
     line_buffer lb;
     file_range pipe_range;
@@ -76,8 +91,13 @@ read_err_pipe(const std::string& netloc,
                     auto line_str
                         = string_fragment(sbr.get_data(), 0, sbr.length())
                               .trim("\n");
-                    if (eq.size() < 10) {
-                        eq.template emplace_back(line_str.to_string());
+                    {
+                        safe::WriteAccess<tailer::safe_error_queue>
+                            writable_eq(eq);
+
+                        if (writable_eq->size() < 10) {
+                            writable_eq->emplace_back(line_str.to_string());
+                        }
                     }
 
                     auto level = line_str.startswith("error:")
@@ -103,8 +123,7 @@ update_tailer_progress(const std::string& netloc, const std::string& msg)
 {
     lnav_data.ld_active_files.fc_progress->writeAccess()
         ->sp_tailers[netloc]
-        .tp_message
-        = msg;
+        .tp_message = msg;
 }
 
 static void
@@ -132,7 +151,7 @@ update_tailer_description(
 
                 iter->second.ofd_description = remote_uname;
             }
-            fc.fc_name_to_errors.erase(netloc);
+            fc.fc_name_to_stubs->writeAccess()->erase(netloc);
         });
 }
 
@@ -154,10 +173,11 @@ tailer::looper::loop_body()
 
             if (create_res.isErr()) {
                 report_error(netloc, create_res.unwrapErr());
-                if (std::any_of(
-                        rpq.rpq_new_paths.begin(),
-                        rpq.rpq_new_paths.end(),
-                        [](const auto& pair) { return !pair.second.loo_tail; }))
+                if (std::any_of(rpq.rpq_new_paths.begin(),
+                                rpq.rpq_new_paths.end(),
+                                [](const auto& pair) {
+                                    return !pair.second.loo_follow;
+                                }))
                 {
                     rpq.send_synced_to_main(netloc);
                     to_erase.push_back(netloc);
@@ -225,11 +245,13 @@ tailer::looper::load_preview(int64_t id, const network::path& path)
                     if (lnav_data.ld_preview_generation != id) {
                         return;
                     }
-                    lnav_data.ld_preview_status_source.get_description()
+                    lnav_data.ld_preview_status_source[0]
+                        .get_description()
                         .set_cylon(false)
                         .clear();
-                    lnav_data.ld_preview_source.clear();
+                    lnav_data.ld_preview_source[0].clear();
                     lnav_data.ld_bottom_source.grep_error(msg);
+                    lnav_data.ld_status[LNS_BOTTOM].set_needs_update();
                 });
             return;
         }
@@ -318,7 +340,8 @@ tailer::looper::host_tailer::for_host(const std::string& netloc)
                                rp.p_locality.l_hostname);
     }
 
-    {
+    std::string cp_err;
+    for (const auto& tailer_impl : tailer_bin) {
         auto in_pipe = TRY(auto_pipe::for_child_fd(STDIN_FILENO));
         auto out_pipe = TRY(auto_pipe::for_child_fd(STDOUT_FILENO));
         auto err_pipe = TRY(auto_pipe::for_child_fd(STDERR_FILENO));
@@ -331,9 +354,12 @@ tailer::looper::host_tailer::for_host(const std::string& netloc)
         if (child.in_child()) {
             auto arg_strs = create_ssh_args_from_config(ssh_dest);
             std::vector<char*> args;
+            auto cmd = fmt::format(cfg.c_transfer_cmd, tailer_bin_name);
 
-            arg_strs.emplace_back(
-                fmt::format(cfg.c_transfer_cmd, tailer_bin_name));
+            if (tailer_impl.get_name().endswith(".py")) {
+                cmd = fmt::format(FMT_STRING("command -v python3 && {}"), cmd);
+            }
+            arg_strs.emplace_back(cmd);
 
             fmt::print(stderr,
                        "tailer({}): executing -- {}\n",
@@ -348,7 +374,7 @@ tailer::looper::host_tailer::for_host(const std::string& netloc)
             _exit(EXIT_FAILURE);
         }
 
-        std::vector<std::string> error_queue;
+        safe_error_queue error_queue;
         log_debug("tailer(%s): starting err reader", netloc.c_str());
         std::thread err_reader([netloc,
                                 err = std::move(err_pipe.read_end()),
@@ -359,24 +385,35 @@ tailer::looper::host_tailer::for_host(const std::string& netloc)
         });
 
         log_debug("tailer(%s): writing to child", netloc.c_str());
-        auto sf = tailer_bin[0].to_string_fragment();
-        ssize_t total_bytes = 0;
         bool write_failed = false;
+        std::string producer_err;
 
-        while (total_bytes < sf.length()) {
-            log_debug("attempting to write %d", sf.length() - total_bytes);
-            auto rc = write(
-                in_pipe.write_end(), sf.data(), sf.length() - total_bytes);
+        auto sfp = tailer_impl.to_string_fragment_producer();
+        while (true) {
+            auto next_res = sfp->next();
+            if (next_res.is<string_fragment_producer::eof>()) {
+                break;
+            }
 
-            if (rc < 0) {
-                log_error("  tailer(%s): write failed -- %s",
-                          netloc.c_str(),
-                          strerror(errno));
+            if (next_res.is<string_fragment_producer::error>()) {
+                // Cannot return from here, the err_reader thread still needs
+                // to be joined and the child reaped.
+                producer_err
+                    = next_res.get<string_fragment_producer::error>().what;
                 write_failed = true;
                 break;
             }
-            log_debug("  wrote %d", rc);
-            total_bytes += rc;
+
+            auto sf = next_res.get<string_fragment>();
+
+            auto write_res = in_pipe.write_end().write_fully(sf);
+            if (write_res.isErr()) {
+                log_error("  tailer(%s): write failed -- %s",
+                          netloc.c_str(),
+                          write_res.unwrapErr().c_str());
+                write_failed = true;
+                break;
+            }
         }
 
         in_pipe.write_end().reset();
@@ -393,21 +430,32 @@ tailer::looper::host_tailer::for_host(const std::string& netloc)
             }
             log_debug("tailer(%s): transfer output -- %.*s",
                       netloc.c_str(),
-                      rc,
+                      (int) rc,
                       buffer);
         }
 
         auto finished_child = std::move(child).wait_for_child();
 
         err_reader.join();
+        if (!producer_err.empty()) {
+            return Err(producer_err);
+        }
         if (!finished_child.was_normal_exit()
             || finished_child.exit_status() != EXIT_SUCCESS)
         {
-            auto error_msg = error_queue.empty() ? "unknown"
-                                                 : error_queue.back();
-            return Err(fmt::format(FMT_STRING("failed to ssh to host: {}"),
-                                   error_msg));
+            auto readable_eq = error_queue.readAccess();
+            auto error_msg = readable_eq->empty() ? "unknown"
+                                                  : readable_eq->back();
+            log_warning("tailer transfer failed: %s", error_msg.c_str());
+            cp_err = fmt::format(FMT_STRING("failed to ssh to host: {}"),
+                                 error_msg);
+            continue;
         }
+        cp_err.clear();
+        break;
+    }
+    if (!cp_err.empty()) {
+        return Err(cp_err);
     }
 
     update_tailer_progress(netloc, "Starting tailer...");
@@ -447,18 +495,18 @@ tailer::looper::host_tailer::for_host(const std::string& netloc)
                                             std::move(err_pipe.read_end())));
 }
 
-static ghc::filesystem::path
+static std::filesystem::path
 remote_cache_path()
 {
     return lnav::paths::workdir() / "remotes";
 }
 
-ghc::filesystem::path
+std::filesystem::path
 tailer::looper::host_tailer::tmp_path()
 {
     auto local_path = remote_cache_path();
 
-    ghc::filesystem::create_directories(local_path);
+    std::filesystem::create_directories(local_path);
     auto_mem<char> resolved_path;
 
     resolved_path = realpath(local_path.c_str(), nullptr);
@@ -517,6 +565,26 @@ tailer::looper::host_tailer::open_remote_path(const std::string& path,
 }
 
 void
+tailer::looper::host_tailer::report_preview_disconnect(int64_t id) const
+{
+    log_warning("no connection to host, cannot preview: %s",
+                this->ht_netloc.c_str());
+
+    auto msg = fmt::format(FMT_STRING("error: disconnected from {}"),
+                           this->ht_netloc);
+    isc::to<main_looper&, services::main_t>().send([id, msg](auto& mlooper) {
+        if (lnav_data.ld_preview_generation != id) {
+            return;
+        }
+        lnav_data.ld_preview_status_source[0]
+            .get_description()
+            .set_cylon(false)
+            .set_value(msg);
+        lnav_data.ld_status[LNS_PREVIEW0].set_needs_update();
+    });
+}
+
+void
 tailer::looper::host_tailer::load_preview(int64_t id, const std::string& path)
 {
     this->ht_state.match(
@@ -529,22 +597,8 @@ tailer::looper::host_tailer::load_preview(int64_t id, const std::string& path)
                         id,
                         TPPT_DONE);
         },
-        [&](const disconnected& d) {
-            log_warning("disconnected from host, cannot preview: %s",
-                        path.c_str());
-
-            auto msg = fmt::format(FMT_STRING("error: disconnected from {}"),
-                                   this->ht_netloc);
-            isc::to<main_looper&, services::main_t>().send([=](auto& mlooper) {
-                if (lnav_data.ld_preview_generation != id) {
-                    return;
-                }
-                lnav_data.ld_preview_status_source.get_description()
-                    .set_cylon(false)
-                    .set_value(msg);
-            });
-        },
-        [&](const synced& s) { require(false); });
+        [&](const disconnected& d) { this->report_preview_disconnect(id); },
+        [&](const synced& s) { this->report_preview_disconnect(id); });
 }
 
 void
@@ -559,10 +613,12 @@ tailer::looper::host_tailer::complete_path(const std::string& path)
                         TPPT_DONE);
         },
         [&](const disconnected& d) {
-            log_warning("disconnected from host, cannot preview: %s",
+            log_warning("disconnected from host, cannot complete: %s",
                         path.c_str());
         },
-        [&](const synced& s) { require(false); });
+        [&](const synced& s) {
+            log_warning("synced with host, cannot complete: %s", path.c_str());
+        });
 }
 
 void
@@ -576,9 +632,12 @@ tailer::looper::host_tailer::loop_body()
 
     this->ht_cycle_count += 1;
     if (this->ht_cycle_count % TOUCH_FREQ == 0) {
-        auto now
-            = ghc::filesystem::file_time_type{std::chrono::system_clock::now()};
-        ghc::filesystem::last_write_time(this->ht_local_path, now);
+        auto now = std::filesystem::file_time_type::clock::now();
+        std::error_code ec;
+
+        // The local path is only created once a file has been transferred,
+        // so this can legitimately fail.
+        std::filesystem::last_write_time(this->ht_local_path, now, ec);
     }
 
     auto& conn = this->ht_state.get<connected>();
@@ -594,7 +653,20 @@ tailer::looper::host_tailer::loop_body()
         auto read_res = tailer::read_packet(conn.ht_from_child);
 
         if (read_res.isErr()) {
-            log_error("read error: %s", read_res.unwrapErr().c_str());
+            auto errmsg = read_res.unwrapErr();
+
+            // The stream is out of sync at this point, there is no way to
+            // recover, so shut the connection down.
+            log_error("tailer(%s): read error: %s",
+                      this->ht_netloc.c_str(),
+                      errmsg.c_str());
+            report_error(this->ht_netloc, errmsg);
+            auto finished_child = std::move(conn).close();
+            log_debug("tailer(%s): exit status %d",
+                      this->ht_netloc.c_str(),
+                      finished_child.exit_status());
+            this->ht_state = disconnected();
+            this->s_looping = false;
             return;
         }
 
@@ -604,10 +676,10 @@ tailer::looper::host_tailer::loop_body()
                 log_debug("all done!");
 
                 auto finished_child = std::move(conn).close();
-                if (finished_child.exit_status() != 0
-                    && !this->ht_error_queue.empty())
+                auto readable_eq = this->ht_error_queue.readAccess();
+                if (finished_child.exit_status() != 0 && !readable_eq->empty())
                 {
-                    report_error(this->ht_netloc, this->ht_error_queue.back());
+                    report_error(this->ht_netloc, readable_eq->back());
                 }
 
                 return state_v{disconnected()};
@@ -633,30 +705,30 @@ tailer::looper::host_tailer::loop_body()
                 auto desired_iter = conn.c_desired_paths.find(pe.pe_path);
                 if (desired_iter != conn.c_desired_paths.end()) {
                     report_error(this->get_display_path(pe.pe_path), pe.pe_msg);
-                    if (!desired_iter->second.loo_tail) {
+                    if (!desired_iter->second.loo_follow) {
                         conn.c_desired_paths.erase(desired_iter);
                     }
                 } else {
                     auto child_iter = conn.c_child_paths.find(pe.pe_path);
 
                     if (child_iter != conn.c_child_paths.end()
-                        && !child_iter->second.loo_tail)
+                        && !child_iter->second.loo_follow)
                     {
                         conn.c_child_paths.erase(child_iter);
                     }
                 }
 
-                auto remote_path = ghc::filesystem::absolute(
-                                       ghc::filesystem::path(pe.pe_path))
+                auto remote_path = std::filesystem::absolute(
+                                       std::filesystem::path(pe.pe_path))
                                        .relative_path();
                 auto local_path = this->ht_local_path / remote_path;
 
                 log_debug("removing %s", local_path.c_str());
                 this->ht_active_files.erase(local_path);
-                ghc::filesystem::remove_all(local_path);
+                std::filesystem::remove_all(local_path);
 
-                if (conn.c_desired_paths.empty() && conn.c_child_paths.empty())
-                {
+                if (conn.c_desired_paths.empty()
+                    && conn.c_child_paths.empty()) {
                     log_info("tailer(%s): all desired paths synced",
                              this->ht_netloc.c_str());
                     return state_v{synced{}};
@@ -693,19 +765,20 @@ tailer::looper::host_tailer::loop_body()
                             return std::move(this->ht_state);
                         }
 
-                        conn.c_child_paths[pob.pob_path]
-                            = std::move(root_iter->second);
+                        // Copy, the root still owns its options and other
+                        // children will need them as well.
+                        conn.c_child_paths[pob.pob_path] = root_iter->second;
                         child_iter = conn.c_child_paths.find(pob.pob_path);
                     }
 
-                    loo = std::move(child_iter->second);
+                    loo = child_iter->second;
                 }
 
                 update_tailer_description(
                     this->ht_netloc, conn.c_desired_paths, this->ht_uname);
 
-                auto remote_path = ghc::filesystem::absolute(
-                                       ghc::filesystem::path(pob.pob_path))
+                auto remote_path = std::filesystem::absolute(
+                                       std::filesystem::path(pob.pob_path))
                                        .relative_path();
                 auto local_path = this->ht_local_path / remote_path;
                 auto open_res
@@ -744,8 +817,7 @@ tailer::looper::host_tailer::loop_body()
                             fc.fc_file_names[lpath_str]
                                 .with_filename(custom_name)
                                 .with_source(logfile_name_source::REMOTE)
-                                .with_tail(loo.loo_tail)
-                                .with_non_utf_visibility(false)
+                                .with_follow(loo.loo_follow)
                                 .with_visible_size_limit(256 * 1024);
                             update_active_files(fc);
                         });
@@ -767,7 +839,7 @@ tailer::looper::host_tailer::loop_body()
 
                 if (fstat(fd, &st) == -1 || !S_ISREG(st.st_mode)) {
                     log_debug("path changed, sending need block");
-                    ghc::filesystem::remove_all(local_path);
+                    std::filesystem::remove_all(local_path);
                     send_packet(conn.ht_to_child.get(),
                                 TPT_NEED_BLOCK,
                                 TPPT_STRING,
@@ -787,12 +859,10 @@ tailer::looper::host_tailer::loop_body()
                 }
 
                 constexpr int64_t BUFFER_SIZE = 4 * 1024 * 1024;
-                auto_mem<unsigned char> buffer;
-
-                buffer = (unsigned char*) malloc(BUFFER_SIZE);
+                auto buffer = auto_mem<unsigned char>::malloc(BUFFER_SIZE);
                 auto remaining = pob.pob_length;
                 auto remaining_offset = pob.pob_offset;
-                tailer::hash_frag thf;
+                hash_frag thf;
                 SHA256_CTX shactx;
                 sha256_init(&shactx);
 
@@ -808,7 +878,7 @@ tailer::looper::host_tailer::loop_body()
                         log_debug(
                             "unable to read file, sending need block -- %s",
                             strerror(errno));
-                        ghc::filesystem::remove_all(local_path);
+                        std::filesystem::remove_all(local_path);
                         break;
                     }
                     if (bytes_read == 0) {
@@ -847,8 +917,8 @@ tailer::looper::host_tailer::loop_body()
                 return std::move(this->ht_state);
             },
             [&](const tailer::packet_tail_block& ptb) {
-                auto remote_path = ghc::filesystem::absolute(
-                                       ghc::filesystem::path(ptb.ptb_path))
+                auto remote_path = std::filesystem::absolute(
+                                       std::filesystem::path(ptb.ptb_path))
                                        .relative_path();
                 auto local_path = this->ht_local_path / remote_path;
 
@@ -856,7 +926,7 @@ tailer::looper::host_tailer::loop_body()
                           ptb.ptb_offset,
                           ptb.ptb_bits.size(),
                           local_path.c_str());
-                ghc::filesystem::create_directories(local_path.parent_path());
+                std::filesystem::create_directories(local_path.parent_path());
                 auto create_res = lnav::filesystem::create_file(
                     local_path, O_WRONLY | O_APPEND | O_CREAT, 0600);
 
@@ -869,10 +939,10 @@ tailer::looper::host_tailer::loop_body()
                            ptb.ptb_bits.data(),
                            ptb.ptb_bits.size(),
                            ptb.ptb_offset);
-                    auto mtime = ghc::filesystem::file_time_type{
+                    auto mtime = std::filesystem::file_time_type{
                         std::chrono::seconds{ptb.ptb_mtime}};
                     // XXX This isn't atomic with the write...
-                    ghc::filesystem::last_write_time(local_path, mtime);
+                    std::filesystem::last_write_time(local_path, mtime);
                 }
                 return std::move(this->ht_state);
             },
@@ -881,7 +951,7 @@ tailer::looper::host_tailer::loop_body()
                     auto iter = conn.c_desired_paths.find(ps.ps_path);
 
                     if (iter != conn.c_desired_paths.end()) {
-                        if (iter->second.loo_tail) {
+                        if (iter->second.loo_follow) {
                             conn.c_synced_desired_paths.insert(ps.ps_path);
                         } else {
                             log_info("synced desired path: %s",
@@ -893,7 +963,7 @@ tailer::looper::host_tailer::loop_body()
                     auto iter = conn.c_child_paths.find(ps.ps_path);
 
                     if (iter != conn.c_child_paths.end()) {
-                        if (iter->second.loo_tail) {
+                        if (iter->second.loo_follow) {
                             conn.c_synced_child_paths.insert(ps.ps_path);
                         } else {
                             log_info("synced child path: %s",
@@ -903,8 +973,8 @@ tailer::looper::host_tailer::loop_body()
                     }
                 }
 
-                if (conn.c_desired_paths.empty() && conn.c_child_paths.empty())
-                {
+                if (conn.c_desired_paths.empty()
+                    && conn.c_child_paths.empty()) {
                     log_info("tailer(%s): all desired paths synced",
                              this->ht_netloc.c_str());
                     return state_v{synced{}};
@@ -935,11 +1005,11 @@ tailer::looper::host_tailer::loop_body()
                 return std::move(this->ht_state);
             },
             [&](const tailer::packet_link& pl) {
-                auto remote_path = ghc::filesystem::absolute(
-                                       ghc::filesystem::path(pl.pl_path))
+                auto remote_path = std::filesystem::absolute(
+                                       std::filesystem::path(pl.pl_path))
                                        .relative_path();
                 auto local_path = this->ht_local_path / remote_path;
-                auto remote_link_path = ghc::filesystem::path(pl.pl_link_value);
+                auto remote_link_path = std::filesystem::path(pl.pl_link_value);
                 std::string link_path;
 
                 if (remote_link_path.is_absolute()) {
@@ -954,8 +1024,8 @@ tailer::looper::host_tailer::loop_body()
                 log_debug("symlinking %s -> %s",
                           local_path.c_str(),
                           link_path.c_str());
-                ghc::filesystem::create_directories(local_path.parent_path());
-                ghc::filesystem::remove_all(local_path);
+                std::filesystem::create_directories(local_path.parent_path());
+                std::filesystem::remove_all(local_path);
                 if (symlink(link_path.c_str(), local_path.c_str()) < 0) {
                     log_error("symlink failed: %s", strerror(errno));
                 }
@@ -964,7 +1034,7 @@ tailer::looper::host_tailer::loop_body()
                     auto iter = conn.c_desired_paths.find(pl.pl_path);
 
                     if (iter != conn.c_desired_paths.end()) {
-                        if (iter->second.loo_tail) {
+                        if (iter->second.loo_follow) {
                             conn.c_synced_desired_paths.insert(pl.pl_path);
                         } else {
                             log_info("synced desired path: %s",
@@ -976,7 +1046,7 @@ tailer::looper::host_tailer::loop_body()
                     auto iter = conn.c_child_paths.find(pl.pl_path);
 
                     if (iter != conn.c_child_paths.end()) {
-                        if (iter->second.loo_tail) {
+                        if (iter->second.loo_follow) {
                             conn.c_synced_child_paths.insert(pl.pl_path);
                         } else {
                             log_info("synced child path: %s",
@@ -997,11 +1067,13 @@ tailer::looper::host_tailer::loop_body()
                                       ppe.ppe_id);
                             return;
                         }
-                        lnav_data.ld_preview_status_source.get_description()
+                        lnav_data.ld_preview_status_source[0]
+                            .get_description()
                             .set_cylon(false)
                             .clear();
-                        lnav_data.ld_preview_source.clear();
+                        lnav_data.ld_preview_source[0].clear();
                         lnav_data.ld_bottom_source.grep_error(ppe.ppe_msg);
+                        lnav_data.ld_status[LNS_BOTTOM].set_needs_update();
                     });
 
                 return std::move(this->ht_state);
@@ -1017,12 +1089,15 @@ tailer::looper::host_tailer::loop_body()
                         }
                         std::string str(ppd.ppd_bits.begin(),
                                         ppd.ppd_bits.end());
-                        lnav_data.ld_preview_status_source.get_description()
+                        lnav_data.ld_preview_status_source[0]
+                            .get_description()
                             .set_cylon(false)
                             .set_value("For file: %s:%s",
                                        netloc.c_str(),
                                        ppd.ppd_path.c_str());
-                        lnav_data.ld_preview_source.replace_with(str)
+                        lnav_data.ld_status[LNS_PREVIEW0].set_needs_update();
+                        lnav_data.ld_preview_source[0]
+                            .replace_with(str)
                             .set_text_format(detect_text_format(str));
                     });
                 return std::move(this->ht_state);
@@ -1034,8 +1109,9 @@ tailer::looper::host_tailer::loop_body()
 
                 isc::to<main_looper&, services::main_t>().send(
                     [full_path](auto& mlooper) {
-                        lnav_data.ld_rl_view->add_possibility(
-                            ln_mode_t::COMMAND, "remote-path", full_path);
+                        static auto& prompt = lnav::prompt::get();
+
+                        prompt.p_remote_paths.insert(full_path);
                     });
                 return std::move(this->ht_state);
             });
@@ -1046,7 +1122,7 @@ tailer::looper::host_tailer::loop_body()
     }
 }
 
-std::chrono::milliseconds
+std::optional<std::chrono::milliseconds>
 tailer::looper::host_tailer::compute_timeout(mstime_t current_time) const
 {
     return 0s;
@@ -1071,12 +1147,12 @@ tailer::looper::host_tailer::get_display_path(
 }
 
 void*
-tailer::looper::host_tailer::run()
+tailer::looper::host_tailer::run(worker* w)
 {
     log_set_thread_prefix(
         fmt::format(FMT_STRING("tailer({})"), this->ht_netloc));
 
-    return service_base::run();
+    return service_base::run(w);
 }
 
 auto_pid<process_state::finished>
@@ -1123,13 +1199,13 @@ tailer::looper::remote_path_queue::send_synced_to_main(
     std::set<std::string> synced_files;
 
     for (const auto& pair : this->rpq_new_paths) {
-        if (!pair.second.loo_tail) {
+        if (!pair.second.loo_follow) {
             synced_files.emplace(
                 fmt::format(FMT_STRING("{}{}"), netloc, pair.first));
         }
     }
     for (const auto& pair : this->rpq_existing_paths) {
-        if (!pair.second.loo_tail) {
+        if (!pair.second.loo_follow) {
             synced_files.emplace(
                 fmt::format(FMT_STRING("{}{}"), netloc, pair.first));
         }
@@ -1150,43 +1226,51 @@ tailer::looper::report_error(std::string path, std::string msg)
     log_error("reporting error: %s -- %s", path.c_str(), msg.c_str());
     isc::to<main_looper&, services::main_t>().send([=](auto& mlooper) {
         file_collection fc;
+        auto um = lnav::console::user_message::error(
+                      attr_line_t("unable to open remote path ")
+                          .append_quoted(lnav::roles::file(path)))
+                      .with_reason(msg);
 
-        fc.fc_name_to_errors.emplace(path,
-                                     file_error_info{
-                                         {},
-                                         msg,
-                                     });
+        fc.fc_name_to_stubs->writeAccess()->emplace(path,
+                                                    file_stub_info{
+                                                        path,
+                                                        std::nullopt,
+                                                        std::nullopt,
+                                                        um.move(),
+                                                    });
         update_active_files(fc);
         lnav_data.ld_active_files.fc_progress->writeAccess()->sp_tailers.erase(
             path);
     });
 }
 
-void
+std::future<void>
 tailer::cleanup_cache()
 {
-    (void) std::async(std::launch::async, []() {
-        auto now = std::chrono::system_clock::now();
-        auto cache_path = remote_cache_path();
-        const auto& cfg = injector::get<const config&>();
-        std::vector<ghc::filesystem::path> to_remove;
+    return std::async(
+        std::launch::async, +[]() {
+            auto now = std::filesystem::file_time_type::clock::now();
+            auto cache_path = remote_cache_path();
+            const auto& cfg = injector::get<const config&>();
+            std::vector<std::filesystem::path> to_remove;
+            std::error_code ec;
 
-        log_debug("cache-ttl %d", cfg.c_cache_ttl.count());
-        for (const auto& entry :
-             ghc::filesystem::directory_iterator(cache_path))
-        {
-            auto mtime = ghc::filesystem::last_write_time(entry.path());
-            auto exp_time = mtime + cfg.c_cache_ttl;
-            if (now < exp_time) {
-                continue;
+            log_debug("cache-ttl %lld", cfg.c_cache_ttl.count());
+            for (const auto& entry :
+                 std::filesystem::directory_iterator(cache_path, ec))
+            {
+                auto mtime = std::filesystem::last_write_time(entry.path());
+                auto exp_time = mtime + cfg.c_cache_ttl;
+                if (now < exp_time) {
+                    continue;
+                }
+
+                to_remove.emplace_back(entry.path());
             }
 
-            to_remove.emplace_back(entry.path());
-        }
-
-        for (auto& entry : to_remove) {
-            log_debug("removing cached remote: %s", entry.c_str());
-            ghc::filesystem::remove_all(entry);
-        }
-    });
+            for (auto& entry : to_remove) {
+                log_debug("removing cached remote: %s", entry.c_str());
+                std::filesystem::remove_all(entry);
+            }
+        });
 }

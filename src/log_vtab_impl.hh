@@ -30,39 +30,121 @@
 #ifndef vtab_impl_hh
 #define vtab_impl_hh
 
+#include <deque>
 #include <map>
+#include <memory>
+#include <optional>
+#include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <sqlite3.h>
 
-#include "logfile_sub_source.hh"
+#include "ArenaAlloc/arenaalloc.h"
+#include "base/log_level_enum.hh"
+#include "base/string_attr_type.hh"
+#include "log_format_fwd.hh"
 #include "pcrepp/pcre2pp.hh"
 #include "robin_hood/robin_hood.h"
+#include "sqlitepp.hh"
+#include "vis_line.hh"
 
 class textview_curses;
 
 enum {
     VT_COL_LINE_NUMBER,
-    VT_COL_PARTITION,
     VT_COL_LOG_TIME,
-    VT_COL_LOG_ACTUAL_TIME,
-    VT_COL_IDLE_MSECS,
     VT_COL_LEVEL,
-    VT_COL_MARK,
-    VT_COL_LOG_COMMENT,
-    VT_COL_LOG_TAGS,
-    VT_COL_FILTERS,
     VT_COL_MAX
 };
 
+class logfile;
 class logfile_sub_source;
 
-struct log_cursor {
-    struct opid_hash {
-        unsigned int value : 6;
+struct msg_range {
+    struct valid {
+        bool contains(const vis_line_t vl) const
+        {
+            return this->v_min_line <= vl && vl < this->v_max_line;
+        }
+
+        void expand_to(const vis_line_t vl)
+        {
+            if (vl < this->v_min_line) {
+                this->v_min_line = vl;
+            }
+            if (vl >= this->v_max_line) {
+                this->v_max_line = vl + 1_vl;
+            }
+        }
+
+        vis_line_t v_min_line;
+        vis_line_t v_max_line;
     };
 
+    struct empty_t {};
+
+    using range_t = mapbox::util::variant<valid, empty_t>;
+
+    static msg_range invalid() { return msg_range{{mapbox::util::no_init{}}}; }
+
+    static msg_range empty() { return msg_range{empty_t()}; }
+
+    std::optional<valid> get_valid() const
+    {
+        if (this->mr_value.is<valid>()) {
+            return this->mr_value.get<valid>();
+        }
+        return std::nullopt;
+    }
+
+    bool contains(vis_line_t vl) const
+    {
+        return this->mr_value.match(
+            [vl](const valid& v) { return v.contains(vl); },
+            [](const empty_t&) { return false; });
+    }
+
+    msg_range& expand_to(vis_line_t vl)
+    {
+        this->mr_value = this->mr_value.match(
+            [vl](valid v) {
+                v.expand_to(vl);
+                return v;
+            },
+            [vl](empty_t) { return valid{vl, vl + 1_vl}; });
+        return *this;
+    }
+
+    msg_range& intersect(const msg_range& rhs)
+    {
+        if (this->mr_value.valid()) {
+            if (rhs.mr_value.valid()) {
+                this->mr_value = this->mr_value.match(
+                    [&rhs](const valid& v) {
+                        return rhs.mr_value.match(
+                            [&v](const valid& rv) {
+                                return range_t{valid{
+                                    std::max(v.v_min_line, rv.v_min_line),
+                                    std::min(v.v_max_line, rv.v_max_line),
+                                }};
+                            },
+                            [](const empty_t&) { return range_t{empty_t()}; });
+                    },
+                    [](const empty_t&) { return range_t{empty_t{}}; });
+            }
+        } else {
+            this->mr_value = rhs.mr_value;
+        }
+
+        return *this;
+    }
+
+    range_t mr_value;
+};
+
+struct log_cursor {
     struct string_constraint {
         unsigned char sc_op;
         std::string sc_value;
@@ -136,13 +218,15 @@ struct log_cursor {
     vis_line_t lc_curr_line;
     int lc_sub_index;
     vis_line_t lc_end_line;
+    vis_line_t lc_direction{1_vl};
 
     using level_constraint = integral_constraint<log_level_t>;
 
-    nonstd::optional<level_constraint> lc_level_constraint;
+    std::optional<level_constraint> lc_level_constraint;
     intern_string_t lc_format_name;
     intern_string_t lc_pattern_name;
-    nonstd::optional<opid_hash> lc_opid;
+    std::optional<uint64_t> lc_opid_bloom_bits;
+    std::optional<uint64_t> lc_tid_bloom_bits;
     std::vector<string_constraint> lc_log_path;
     logfile* lc_last_log_path_match{nullptr};
     logfile* lc_last_log_path_mismatch{nullptr};
@@ -152,6 +236,9 @@ struct log_cursor {
 
     std::vector<column_constraint> lc_indexed_columns;
     std::vector<vis_line_t> lc_indexed_lines;
+    msg_range lc_indexed_lines_range = msg_range::empty();
+
+    size_t lc_scanned_rows{0};
 
     enum class constraint_t {
         none,
@@ -160,12 +247,22 @@ struct log_cursor {
 
     void update(unsigned char op, vis_line_t vl, constraint_t cons);
 
+    /**
+     * Move to the next line that could produce a row: the next line from
+     * the column index while the index covers the cursor, otherwise the next
+     * line in the scan direction.
+     */
+    void advance();
+
     void set_eof() { this->lc_curr_line = this->lc_end_line = 0_vl; }
 
     bool is_eof() const
     {
         return this->lc_indexed_lines.empty()
-            && this->lc_curr_line >= this->lc_end_line;
+            && ((this->lc_direction > 0
+                 && this->lc_curr_line >= this->lc_end_line)
+                || (this->lc_direction < 0
+                    && this->lc_curr_line <= this->lc_end_line));
     }
 };
 
@@ -174,30 +271,44 @@ const std::string LOG_TIME = "log_time";
 
 class log_vtab_impl {
 public:
+    static const std::unordered_set<string_fragment, frag_hasher>
+        RESERVED_COLUMNS;
+
+    enum class provenance_t {
+        format,
+        user,
+        /** Created alongside a named search and owned by it. */
+        named_search,
+    };
+
     struct vtab_column {
-        vtab_column(const std::string name = "",
+        vtab_column(intern_string_t name = intern_string_t{},
                     int type = SQLITE3_TEXT,
-                    const std::string collator = "",
+                    intern_string_t collator = intern_string_t{},
                     bool hidden = false,
-                    const std::string comment = "",
+                    string_fragment comment = string_fragment{},
                     unsigned int subtype = 0)
-            : vc_name(name), vc_type(type), vc_collator(collator),
-              vc_hidden(hidden), vc_comment(comment), vc_subtype(subtype)
+            : vc_name(name), vc_collator(collator), vc_comment(comment),
+              vc_type(type), vc_subtype(subtype), vc_hidden(hidden)
         {
         }
 
-        vtab_column& with_comment(const std::string comment)
+        vtab_column& with_comment(string_fragment comment)
         {
             this->vc_comment = comment;
             return *this;
         }
 
-        std::string vc_name;
+        intern_string_t vc_name;
+        intern_string_t vc_collator;
+        /**
+         * Points at a string literal or at text owned by the format, both of
+         * which outlive any column built from them.
+         */
+        string_fragment vc_comment;
         int vc_type;
-        std::string vc_collator;
-        bool vc_hidden;
-        std::string vc_comment;
         int vc_subtype;
+        bool vc_hidden;
     };
 
     static std::pair<int, unsigned int> logline_value_to_sqlite_type(
@@ -207,7 +318,6 @@ public:
         : vi_name(name), vi_tags_name(intern_string::lookup(
                              fmt::format(FMT_STRING("{}.log_tags"), name)))
     {
-        this->vi_attrs.resize(128);
     }
 
     virtual ~log_vtab_impl() = default;
@@ -215,6 +325,11 @@ public:
     intern_string_t get_name() const { return this->vi_name; }
 
     intern_string_t get_tags_name() const { return this->vi_tags_name; }
+
+    virtual std::optional<std::string> get_command() const
+    {
+        return std::nullopt;
+    }
 
     std::string get_table_statement();
 
@@ -226,26 +341,43 @@ public:
 
     virtual void get_columns(std::vector<vtab_column>& cols) const {}
 
-    virtual void get_foreign_keys(std::vector<std::string>& keys_inout) const;
+    virtual void get_foreign_keys(
+        std::unordered_set<std::string>& keys_inout) const;
 
     virtual void get_primary_keys(std::vector<std::string>& keys_out) const {}
 
     virtual void extract(logfile* lf,
                          uint64_t line_number,
+                         string_attrs_t& sa,
                          logline_value_vector& values);
 
+    virtual bool matches(logline_value_vector& values) { return false; }
+
     struct column_index {
-        robin_hood::unordered_map<std::string, std::vector<vis_line_t>>
-            ci_value_to_lines;
-        int32_t ci_index_generation{0};
-        vis_line_t ci_max_line{0};
+        robin_hood::
+            unordered_map<string_fragment, std::deque<vis_line_t>, frag_hasher>
+                ci_value_to_lines;
+        uint32_t ci_index_generation{0};
+        msg_range ci_indexed_range = msg_range::empty();
+
+        ArenaAlloc::Alloc<char> ci_string_arena;
     };
 
     std::map<int32_t, column_index> vi_column_indexes;
 
+    void expand_indexes_to(
+        const std::vector<log_cursor::column_constraint>& cons,
+        const vis_line_t vl)
+    {
+        for (const auto& cc : cons) {
+            this->vi_column_indexes[cc.cc_column].ci_indexed_range.expand_to(
+                vl);
+        }
+    }
+
+    provenance_t vi_provenance{provenance_t::format};
     bool vi_supports_indexes{true};
     int vi_column_count{0};
-    string_attrs_t vi_attrs;
 
 protected:
     const intern_string_t vi_name;
@@ -254,15 +386,12 @@ protected:
 
 class log_format_vtab_impl : public log_vtab_impl {
 public:
-    log_format_vtab_impl(const log_format& format)
-        : log_vtab_impl(format.get_name()), lfvi_format(format)
-    {
-    }
+    log_format_vtab_impl(std::shared_ptr<const log_format> format);
 
     virtual bool next(log_cursor& lc, logfile_sub_source& lss);
 
 protected:
-    const log_format& lfvi_format;
+    std::shared_ptr<const log_format> lfvi_format;
 };
 
 using sql_progress_callback_t = int (*)(const log_cursor&);
@@ -283,62 +412,67 @@ public:
     sql_progress_guard(sql_progress_callback_t cb,
                        sql_progress_finished_callback_t fcb,
                        source_location loc,
-                       const attr_line_t& content)
+                       const attr_line_t& content,
+                       bool run_cb)
     {
         log_vtab_data.lvd_looping = true;
-        log_vtab_data.lvd_progress = cb;
-        log_vtab_data.lvd_finished = fcb;
+        if (run_cb) {
+            log_vtab_data.lvd_progress = cb;
+            log_vtab_data.lvd_finished = fcb;
+        }
         log_vtab_data.lvd_location = loc;
         log_vtab_data.lvd_content = content;
     }
 
     ~sql_progress_guard()
     {
+        log_vtab_data.lvd_looping = true;
+        log_vtab_data.lvd_progress = nullptr;
+        log_vtab_data.lvd_location = source_location{};
+        log_vtab_data.lvd_content.clear();
         if (log_vtab_data.lvd_finished) {
             log_vtab_data.lvd_finished();
         }
-        log_vtab_data.lvd_looping = true;
-        log_vtab_data.lvd_progress = nullptr;
         log_vtab_data.lvd_finished = nullptr;
-        log_vtab_data.lvd_location = source_location{};
-        log_vtab_data.lvd_content.clear();
     }
 };
 
 class log_vtab_manager {
 public:
-    using iterator = std::map<intern_string_t,
+    using iterator = std::map<string_fragment,
                               std::shared_ptr<log_vtab_impl>>::const_iterator;
 
-    log_vtab_manager(sqlite3* db, textview_curses& tc, logfile_sub_source& lss);
+    log_vtab_manager(auto_sqlite3& db, logfile_sub_source& lss);
     ~log_vtab_manager();
 
-    textview_curses* get_view() const { return &this->vm_textview; }
+    using injectable = log_vtab_manager(auto_sqlite3&, logfile_sub_source&);
 
     logfile_sub_source* get_source() { return &this->vm_source; }
 
     std::string register_vtab(std::shared_ptr<log_vtab_impl> vi);
-    std::string unregister_vtab(intern_string_t name);
+    std::string unregister_vtab(string_fragment name);
+
+    std::shared_ptr<log_vtab_impl> lookup_impl(string_fragment name) const;
 
     std::shared_ptr<log_vtab_impl> lookup_impl(intern_string_t name) const
     {
-        auto iter = this->vm_impls.find(name);
-
-        if (iter != this->vm_impls.end()) {
-            return iter->second;
-        }
-        return nullptr;
+        return this->lookup_impl(name.to_string_fragment());
     }
 
     iterator begin() const { return this->vm_impls.begin(); }
 
     iterator end() const { return this->vm_impls.end(); }
 
+    // Returns true if any name in the given set refers to a table
+    // backed by log data: a per-format vtab registered here, or one
+    // of the fixed cross-log tables (all_logs, all_logs_vtab,
+    // all_opids, all_thread_ids).
+    bool has_log_backed_table(const std::set<std::string>& table_names) const;
+
 private:
-    sqlite3* vm_db;
-    textview_curses& vm_textview;
+    auto_sqlite3& vm_db;
     logfile_sub_source& vm_source;
-    std::map<intern_string_t, std::shared_ptr<log_vtab_impl>> vm_impls;
+    std::map<string_fragment, std::shared_ptr<log_vtab_impl>> vm_impls;
 };
 
 #endif

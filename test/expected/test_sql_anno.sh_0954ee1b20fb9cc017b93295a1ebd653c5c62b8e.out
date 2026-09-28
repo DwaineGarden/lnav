@@ -1,0 +1,20 @@
+                 from access_log | filter cs_method == 'GET' || cs_method == 'PUT'
+      prql_stage ----------------
+  prql_transform ----
+       prql_fqid      ----------
+      prql_stage                 -------------------------------------------------
+       prql_pipe                 -
+  prql_transform                   ------
+       prql_fqid                          ---------
+       prql_oper                                    --
+     prql_string                                       -----
+       prql_oper                                             --
+       prql_fqid                                                ---------
+       prql_oper                                                          --
+     prql_string                                                             -----
+from: PRQL command to specify a data source
+Formatted:
+from access_log
+filter cs_method == 'GET' || cs_method == 'PUT'
+
+Cursor offset: 2

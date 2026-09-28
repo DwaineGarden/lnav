@@ -29,24 +29,38 @@
  * @file fs-extension-functions.cc
  */
 
+#include <algorithm>
+#include <future>
+#include <map>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include <errno.h>
-#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "base/auto_fd.hh"
+#include "base/auto_mem.hh"
+#include "base/auto_pid.hh"
+#include "base/injector.hh"
+#include "base/intern_string.hh"
+#include "base/lnav.console.hh"
+#include "base/opt_util.hh"
+#include "bound_tags.hh"
 #include "config.h"
+#include "mapbox/variant.hpp"
 #include "sqlite-extension-func.hh"
 #include "sqlite3.h"
 #include "vtab_module.hh"
+#include "yajlpp/yajlpp_def.hh"
 
-using namespace mapbox;
+extern char** environ;
 
-static util::variant<const char*, string_fragment>
+static mapbox::util::variant<const char*, string_fragment>
 sql_basename(const char* path_in)
 {
     int text_end = -1;
@@ -72,12 +86,10 @@ sql_basename(const char* path_in)
     }
 }
 
-static util::variant<const char*, string_fragment>
+static mapbox::util::variant<const char*, string_fragment>
 sql_dirname(const char* path_in)
 {
-    ssize_t text_end;
-
-    text_end = strlen(path_in) - 1;
+    ssize_t text_end = strlen(path_in) - 1;
     while (text_end >= 0
            && (path_in[text_end] == '/' || path_in[text_end] == '\\'))
     {
@@ -86,6 +98,13 @@ sql_dirname(const char* path_in)
 
     while (text_end >= 0) {
         if (path_in[text_end] == '/' || path_in[text_end] == '\\') {
+            // Drop any other separators before this one, like "foo//bar".
+            while (text_end > 0
+                   && (path_in[text_end - 1] == '/'
+                       || path_in[text_end - 1] == '\\'))
+            {
+                text_end -= 1;
+            }
             return string_fragment(path_in, 0, text_end == 0 ? 1 : text_end);
         }
 
@@ -95,18 +114,18 @@ sql_dirname(const char* path_in)
     return path_in[0] == '/' ? "/" : ".";
 }
 
-static nonstd::optional<std::string>
+static std::optional<std::string>
 sql_joinpath(const std::vector<const char*>& paths)
 {
     std::string full_path;
 
     if (paths.empty()) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     for (auto& path_in : paths) {
         if (path_in == nullptr) {
-            return nonstd::nullopt;
+            return std::nullopt;
         }
 
         if (path_in[0] == '/' || path_in[0] == '\\') {
@@ -123,42 +142,243 @@ sql_joinpath(const std::vector<const char*>& paths)
     return full_path;
 }
 
-static std::string
+static text_auto_buffer
 sql_readlink(const char* path)
 {
     struct stat st;
 
     if (lstat(path, &st) == -1) {
-        throw sqlite_func_error(
-            "unable to stat path: {} -- {}", path, strerror(errno));
+        throw lnav::console::user_message::error(
+            attr_line_t("readlink() cannot lstat path: ")
+                .append(lnav::roles::file(path)))
+            .with_errno_reason();
     }
 
-    char buf[st.st_size];
-    ssize_t rc;
+    auto path_len = strlen(path);
+    if (!S_ISLNK(st.st_mode)) {
+        auto buf = auto_buffer::from(path, path_len);
+        return text_auto_buffer{std::move(buf)};
+    }
 
-    rc = readlink(path, buf, sizeof(buf));
-    if (rc < 0) {
-        if (errno == EINVAL) {
-            return path;
+    // st_size is not reliable: it is zero for some links, like the ones in
+    // /proc on Linux, and the link can change after the lstat().  So, grow
+    // the buffer until the target fits with room to spare, since readlink()
+    // truncates without saying so.
+    auto buf_size = std::max<size_t>(st.st_size, PATH_MAX) + 1;
+    while (true) {
+        auto buf = auto_buffer::alloc(buf_size);
+        auto rc = readlink(path, buf.in(), buf.capacity());
+        if (rc < 0) {
+            throw lnav::console::user_message::error(
+                attr_line_t("readlink() failed for path: ")
+                    .append(lnav::roles::file(path)))
+                .with_errno_reason();
         }
-        throw sqlite_func_error(
-            "unable to read link: {} -- {}", path, strerror(errno));
+        if ((size_t) rc < buf.capacity()) {
+            buf.resize(rc);
+            return text_auto_buffer{std::move(buf)};
+        }
+        buf_size *= 2;
     }
-
-    return std::string(buf, rc);
 }
 
-static std::string
+static text_auto_buffer
 sql_realpath(const char* path)
 {
-    char resolved_path[PATH_MAX];
+    auto resolved_path = auto_buffer::alloc(PATH_MAX);
+    if (realpath(path, resolved_path.in()) == nullptr) {
+        throw lnav::console::user_message::error(
+            attr_line_t("Could not get real path for ")
+                .append_quoted(lnav::roles::file(path)))
+            .with_errno_reason();
+    }
+    resolved_path.resize(strlen(resolved_path.in()));
 
-    if (realpath(path, resolved_path) == nullptr) {
-        throw sqlite_func_error(
-            "Could not get real path for {} -- {}", path, strerror(errno));
+    return text_auto_buffer{std::move(resolved_path)};
+}
+
+struct shell_exec_options {
+    std::map<std::string, std::optional<std::string>> po_env;
+};
+
+static const typed_json_path_container<shell_exec_options>&
+get_shell_exec_options_handlers()
+{
+    static const json_path_container shell_exec_env_handlers = {
+        yajlpp::pattern_property_handler(R"((?<name>[^=]+))")
+            .for_field(&shell_exec_options::po_env),
+    };
+
+    static const typed_json_path_container<shell_exec_options> retval = {
+        yajlpp::property_handler("env").with_children(shell_exec_env_handlers),
+    };
+
+    return retval;
+}
+
+static blob_auto_buffer
+sql_shell_exec(const char* cmd,
+               std::optional<string_fragment> input,
+               std::optional<string_fragment> opts_json)
+{
+    static const intern_string_t SRC = intern_string::lookup("options");
+    static auto& lnflags = injector::get<lnav_flags_storage&>();
+
+    if (lnflags.is_set<lnav_flags::secure_mode>()) {
+        throw sqlite_func_error("not available in secure mode");
     }
 
-    return resolved_path;
+    shell_exec_options options;
+
+    if (opts_json) {
+        auto parse_res = get_shell_exec_options_handlers().parser_for(SRC).of(
+            opts_json.value());
+
+        if (parse_res.isErr()) {
+            throw lnav::console::user_message::error(
+                "invalid options parameter")
+                .with_reason(parse_res.unwrapErr()[0]);
+        }
+
+        options = parse_res.unwrap();
+    }
+
+    // The child can only call async-signal-safe functions between fork() and
+    // exec, so everything that allocates is done here.
+    const auto shell = getenv_opt("SHELL").value_or("bash");
+    const char* const args[] = {
+        shell,
+        "-c",
+        cmd,
+        nullptr,
+    };
+    std::vector<std::string> env_strs;
+    for (size_t lpc = 0; environ[lpc] != nullptr; lpc++) {
+        auto name = string_fragment::from_c_str(environ[lpc])
+                        .split_when(string_fragment::tag1{'='})
+                        .first;
+
+        if (options.po_env.count(name.to_string()) == 0) {
+            env_strs.emplace_back(environ[lpc]);
+        }
+    }
+    for (const auto& epair : options.po_env) {
+        if (epair.second.has_value()) {
+            env_strs.emplace_back(
+                fmt::format(FMT_STRING("{}={}"), epair.first, *epair.second));
+        }
+    }
+    std::vector<char*> child_env;
+    for (auto& env_str : env_strs) {
+        child_env.emplace_back(env_str.data());
+    }
+    child_env.emplace_back(nullptr);
+
+    auto child_fds_res
+        = auto_pipe::for_child_fds(STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO);
+    if (child_fds_res.isErr()) {
+        throw lnav::console::user_message::error("cannot open child pipes")
+            .with_reason(child_fds_res.unwrapErr());
+    }
+    auto child_pid_res = lnav::pid::from_fork();
+    if (child_pid_res.isErr()) {
+        throw lnav::console::user_message::error("cannot fork()")
+            .with_reason(child_pid_res.unwrapErr());
+    }
+
+    auto child_fds = child_fds_res.unwrap();
+    auto child_pid = child_pid_res.unwrap();
+
+    for (auto& child_fd : child_fds) {
+        child_fd.after_fork(child_pid.in());
+    }
+
+    if (child_pid.in_child()) {
+        environ = child_env.data();
+        execvp(args[0], (char**) args);
+        _exit(EXIT_FAILURE);
+    }
+
+    auto out_reader = std::async(
+        std::launch::async, [out_fd = std::move(child_fds[1].read_end())]() {
+            auto buffer = auto_buffer::alloc(4096);
+
+            while (true) {
+                if (buffer.available() < 4096) {
+                    buffer.expand_by(4096);
+                }
+
+                auto rc
+                    = read(out_fd, buffer.next_available(), buffer.available());
+                if (rc < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                if (rc == 0) {
+                    break;
+                }
+                buffer.resize_by(rc);
+            }
+
+            return buffer;
+        });
+
+    auto err_reader = std::async(
+        std::launch::async, [err_fd = std::move(child_fds[2].read_end())]() {
+            auto buffer = auto_buffer::alloc(4096);
+
+            while (true) {
+                if (buffer.available() < 4096) {
+                    buffer.expand_by(4096);
+                }
+
+                auto rc
+                    = read(err_fd, buffer.next_available(), buffer.available());
+                if (rc < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                if (rc == 0) {
+                    break;
+                }
+                buffer.resize_by(rc);
+            }
+
+            return buffer;
+        });
+
+    if (input) {
+        // A child that exits without reading all of its input is not an
+        // error, and SIGPIPE is ignored, so a failed write is ignored too.
+        (void) child_fds[0].write_end().write_fully(input.value());
+    }
+    child_fds[0].close();
+
+    auto retval = blob_auto_buffer{out_reader.get()};
+
+    auto finished_child = std::move(child_pid).wait_for_child();
+
+    if (!finished_child.was_normal_exit()) {
+        throw lnav::console::user_message::error(
+            attr_line_t("child failed with signal ")
+                .append(lnav::roles::number(
+                    fmt::to_string(finished_child.term_signal()))))
+            .with_reason(err_reader.get().to_string());
+    }
+
+    if (finished_child.exit_status() != EXIT_SUCCESS) {
+        throw lnav::console::user_message::error(
+            attr_line_t("child failed with exit code ")
+                .append(lnav::roles::number(
+                    fmt::to_string(finished_child.exit_status()))))
+            .with_reason(err_reader.get().to_string());
+    }
+
+    return retval;
 }
 
 int
@@ -170,6 +390,7 @@ fs_extension_functions(struct FuncDef** basic_funcs,
         sqlite_func_adapter<decltype(&sql_basename), sql_basename>::builder(
             help_text("basename", "Extract the base portion of a pathname.")
                 .sql_function()
+                .with_prql_path({"fs", "basename"})
                 .with_parameter({"path", "The path"})
                 .with_tags({"filename"})
                 .with_example({"To get the base of a plain file name",
@@ -183,12 +404,18 @@ fs_extension_functions(struct FuncDef** basic_funcs,
                 .with_example({"To get the base of a Windows path",
                                "SELECT basename('foo\\bar')"})
                 .with_example({"To get the base of the root directory",
-                               "SELECT basename('/')"})),
+                               "SELECT basename('/')"})
+                .with_example({
+                    "To get the base of a path",
+                    "from [{p='foo/bar'}] | select { fs.basename p }",
+                    help_example::language::prql,
+                })),
 
         sqlite_func_adapter<decltype(&sql_dirname), sql_dirname>::builder(
             help_text("dirname", "Extract the directory portion of a pathname.")
                 .sql_function()
                 .with_parameter({"path", "The path"})
+                .with_prql_path({"fs", "dirname"})
                 .with_tags({"filename"})
                 .with_example({"To get the directory of a relative file path",
                                "SELECT dirname('foo/bar')"})
@@ -205,6 +432,7 @@ fs_extension_functions(struct FuncDef** basic_funcs,
         sqlite_func_adapter<decltype(&sql_joinpath), sql_joinpath>::builder(
             help_text("joinpath", "Join components of a path together.")
                 .sql_function()
+                .with_prql_path({"fs", "join"})
                 .with_parameter(
                     help_text(
                         "path",
@@ -231,8 +459,11 @@ fs_extension_functions(struct FuncDef** basic_funcs,
                      "SELECT joinpath('/', 'foo', '/bar')"})),
 
         sqlite_func_adapter<decltype(&sql_readlink), sql_readlink>::builder(
-            help_text("readlink", "Read the target of a symbolic link.")
+            help_text("readlink",
+                      "Read the target of a symbolic link.  If the path is "
+                      "not a symbolic link, it is returned unchanged.")
                 .sql_function()
+                .with_prql_path({"fs", "readlink"})
                 .with_parameter({"path", "The path to the symbolic link."})
                 .with_tags({"filename"})),
 
@@ -243,8 +474,36 @@ fs_extension_functions(struct FuncDef** basic_funcs,
                 "symbolic links and "
                 "resolving '.' and '..' references.")
                 .sql_function()
+                .with_prql_path({"fs", "realpath"})
                 .with_parameter({"path", "The path to resolve."})
                 .with_tags({"filename"})),
+
+        sqlite_func_adapter<decltype(&sql_shell_exec), sql_shell_exec>::builder(
+            help_text("shell_exec",
+                      "Executes a shell command and returns its output.")
+                .sql_function()
+                .with_prql_path({"shell", "exec"})
+                .with_parameter({"cmd", "The command to execute."})
+                .with_parameter(help_text{
+                    "input",
+                    "A blob of data to write to the command's standard input."}
+                                    .optional())
+                .with_parameter(
+                    help_text{"options",
+                              "A JSON object containing options for the "
+                              "execution with the following properties:"}
+                        .optional()
+                        .with_parameter(help_text{
+                            "env",
+                            "An object containing the environment variables "
+                            "to set or, if NULL, to unset."}
+                                            .optional()))
+                .with_tags({"shell"}))
+            .with_flags(
+#ifdef SQLITE_DIRECTONLY
+                SQLITE_DIRECTONLY |
+#endif
+                SQLITE_UTF8),
 
         /*
          * TODO: add other functions like normpath, ...

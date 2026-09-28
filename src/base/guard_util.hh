@@ -1,0 +1,96 @@
+/**
+ * Copyright (c) 2025, Timothy Stack
+ *
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * * Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ * * Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ * * Neither the name of Timothy Stack nor the names of its contributors
+ * may be used to endorse or promote products derived from this software
+ * without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ''AS IS'' AND ANY
+ * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#ifndef lnav_guard_util_hh
+#define lnav_guard_util_hh
+
+#include <utility>
+
+namespace lnav {
+
+template<typename A>
+struct final_action {
+    explicit final_action(A a) : act{std::move(a)} {}
+    final_action(const final_action&) = delete;
+    final_action& operator=(const final_action&) = delete;
+    final_action& operator=(final_action&&) = delete;
+    final_action(final_action&&) = delete;
+    ~final_action() { act(); }
+
+private:
+    A act;
+};
+
+template<typename A>
+final_action<A>
+finally(A act)  // deduce action type
+{
+    return final_action<A>{std::move(act)};
+}
+
+struct guard_helper {
+    guard_helper() = default;
+    guard_helper(const guard_helper&) = delete;
+    guard_helper(guard_helper&& other) noexcept { other.gh_enabled = false; }
+    guard_helper& operator=(guard_helper&& other) noexcept
+    {
+        other.gh_enabled = false;
+
+        return *this;
+    }
+
+    operator bool() const { return this->gh_enabled; }
+
+    bool gh_enabled{true};
+};
+
+struct recursion_preventer : guard_helper {
+    explicit recursion_preventer(size_t* depth) : rp_depth(depth)
+    {
+        *rp_depth += 1;
+    }
+
+    recursion_preventer(const recursion_preventer&) = delete;
+    recursion_preventer& operator=(const recursion_preventer&) = delete;
+    recursion_preventer& operator=(recursion_preventer&&) = default;
+    recursion_preventer(recursion_preventer&&) = default;
+
+    ~recursion_preventer()
+    {
+        if (this->gh_enabled) {
+            *rp_depth -= 1;
+        }
+    }
+
+    size_t* rp_depth{nullptr};
+};
+
+}  // namespace lnav
+
+#endif

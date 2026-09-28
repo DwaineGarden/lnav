@@ -11,32 +11,20 @@ navigate through your logs using a variety of :ref:`hotkeys<hotkeys>`.
 for doing things like applying filters, tagging messages, and more.  You can
 then analyze your log messages using the :ref:`sql-ext`.
 
-Dependencies
-------------
+.. figure:: lnav-intro-screen.png
+   :align: center
+   :alt: Screenshot of lnav showing a mix of syslog and web access_log messages.
 
-When compiling from source, the following dependencies are required:
+   Screenshot of **lnav** viewing syslog and web access_log messages.
 
-* `NCurses <http://www.gnu.org/s/ncurses/>`_
-* `PCRE2 <http://www.pcre.org>`_
-* `SQLite <http://www.sqlite.org>`_
-* `ZLib <http://wwww.zlib.net>`_
-* `Bzip2 <http://www.bzip.org>`_
-* `Readline <http://www.gnu.org/s/readline>`_
-* `libcurl <https://curl.haxx.se>`_
-* `libarchive <https://libarchive.org>`_
 
-Installation
-------------
+Downloads
+---------
 
-Check the `downloads page <http://lnav.org/downloads>`_ to see if there are
-packages for your operating system.  To compile from source, use the following
-commands:
+Binaries and source code for lnav can be downloaded from the
+`releases page <https://github.com/tstack/lnav/releases>`_.
 
-.. prompt:: bash
-
-   ./configure
-   make
-   sudo make install
+When building from source, follow the steps in :ref:`development`.
 
 
 Viewing Logs
@@ -45,7 +33,7 @@ Viewing Logs
 The arguments to **lnav** are the log files, directories, or URLs to be viewed.
 For example, to view all of the CUPS logs on your system:
 
-.. prompt:: bash
+.. code-block:: bash
 
    lnav /var/log/cups
 
@@ -56,7 +44,7 @@ define your own.
 If no arguments are given, **lnav** will try to open the syslog file on your
 system:
 
-.. prompt:: bash
+.. code-block:: bash
 
    lnav
 
@@ -110,8 +98,10 @@ command can be used to the change the theme:
 
 The builtin themes are:
 `default <https://github.com/tstack/lnav/blob/master/src/themes/default-theme.json>`_,
+`dracula <https://github.com/tstack/lnav/blob/master/src/themes/dracula.json>`_,
 `eldar <https://github.com/tstack/lnav/blob/master/src/themes/eldar.json>`_,
 `grayscale <https://github.com/tstack/lnav/blob/master/src/themes/grayscale.json>`_,
+`modus-operandi <https://github.com/tstack/lnav/blob/master/src/themes/modus-operandi.json>`_,
 `monocai <https://github.com/tstack/lnav/blob/master/src/themes/monocai.json>`_,
 `night-owl <https://github.com/tstack/lnav/blob/master/src/themes/night-owl.json>`_,
 `solarized-dark <https://github.com/tstack/lnav/blob/master/src/themes/solarized-dark.json>`_,
@@ -121,11 +111,87 @@ and
 To create or customize a theme, consult the :ref:`themes` section.
 
 
+Cursor Mode (v0.11.2+)
+^^^^^^^^^^^^^^^^^^^^^^
+
+The default mode for scrolling in **lnav** is "cursor" mode where
+there is a cursor line in the view that is moved by the arrow keys
+and other interactions.  Any interactions, such as jumping to a
+search hit, are then focused on that line.
+
+Alternatively, you can enable "top" mode where the contents of the
+main view are moved when the arrow keys are pressed.  Any
+interactions, such as jumping to a search hit, are then focused
+on the top line in the view.  You can change to "top" mode with
+the following command:
+
+.. code-block:: lnav
+
+   :config /ui/movement/mode top
+
+
+Mouse Support (v0.12.2+)
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Mouse support can be enabled temporarily by pressing :kbd:`F2`
+and can be set as the default by executing the following command:
+
+.. code-block:: lnav
+
+   :config /ui/mouse/mode enabled
+
+See :ref:`ui_mouse` for more details.
+
 Log Formats
 ^^^^^^^^^^^
 
-In order for **lnav** to understand your log files, it needs to told how to
-parse the log messages using a log format definition.  There are many log
+In order for **lnav** to understand your log files, it needs to be told how
+to parse the log messages using a log format definition.  There are many log
 formats builtin and **lnav** will automatically determine the best format to
 use.  In case your log file is not recognized, consult the :ref:`log_formats`
 section for information on how to create a format.
+
+.. _development:
+
+Development
+-----------
+
+Development of lnav is hosted on `GitHub <https://github.com/tstack/lnav/>`_.
+
+`Issues <https://github.com/tstack/lnav/issues>`_ should be used for bugs
+and feature requests.
+
+`Discussions <https://github.com/tstack/lnav/discussions>`_ should be used
+for asking questions and sharing tips.
+
+Dependencies
+^^^^^^^^^^^^
+
+When compiling from source, the following dependencies are required:
+
+* `PCRE2 <http://www.pcre.org>`_
+* `SQLite <http://www.sqlite.org>`_
+* `ZLib <http://wwww.zlib.net>`_
+* `Bzip2 <http://www.bzip.org>`_
+* `libcurl <https://curl.haxx.se>`_
+* `libarchive <https://libarchive.org>`_
+* `libunistring <https://www.gnu.org/software/libunistring/>`_
+* `cargo/rust <https://www.rust-lang.org>`_
+
+Installation
+^^^^^^^^^^^^
+
+Check the `downloads page <http://lnav.org/downloads>`_ to see if there are
+packages for your operating system.  To compile from source, use the following
+commands:
+
+.. note::
+
+   Run :code:`./autogen.sh` if compiling from the git repository.
+
+.. code-block:: bash
+
+   ./configure
+   make
+   sudo make install
+

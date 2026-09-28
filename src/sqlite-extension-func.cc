@@ -29,13 +29,23 @@
  * @file sqlite-extension-func.c
  */
 
+#include <map>
+#include <mutex>
+#include <string>
+
 #include "sqlite-extension-func.hh"
 
 #include "base/auto_mem.hh"
+#include "base/itertools.hh"
 #include "base/lnav_log.hh"
 #include "base/string_util.hh"
 #include "config.h"
+#include "help_text.hh"
 #include "sql_help.hh"
+
+#ifdef HAVE_RUST_DEPS
+#    include "lnav_rs_ext.cxx.hh"
+#endif
 
 extern "C"
 {
@@ -44,6 +54,15 @@ struct sqlite3_api_routines;
 int sqlite3_series_init(sqlite3* db,
                         char** pzErrMsg,
                         const sqlite3_api_routines* pApi);
+}
+
+#ifdef HAVE_RUST_DEPS
+rust::Vec<lnav_rs_ext::SourceTreeElement> sqlite_extension_prql;
+#endif
+
+namespace lnav::sql {
+std::multimap<std::string, const help_text*> prql_functions;
+
 }
 
 sqlite_registration_func_t sqlite_registration_funcs[] = {
@@ -59,10 +78,130 @@ sqlite_registration_func_t sqlite_registration_funcs[] = {
     nullptr,
 };
 
+sqlite_registration_func_t sqlite_thread_safe_registration_funcs[] = {
+    common_extension_functions,
+    // state_extension_functions is not thread-safe and is left out
+    string_extension_functions,
+    network_extension_functions,
+    fs_extension_functions,
+    json_extension_functions,
+    yaml_extension_functions,
+    time_extension_functions,
+
+    nullptr,
+};
+
+struct prql_hier {
+    std::map<std::string, prql_hier> ph_modules;
+    std::map<std::string, std::string> ph_declarations;
+
+    void to_string(std::string& accum) const
+    {
+        for (const auto& mod_pair : this->ph_modules) {
+            accum.append("module ");
+            accum.append(mod_pair.first);
+            accum.append(" {\n");
+            mod_pair.second.to_string(accum);
+            accum.append("}\n");
+        }
+        for (const auto& decl_pair : this->ph_declarations) {
+            accum.append(decl_pair.second);
+            accum.append("\n");
+        }
+    }
+};
+
+static void
+register_help(prql_hier& phier, const help_text& ht)
+{
+    auto prql_fqid = fmt::to_string(fmt::join(ht.ht_prql_path, "."));
+    lnav::sql::prql_functions.emplace(prql_fqid, &ht);
+
+    auto* curr_hier = &phier;
+    for (size_t name_index = 0; name_index < ht.ht_prql_path.size();
+         name_index++)
+    {
+        const auto& prql_name = ht.ht_prql_path[name_index];
+        if (name_index == ht.ht_prql_path.size() - 1) {
+            auto param_names
+                = ht.ht_parameters | lnav::itertools::map([](const auto& elem) {
+                      if (elem.ht_nargs == help_nargs_t::HN_OPTIONAL
+                          || elem.ht_nargs == help_nargs_t::HN_ZERO_OR_MORE)
+                      {
+                          return fmt::format(FMT_STRING("{}:null"),
+                                             elem.ht_name);
+                      }
+                      return fmt::format(FMT_STRING("p_{}"), elem.ht_name);
+                  });
+            auto func_args
+                = ht.ht_parameters | lnav::itertools::map([](const auto& elem) {
+                      if (elem.ht_nargs == help_nargs_t::HN_OPTIONAL
+                          || elem.ht_nargs == help_nargs_t::HN_ZERO_OR_MORE)
+                      {
+                          return fmt::format(FMT_STRING("{{{}:0}}"),
+                                             elem.ht_name);
+                      }
+                      return fmt::format(FMT_STRING("{{p_{}:0}}"),
+                                         elem.ht_name);
+                  });
+            curr_hier->ph_declarations[prql_name]
+                = fmt::format(FMT_STRING("let {} = func {} -> s\"{}({})\""),
+                              prql_name,
+                              fmt::join(param_names, " "),
+                              ht.ht_name,
+                              fmt::join(func_args, ", "));
+        } else {
+            curr_hier = &curr_hier->ph_modules[prql_name];
+        }
+    }
+}
+
+static void
+insert_sql_help(help_text& root, const help_text& curr)
+{
+    if (curr.ht_flag_name) {
+        sqlite_function_help.insert(
+            std::make_pair(toupper(curr.ht_flag_name), &root));
+    } else if (isupper(curr.ht_name[0])) {
+        sqlite_function_help.insert(
+            std::make_pair(toupper(curr.ht_name), &root));
+    }
+    for (const auto& param : curr.ht_parameters) {
+        if (param.ht_flag_name) {
+            insert_sql_help(root, param);
+        }
+        if (param.ht_format == help_parameter_format_t::HPF_NONE
+            && param.ht_nargs == help_nargs_t::HN_OPTIONAL)
+        {
+            insert_sql_help(root, param);
+        }
+        for (const auto& eval : param.ht_enum_values) {
+            sqlite_function_help.emplace(eval.to_string(), &root);
+        }
+    }
+}
+
 int
 register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
 {
+    // The per-connection registration below is safe to run from several
+    // threads at once, but the help and PRQL tables it fills in are
+    // process-global and only ever want filling once.  Elect a single caller
+    // to do that part, and only ever from the full set -- electing a caller
+    // that passed a subset would leave the groups it omits out of the help
+    // for the life of the process.
+    static std::once_flag help_once;
+    bool help_registration_done = true;
+    if (reg_funcs == sqlite_registration_funcs) {
+        std::call_once(help_once, [&]() { help_registration_done = false; });
+    }
+
+    prql_hier phier;
     int lpc;
+
+    phier.ph_modules["sqlite"].ph_declarations["strftime"]
+        = "let strftime = func p_format p_timestring -> "
+          "s\"strftime({p_format:0}, {p_timestring:0})\"";
 
     require(db != nullptr);
     require(reg_funcs != nullptr);
@@ -94,11 +233,16 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
                                     nullptr,
                                     nullptr);
 
-            if (fd.fd_help.ht_context != help_context_t::HC_NONE) {
-                help_text& ht = fd.fd_help;
+            if (!help_registration_done
+                && fd.fd_help.ht_context != help_context_t::HC_NONE)
+            {
+                auto& ht = fd.fd_help;
 
                 sqlite_function_help.insert(std::make_pair(ht.ht_name, &ht));
                 ht.index_tags();
+                if (!ht.ht_prql_path.empty()) {
+                    register_help(phier, ht);
+                }
             }
         }
 
@@ -109,17 +253,22 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
             sqlite3_create_function(db,
                                     agg_funcs[i].zName,
                                     agg_funcs[i].nArg,
-                                    SQLITE_UTF8,
+                                    agg_funcs[i].eTextRep,
                                     (void*) &agg_funcs[i],
                                     nullptr,
                                     agg_funcs[i].xStep,
                                     agg_funcs[i].xFinalize);
 
-            if (fda.fda_help.ht_context != help_context_t::HC_NONE) {
-                help_text& ht = fda.fda_help;
+            if (!help_registration_done
+                && fda.fda_help.ht_context != help_context_t::HC_NONE)
+            {
+                auto& ht = fda.fda_help;
 
                 sqlite_function_help.insert(std::make_pair(ht.ht_name, &ht));
                 ht.index_tags();
+                if (!ht.ht_prql_path.empty()) {
+                    register_help(phier, ht);
+                }
             }
         }
     }
@@ -157,6 +306,27 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
             .with_example(
                 {"To get the first non-null value from three parameters",
                  "SELECT coalesce(null, 0, null)"}),
+
+        help_text("concat",
+                  "Returns a string that is the concatenation of all non-NULL "
+                  "arguments")
+            .sql_function()
+            .with_parameter(help_text("X", "The values to concatenate together")
+                                .one_or_more())
+            .with_tags({"string"})
+            .with_example({"To concatenate a label and number",
+                           "SELECT concat('Size: ', 1234)"}),
+
+        help_text("concat_ws",
+                  "Returns a string that is the concatenation of all non-NULL "
+                  "arguments separated by the first argument")
+            .sql_function()
+            .with_parameter(help_text("sep", "The separator"))
+            .with_parameter(help_text("X", "The values to concatenate together")
+                                .one_or_more())
+            .with_tags({"string"})
+            .with_example({"To separate numbers with a comma",
+                           "SELECT concat_ws(',', 1, 2, 3, 4)"}),
 
         help_text("glob", "Match a string against Unix glob pattern")
             .sql_function()
@@ -323,6 +493,20 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
                 {"To test if 1 is different from 1", "SELECT nullif(1, 1)"})
             .with_example(
                 {"To test if 1 is different from 2", "SELECT nullif(1, 2)"}),
+
+        help_text("octet_length",
+                  "Returns the number of bytes in the given string as encoded "
+                  "in the database")
+            .sql_function()
+            .with_parameter({"X", "The value to examine"})
+            .with_example({
+                "To get the number of bytes for a string",
+                "SELECT octet_length('Hello, World!')",
+            })
+            .with_example({
+                "To get the number of bytes for a number",
+                "SELECT octet_length(42)",
+            }),
 
         help_text("printf",
                   "Returns a string with this functions arguments substituted "
@@ -517,6 +701,17 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
                 {"To get the type of the number 1", "SELECT typeof(1)"})
             .with_example({"To get the type of the string 'abc'",
                            "SELECT typeof('abc')"}),
+
+        help_text("unhex")
+            .with_summary("Returns a blob value that is a decoding of the "
+                          "given hex string")
+            .sql_function()
+            .with_tags({"string"})
+            .with_parameter({"X", "The hex string to decode"})
+            .with_example({
+                "To decode the string 'Hello' encoded in hex",
+                "SELECT unhex('48656c6c6f')",
+            }),
 
         help_text("unicode",
                   "Returns the numeric unicode code point corresponding to the "
@@ -744,11 +939,341 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
                 "SELECT value FROM generate_series(10, 14, 2)",
             })
             .with_example({"To count down from five to 1",
-                           "SELECT value FROM generate_series(1, 5, -1)"})};
+                           "SELECT value FROM generate_series(1, 5, -1)"}),
 
-    for (auto& ht : builtin_funcs) {
-        sqlite_function_help.insert(std::make_pair(ht.ht_name, &ht));
-        ht.index_tags();
+        help_text("json",
+                  "Verifies that its argument is valid JSON and returns a "
+                  "minified version or throws an error.")
+            .sql_function()
+            .with_parameter({"X", "The string to interpret as JSON."})
+            .with_tags({"json"}),
+
+        help_text("json_array", "Constructs a JSON array from its arguments.")
+            .sql_function()
+            .with_parameter(
+                help_text{"X", "The values of the JSON array"}.zero_or_more())
+            .with_tags({"json"})
+            .with_example({"To create an array of all types",
+                           "SELECT json_array(NULL, 1, 2.1, 'three', "
+                           "json_array(4), json_object('five', 'six'))"})
+            .with_example({"To create an empty array", "SELECT json_array()"}),
+
+        help_text("json_array_length", "Returns the length of a JSON array.")
+            .sql_function()
+            .with_parameter({"X", "The JSON object."})
+            .with_parameter(
+                help_text{"P", "The path to the array in 'X'."}.optional())
+            .with_tags({"json"})
+            .with_example({"To get the length of an array",
+                           "SELECT json_array_length('[1, 2, 3]')"})
+            .with_example(
+                {"To get the length of a nested array",
+                 "SELECT json_array_length('{\"arr\": [1, 2, 3]}', '$.arr')"}),
+
+        help_text(
+            "json_extract",
+            "Returns the value(s) from the given JSON at the given path(s).")
+            .sql_function()
+            .with_parameter({"X", "The JSON value."})
+            .with_parameter(
+                help_text{"P", "The path to extract."}.one_or_more())
+            .with_tags({"json"})
+            .with_example({"To get a number",
+                           R"(SELECT json_extract('{"num": 1}', '$.num'))"})
+            .with_example(
+                {"To get two numbers",
+                 R"(SELECT json_extract('{"num": 1, "val": 2}', '$.num', '$.val'))"})
+            .with_example(
+                {"To get an object",
+                 R"(SELECT json_extract('{"obj": {"sub": 1}}', '$.obj'))"})
+#if 0 && SQLITE_VERSION_NUMBER >= 3038000
+            .with_example({"To get a JSON value using the short-hand",
+                           R"(SELECT '{"a":"b"}' -> '$.a')"})
+            .with_example({"To get a SQL value using the short-hand",
+                           R"(SELECT '{"a":"b"}' ->> '$.a')"})
+#endif
+            ,
+
+        help_text("json_insert",
+                  "Inserts values into a JSON object/array at the given "
+                  "locations, if it does not already exist")
+            .sql_function()
+            .with_parameter({"X", "The JSON value to update"})
+            .with_parameter({"P",
+                             "The path to the insertion point.  A '#' array "
+                             "index means append the value"})
+            .with_parameter({"Y", "The value to insert"})
+            .with_tags({"json"})
+            .with_example({"To append to an array",
+                           R"(SELECT json_insert('[1, 2]', '$[#]', 3))"})
+            .with_example({"To update an object",
+                           R"(SELECT json_insert('{"a": 1}', '$.b', 2))"})
+            .with_example({"To ensure a value is set",
+                           R"(SELECT json_insert('{"a": 1}', '$.a', 2))"})
+            .with_example(
+                {"To update multiple values",
+                 R"(SELECT json_insert('{"a": 1}', '$.b', 2, '$.c', 3))"}),
+
+        help_text("json_replace",
+                  "Replaces existing values in a JSON object/array at the "
+                  "given locations")
+            .sql_function()
+            .with_parameter({"X", "The JSON value to update"})
+            .with_parameter({"P", "The path to replace"})
+            .with_parameter({"Y", "The new value for the property"})
+            .with_tags({"json"})
+            .with_example({"To replace an existing value",
+                           R"(SELECT json_replace('{"a": 1}', '$.a', 2))"})
+            .with_example(
+                {"To replace a value without creating a new property",
+                 R"(SELECT json_replace('{"a": 1}', '$.a', 2, '$.b', 3))"}),
+
+        help_text("json_set",
+                  "Inserts or replaces existing values in a JSON object/array "
+                  "at the given locations")
+            .sql_function()
+            .with_parameter({"X", "The JSON value to update"})
+            .with_parameter({"P",
+                             "The path to the insertion point.  A '#' array "
+                             "index means append the value"})
+            .with_parameter({"Y", "The value to set"})
+            .with_tags({"json"})
+            .with_example({"To replace an existing array element",
+                           R"(SELECT json_set('[1, 2]', '$[1]', 3))"})
+            .with_example(
+                {"To replace a value and create a new property",
+                 R"(SELECT json_set('{"a": 1}', '$.a', 2, '$.b', 3))"}),
+
+        help_text("json_object",
+                  "Create a JSON object from the given arguments")
+            .sql_function()
+            .with_parameter({"N", "The property name"})
+            .with_parameter({"V", "The property value"})
+            .with_tags({"json"})
+            .with_example(
+                {"To create an object", "SELECT json_object('a', 1, 'b', 'c')"})
+            .with_example(
+                {"To create an empty object", "SELECT json_object()"}),
+
+        help_text("json_remove", "Removes paths from a JSON value")
+            .sql_function()
+            .with_parameter({"X", "The JSON value to update"})
+            .with_parameter(help_text{"P", "The paths to remove"}.one_or_more())
+            .with_tags({"json"})
+            .with_example({"To remove elements of an array",
+                           "SELECT json_remove('[1,2,3]', '$[1]', '$[1]')"})
+            .with_example({"To remove object properties",
+                           R"(SELECT json_remove('{"a":1,"b":2}', '$.b'))"}),
+
+        help_text("json_type", "Returns the type of a JSON value")
+            .sql_function()
+            .with_parameter({"X", "The JSON value to query"})
+            .with_parameter(help_text{"P", "The path to the value"}.optional())
+            .with_tags({"json"})
+            .with_example(
+                {"To get the type of a value",
+                 R"(SELECT json_type('[null,1,2.1,"three",{"four":5}]'))"})
+            .with_example(
+                {"To get the type of an array element",
+                 R"(SELECT json_type('[null,1,2.1,"three",{"four":5}]', '$[0]'))"})
+            .with_example(
+                {"To get the type of a string",
+                 R"(SELECT json_type('[null,1,2.1,"three",{"four":5}]', '$[3]'))"}),
+
+        help_text("json_valid", "Tests if the given value is valid JSON")
+            .sql_function()
+            .with_parameter({"X", "The value to check"})
+            .with_tags({"json"})
+            .with_example({"To check an empty string", "SELECT json_valid('')"})
+            .with_example({"To check a string", R"(SELECT json_valid('"a"'))"}),
+
+        help_text("json_quote",
+                  "Returns the JSON representation of the given value, if it "
+                  "is not already JSON")
+            .sql_function()
+            .with_parameter({"X", "The value to convert"})
+            .with_tags({"json"})
+            .with_example(
+                {"To convert a string", "SELECT json_quote('Hello, World!')"})
+            .with_example({"To pass through an existing JSON value",
+                           R"(SELECT json_quote(json('"Hello, World!"')))"}),
+
+        help_text("json_each",
+                  "A table-valued-function that returns the children of the "
+                  "top-level JSON value")
+            .sql_table_valued_function()
+            .with_parameter({"X", "The JSON value to query"})
+            .with_parameter(
+                help_text{"P", "The path to the value to query"}.optional())
+            .with_result({"key",
+                          "The array index for elements of an array or "
+                          "property names of the object"})
+            .with_result({"value", "The value for the current element"})
+            .with_result({"type", "The type of the current element"})
+            .with_result(
+                {"atom",
+                 "The SQL value of the element, if it is a primitive type"})
+            .with_result({"fullkey", "The path to the current element"})
+            .with_tags({"json"})
+            .with_example(
+                {"To iterate over an array",
+                 R"(SELECT * FROM json_each('[null,1,"two",{"three":4.5}]'))"}),
+
+        help_text("json_tree",
+                  "A table-valued-function that recursively descends through a "
+                  "JSON value")
+            .sql_table_valued_function()
+            .with_parameter({"X", "The JSON value to query"})
+            .with_parameter(
+                help_text{"P", "The path to the value to query"}.optional())
+            .with_result({"key",
+                          "The array index for elements of an array or "
+                          "property names of the object"})
+            .with_result({"value", "The value for the current element"})
+            .with_result({"type", "The type of the current element"})
+            .with_result(
+                {"atom",
+                 "The SQL value of the element, if it is a primitive type"})
+            .with_result({"fullkey", "The path to the current element"})
+            .with_result({"path", "The path to the container of this element"})
+            .with_tags({"json"})
+            .with_example(
+                {"To iterate over an array",
+                 R"(SELECT key,value,type,atom,fullkey,path FROM json_tree('[null,1,"two",{"three":4.5}]'))"}),
+
+        help_text("text.contains", "Returns true if col contains sub")
+            .prql_function()
+            .with_parameter(
+                help_text{"sub", "The substring to look for in col"})
+            .with_parameter(help_text{"col", "The string to examine"})
+            .with_example({
+                "To check if 'Hello' contains 'lo'",
+                "from [{s='Hello'}] | select { s=text.contains 'lo' s }",
+                help_example::language::prql,
+            })
+            .with_example({
+                "To check if 'Goodbye' contains 'lo'",
+                "from [{s='Goodbye'}] | select { s=text.contains 'lo' s }",
+                help_example::language::prql,
+            }),
+        help_text("text.ends_with", "Returns true if col ends with suffix")
+            .prql_function()
+            .with_parameter(
+                help_text{"suffix", "The string to look for at the end of col"})
+            .with_parameter(help_text{"col", "The string to examine"})
+            .with_example({
+                "To check if 'Hello' ends with 'lo'",
+                "from [{s='Hello'}] | select { s=text.ends_with 'lo' s }",
+                help_example::language::prql,
+            })
+            .with_example({
+                "To check if 'Goodbye' ends with 'lo'",
+                "from [{s='Goodbye'}] | select { s=text.ends_with 'lo' s }",
+                help_example::language::prql,
+            }),
+        help_text("text.extract", "Extract a slice of a string")
+            .prql_function()
+            .with_parameter(help_text{
+                "idx",
+                "The starting index where the first character is index 1"})
+            .with_parameter(help_text{"len", "The length of the slice"})
+            .with_parameter(help_text{"str", "The string to extract from"})
+            .with_example({
+                "To extract a substring from s",
+                "from [{s='Hello, World!'}] | select { s=text.extract 1 5 s }",
+                help_example::language::prql,
+            }),
+        help_text("text.length", "Returns the number of characters in col")
+            .prql_function()
+            .with_parameter(help_text{"col", "The string to examine"})
+            .with_example({
+                "To count the number of characters in s",
+                "from [{s='Hello, World!'}] | select { s=text.length s }",
+                help_example::language::prql,
+            }),
+        help_text("text.lower", "Converts col to lowercase")
+            .prql_function()
+            .with_parameter(help_text{"col", "The string to convert"})
+            .with_example({
+                "To convert s to lowercase",
+                "from [{s='HELLO'}] | select { s=text.lower s }",
+                help_example::language::prql,
+            }),
+        help_text("text.ltrim", "Remove whitespace from the left side of col")
+            .prql_function()
+            .with_parameter(help_text{"col", "The string to trim"})
+            .with_example({
+                "To trim the left side of s",
+                "from [{s='  HELLO  '}] | select { s=text.ltrim s }",
+                help_example::language::prql,
+            }),
+        help_text("text.replace",
+                  "Replace all occurrences of before with after in col")
+            .prql_function()
+            .with_parameter(help_text{"before", "The string to find"})
+            .with_parameter(help_text{"after", "The replacement"})
+            .with_parameter(help_text{"col", "The string to trim"})
+            .with_example({
+                "To erase foo in s",
+                "from [{s='foobar'}] | select { s=text.replace 'foo' '' s }",
+                help_example::language::prql,
+            }),
+        help_text("text.rtrim", "Remove whitespace from the right side of col")
+            .prql_function()
+            .with_parameter(help_text{"col", "The string to trim"})
+            .with_example({
+                "To trim the right side of s",
+                "from [{s='  HELLO  '}] | select { s=text.rtrim s }",
+                help_example::language::prql,
+            }),
+        help_text("text.starts_with", "Returns true if col starts with suffix")
+            .prql_function()
+            .with_parameter(help_text{
+                "suffix", "The string to look for at the start of col"})
+            .with_parameter(help_text{"col", "The string to examine"})
+            .with_example({
+                "To check if 'Hello' starts with 'lo'",
+                "from [{s='Hello'}] | select { s=text.starts_with 'He' s }",
+                help_example::language::prql,
+            })
+            .with_example({
+                "To check if 'Goodbye' starts with 'lo'",
+                "from [{s='Goodbye'}] | select { s=text.starts_with 'He' s }",
+                help_example::language::prql,
+            }),
+        help_text("text.trim", "Remove whitespace from the both sides of col")
+            .prql_function()
+            .with_parameter(help_text{"col", "The string to trim"})
+            .with_example({
+                "To trim s",
+                "from [{s='  HELLO  '}] | select { s=text.trim s }",
+                help_example::language::prql,
+            }),
+        help_text("text.upper", "Converts col to uppercase")
+            .prql_function()
+            .with_parameter(help_text{"col", "The string to convert"})
+            .with_example({
+                "To convert s to uppercase",
+                "from [{s='hello'}] | select { s=text.upper s }",
+                help_example::language::prql,
+            }),
+    };
+
+    if (!help_registration_done) {
+        for (auto& ht : builtin_funcs) {
+            switch (ht.ht_context) {
+                case help_context_t::HC_PRQL_FUNCTION:
+                    lnav::sql::prql_functions.emplace(ht.ht_name, &ht);
+                    break;
+                default:
+                    sqlite_function_help.emplace(ht.ht_name, &ht);
+                    break;
+            }
+            ht.index_tags();
+            if (!ht.ht_prql_path.empty()) {
+                register_help(phier, ht);
+            }
+        }
     }
 
     static help_text builtin_win_funcs[] = {
@@ -847,9 +1372,11 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
             .with_tags({"window"}),
     };
 
-    for (auto& ht : builtin_win_funcs) {
-        sqlite_function_help.insert(std::make_pair(ht.ht_name, &ht));
-        ht.index_tags();
+    if (!help_registration_done) {
+        for (auto& ht : builtin_win_funcs) {
+            sqlite_function_help.insert(std::make_pair(ht.ht_name, &ht));
+            ht.index_tags();
+        }
     }
 
     static help_text idents[] = {
@@ -875,12 +1402,12 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
 
         help_text("CREATE", "Assign a name to a SELECT statement")
             .sql_keyword()
-            .with_parameter(help_text("TEMP").optional())
+            .with_parameter(help_text("TEMP").flag())
             .with_parameter(help_text("").with_flag_name("VIEW"))
             .with_parameter(
                 help_text("IF NOT EXISTS",
                           "Do not create the view if it already exists")
-                    .optional())
+                    .flag())
             .with_parameter(
                 help_text("schema-name.", "The database to create the view in")
                     .optional())
@@ -892,9 +1419,9 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
 
         help_text("CREATE", "Create a table")
             .sql_keyword()
-            .with_parameter(help_text("TEMP").optional())
+            .with_parameter(help_text("TEMP").flag())
             .with_parameter(help_text("").with_flag_name("TABLE"))
-            .with_parameter(help_text("IF NOT EXISTS").optional())
+            .with_parameter(help_text("IF NOT EXISTS").flag())
             .with_parameter(help_text("schema-name.").optional())
             .with_parameter(help_text("table-name"))
             .with_parameter(help_text("select-stmt").with_flag_name("AS")),
@@ -911,28 +1438,28 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
         help_text("DROP", "Drop an index")
             .sql_keyword()
             .with_parameter(help_text("").with_flag_name("INDEX"))
-            .with_parameter(help_text("IF EXISTS").optional())
+            .with_parameter(help_text("IF EXISTS").flag())
             .with_parameter(help_text("schema-name.").optional())
             .with_parameter(help_text("index-name")),
 
         help_text("DROP", "Drop a table")
             .sql_keyword()
             .with_parameter(help_text("").with_flag_name("TABLE"))
-            .with_parameter(help_text("IF EXISTS").optional())
+            .with_parameter(help_text("IF EXISTS").flag())
             .with_parameter(help_text("schema-name.").optional())
             .with_parameter(help_text("table-name")),
 
         help_text("DROP", "Drop a view")
             .sql_keyword()
             .with_parameter(help_text("").with_flag_name("VIEW"))
-            .with_parameter(help_text("IF EXISTS").optional())
+            .with_parameter(help_text("IF EXISTS").flag())
             .with_parameter(help_text("schema-name.").optional())
             .with_parameter(help_text("view-name")),
 
         help_text("DROP", "Drop a trigger")
             .sql_keyword()
             .with_parameter(help_text("").with_flag_name("TRIGGER"))
-            .with_parameter(help_text("IF EXISTS").optional())
+            .with_parameter(help_text("IF EXISTS").flag())
             .with_parameter(help_text("schema-name.").optional())
             .with_parameter(help_text("trigger-name")),
 
@@ -955,6 +1482,10 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
         help_text("SELECT",
                   "Query the database and return zero or more rows of data.")
             .sql_keyword()
+            .with_parameter(
+                help_text("filter", "Additional processing of rows")
+                    .optional()
+                    .with_enum_values({"DISTINCT"_frag, "ALL"_frag}))
             .with_parameter(
                 help_text(
                     "result-column",
@@ -982,9 +1513,9 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
                 help_text("limit-expr", "The maximum number of rows to return.")
                     .with_flag_name("LIMIT")
                     .zero_or_more())
-            .with_example(
-                {"To select all of the columns from the table 'syslog_log'",
-                 "SELECT * FROM syslog_log"}),
+            .with_example({"To select all of the columns from the table "
+                           "'lnav_example_log'",
+                           "SELECT * FROM lnav_example_log"}),
 
         help_text("WITH",
                   "Create a temporary view that exists only for the duration "
@@ -1066,7 +1597,7 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
 
         help_text("expr", "Match an expression against a glob pattern.")
             .sql_infix()
-            .with_parameter(help_text("NOT").optional())
+            .with_parameter(help_text("NOT").flag())
             .with_parameter(
                 help_text("pattern", "The glob pattern to match against.")
                     .with_flag_name("GLOB"))
@@ -1077,10 +1608,15 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
 
         help_text("expr", "Match an expression against a text pattern.")
             .sql_infix()
-            .with_parameter(help_text("NOT").optional())
+            .with_parameter(help_text("NOT").flag())
             .with_parameter(
                 help_text("pattern", "The pattern to match against.")
                     .with_flag_name("LIKE"))
+            .with_parameter(
+                help_text("escape",
+                          "Character used to escape a % or _ in the pattern")
+                    .with_flag_name("ESCAPE")
+                    .optional())
             .with_example({
                 "To check if a value matches the pattern 'Hello, %!'",
                 "SELECT 'Hello, World!' LIKE 'Hello, %!'",
@@ -1088,13 +1624,28 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
 
         help_text("expr", "Match an expression against a regular expression.")
             .sql_infix()
-            .with_parameter(help_text("NOT").optional())
+            .with_parameter(help_text("NOT").flag())
             .with_parameter(
                 help_text("pattern", "The regular expression to match against.")
                     .with_flag_name("REGEXP"))
             .with_example({
                 "To check if a value matches the pattern 'file-\\d+'",
                 "SELECT 'file-23' REGEXP 'file-\\d+'",
+            }),
+
+        help_text("expr", "Check an expression against NULL")
+            .sql_infix()
+            .with_parameter(help_text("nullness")
+                                .with_enum_values({
+                                    "ISNULL"_frag,
+                                    "NOTNULL"_frag,
+                                    "NOT NULL"_frag,
+                                    "IS NOT NULL"_frag,
+                                })
+                                .optional())
+            .with_example({
+                "To check if a value is not NULL",
+                "SELECT 'abc' NOT NULL",
             }),
 
         help_text("expr", "Assign a collating sequence to the expression.")
@@ -1110,7 +1661,7 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
 
         help_text("expr", "Test if an expression is between two values.")
             .sql_infix()
-            .with_parameter(help_text("NOT").optional())
+            .with_parameter(help_text("NOT").flag())
             .with_parameter(
                 help_text("low", "The low point").with_flag_name("BETWEEN"))
             .with_parameter(
@@ -1123,6 +1674,53 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
                 "To check if 10 is between 5 and 10",
                 "SELECT 10 BETWEEN 5 AND 10",
             }),
+
+        help_text("expr", "Test the distinctness of an expression")
+            .sql_infix()
+            .with_parameter(
+                help_text("expr")
+                    .with_flag_name("IS")
+                    .with_parameter(help_text("NOT").flag())
+                    .with_parameter(help_text("DISTINCT FROM").flag()))
+            .with_example({
+                "To check if 10 is between 5 and 10",
+                "SELECT 10 BETWEEN 5 AND 10",
+            }),
+
+        help_text("ordering-term")
+            .sql_infix()
+            .with_summary("The values to use in ordering result rows")
+            .with_parameter(help_text("collation-name")
+                                .with_flag_name("COLLATE")
+                                .optional())
+            .with_parameter(
+                help_text("direction", "The direction, ASCending or DESCending")
+                    .optional()
+                    .with_enum_values({"ASC"_frag, "DESC"_frag}))
+            .with_parameter(
+                help_text("null-handling")
+                    .optional()
+                    .with_enum_values({"NULLS FIRST"_frag, "NULLS LAST"_frag})),
+
+        help_text("select-stmt")
+            .with_summary(
+                "Execute a query and return 0 if no rows match or 1 otherwise")
+            .sql_infix()
+            .with_grouping("(", ")")
+            .with_flag_name("EXISTS"),
+
+        help_text("select-stmt")
+            .with_summary(
+                "Execute a query and return 1 if no rows match or 0 otherwise")
+            .sql_infix()
+            .with_grouping("(", ")")
+            .with_flag_name("NOT EXISTS"),
+
+        help_text("FILTER")
+            .with_summary("Condition for rows to include in the aggregate")
+            .sql_infix()
+            .with_grouping("(", ")")
+            .with_parameter(help_text("expr").with_flag_name("WHERE")),
 
         help_text("OVER", "Executes the preceding function over a window")
             .sql_keyword()
@@ -1152,15 +1750,27 @@ register_sqlite_funcs(sqlite3* db, sqlite_registration_func_t* reg_funcs)
                                 .optional()),
     };
 
-    for (auto& ht : idents) {
-        sqlite_function_help.insert(make_pair(toupper(ht.ht_name), &ht));
-        for (const auto& param : ht.ht_parameters) {
-            if (!param.ht_flag_name) {
-                continue;
-            }
-            sqlite_function_help.insert(
-                make_pair(toupper(param.ht_flag_name), &ht));
+    if (!help_registration_done) {
+        for (auto& ht : idents) {
+            insert_sql_help(ht, ht);
         }
+
+#ifdef HAVE_RUST_DEPS
+        // Under the same election as the help tables: phier is only filled
+        // in by the branches above, so a caller that skipped them has
+        // nothing to contribute here either.
+        require(sqlite_extension_prql.empty());
+        require(phier.ph_declarations.empty());
+        for (const auto& mod_pair : phier.ph_modules) {
+            std::string content;
+
+            mod_pair.second.to_string(content);
+            sqlite_extension_prql.emplace_back(lnav_rs_ext::SourceTreeElement{
+                fmt::format(FMT_STRING("{}.prql"), mod_pair.first),
+                content,
+            });
+        }
+#endif
     }
 
     return 0;

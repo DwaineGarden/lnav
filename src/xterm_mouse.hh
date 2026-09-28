@@ -32,21 +32,9 @@
 #ifndef xterm_mouse_hh
 #define xterm_mouse_hh
 
-#include "config.h"
+#include <notcurses/notcurses.h>
 
-#if defined HAVE_NCURSESW_CURSES_H
-#    include <ncursesw/curses.h>
-#elif defined HAVE_NCURSESW_H
-#    include <ncursesw.h>
-#elif defined HAVE_NCURSES_CURSES_H
-#    include <ncurses/curses.h>
-#elif defined HAVE_NCURSES_H
-#    include <ncurses.h>
-#elif defined HAVE_CURSES_H
-#    include <curses.h>
-#else
-#    error "SysV or X/Open-compatible Curses header file required"
-#endif
+#include "config.h"
 
 /**
  * Base class for delegates of the xterm_mouse class.
@@ -64,7 +52,7 @@ public:
      * @param x      The X coordinate where the event occurred.
      * @param y      The Y coordinate where the event occurred.
      */
-    virtual void mouse_event(int button, bool release, int x, int y) = 0;
+    virtual void mouse_event(notcurses* nc, int button, bool release, int x, int y) = 0;
 };
 
 /**
@@ -84,27 +72,21 @@ public:
     static const int XT_BUTTON__MASK
         = XT_SCROLL_WHEEL_FLAG | XT_BUTTON1 | XT_BUTTON2 | XT_BUTTON3;
 
+    static const int XT_MODIFIER_SHIFT = 4;
+    static const int XT_MODIFIER_META = 8;
+    static const int XT_MODIFIER_CTRL = 16;
+    static const int XT_MODIFIER_MASK
+        = XT_MODIFIER_SHIFT | XT_MODIFIER_META | XT_MODIFIER_CTRL;
+
     static const char* XT_TERMCAP;
     static const char* XT_TERMCAP_TRACKING;
     static const char* XT_TERMCAP_SGR;
 
     /**
-     * @return True if the user's terminal supports xterm-mouse events.
-     */
-    static bool is_available();
-
-    ~xterm_mouse()
-    {
-        if (this->is_enabled()) {
-            set_enabled(false);
-        }
-    }
-
-    /**
      * @param enabled True if xterm mouse support should be enabled in the
      *   terminal.
      */
-    void set_enabled(bool enabled);
+    void set_enabled(notcurses* nc, bool enable);
 
     /**
      * @return True if xterm mouse support is enabled, false otherwise.
@@ -116,13 +98,13 @@ public:
      */
     void set_behavior(mouse_behavior* mb) { this->xm_behavior = mb; }
 
-    mouse_behavior* get_behavior() { return this->xm_behavior; }
+    mouse_behavior* get_behavior() const { return this->xm_behavior; }
 
     /**
      * Handle a KEY_MOUSE character from ncurses.
      * @param ch unused
      */
-    void handle_mouse();
+    void handle_mouse(notcurses* nc, const ncinput& nci);
 
 private:
     bool xm_enabled{false};

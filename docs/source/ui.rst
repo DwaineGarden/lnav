@@ -1,5 +1,9 @@
 .. _ui:
 
+.. role:: log_level_error
+.. role:: log_level_warning
+.. role:: search_match
+
 User Interface
 ==============
 
@@ -8,7 +12,7 @@ with status bars above and below, and the interactive prompt as the last line.
 
 .. figure:: lnav-ui.png
    :align: center
-   :alt: Screenshot of lnav showing a mix of syslog and web access_log messages.
+   :figwidth: 90%
 
    Screenshot of **lnav** viewing syslog and web access_log messages.
 
@@ -17,12 +21,22 @@ loaded.  There are other views for displaying content like plaintext files
 and SQL results.  The :ref:`ui_views` section describes the characteristics of
 each view in more detail.  You can switch to the different views using the
 hotkeys described in the :ref:`hotkeys_display` section or by pressing
-:kbd:`ENTER` to activate the breadcrumb bar, moving to the first crumb, and
+:kbd:`\`` to activate the breadcrumb bar, moving to the first crumb, and
 then selecting the desired view.  You can switch back to the previous view by
 pressing :kbd:`q`.  You can switch forward to the new view by pressing
 :kbd:`a`.  If the views are time-based (e.g. log and histogram), pressing
 :kbd:`Shift` + :kbd:`q` and :kbd:`Shift` + :kbd:`a` will synchronize the top
 times in the views.
+
+**lnav** provides many operations to work with the log/text data in the
+main view.  For example, you can add comments and tags to log messages.
+The highlighted cursor line is used as the reference point to edit the
+comment or tags.  Alternatively, you can press :kbd:`Ctrl` + :kbd:`x`
+to switch to "top" mode where the "focused" line is the top line in the
+view and most operations now work with that line.  When in "cursor" mode,
+the :kbd:`↑` and :kbd:`↓` keys now move the focused line instead of scrolling
+the view.  Jumping to bookmarks, like errors, will also move the focused
+line instead of moving the next error to the top of the view.
 
 The right side of the display has a proportionally sized 'scrollbar' that
 shows:
@@ -40,7 +54,7 @@ The top status bar shows the current time and messages stored in the
 :ref:`table_lnav_user_notifications` table.
 
 Below the top status bar is the breadcrumb bar that displays the semantic
-location of the top line in the main view.  For example, within a
+location of the focused line in the main view.  For example, within a
 pretty-printed JSON document, it will show the path to property at the top
 of the view.  The actual content of the bar depends on the current view and
 will be updated as you navigate around the main view.  The bar can also be
@@ -55,7 +69,7 @@ Breadcrumb Bar
 
    Screenshot of the breadcrumb bar focused and navigating the help text
 
-To focus on the breadcrumb bar, press :kbd:`ENTER`.  The :kbd:`←`/:kbd:`→`
+To focus on the breadcrumb bar, press :kbd:`\``.  The :kbd:`←`/:kbd:`→`
 cursor keys can be used to select a crumb and the :kbd:`↑`/:kbd:`↓` keys can
 be used select a value of that crumb.  To accept a value and drop focus on the
 bar, press :kbd:`ENTER`.  To accept a value and move to the next crumb, press
@@ -73,6 +87,23 @@ When a dropdown or combobox is selected, you can type part of the desired value
 to filter the list of values.  For example, the first crumb is always the
 current view, typing in "hi" will filter the list down to the "HIST" value.
 
+Background Tasks
+----------------
+
+.. figure:: lnav-progress-1.png
+    :align: center
+    :figwidth: 90%
+
+    Screenshot of the background task list showing a backup in progress
+
+Some long-running tasks can be run in the background without blocking the UI.
+For example, the in-memory SQLite DB can be backed up to a file, which can
+take some time if the DB is large.  The progress of these tasks will be
+displayed between the main view and the status bars at the bottom.  While
+running, an hourglass will be shown with the current status of the progress.
+If the task finishes with some messages, they will be displayed in the same
+area for a short time before being hidden.
+
 Configuration Panels
 --------------------
 
@@ -87,21 +118,44 @@ panels: Files and Filters.  These panels provide visual access to parts of
 lnav's configuration.  To access the panels, press the :kbd:`TAB` key.
 To hide the panels again, press :kbd:`q`.
 
+Files
+^^^^^
+
 .. figure:: lnav-files-panel.png
    :align: center
    :figwidth: 90%
 
    Screenshot of the files panel showing the loaded files.
 
-The Files panel is open initially to display progress in loading files.
-The following information can be displayed for each file:
+The Files panel is open initially to display progress in indexing files.
+The following information is displayed for each file:
 
 * the "unique" portion of the path relative to the other files;
 * the amount of data that has been indexed;
+* and, a progress bar or an icon to show the status of the file.  The
+  following icons may appear:
+
+  * green check mark (✔) if the file was successfully indexed;
+  * yellow warning (⚠) if there are notes for the file, such as why it was
+    hidden
+  * red X (✘) if there was an error reading the file.
+
+To the right of the file list is a panel that shows details for each
+file.  You can focus on the details view by pressing :kbd:`CTRL` + :kbd:`]`.
+Press :kbd:`Esc` to return focus to the file listing.
+
+The following information is shown in the details view:
+
 * the date range of log messages contained in the file;
 * the errors that were encountered while trying to index the file;
 * the notes recorded for files where some automatic action was taken,
-  like hiding the file if it was seen as a duplicate of another file.
+  like hiding the file if it was seen as a duplicate of another file;
+* the details of the demultiplexing and log format matching process.
+
+.. _ui_filters:
+
+Filters
+^^^^^^^
 
 .. figure:: lnav-filters-panel.png
    :align: center
@@ -119,18 +173,27 @@ To edit the filters, you can press TAB to change the focus from the main
 view to the filter editor.  The editor allows you to create, enable/disable,
 and delete filters easily.
 
+The view's :ref:`named searches<named_searches>` are listed below its filters,
+with the number of lines each one matches.  They are created by pressing
+:kbd:`s` and respond to the same keys as the filters, so a search can be
+enabled, disabled, edited, and deleted from here as well.  Pressing :kbd:`.`
+focuses the selected search, which narrows the search hotkeys to its hits
+alone; the focused search is marked with a :code:`▸` and pressing :kbd:`.` on
+it again gives the focus up.
+
 Bottom Status Bar
 -----------------
 
 The second to last line is the bottom status bar, which shows the following:
 
-* the line number of the top line, starting from zero;
+* the line number of the focused line, starting from zero;
 * the location within the view, as a percentage;
 * the current search hit, the total number of hits, and the search term;
 * the loading indicator.
 
 When the interactive prompt is active, this bar can show the prompt
-description, help text, or error message.
+description, help text, or error message.  You can also click and
+drag this bar to resize the prompt when in multi-line mode.
 
 Prompt
 ------
@@ -149,33 +212,80 @@ will activate a corresponding prompt:
 * :kbd:`|` - The script prompt.  Enter a path to the lnav script to
   execute, along with the arguments to pass in.
 
-The command-line is by the readline library, so the usual set of keyboard
-shortcuts can be used for editing and moving within the command-line.
+The prompt has emacs-like keyboard shortcuts that can be used for editing
+and moving within the command-line.
+
+To cancel the prompt, you must press :kbd:`Esc` twice.  This is to prevent
+accidentally closing the prompt when closing a completion popup.
+
+.. note::
+
+    Commands can also be executed by pasting a snippet when focused on
+    the main view, without opening a prompt.  The pasted snippet should
+    start with the appropriate sigil, for example, the colon in
+    :code:`:echo Hello, World!`.  This functionality requires the terminal
+    to support
+    `bracketed paste <https://en.wikipedia.org/wiki/Bracketed-paste>`_
+    mode.
 
 .. _ui_views:
 
 Views
 -----
 
-The accessible content within lnav is separated into the following views.
+The accessible content within lnav is separated into multiple views.
+The LOG view is shown by default when log files are detected.  You can
+switch to the TEXT view by pressing :kbd:`t` and to the HELP view by
+pressing :kbd:`?`.  Other views can be reached through the breadcrumb
+bar (press :kbd:`\`` and select a view from the first crumb) or with the
+:ref:`:switch-to-view<switch_to_view>` command.  Pressing :kbd:`q` will
+return to the previous view and :kbd:`a` will go forward again.  For
+time-based views (e.g. LOG, HIST, TIMELINE), pressing :kbd:`Shift` +
+:kbd:`Q` and :kbd:`Shift` + :kbd:`A` will switch views while keeping
+the focused time in sync.
+
+The LOG, TEXT, and TIMELINE views support pinning important log lines to the
+top of the view so they remain visible as you scroll.  This is useful for
+keeping context visible, such as a request header, session start message,
+or a CSV header.
+
+To pin the focused line as a sticky header, press :kbd:`CTRL` + :kbd:`s` or
+use the :ref:`:toggle-sticky-header<toggle_sticky_header>` command.  Pinned
+lines are displayed at the top of the view with the status bar
+styling.  Running the command again on a pinned line will unpin it.
+To remove all sticky headers at once, use the
+:ref:`:clear-all-sticky-headers<clear_all_sticky_headers>` command.
+
 
 LOG
 ^^^
 
+.. figure:: lnav-log-multi-line-msg.png
+    :align: center
+    :figwidth: 90%
+
+    Screenshot of the **lnav** LOG view displaying a PostgreSQL log.
+    Since the log message at the top of the view is partially scrolled
+    off the screen, the first line of the message is displayed at the
+    top.  You can left-click the header to scroll to the first line of
+    the message or press :kbd:`{`.
+
 The log view displays the log messages from any loaded log files in time
-order.  This view will be shown by default if any log messages are available.
+order.  This view will be shown by default if any log files were detected.
+If plain text files were also loaded, they will be available in the TEXT
+view, which you can switch to by pressing :kbd:`t`.
 
 On color displays, the log messages will be highlighted as follows:
 
-* Errors will be colored in red;
-* warnings will be yellow;
-* search hits are reverse video;
+* Errors will be colored in :log_level_error:`red`;
+* warnings will be :log_level_warning:`yellow`;
+* search hits are :search_match:`reverse video`;
 * various color highlights will be applied to: IP addresses, SQL keywords,
   XML tags, file and line numbers in Java backtraces, and quoted strings;
 * "identifiers" in the messages will be randomly assigned colors based on their
   content (works best on "xterm-256color" terminals).
 
-.. note::
+.. tip::
 
   If the coloring is too much for your tastes, you can change to the
   "grayscale" theme by entering the following command:
@@ -184,16 +294,42 @@ On color displays, the log messages will be highlighted as follows:
 
     :config /ui/theme grayscale
 
+Timestamps in log messages will be rewritten to the local timezone (or the
+timezone specified by :envvar:`TZ`) automatically if they include a
+timezone component.  If a file's timestamps do not include a timezone, they
+will be treated as if they are from the local zone.  You can change the zone
+to use for these types of files using the
+:ref:`:set-file-timezone<set_file_timezone>` command.
+
 .. note::
 
   If a log message has a timestamp that is out-of-order with its neighboring
   messages, the timestamp will be highlighted in yellow.  When one of these
-  messages is at the top of the log view, an overlay will display the
+  messages is focused, an overlay will display the
   difference between the "actual time" and the "received time".  The "actual
   time" is the original textual timestamp.  The "received time" is the time
   of an earlier message that is larger than this log message's time.
 
-The source file name for each message can be displayed by scrolling left.
+
+To get more details about a log message, move to the starting line of the
+message and press :kbd:`p` to open an overlay with information about the
+timestamp and individual fields.  You then can focus into the overlay panel
+by pressing :kbd:`Ctrl` + :kbd:`]` to operate on individual fields in the
+message.  Inside the overlay, the following hotkeys are supported:
+
+* :kbd:`SPC` to toggle field visibility
+* :kbd:`c` to copy the value of a field
+* :kbd:`#` to open the SQL prompt with a query to create a chart of this
+  field's values over time.
+
+.. tip::
+    The "Permalink" line in the details overlay contains a string that you
+    can use to reference this particular message.  It can be used as an
+    argument to the :ref:`:goto<goto>` command, the target of a Markdown
+    link in a log message comment, or compared to the :code:`log_line_link`
+    link in log tables.
+
+The log file name for each message can be displayed by scrolling left.
 Scrolling left once will show the shortened version of the file name relative
 to the other files that are loaded.  In the shortened version, the unique
 portion of the file name will be in square brackets.  Scrolling left a second
@@ -201,20 +337,72 @@ time will show the full path.
 
 The breadcrumb bar will show the following crumbs:
 
-* the timestamp for the top line;
-* the log format for the top line;
-* the name of the file the top line was pulled from;
-* the "operation ID" of the top log message, if it is supported by the log
+* the timestamp for the focused line;
+* the log format for the focused line;
+* the name of the file the focused line was pulled from;
+* the "operation ID" of the focused log message, if it is supported by the log
   format.
 
 These crumbs are interactive and can be used to navigate to different parts
 of the log view.  For example, selecting a different value in the log format
 crumb will jump to the first message with that format.
 
+The file crumb will show a "↻" icon if the file is from the output of a FIFO,
+:code:`:sh` command, or data that was piped into the standard input.  When
+the pipe is closed, the icon will disappear.
+
 TEXT
 ^^^^
 
 The text view displays files for which lnav could not detect any log messages.
+
+Press :kbd:`t` to switch to the text view.  While in the text view, you can
+press :kbd:`f` or :kbd:`Shift` + :kbd:`F` to switch to the next / previous
+text file.
+
+The breadcrumb bar will show the name of the file currently displayed file.
+To switch to a different file, you can select the file crumb and search for
+the file you want to focus on.  If the file is the output of a FIFO,
+:code:`:sh` command, or data that was piped into the standard input, the file
+crumb will show a "↻" icon.  When the pipe is closed, the icon will disappear.
+
+If the content is piped into lnav through standard input, a FIFO, or a
+:code:`:sh` command, the time that lines are received are recorded.  You
+can press :kbd:`Shift` + :kbd:`T` to view the elapsed time like in the
+LOG view.  The breadcrumb bar will also show the received time of the
+focused line after the file name crumb.  If the output being shown is from
+a :code:`:sh` command, you can press :kbd:`Ctrl` + :kbd:`C` to send a
+SIGINT to the child process without killing **lnav** itself.
+
+.. figure:: lnav-make-check-log.png
+   :align: center
+   :figwidth: 90%
+
+   Screenshot of the TEXT view showing the output of :code:`sh make check`.
+   Each line is timestamped internally when it was received so it's
+   possible to view how long each test is taking to run.  The "↻" icon
+   next to the file name in the breadcrumb bar means that the make is
+   still running.
+
+If the document has some recognizable structure, the breadcrumb bar will
+be updated with the path to the focused line.  The following document types
+are recognized: JSON, XML, TOML, man, diff, and Markdown.
+
+Binary Files
+""""""""""""
+
+Files that contain binary data will be displayed as a hexdump.  Each line
+shows 16 bytes as hex values followed by their character representations.
+The following byte types are highlighted to make them easier to identify:
+
+* **NULL bytes** (0x00) -- displayed as a diamond (◊) in the character column.
+* **ASCII control characters and whitespace** -- whitespace characters are
+  displayed as an underscore (_) and control characters as a bullet (•).
+* **Non-ASCII bytes** -- displayed as a multiplication sign (×) in the
+  character column.
+
+Printable ASCII characters are displayed as-is without any special styling.
+
 
 Markdown
 """"""""
@@ -222,29 +410,220 @@ Markdown
 Files with an :code:`.md` (or :code:`.markdown`) extension will be treated as
 Markdown files and rendered separately.
 
+.. figure:: lnav-markdown-example.png
+   :align: center
+
+   Viewing the **lnav** :file:`README.md` file.
+
+In addition to the standard Markdown syntax, lnav supports the following:
+
+* `GitHub Alerts <https://github.blog/changelog/2023-12-14-new-markdown-extension-alerts-provide-distinctive-styling-for-significant-content/>`_
+* HTML :code:`<span>` tags with the following CSS properties:
+   - :code:`color` and :code:`background-color` with CSS color names
+   - :code:`font-weight` with a value of :code:`bold` or :code:`bolder`
+   - :code:`text-decoration` with :code:`underline`
+   - :code:`border-left` and :code:`border-right` with the :code:`solid`,
+   - :code:`dashed` and :code:`dotted` line styles and colors.
+   - :code:`white-space` with a value of :code:`nowrap`
+* Anchors can be explicitly declared with :code:`<a name="...">`.
+* Internal links can be clicked to move to that section of the document.
+* Code blocks with the language set to :code:`lnav` will have a play
+  button (▶) next to it that can be clicked to execute the given code.
+
 DB
 ^^
 
 The DB view shows the results of queries done through the SQLite interface.
-You can execute a query by pressing :kbd:`;` and then entering a SQL statement.
-You can switch to the SQL view by pressing :kbd:`v`.
+You can execute a query by pressing :kbd:`;` and then entering a SQL or
+PRQL [#]_ statement.
+
+Press :kbd:`v` to switch to the database result view.
+
+A status bar above the bottom status bar shows the query that populated
+the view, how long ago it ran, and how long it took.  Clicking the reload
+icon (↻) at the left of the bar — or pressing :kbd:`F5` — re-runs the
+query via the :code:`:reload-view` command.
+
+Pressing :kbd:`z` / :kbd:`Shift` + :kbd:`z` (or running
+:code:`:zoom-to`) in the DB view changes the view's zoom level
+and re-runs the last query so that any references to the
+:code:`$zoom_level` SQL variable pick up the new value.  Passing this
+value to the :code:`timeslice()` function can be useful for easily
+adjusting the time slice duration based on the zoom level.
+This is useful with the :ref:`stats_hist` and :ref:`stats_timeseries`
+PRQL functions, whose default :code:`slice` parameter is
+:code:`$zoom_level`.
+
+If the query reads from log-backed tables (:code:`all_logs`,
+per-format tables like :code:`syslog_log`, :code:`all_opids`, etc.),
+the timing status also notes whether the results are based on
+the current log data or old log data.  For queries that don't
+read from log data (e.g. :code:`;SELECT 1`), the timing status
+does not mention the log data freshness.
+
+The same query metadata is exposed via the :code:`view_details`
+column on the :code:`lnav_views` vtable as a JSON object containing
+:code:`zoom-level`, :code:`query`, :code:`run-at`, and
+:code:`duration-us`.
+
+.. [#] lnav must be compiled in an environment with Rust/Cargo available
+   for PRQL support.
 
 HELP
 ^^^^
 
-The help view displays the builtin help text.  Press :kbd:`?` to switch to the
-help view at any time.  While in the help view, the breadcrumb bar can be used
-to navigate to different sections of the document.
+The help view displays the builtin help text.  While in the help view, the
+breadcrumb bar can be used to navigate to different sections of the document.
+
+Press :kbd:`?` to switch to the help view or use the command :code:`:help`.
 
 HIST
 ^^^^
 
 The histogram view displays a stacked bar chart of messages over time
-classified by their log level and whether they've been bookmarked.  Press
-:kbd:`i` to switch back and forth to the histogram view.  You can also press
-:kbd:`Shift`+:kbd:`i` to toggle the histogram view while synchronizing the top
-time.  While in the histogram view, pressing :kbd:`z`/:kbd:`Shift`+:kbd:`z`
-will zoom in/out.
+classified by their log level and whether they've been bookmarked.
+
+Press :kbd:`i` to switch back and forth to the histogram view.  You
+can also press :kbd:`Shift` + :kbd:`i` to toggle the histogram view
+while synchronizing the top time.  While in the histogram view,
+pressing :kbd:`z` / :kbd:`Shift` + :kbd:`Z` will zoom in/out.  (In the
+LOG, TEXT, and TIMELINE views, these keys adjust the filter context
+instead; see the :ref:`filter-context<filter_context>` command.)
+
+.. _timeline:
+
+TIMELINE
+^^^^^^^^
+
+.. note:: This feature is available in v0.12.0+.
+
+.. figure:: lnav-timeline-1.png
+   :align: center
+
+   Screenshot of the timeline view when viewing logs from the
+   VMWare Update Manager.  Most rows show API requests as they
+   are received and processed.
+
+The timeline view [#]_ visualizes operations, log files, threads, tags,
+partitions, and :ref:`named searches<named_searches>` over time. The items are
+ordered top-to-bottom by their start time.  So, scrolling down will move
+forward in time.
+
+The timeline index is not refreshed automatically as new log data arrives.
+Press :kbd:`F5` (or run :code:`:reload-view`) to rebuild the index with the
+latest data.
+
+An operation is identified by an ID that can come from multiple sources:
+
+* If the ID is in the log message, the log format can set the
+  :code:`opid-field` property.  This option is useful if the software
+  explicitly keeps track of the operations.
+* If an ID should be generated from multiple parts of the log message,
+  the log format should create an :code:`opid/description`.  This
+  description contains a :code:`format` array that specifies the fields
+  in the message to hash together.  For example, web log formats can
+  use the client IP and User-Agent that will roughly correspond to a
+  unique visitor.
+* If a log format defines a duration, an ID will be generated
+  from a hash of the entire log message.  This option is useful for
+  low-level logs where there is no overarching operation to tie them
+  together.
+* If an ID cannot be generated through these simple methods, one
+  can be set manually by doing an :code:`UPDATE` of the :code:`log_opid`
+  column on the log vtable.
+
+The time span of an item is determined by the earliest and latest
+timestamps of messages associated with the item.  If the log messages
+contain a duration, that will also be used in the calculation.  The
+span is shown in the view using a reverse-video bar.  The time
+scale of the view is automatically adjusted to fit the item at
+the top and bottom.  The current scale is shown in the header.
+
+Each row in the view shows:
+
+* The duration of the item.
+* Sparklines showing the number of errors and warnings relative to the
+  total number of messages associated with the item.
+* The ID of the item.
+* A description of the item.  For operations, the description is captured
+  from the log message or a description can be set by doing an
+  :code:`UPDATE` of the :code:`all_opids` table.
+
+The preview panel at the bottom of the display will show the
+messages associated with the focused item.
+
+The following hotkeys can be useful in this view:
+
+* :kbd:`ENTER` -- Focus on the preview panel.  Pressing :kbd:`q` or
+  :kbd:`Escape` will change the focus back to the main view.
+* :kbd:`p` -- If the log format defined sub-operations with the
+  :code:`opid/subid` property, this will toggle an overlay panel
+  that displays the sub-operation descriptions.
+
+  .. figure:: lnav-timeline-2.png
+     :align: center
+
+     Screenshot showing the same log as above after pressing
+     :kbd:`p`.  The overlay panel shows a breakdown of
+     sub-operations performed while processing the main operation.
+
+* :kbd:`Shift` + :kbd:`q` -- Return to the previous view and change
+  its focused line to match the time that was focused in the timeline
+  view.
+* :kbd:`Shift` + :kbd:`a` -- After leaving the timeline view, pressing
+  these keys will return to the timeline view while keeping the focused
+  time in sync.
+
+Metric sparklines (v0.15.0+)
+""""""""""""""""""""""""""""
+
+.. figure:: ../assets/images/lnav-timeline-metrics.svg
+   :align: center
+
+   Screenshot of the timeline view with :code:`cpu_pct` and
+   :code:`rss` sparklines overlaid at the top.
+
+To help visualize the relationship between log messages and
+metrics, the timeline view supports adding metric sparklines
+to the header.  For example, if you suspected that a particular
+operation was causing an increase in CPU usage, you could add
+the CPU metric to the timeline.  Then, while scrolling through
+the timeline, you could keep an eye on the CPU sparkline to
+see if there is any correlation.  Multiple metrics can be
+added at once to compare different metrics against each other.
+
+Metric values come from loaded metrics files or an arbitrary
+SQL query.  The bar heights scale against the metric's overall
+min/max so a given value renders at the same height regardless
+of which part of the timeline is in view.  Gaps between samples
+are filled using last-value-carried-forward so gauge-style
+metrics appear continuous.  The value of the metrics for the
+focused line are shown in the preview status bar.
+
+The following commands manage the sparklines:
+
+* :code:`:timeline-metric <name>` -- Track a metric from a loaded
+  metrics file.  :code:`<name>` can be either a bare column name
+  (e.g. :code:`cpu_pct`) -- which aggregates samples across every
+  loaded file that ships that column, useful when a metric has
+  been split across per-day CSVs -- or a qualified
+  :code:`<source>.<column>` name to scope to one file's column.
+  If the name doesn't match any loaded file's columns, the row
+  renders an inline error in place of the sparkline; the next
+  rebuild will start drawing the sparkline once a matching file
+  is loaded.
+* :code:`:timeline-metric-sql <label> <query>` -- Track a metric
+  driven by a SQL query.  The query must return columns named
+  :code:`log_time` and :code:`value`; use :code:`AS` to alias.
+  Text values like :code:`"20ms"` or :code:`"1.5KB"` are
+  recognized and normalized to their base unit so the sparkline
+  scales correctly and the status-bar readout picks up the unit.
+  Any runtime errors from the query are rendered inline on the
+  sparkline row.
+* :code:`:clear-timeline-metric <label>` -- Stop tracking a
+  metric.
+
+.. [#] Formerly called the "Gantt Chart" view.
 
 PRETTY
 ^^^^^^
@@ -254,10 +633,28 @@ the result of a pretty-printer run on that text.  For example, if a log
 message contained an XML message on a single line, the pretty-printer would
 break the XML across multiple lines with appropriate indentation.
 
+.. figure:: lnav-pretty-view-before.png
+   :align: center
+   :figwidth: 90%
+
+   Screenshot of a log message with a flat JSON object.
+
+.. figure:: lnav-pretty-view-after.png
+   :align: center
+   :figwidth: 90%
+
+   Screenshot of the same log message in the PRETTY view.  The JSON object
+   is now indented for easier reading.
+
+Press :kbd:`Shift` + :kbd:`P` to switch to the pretty-print view.
+
 SCHEMA
 ^^^^^^
 
 The schema view displays the current schema of the builtin SQLite database.
+
+Press :kbd:`;` to enter the SQL prompt and then enter :code:`.schema` to
+open the schema view.
 
 SPECTRO
 ^^^^^^^
@@ -284,3 +681,78 @@ range of values.  The panel at the bottom of the view shows the data points
 themselves from the original source, the log file or the SQL query results.
 You can press :kbd:`TAB` to focus on the details panel so you can scroll
 around and get a closer look at the values.
+
+.. _ui_mouse:
+
+Mouse Support (v0.12.2+)
+------------------------
+
+With mouse support enabled, either through the `/ui/mouse/mode`
+configuration option or by pressing :kbd:`F2`, many of the UI
+elements will respond to mouse inputs:
+
+* clicking on the main view will move the cursor to the given
+  row and dragging will scroll the view as needed;
+* :kbd:`Shift` (or :kbd:`CTRL`) clicking/dragging in the main
+  view will highlight lines and then toggle their bookmark
+  status on release;
+* double-clicking in the main view will select the underlying
+  text and drag-selecting within a line will select the given
+  text;
+* when double-clicking text: if the mouse pointer is inside
+  a quoted string, the contents of the string will be selected;
+  if the mouse pointer is on the quote, the quote will be included
+  in the selection; if the mouse pointer is over a bracket
+  (e.g. [],{},()) where the matching bracket is on the same line,
+  the selection will span from one bracket to the other;
+* when text is selected, a menu will pop up that can be used
+  to filter based on the current text, search for it, or copy
+  it to the clipboard;
+* right-clicking the start of a message in the LOG view or a
+  row in the DB view will open the details overlay;
+* the details overlay displays a diamond next to fields to
+  indicate whether they are shown/hidden and this can be
+  clicked to toggle the state;
+* the log details will show a bar chart icon for fields with
+  values which, when clicked, will open either the spectrogram
+  view for the given field or open the DB query prompt with a
+  PRQL query to generate a histogram of the field values;
+* left-clicking a local link in a Markdown document will move
+  the cursor to that part of the document;
+* right-clicking a link in a Markdown document will open an
+  overlay menu with relevant options;
+* clicking in the scroll area will move the view by a page,
+  double-clicking will move the view to that area, and
+  dragging the scrollbar will move the view to the given spot;
+* clicking on the breadcrumb bar will select a crumb and
+  selecting a possibility from the popup will move to that
+  location in the view;
+* clicking on portions of the bottom status bar will trigger
+  a relevant action (e.g. clicking the line number will open
+  the command prompt with :code:`:goto <current-line>`);
+* clicking on the configuration panel tabs (i.e. Files/Filters)
+  will open the selected panel and clicking parts of the
+  display in there will perform the relevant action (e.g.
+  clicking the diamond will enable/disable the file/filter);
+* clicking in a prompt will move the cursor to the location;
+* clicking on a column in the spectrogram view will select it.
+
+.. note::
+
+   A downside of enabling mouse support is that normal text
+   selection and copy will no longer work.  While lnav has
+   some support for selection in the main view, there are
+   still likely to be cases where that is insufficient.
+   In those cases, you can press :kbd:`F2` to quickly
+   switch back-and-forth.  Or, some terminals have support
+   for switching while a modifier is pressed:
+
+   .. list-table::
+      :header-rows: 1
+
+      * - Key
+        - Terminal
+      * - :kbd:`Option`
+        - iTerm, Hyper
+      * - :kbd:`Fn`
+        - Terminal.app

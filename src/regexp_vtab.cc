@@ -27,21 +27,23 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifdef __CYGWIN__
-#    include <alloca.h>
-#endif
+#include <cmath>
 
+#include "base/lnav.console.into.hh"
 #include "base/lnav_log.hh"
 #include "column_namer.hh"
 #include "config.h"
 #include "lnav_util.hh"
 #include "pcrepp/pcre2pp.hh"
-#include "scn/scn.h"
+#include "scn/scan.h"
 #include "sql_help.hh"
 #include "sql_util.hh"
+#include "sqlitepp.hh"
 #include "vtab_module.hh"
 #include "yajlpp/yajlpp.hh"
 #include "yajlpp/yajlpp_def.hh"
+
+namespace {
 
 enum {
     RC_COL_MATCH_INDEX,
@@ -92,7 +94,10 @@ CREATE TABLE regexp_capture (
 
         int next()
         {
-            if (this->c_index >= (this->c_match_data.get_count() - 1)) {
+            // There is a row for every capture in the pattern, not just the
+            // ones set by this match: get_count() stops at the last capture
+            // that was set.
+            if (this->c_index >= (int) this->c_pattern->get_capture_count()) {
                 auto match_res = this->c_pattern->capture_from(this->c_content)
                                      .at(this->c_remaining)
                                      .into(this->c_match_data)
@@ -145,7 +150,8 @@ CREATE TABLE regexp_capture (
                 }
                 break;
             case RC_COL_CAPTURE_COUNT:
-                sqlite3_result_int64(ctx, vc.c_match_data.get_count());
+                sqlite3_result_int64(ctx,
+                                     vc.c_pattern->get_capture_count() + 1);
                 break;
             case RC_COL_RANGE_START:
                 if (cap.has_value()) {
@@ -238,9 +244,12 @@ rcFilter(sqlite3_vtab_cursor* pVtabCursor,
     auto pattern = from_sqlite<string_fragment>()(argc, argv, 1);
     auto compile_res = lnav::pcre2pp::code::from(pattern);
     if (compile_res.isErr()) {
-        pVtabCursor->pVtab->zErrMsg
-            = sqlite3_mprintf("Invalid regular expression: %s",
-                              compile_res.unwrapErr().get_message().c_str());
+        static const intern_string_t PATTERN_SRC
+            = intern_string::lookup("pattern");
+
+        set_vtable_errmsg(pVtabCursor->pVtab,
+                          lnav::console::to_user_message(
+                              PATTERN_SRC, compile_res.unwrapErr()));
         return SQLITE_ERROR;
     }
 
@@ -275,12 +284,63 @@ struct regexp_capture_flags {
     bool convert_numbers{true};
 };
 
-const typed_json_path_container<regexp_capture_flags>
-    regexp_capture_flags_handlers
-    = typed_json_path_container<regexp_capture_flags>{
-        yajlpp::property_handler("convert-numbers")
-            .for_field(&regexp_capture_flags::convert_numbers),
-    };
+const typed_json_path_container<regexp_capture_flags>&
+get_regexp_capture_flags_handlers()
+{
+    static const typed_json_path_container<regexp_capture_flags> retval
+        = typed_json_path_container<regexp_capture_flags>{
+            yajlpp::property_handler("convert-numbers")
+                .for_field(&regexp_capture_flags::convert_numbers),
+        };
+
+    return retval;
+}
+
+/**
+ * Generate a captured value, turning text that looks like a number into a
+ * JSON number.  A "0x" prefix is read as hex, and anything else as decimal,
+ * so a zero-padded value like "0755" is 755 and not octal.
+ */
+void
+gen_capture_value(yajl_gen gen, string_fragment cap)
+{
+    static const auto JSON_NUMBER_RE = lnav::pcre2pp::code::from_const(
+        R"(\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z)");
+
+    const auto cap_view = cap.to_string_view();
+
+    if (cap.startswith("0x") || cap.startswith("0X")) {
+        auto scan_hex_res
+            = scn::scan_int<int64_t>(cap_view.substr(2), 16);
+        if (cap.length() > 2 && scan_hex_res && scan_hex_res->range().empty())
+        {
+            yajl_gen_integer(gen, scan_hex_res->value());
+            return;
+        }
+    } else {
+        auto scan_int_res = scn::scan_int<int64_t>(cap_view, 10);
+        if (scan_int_res && scan_int_res->range().empty()) {
+            yajl_gen_integer(gen, scan_int_res->value());
+            return;
+        }
+
+        auto scan_float_res = scn::scan_value<double>(cap_view);
+        if (scan_float_res && scan_float_res->range().empty()
+            && std::isfinite(scan_float_res->value()))
+        {
+            // Keep the number as written when it is already valid JSON,
+            // otherwise write the value that was parsed from it.
+            if (JSON_NUMBER_RE.find_in(cap).ignore_error().has_value()) {
+                yajl_gen_number(gen, cap_view.data(), cap_view.length());
+            } else {
+                yajl_gen_double(gen, scan_float_res->value());
+            }
+            return;
+        }
+    }
+
+    yajl_gen_pstring(gen, cap_view.data(), cap_view.length());
+}
 
 struct regexp_capture_into_json {
     static constexpr const char* NAME = "regexp_capture_into_json";
@@ -310,7 +370,7 @@ CREATE TABLE regexp_capture_into_json (
         size_t c_match_index{0};
         sqlite3_int64 c_rowid{0};
         std::string c_flags_string;
-        nonstd::optional<regexp_capture_flags> c_flags;
+        std::optional<regexp_capture_flags> c_flags;
 
         cursor(sqlite3_vtab* vt) : base({vt}) {}
 
@@ -359,7 +419,8 @@ CREATE TABLE regexp_capture_into_json (
                 {
                     yajlpp_map root_map(gen);
 
-                    for (int lpc = 1; lpc < vc.c_match_data.get_count(); lpc++)
+                    for (size_t lpc = 1; lpc < vc.c_match_data.get_count();
+                         lpc++)
                     {
                         const auto& colname = vc.c_namer->cn_names[lpc];
                         const auto cap = vc.c_match_data[lpc];
@@ -371,27 +432,7 @@ CREATE TABLE regexp_capture_into_json (
                         yajl_gen_pstring(gen, colname.data(), colname.length());
 
                         if (!vc.c_flags || vc.c_flags->convert_numbers) {
-                            auto cap_view = cap->to_string_view();
-                            auto scan_int_res
-                                = scn::scan_value<int64_t>(cap_view);
-
-                            if (scan_int_res && scan_int_res.range().empty()) {
-                                yajl_gen_integer(gen, scan_int_res.value());
-                                continue;
-                            }
-
-                            auto scan_float_res
-                                = scn::scan_value<double>(cap_view);
-                            if (scan_float_res
-                                && scan_float_res.range().empty())
-                            {
-                                yajl_gen_number(
-                                    gen, cap_view.data(), cap_view.length());
-                                continue;
-                            }
-
-                            yajl_gen_pstring(
-                                gen, cap_view.data(), cap_view.length());
+                            gen_capture_value(gen, cap.value());
                         } else {
                             yajl_gen_pstring(gen, cap->data(), cap->length());
                         }
@@ -472,7 +513,7 @@ rcjFilter(sqlite3_vtab_cursor* pVtabCursor,
         pCur->c_content.clear();
         pCur->c_pattern.reset();
         pCur->c_flags_string.clear();
-        pCur->c_flags = nonstd::nullopt;
+        pCur->c_flags = std::nullopt;
         return SQLITE_OK;
     }
 
@@ -485,30 +526,33 @@ rcjFilter(sqlite3_vtab_cursor* pVtabCursor,
     auto pattern = from_sqlite<string_fragment>()(argc, argv, 1);
     auto compile_res = lnav::pcre2pp::code::from(pattern);
     if (compile_res.isErr()) {
-        pVtabCursor->pVtab->zErrMsg
-            = sqlite3_mprintf("Invalid regular expression: %s",
-                              compile_res.unwrapErr().get_message().c_str());
+        static const intern_string_t PATTERN_SRC
+            = intern_string::lookup("pattern");
+
+        set_vtable_errmsg(pVtabCursor->pVtab,
+                          lnav::console::to_user_message(
+                              PATTERN_SRC, compile_res.unwrapErr()));
         return SQLITE_ERROR;
     }
 
     pCur->c_flags_string.clear();
-    pCur->c_flags = nonstd::nullopt;
+    pCur->c_flags = std::nullopt;
     if (argc == 3) {
         static const intern_string_t FLAGS_SRC = intern_string::lookup("flags");
         const auto flags_json = from_sqlite<string_fragment>()(argc, argv, 2);
 
         if (!flags_json.empty()) {
             const auto parse_res
-                = regexp_capture_flags_handlers.parser_for(FLAGS_SRC).of(
+                = get_regexp_capture_flags_handlers().parser_for(FLAGS_SRC).of(
                     flags_json);
 
             if (parse_res.isErr()) {
-                auto um = lnav::console::user_message::error(
-                              "unable to parse flags")
-                              .with_reason(parse_res.unwrapErr()[0]);
+                const auto um = lnav::console::user_message::error(
+                                    "unable to parse flags")
+                                    .with_reason(parse_res.unwrapErr()[0])
+                                    .move();
 
-                pVtabCursor->pVtab->zErrMsg = sqlite3_mprintf(
-                    "%s%s", sqlitepp::ERROR_PREFIX, lnav::to_json(um).c_str());
+                set_vtable_errmsg(pVtabCursor->pVtab, um);
                 return SQLITE_ERROR;
             }
 
@@ -520,8 +564,8 @@ rcjFilter(sqlite3_vtab_cursor* pVtabCursor,
     pCur->c_pattern = compile_res.unwrap().to_shared();
     pCur->c_namer
         = std::make_unique<column_namer>(column_namer::language::JSON);
-    pCur->c_namer->add_column(string_fragment::from_const("__all__"));
-    for (int lpc = 1; lpc <= pCur->c_pattern->get_capture_count(); lpc++) {
+    pCur->c_namer->add_column("__all__"_frag);
+    for (size_t lpc = 1; lpc <= pCur->c_pattern->get_capture_count(); lpc++) {
         pCur->c_namer->add_column(string_fragment::from_c_str(
             pCur->c_pattern->get_name_for_capture(lpc)));
     }
@@ -540,6 +584,8 @@ rcjFilter(sqlite3_vtab_cursor* pVtabCursor,
 
     return SQLITE_OK;
 }
+
+}  // namespace
 
 int
 register_regexp_vtab(sqlite3* db)

@@ -2,11 +2,15 @@ name: lnav
 adopt-info: lnav
 summary: Log File Navigator
 description: |
-  The Log File Navigator, **lnav** for short, is an advanced log file viewer
-  for the small-scale.
+  The Log File Navigator is a log file viewer for the terminal.
 icon: docs/assets/images/favicon.png
+contact: support@lnav.org
+website: https://lnav.org
+issues: https://github.com/tstack/lnav/issues
+source-code: https://github.com/tstack/lnav
+donation: https://github.com/sponsors/tstack
 
-base: core20
+base: core22
 grade: stable
 confinement: strict
 
@@ -15,10 +19,25 @@ environment:
   GIT_TEMPLATE_DIR: $SNAP/usr/share/git-core/templates
   GIT_EXEC_PATH: $SNAP/usr/lib/git-core
 
+plugs:
+  etc-lnav:
+    interface: system-files
+    read:
+      - /etc/lnav
+
+slots:
+  lnav-bin:
+    interface: content
+    content: lnav
+    source:
+      read:
+        - $SNAP/bin
+
 apps:
   lnav:
     command: usr/bin/lnav
     plugs:
+      - etc-lnav
       - home            # optional, allows to read log files from home directory
       - log-observe     # required, provide access to system logs in /var/log
       - network         # required, lnav uses sendto() with UNIX domain socket
@@ -27,56 +46,49 @@ apps:
       - x11
 
 parts:
-  selective-checkout:
-    source: https://github.com/Lin-Buo-Ren/selective-checkout.git
-    source-tag: v2.0.2
-    plugin: dump
-    build-packages:
-    # Uncomment the VCS your main part is using
-    - git
-    - curl
-    - jq
-    - sed
-
-    #- mercurial
-    #- subversion
-    stage:
-      - scriptlets/selective-checkout
-    prime:
-      - -*
+  rustup:
+    plugin: rust
+    rust-channel: stable
+    source: .
+    override-build: ""
+    override-prime: ""
   lnav:
     after:
-      - selective-checkout
+      - rustup
     plugin: autotools
     autotools-configure-parameters:
       - CFLAGS="-O2"
       - CXXFLAGS="-O2"
+      - PATH="${HOME}/.cargo/bin:${PATH}"
     source: https://github.com/tstack/lnav.git
     source-depth: 500
     override-pull: |
-      snapcraftctl pull
-
-      "$SNAPCRAFT_STAGE"/scriptlets/selective-checkout --debug --force-snapshot
+      craftctl default
+      ${CRAFT_PROJECT_DIR}/snap/local/scriptlets/selective-checkout --force-snapshot
+    override-build: |
+      craftctl default
+      execstack --clear-execstack $SNAPCRAFT_PART_INSTALL/usr/bin/lnav || true
     build-packages:
+      - git
+      - curl
+      - jq
+      - sed
       - build-essential
       - libarchive-dev
       - libcurl4-gnutls-dev
       - libpcre2-dev
       - libsqlite3-dev
-      - libncursesw6
-      - libreadline-dev
+      - libunistring-dev
       - zlib1g-dev
       - libbz2-dev
-      - libgpm-dev
+      - execstack
     stage-packages:
       - zlib1g
       - git-core
       - libcurl4
-      - libncursesw6
       - libpcre2-8-0
-      - libgpm2
       - libarchive13
-      - libicu66
+      - libicu70
       - libxml2
       - locales-all
       - ssh

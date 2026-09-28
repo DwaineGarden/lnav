@@ -1,11 +1,62 @@
 {
     "$schema": "https://lnav.org/schemas/config-v1.schema.json",
-    "ui" : {
+    "apps": {
+        "lnav": {
+            "api-test": {
+                "description": "Examples of using lnav's external APIs"
+            }
+        }
+    },
+    "ui": {
         "clock-format": "%Y-%m-%dT%H:%M:%S %Z",
         "dim-text": false,
         "default-colors": true,
         "keymap": "default",
-        "theme": "default"
+        "theme": "default",
+        "mouse": {
+            "mode": "disabled"
+        },
+        "movement": {
+            "mode": "cursor"
+        },
+        "views": {
+            "log": {
+                "time-column": "disabled"
+            }
+        }
+    },
+    "log": {
+        "date-time": {
+            "convert-zoned-to-local": true
+        },
+        "annotations": {
+            "org.postgresql.statement-error": {
+                "description": "statement error",
+                "condition": ":log_level COLLATE loglevel >= 'error' AND :log_body LIKE '% at character %' AND :log_format IN ('postgres_log', 'vpostgres_log')",
+                "handler": "|pg-annotate-errors"
+            }
+        },
+        "demux": {
+            "container": {
+                "pattern": "^(?:\\x1b\\[\\d*K)?(?<mux_id>[a-zA-Z0-9][\\@a-zA-Z0-9_\\.\\-]*)\\s+\\| (?<timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.\\d{9}Z )?(?<body>.*)"
+            },
+            "recv-with-pod": {
+                "control-pattern": "^===== (?:START|END) =====$",
+                "pattern": "^(?<timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?:Z|[+\\-]\\d{2}:\\d{2})) source=[a-zA-Z0-9][a-zA-Z0-9_\\.\\-]* (?<body>.*) kubernetes_host=(?<k8s_host>[a-zA-Z0-9][a-zA-Z0-9_\\.\\-]*) kubernetes_pod_name=(?<mux_id>[a-zA-Z0-9][a-zA-Z0-9_\\.\\-]*)"
+            },
+            "container-with-type": {
+                "enabled": false,
+                "pattern": "^(?<mux_id>[a-zA-Z][\\w\\-]{3,}) (?<container_type>[a-zA-Z][\\w\\-]{3,}) (?<body>.*)"
+            }
+        },
+        "demux-json": {
+            "graylog": {
+                "enabled": false,
+                "timestamp": "timestamp",
+                "mux_id": "source",
+                "body": "message"
+            }
+        }
     },
     "tuning": {
         "archive-manager": {
@@ -23,6 +74,11 @@
                 "transfer-command": "cat > {0:} && chmod ugo+rx ./{0:}"
             }
         },
+        "piper": {
+            "max-size": 10485760,
+            "rotations": 4,
+            "ttl": "2d"
+        },
         "clipboard": {
             "impls": {
                 "MacOS": {
@@ -37,9 +93,9 @@
                     }
                 },
                 "Wayland": {
-                    "test": "test -n \"$WAYLAND_DISPLAY\"",
+                    "test": "test -n \"$WAYLAND_DISPLAY\" && command -v wl-copy",
                     "general": {
-                        "write": "wl-copy --foreground --type text/plain",
+                        "write": "wl-copy --type text/plain",
                         "read": "wl-paste --no-newline"
                     }
                 },
@@ -70,6 +126,82 @@
                         "write": "clip.exe"
                     }
                 }
+            }
+        },
+        "external-opener": {
+            "impls": {
+                "MacOS": {
+                    "test": "command -v open",
+                    "command": "open"
+                },
+                "XDG": {
+                    "test": "command -v xdg-open",
+                    "command": "xdg-open"
+                }
+            }
+        },
+        "external-editor": {
+            "impls": {
+                "IntelliJ": {
+                    "config-dir": ".idea",
+                    "prefers": "^.*(?:\\.java|\\.kt|\\.py)$",
+                    "disfavors": "^.*(?:\\.log|\\.json|\\.gz|\\.bz2|\\.\\d+)$",
+                    "test": "command -v idea",
+                    "command": "idea --line ${LINE} --column ${COL} \"$FILE_PATH\""
+                },
+                "CLion": {
+                    "config-dir": ".idea",
+                    "disfavors": "^.*(?:\\.log|\\.json|\\.gz|\\.bz2|\\.\\d+)$",
+                    "test": "command -v clion",
+                    "command": "clion --line ${LINE} --column ${COL} \"$FILE_PATH\""
+                },
+                "RustRover": {
+                    "config-dir": ".idea",
+                    "prefers": "^.*(?:Cargo.toml|\\.rs)",
+                    "disfavors": "^.*(?:\\.log|\\.json|\\.gz|\\.bz2|\\.\\d+)$",
+                    "test": "command -v rustrover",
+                    "command": "rustrover --line ${LINE} --column ${COL} \"$FILE_PATH\""
+                },
+                "VSCode": {
+                    "config-dir": ".vscode",
+                    "test": "command -v code",
+                    "command": "env VSCODE_PWD=\"$PWD\" code -g \"$FILE_PATH\":$LINE:$COL"
+                },
+                "VSCode.app": {
+                    "config-dir": ".vscode",
+                    "test": "command -v '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code'",
+                    "command": "env VSCODE_PWD=\"$PWD\" '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code' -g \"$FILE_PATH\":$LINE:$COL"
+                },
+                "zzz.MacOS": {
+                    "test": "command -v open",
+                    "command": "open -t \"$FILE_PATH\""
+                }
+            }
+        },
+        "textfile": {
+            "max-unformatted-line-length": 2048
+        },
+        "logfile": {
+            "indexing-threads": 0
+        },
+        "url-scheme": {
+            "docker": {
+                "handler": "docker-url-handler"
+            },
+            "docker-compose": {
+                "handler": "docker-compose-url-handler"
+            },
+            "journald": {
+                "handler": "journald-url-handler"
+            },
+            "piper": {
+                "handler": "piper-url-handler"
+            },
+            "podman": {
+                "handler": "docker-url-handler"
+            },
+            "strace": {
+                "handler": "strace-url-handler"
             }
         }
     }

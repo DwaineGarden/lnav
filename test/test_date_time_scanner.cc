@@ -30,11 +30,26 @@
 #include <assert.h>
 #include <locale.h>
 
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "../src/lnav_util.hh"
 #include "base/date_time_scanner.hh"
 #include "config.h"
+#include "doctest/doctest.h"
+#include "lnav_config.hh"
+#include "ptimec.hh"
 
 static const char* GOOD_TIMES[] = {
+    "2023-001T00:59:36.208491Z",
+    "2023-200T00:59:36.208491Z",
+    "2023-08-11T00:59:36.208491Z",
+    "09/Aug/2023:21:41:44 +0000",
+    "2022-08-27T17:22:01.694554+03:00",
+    "2022-08-27T17:22:01.694554+0300",
+    "2022-08-27T17:22:01.694554+00:00",
+    "2022-08-27T17:22:01.694554+0000",
+    "2022-08-27T17:22:01.694554Z",
+    "2022-08-27 17:22:01.694554 UTC",
+    "2022-08-27 17:22:01.694554 GMT",
     "2017 May 08 Mon 18:57:57.578",
     "May 01 00:00:01",
     "May 10 12:00:01",
@@ -53,35 +68,143 @@ static const char* BAD_TIMES[] = {
     "@4000000043",
 };
 
-int
-main(int argc, char* argv[])
+TEST_CASE("date_time_scanner")
 {
     setenv("TZ", "UTC", 1);
 
+    lnav_config.lc_log_date_time.c_zoned_to_local = false;
+
+    {
+        static const char* ts = "Mar-18 21:41:15";
+        exttm tm;
+        off_t off = 0;
+        ssize_t len = strlen(ts);
+
+        auto rc = ptime_fmt("%b-%d %H:%M:%S", &tm, ts, off, len);
+        CHECK(rc);
+    }
+
+    {
+        const auto sf = string_fragment::from_const("2022-03-02T10:20:30+");
+        timeval tv;
+        exttm tm;
+        date_time_scanner dts;
+        const auto* rc = dts.scan(sf.data(), sf.length(), nullptr, &tm, tv);
+        auto matched_size = rc - sf.data();
+        auto rem = sf.substr(matched_size);
+        CHECK(rem == "+");
+    }
+
+    {
+        const auto sf
+            = string_fragment::from_const("2025-04-24T19:51:48.55604564Z");
+        timeval tv;
+        exttm tm;
+        date_time_scanner dts;
+        const auto* rc = dts.scan(sf.data(), sf.length(), nullptr, &tm, tv);
+        CHECK(rc != nullptr);
+        printf("fmt %s\n", PTIMEC_FORMAT_STR[dts.dts_fmt_lock]);
+        CHECK((tm.et_flags & ETF_NANOS_SET));
+
+        char ts[64];
+        dts.ftime(ts, sizeof(ts), nullptr, tm);
+
+        CHECK(std::string(ts) == std::string("2025-04-24T19:51:48.556045640Z"));
+    }
+
     for (const auto* good_time : GOOD_TIMES) {
         date_time_scanner dts;
-        struct timeval tv;
-        struct exttm tm;
+        timeval tv;
+        exttm tm;
         const char* rc;
 
         rc = dts.scan(good_time, strlen(good_time), nullptr, &tm, tv);
+        CHECK(dts.dts_zoned_to_local == false);
         printf("ret %s %p\n", good_time, rc);
         assert(rc != nullptr);
 
         char ts[64];
 
-        gmtime_r(&tv.tv_sec, &tm.et_tm);
         dts.ftime(ts, sizeof(ts), nullptr, tm);
+        printf("fmt %s\n", PTIMEC_FORMATS[dts.dts_fmt_lock].pf_fmt);
         printf("orig %s\n", good_time);
         printf("loop %s\n", ts);
-        assert(strcmp(ts, good_time) == 0);
+        CHECK(std::string(ts) == std::string(good_time));
+    }
+
+    {
+        const auto sf
+            = string_fragment::from_const("2014-02-11 16:12:34.123.456");
+        timeval tv;
+        exttm tm;
+        date_time_scanner dts;
+        const auto* rc = dts.scan(sf.data(), sf.length(), nullptr, &tm, tv);
+        CHECK((tm.et_flags & ETF_MILLIS_SET));
+        CHECK(std::string(rc) == sf.substr(23).to_string());
+
+        char ts[64];
+        dts.ftime(ts, sizeof(ts), nullptr, tm);
+
+        CHECK(std::string(ts) == std::string("2014-02-11 16:12:34.123"));
+    }
+
+    {
+        const auto sf
+            = string_fragment::from_const("2014-02-11 16:12:34.12345Z");
+        timeval tv;
+        exttm tm;
+        date_time_scanner dts;
+        const auto* rc = dts.scan(sf.data(), sf.length(), nullptr, &tm, tv);
+        printf("fmt %s\n", PTIMEC_FORMAT_STR[dts.dts_fmt_lock]);
+        CHECK(rc != nullptr);
+        CHECK((tm.et_flags & ETF_MICROS_SET));
+        CHECK(*rc == '\0');
+
+        char ts[64];
+        dts.ftime(ts, sizeof(ts), nullptr, tm);
+
+        CHECK(std::string(ts) == std::string("2014-02-11 16:12:34.123450Z"));
+
+        {
+            const auto feb26 = string_fragment::from_const("Feb 26");
+            date_time_scanner dts2;
+            exttm tm2;
+            timeval tv2;
+            dts2.set_base_time(tv.tv_sec, tm.et_tm);
+            CHECK(dts2.scan(feb26.data(), feb26.length(), nullptr, &tm2, tv2)
+                  != nullptr);
+            CHECK(tm2.et_nsec == 0);
+            CHECK(tm2.et_tm.tm_sec == 0);
+            CHECK(tm2.et_tm.tm_min == 0);
+            CHECK(tm2.et_tm.tm_hour == 0);
+        }
+    }
+
+    {
+        const auto sf
+            = string_fragment::from_const("Tue Jul 25 12:01:01 AM UTC 2023");
+        timeval tv;
+        exttm tm;
+        date_time_scanner dts;
+        const auto* rc = dts.scan(sf.data(), sf.length(), nullptr, &tm, tv);
+        printf("fmt %s\n", PTIMEC_FORMAT_STR[dts.dts_fmt_lock]);
+        CHECK(rc != nullptr);
+        CHECK((tm.et_flags & ETF_ZONE_SET));
+        CHECK((tm.et_flags & ETF_Z_IS_UTC));
+        CHECK(*rc == '\0');
+
+        char ts[64];
+        dts.ftime(ts, sizeof(ts), nullptr, tm);
+
+        CHECK(std::string(ts)
+              == std::string("Tue Jul 25 12:01:01 AM UTC 2023"));
     }
 
     {
         static const char* OLD_TIME = "05/18/1960 12:00:53 AM";
         date_time_scanner dts;
-        struct timeval tv;
-        struct exttm tm;
+        timeval tv;
+        exttm tm;
 
         auto rc = dts.scan(OLD_TIME, strlen(OLD_TIME), nullptr, &tm, tv);
         assert(rc != nullptr);
@@ -92,7 +215,7 @@ main(int argc, char* argv[])
 
     {
         date_time_scanner dts;
-        struct timeval tv;
+        timeval tv;
 
         dts.convert_to_timeval("@40000000433225833b6e1a8c", -1, nullptr, tv);
         assert(tv.tv_sec == 1127359865);
@@ -106,8 +229,8 @@ main(int argc, char* argv[])
 
     for (const auto* bad_time : BAD_TIMES) {
         date_time_scanner dts;
-        struct timeval tv;
-        struct exttm tm;
+        timeval tv;
+        exttm tm;
 
         printf("Checking bad time: %s\n", bad_time);
         assert(dts.scan(bad_time, strlen(bad_time), nullptr, &tm, tv)
@@ -117,31 +240,35 @@ main(int argc, char* argv[])
     {
         const char* en_date = "Jan  1 12:00:00";
         const char* es_date = " 1/Ene/2014:12:00:00 +0000";
-        struct timeval en_tv, es_tv;
-        struct exttm en_tm, es_tm;
+        timeval en_tv, es_tv;
+        exttm en_tm, es_tm;
         date_time_scanner dts;
 
         if (setlocale(LC_TIME, "es_ES.UTF-8") != nullptr) {
-            assert(dts.scan(en_date, strlen(en_date), nullptr, &en_tm, en_tv)
-                   != nullptr);
+            CHECK(dts.scan(en_date, strlen(en_date), nullptr, &en_tm, en_tv)
+                  != nullptr);
             dts.clear();
-            assert(dts.scan(es_date, strlen(es_date), nullptr, &es_tm, es_tv)
-                   != nullptr);
+            CHECK(dts.scan(es_date, strlen(es_date), nullptr, &es_tm, es_tv)
+                  != nullptr);
         }
     }
 
     {
         const char* en_date = "Jan  1 12:00:00";
         const char* fr_date = "août 19 11:08:37";
-        struct timeval en_tv, fr_tv;
-        struct exttm en_tm, fr_tm;
+        const char* fr_date2 = "nov. 29 20:23:37";
+        timeval en_tv, fr_tv;
+        exttm en_tm, fr_tm;
         date_time_scanner dts;
 
         if (setlocale(LC_TIME, "fr_FR.UTF-8") != nullptr) {
-            assert(dts.scan(en_date, strlen(en_date), nullptr, &en_tm, en_tv)
-                   != nullptr);
+            CHECK(dts.scan(en_date, strlen(en_date), nullptr, &en_tm, en_tv)
+                  != nullptr);
             dts.clear();
-            assert(dts.scan(fr_date, strlen(fr_date), nullptr, &fr_tm, fr_tv)
+            CHECK(dts.scan(fr_date, strlen(fr_date), nullptr, &fr_tm, fr_tv)
+                  != nullptr);
+            dts.clear();
+            assert(dts.scan(fr_date2, strlen(fr_date), nullptr, &fr_tm, fr_tv)
                    != nullptr);
         }
     }
@@ -154,30 +281,30 @@ main(int argc, char* argv[])
         };
         char buf[64];
         date_time_scanner dts;
-        struct exttm tm;
-        struct timeval tv;
+        exttm tm;
+        timeval tv;
 
         const auto* ts_end = dts.scan(ts, strlen(ts), fmt, &tm, tv);
-        assert(ts_end - ts == 12);
+        CHECK(ts_end - ts == 12);
         auto rc = dts.ftime(buf, sizeof(buf), fmt, tm);
-        assert(rc == 12);
-        assert(strcmp(ts, buf) == 0);
+        CHECK(rc == 12);
+        CHECK(strcmp(ts, buf) == 0);
     }
 
     {
         const char* epoch_str = "ts 1428721664 ]";
-        struct exttm tm;
+        exttm tm;
         off_t off = 0;
 
         memset(&tm, 0, sizeof(tm));
         bool rc = ptime_fmt("ts %s ]", &tm, epoch_str, off, strlen(epoch_str));
-        assert(rc);
-        assert(tm2sec(&tm.et_tm) == 1428721664);
+        CHECK(rc);
+        CHECK(tm2sec(&tm.et_tm) == 1428721664);
     }
 
     {
         const char* epoch_str = "ts 60150c93 ]";
-        struct exttm tm;
+        exttm tm;
         off_t off = 0;
 
         memset(&tm, 0, sizeof(tm));
@@ -188,5 +315,403 @@ main(int argc, char* argv[])
         char buf[32];
         ftime_fmt(buf, sizeof(buf), "ts %q ]", tm);
         assert(strcmp(buf, epoch_str) == 0);
+    }
+
+    {
+        auto ts = "Jan  1 12:00:00";
+        const char* fmt[] = {
+            "%b %e %H:%M:%S",
+            nullptr,
+        };
+        char buf[64];
+        date_time_scanner dts;
+        exttm tm;
+        timeval tv;
+
+        const auto* ts_end = dts.scan(ts, strlen(ts), fmt, &tm, tv);
+        assert(ts_end - ts == 15);
+        auto rc = dts.ftime(buf, sizeof(buf), fmt, tm);
+        assert(rc == 15);
+        assert(strcmp(ts, buf) == 0);
+    }
+
+    {
+        const auto* ts = "1743570493000000014";
+        const char* fmt[] = {
+            "%9",
+            nullptr,
+        };
+        char buf[64];
+        date_time_scanner dts;
+        exttm tm;
+        timeval tv;
+
+        const auto* ts_end = dts.scan(ts, strlen(ts), fmt, &tm, tv);
+        assert(ts_end - ts == 19);
+        assert(tv.tv_sec == 1743570493);
+        assert(tm.et_nsec == 14);
+        auto rc = ftime_fmt(buf, sizeof(buf), fmt[0], tm);
+        assert(rc == 19);
+        assert(strcmp(ts, buf) == 0);
+    }
+
+    {
+        const auto* ts = "1428634687123";
+        const char* fmt[] = {
+            "%i",
+            nullptr,
+        };
+        char buf[64];
+        date_time_scanner dts;
+        exttm tm;
+        timeval tv;
+
+        assert(dts.scan(ts, strlen(ts), fmt, &tm, tv) != nullptr);
+        auto rc = ftime_fmt(buf, sizeof(buf), fmt[0], tm);
+        assert(rc == 13);
+        assert(strcmp(ts, buf) == 0);
+    }
+
+    {
+        const auto* ts = "12345.9";
+        const char* fmt[] = {
+            "%i.%f",
+            nullptr,
+        };
+        date_time_scanner dts;
+        exttm tm;
+        timeval tv;
+
+        const auto* ts_end = dts.scan(ts, strlen(ts), fmt, &tm, tv);
+        assert(ts_end - ts == 7);
+        assert(tv.tv_sec == 12);
+        assert(tv.tv_usec == 345900);
+        assert(tm.et_flags & ETF_MICROS_SET);
+        assert(!(tm.et_flags & ETF_MILLIS_SET));
+    }
+
+    {
+        const auto* ts = "1428634687123456.789";
+        const char* fmt[] = {
+            "%6.%f",
+            nullptr,
+        };
+        date_time_scanner dts;
+        exttm tm;
+        timeval tv;
+
+        assert(dts.scan(ts, strlen(ts), fmt, &tm, tv) != nullptr);
+        assert(tm.et_nsec == 123456789);
+        assert(tm.et_flags & ETF_NANOS_SET);
+    }
+
+    {
+        const auto* ts = "90061234567890123";
+        const char* fmt[] = {
+            "%2",
+            nullptr,
+        };
+        char buf[64];
+        date_time_scanner dts;
+        exttm tm;
+        timeval tv;
+
+        // Relative times are not shifted into the local zone, even past the
+        // first day.
+        const auto* old_tz = getenv("TZ");
+        const auto saved_tz = std::string(old_tz ? old_tz : "");
+        setenv("TZ", "America/Los_Angeles", 1);
+        tzset();
+        const auto* ts_end = dts.scan(ts, strlen(ts), fmt, &tm, tv);
+        if (old_tz) {
+            setenv("TZ", saved_tz.c_str(), 1);
+        } else {
+            unsetenv("TZ");
+        }
+        tzset();
+
+        assert(ts_end - ts == 17);
+        assert(tv.tv_sec == 90061);
+        assert(tm.et_nsec == 234567890);
+        assert(tm.et_tm.tm_mday == 2);
+        assert(tm.et_tm.tm_hour == 1);
+        assert(tm.et_flags & ETF_NANOS_SET);
+
+        ftime_fmt(buf, sizeof(buf), fmt[0], tm);
+        assert(strcmp(buf, "90061234567890000") == 0);
+    }
+
+    {
+        const char* fmts[] = {"%s", "%i", "%6", "%9", "%2"};
+
+        for (const auto* fmt_str : fmts) {
+            const char* fmt[] = {
+                fmt_str,
+                nullptr,
+            };
+            date_time_scanner dts;
+            exttm tm;
+            timeval tv;
+
+            assert(dts.scan("0", 1, fmt, &tm, tv) != nullptr);
+            assert(tv.tv_sec == 0);
+            assert(dts.scan("x", 1, fmt, &tm, tv) == nullptr);
+        }
+    }
+
+    {
+        const auto* ts = "8-3-2021 7:01:28";
+        const char* fmt = "%-d-%-m-%Y %-H:%M:%S";
+        exttm tm;
+        off_t off = 0;
+
+        bool rc = ptime_fmt(fmt, &tm, ts, off, strlen(ts));
+        assert(rc);
+        assert(off == (off_t) strlen(ts));
+        assert(tm.et_tm.tm_mday == 8);
+        assert(tm.et_tm.tm_mon == 2);
+        assert(tm.et_tm.tm_hour == 7);
+
+        char buf[64];
+        ftime_fmt(buf, sizeof(buf), fmt, tm);
+        assert(strcmp(buf, ts) == 0);
+    }
+
+    {
+        const auto* ts = " 8/ 3/2021  7:01:28";
+        const char* fmt = "%_d/%_m/%Y %_H:%M:%S";
+        exttm tm;
+        off_t off = 0;
+
+        bool rc = ptime_fmt(fmt, &tm, ts, off, strlen(ts));
+        assert(rc);
+        assert(off == (off_t) strlen(ts));
+        assert(tm.et_tm.tm_mday == 8);
+        assert(tm.et_tm.tm_mon == 2);
+        assert(tm.et_tm.tm_hour == 7);
+        assert(tm.et_tm.tm_min == 1);
+        assert(tm.et_tm.tm_sec == 28);
+
+        char buf[64];
+        ftime_fmt(buf, sizeof(buf), fmt, tm);
+        assert(strcmp(buf, ts) == 0);
+    }
+
+    {
+        const auto* ts = "18/12/2021 17:01:28";
+        const char* fmt = "%_d/%_m/%Y %_H:%M:%S";
+        exttm tm;
+        off_t off = 0;
+
+        bool rc = ptime_fmt(fmt, &tm, ts, off, strlen(ts));
+        assert(rc);
+        assert(off == (off_t) strlen(ts));
+        assert(tm.et_tm.tm_mday == 18);
+        assert(tm.et_tm.tm_mon == 11);
+        assert(tm.et_tm.tm_hour == 17);
+
+        char buf[64];
+        ftime_fmt(buf, sizeof(buf), fmt, tm);
+        assert(strcmp(buf, ts) == 0);
+    }
+
+    // A space in a format needs to match the no-break spaces that turn up in
+    // place of an ASCII one.  Apple separates the time from the AM/PM marker
+    // with a NARROW NO-BREAK SPACE, so the whole timestamp is missed without
+    // this and the log message gets the current time instead.
+    {
+        const char* fmt = "%b %e, %Y at %l:%M:%S %p";
+        struct {
+            const char* sv_name;
+            const char* sv_timestamp;
+        } variants[] = {
+            {"ASCII space", "Mar 10, 2026 at 11:51:40 AM"},
+            {"U+00A0 NO-BREAK SPACE", "Mar 10, 2026 at 11:51:40\xc2\xa0"
+                                      "AM"},
+            {"U+2007 FIGURE SPACE", "Mar 10, 2026 at 11:51:40\xe2\x80\x87"
+                                    "AM"},
+            {"U+2009 THIN SPACE", "Mar 10, 2026 at 11:51:40\xe2\x80\x89"
+                                  "AM"},
+            {"U+202F NARROW NO-BREAK SPACE",
+             "Mar 10, 2026 at 11:51:40\xe2\x80\xaf"
+             "AM"},
+        };
+
+        for (const auto& variant : variants) {
+            exttm tm;
+            off_t off = 0;
+            auto len = (ssize_t) strlen(variant.sv_timestamp);
+
+            printf("checking %s\n", variant.sv_name);
+            bool rc = ptime_fmt(fmt, &tm, variant.sv_timestamp, off, len);
+            CHECK(rc);
+            // The whole timestamp is consumed, so a wider space does not
+            // leave a stray byte behind.
+            CHECK(off == len);
+            CHECK(tm.et_tm.tm_mon == 2);
+            CHECK(tm.et_tm.tm_mday == 10);
+            CHECK(tm.et_tm.tm_year == 126);
+            CHECK(tm.et_tm.tm_hour == 11);
+            CHECK(tm.et_tm.tm_min == 51);
+            CHECK(tm.et_tm.tm_sec == 40);
+        }
+    }
+
+    // Only the spaces above were added, so some other character in that spot
+    // is still a mismatch.  U+200B sits next to U+2009 in the same block and
+    // has "SPACE" in its name, but it has no width and is not a separator.
+    {
+        const char* fmt = "%b %e, %Y at %l:%M:%S %p";
+        const char* bad_timestamps[] = {
+            "Mar 10, 2026 at 11:51:40_AM",
+            "Mar 10, 2026 at 11:51:40\xe2\x80\x8b"
+            "AM",  // U+200B ZERO WIDTH SPACE
+            "Mar 10, 2026 at 11:51:40\xe2\x80\x90"
+            "AM",  // U+2010 HYPHEN
+        };
+
+        for (const auto* ts : bad_timestamps) {
+            exttm tm;
+            off_t off = 0;
+
+            bool rc = ptime_fmt(fmt, &tm, ts, off, strlen(ts));
+            CHECK(!rc);
+        }
+    }
+
+    // The same timestamp, however it spells the space before the marker,
+    // scans with the built-in formats and lands on the same time.  The last
+    // one also leaves the day and hour unpadded, which is how Apple writes
+    // them.
+    {
+        struct {
+            const char* sc_timestamp;
+            int sc_mday;
+            int sc_hour;
+        } cases[] = {
+            {"Mar 10, 2026 at 11:51:40 AM", 10, 11},
+            {"Mar 10, 2026 at 11:51:40\xc2\xa0"
+             "AM",
+             10,
+             11},
+            {"Mar 10, 2026 at 11:51:40\xe2\x80\xaf"
+             "AM",
+             10,
+             11},
+            {"Mar 5, 2026 at 9:51:40\xe2\x80\xaf"
+             "PM",
+             5,
+             21},
+        };
+        time_t ascii_secs = 0;
+
+        for (const auto& sc : cases) {
+            date_time_scanner dts;
+            timeval tv;
+            exttm tm;
+
+            printf("scanning %s\n", sc.sc_timestamp);
+            const auto* rc
+                = dts.scan(sc.sc_timestamp, strlen(sc.sc_timestamp), nullptr,
+                           &tm, tv);
+            CHECK(rc != nullptr);
+            CHECK(tm.et_tm.tm_mon == 2);
+            CHECK(tm.et_tm.tm_year == 126);
+            CHECK(tm.et_tm.tm_mday == sc.sc_mday);
+            CHECK(tm.et_tm.tm_hour == sc.sc_hour);
+            CHECK(tm.et_tm.tm_min == 51);
+            CHECK(tm.et_tm.tm_sec == 40);
+
+            // the three spellings of the same instant agree
+            if (sc.sc_mday == 10) {
+                if (ascii_secs == 0) {
+                    ascii_secs = tv.tv_sec;
+                } else {
+                    CHECK(tv.tv_sec == ascii_secs);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("date_time_scanner same minute with a different offset")
+{
+    static const char* const TS1 = "2022-03-02T10:20:30-0700";
+    static const char* const TS2 = "2022-03-02T10:20:31+0000";
+
+    date_time_scanner dts;
+    timeval tv1, tv2;
+    exttm tm1, tm2;
+
+    REQUIRE(dts.scan(TS1, strlen(TS1), nullptr, &tm1, tv1, false) != nullptr);
+    REQUIRE(dts.scan(TS2, strlen(TS2), nullptr, &tm2, tv2, false) != nullptr);
+
+    // Same wall-clock minute, but seven hours apart.
+    CHECK(tv2.tv_sec - tv1.tv_sec == 1 - 7 * 60 * 60);
+}
+
+TEST_CASE("date_time_scanner scan_relocking")
+{
+    static const char* const TS1 = "2022-03-02T10:00";
+    static const char* const TS2 = "2022-03-02 10:00:00.123";
+
+    timeval tv;
+    exttm tm;
+
+    SUBCASE("scan() stays on the locked format")
+    {
+        date_time_scanner dts;
+
+        REQUIRE(dts.scan(TS1, strlen(TS1), nullptr, &tm, tv, false)
+                != nullptr);
+        CHECK(dts.scan(TS2, strlen(TS2), nullptr, &tm, tv, false) == nullptr);
+    }
+
+    SUBCASE("scan_relocking() finds the new format")
+    {
+        date_time_scanner dts;
+
+        REQUIRE(dts.scan_relocking(TS1, strlen(TS1), nullptr, &tm, tv, false)
+                != nullptr);
+        CHECK(dts.scan_relocking(TS2, strlen(TS2), nullptr, &tm, tv, false)
+              == TS2 + strlen(TS2));
+        CHECK(tm.et_tm.tm_hour == 10);
+        CHECK(tm.et_tm.tm_min == 0);
+        CHECK(tv.tv_usec == 123000);
+    }
+
+    SUBCASE("scan_relocking() keeps the lock when nothing else matches")
+    {
+        static const char* const BAD = "not a timestamp";
+
+        date_time_scanner dts;
+
+        REQUIRE(dts.scan_relocking(TS1, strlen(TS1), nullptr, &tm, tv, false)
+                != nullptr);
+        const auto locked_fmt = dts.dts_fmt_lock;
+        REQUIRE(locked_fmt != -1);
+
+        CHECK(dts.scan_relocking(BAD, strlen(BAD), nullptr, &tm, tv, false)
+              == nullptr);
+        CHECK(dts.dts_fmt_lock == locked_fmt);
+    }
+
+    SUBCASE("scan_relocking() returns a partial match")
+    {
+        static const char* const PARTIAL = "2022-03-02T11:30 and more";
+
+        date_time_scanner dts;
+
+        REQUIRE(dts.scan_relocking(TS1, strlen(TS1), nullptr, &tm, tv, false)
+                != nullptr);
+        const auto locked_fmt = dts.dts_fmt_lock;
+
+        const auto* end = dts.scan_relocking(
+            PARTIAL, strlen(PARTIAL), nullptr, &tm, tv, false);
+        REQUIRE(end != nullptr);
+        CHECK(end == PARTIAL + strlen("2022-03-02T11:30"));
+        CHECK(tm.et_tm.tm_hour == 11);
+        CHECK(tm.et_tm.tm_min == 30);
+        CHECK(dts.dts_fmt_lock == locked_fmt);
     }
 }

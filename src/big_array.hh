@@ -32,19 +32,17 @@
 #ifndef lnav_big_array_hh
 #define lnav_big_array_hh
 
+#include <algorithm>
+
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "base/lnav_log.hh"
 #include "base/math_util.hh"
 
 template<typename T>
 struct big_array {
     static const size_t DEFAULT_INCREMENT = 100 * 1000;
-
-    big_array()
-        : ba_ptr(nullptr), ba_size(0), ba_capacity(0){
-
-                                       };
 
     bool reserve(size_t size)
     {
@@ -56,8 +54,16 @@ struct big_array {
             munmap(this->ba_ptr,
                    roundup_size(this->ba_capacity * sizeof(T), getpagesize()));
         }
+        this->ba_size = 0;
 
-        this->ba_capacity = size + DEFAULT_INCREMENT;
+        // Growing by a flat increment costs a remap and a rebuild for every
+        // DEFAULT_INCREMENT elements an index gains, which a file being
+        // appended to reaches over and over.  Half again as much, once that
+        // beats the flat step, bounds that to O(log n) remaps.  The extra is
+        // address space rather than memory -- the pages past ba_size are
+        // never touched, so they are never faulted in.
+        this->ba_capacity
+            = std::max(size + DEFAULT_INCREMENT, size + size / 2);
         void* result
             = mmap(nullptr,
                    roundup_size(this->ba_capacity * sizeof(T), getpagesize()),
@@ -71,17 +77,11 @@ struct big_array {
         this->ba_ptr = (T*) result;
 
         return true;
-    };
+    }
 
-    void clear()
-    {
-        this->ba_size = 0;
-    };
+    void clear() { this->ba_size = 0; }
 
-    size_t size() const
-    {
-        return this->ba_size;
-    };
+    size_t size() const { return this->ba_size; }
 
     void shrink_to(size_t new_size)
     {
@@ -90,47 +90,29 @@ struct big_array {
         this->ba_size = new_size;
     }
 
-    bool empty() const
-    {
-        return this->ba_size == 0;
-    };
+    bool empty() const { return this->ba_size == 0; }
 
     void push_back(const T& val)
     {
         this->ba_ptr[this->ba_size] = val;
         this->ba_size += 1;
-    };
-
-    T& operator[](size_t index)
-    {
-        return this->ba_ptr[index];
-    };
-
-    const T& operator[](size_t index) const
-    {
-        return this->ba_ptr[index];
-    };
-
-    T& back()
-    {
-        return this->ba_ptr[this->ba_size - 1];
     }
 
-    typedef T* iterator;
+    T& operator[](size_t index) { return this->ba_ptr[index]; }
 
-    iterator begin()
-    {
-        return this->ba_ptr;
-    };
+    const T& operator[](size_t index) const { return this->ba_ptr[index]; }
 
-    iterator end()
-    {
-        return this->ba_ptr + this->ba_size;
-    };
+    T& back() { return this->ba_ptr[this->ba_size - 1]; }
 
-    T* ba_ptr;
-    size_t ba_size;
-    size_t ba_capacity;
+    using iterator = T*;
+
+    iterator begin() { return this->ba_ptr; }
+
+    iterator end() { return this->ba_ptr + this->ba_size; }
+
+    T* ba_ptr{nullptr};
+    size_t ba_size{0};
+    size_t ba_capacity{0};
 };
 
 #endif

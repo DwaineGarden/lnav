@@ -37,6 +37,7 @@
 
 #include "auto_mem.hh"
 #include "intern_string.hh"
+#include "strnatcmp.h"
 #include "ww898/cp_utf8.hpp"
 
 void scrub_to_utf8(char* buffer, size_t length);
@@ -88,7 +89,7 @@ endswith(const char* str, const char* suffix)
 }
 
 template<int N>
-inline bool
+bool
 endswith(const std::string& str, const char (&suffix)[N])
 {
     if (N - 1 > str.length()) {
@@ -100,7 +101,12 @@ endswith(const std::string& str, const char (&suffix)[N])
 
 void truncate_to(std::string& str, size_t max_char_len);
 
-std::string scrub_ws(const char* in);
+std::string scrub_ws(const char* in, ssize_t len = -1);
+inline std::string
+scrub_ws(const string_fragment& sf)
+{
+    return scrub_ws(sf.data(), sf.length());
+}
 
 inline std::string
 trim(const std::string& str)
@@ -113,6 +119,16 @@ trim(const std::string& str)
         ;
 
     return str.substr(start, end - start);
+}
+
+inline const char*
+ltrim(const char* str)
+{
+    while (isspace(*str)) {
+        str += 1;
+    }
+
+    return str;
 }
 
 inline std::string
@@ -162,23 +178,7 @@ toupper(const std::string& str)
     return toupper(str.c_str());
 }
 
-inline ssize_t
-utf8_char_to_byte_index(const std::string& str, ssize_t ch_index)
-{
-    ssize_t retval = 0;
-
-    while (ch_index > 0) {
-        auto ch_len
-            = ww898::utf::utf8::char_size([&str, retval]() {
-                  return std::make_pair(str[retval], str.length() - retval - 1);
-              }).unwrapOr(1);
-
-        retval += ch_len;
-        ch_index -= 1;
-    }
-
-    return retval;
-}
+ssize_t utf8_char_to_byte_index(const std::string& str, ssize_t ch_index);
 
 inline Result<size_t, const char*>
 utf8_string_length(const char* str, ssize_t len = -1)
@@ -207,11 +207,13 @@ utf8_string_length(const std::string& str)
     return utf8_string_length(str.c_str(), str.length());
 }
 
-bool is_url(const std::string& fn);
-
 bool is_blank(const std::string& str);
 
+size_t compute_indent_size(const std::string& str);
+
 size_t abbreviate_str(char* str, size_t len, size_t max_len);
+
+size_t last_word_str(char* str, size_t len, size_t max_len);
 
 void split_ws(const std::string& str, std::vector<std::string>& toks_out);
 
@@ -227,6 +229,123 @@ on_blank(const std::string& str, const std::string& def)
     }
 
     return str;
+}
+
+std::string to_superscript(const std::string& in);
+
+template<typename T, std::enable_if_t<std::is_integral_v<T>, bool> = true>
+std::string
+to_superscript(T in)
+{
+    return to_superscript(fmt::to_string(in));
+}
+
+struct strnatless {
+    bool operator()(const std::string& lhs, const std::string& rhs) const
+    {
+        return strnatcmp(lhs.size(), lhs.data(), rhs.size(), rhs.data()) < 0;
+    }
+
+    bool operator()(const string_fragment& lhs,
+                    const string_fragment& rhs) const
+    {
+        return strnatcmp(lhs.length(), lhs.data(), rhs.length(), rhs.data())
+            < 0;
+    }
+};
+
+struct strnatcaseless {
+    bool operator()(const std::string& lhs, const std::string& rhs) const
+    {
+        return strnatcasecmp(lhs.size(), lhs.data(), rhs.size(), rhs.data())
+            < 0;
+    }
+
+    bool operator()(const string_fragment& lhs,
+                    const string_fragment& rhs) const
+    {
+        return strnatcasecmp(lhs.length(), lhs.data(), rhs.length(), rhs.data())
+            < 0;
+    }
+};
+
+namespace lnav {
+class tainted_string {
+public:
+    explicit tainted_string(std::string s) : ts_str(std::move(s)) {}
+
+    bool operator==(const tainted_string& other) const
+    {
+        return this->ts_str == other.ts_str;
+    }
+
+    bool operator!=(const tainted_string& other) const
+    {
+        return this->ts_str != other.ts_str;
+    }
+
+    bool operator<(const tainted_string& other) const
+    {
+        return this->ts_str < other.ts_str;
+    }
+
+    bool empty() const { return this->ts_str.empty(); }
+
+    size_t length() const { return this->ts_str.length(); }
+
+    size_t size() const { return this->ts_str.size(); }
+
+    friend fmt::formatter<lnav::tainted_string>;
+
+private:
+    const std::string ts_str;
+};
+}  // namespace lnav
+
+namespace fmt {
+template<>
+struct formatter<lnav::tainted_string> : formatter<string_view> {
+    auto format(const lnav::tainted_string& ts, format_context& ctx)
+        -> decltype(ctx.out()) const;
+};
+}  // namespace fmt
+
+namespace lnav::pcre2pp {
+
+std::string quote(string_fragment sf);
+
+}  // namespace lnav::pcre2pp
+
+enum class text_align_t {
+    start,
+    center,
+    end,
+};
+
+inline string_fragment
+to_string_fragment(const auto_buffer& buf)
+{
+    return string_fragment::from_bytes(buf.begin(), buf.size());
+}
+
+inline bool
+operator==(const auto_buffer& buf, const string_fragment& sf)
+{
+    if ((int) buf.size() != sf.length()) {
+        return false;
+    }
+
+    return memcmp(buf.begin(), sf.data(), sf.length()) == 0;
+}
+
+inline bool
+operator==(const string_fragment& sf, const auto_buffer& buf)
+{
+    if ((int) buf.size() != sf.length()) {
+        return false;
+    }
+
+    return memcmp(buf.begin(), sf.data(), sf.length()) == 0;
 }
 
 #endif

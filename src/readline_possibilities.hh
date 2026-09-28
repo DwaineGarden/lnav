@@ -31,55 +31,22 @@
 #define LNAV_READLINE_POSSIBILITIES_H
 
 #include <string>
+#include <unordered_set>
 
-#include "readline_curses.hh"
 #include "textview_curses.hh"
 #include "view_helpers.hh"
 
 enum class text_quoting {
     none,
     sql,
+    prql,
     regex,
 };
 
-void add_view_text_possibilities(readline_curses* rlc,
-                                 int context,
-                                 const std::string& type,
-                                 textview_curses* tc,
-                                 text_quoting tq);
-
-template<typename T,
-         typename... Args,
-         std::enable_if_t<std::is_enum<T>::value, bool> = true>
-void
-add_view_text_possibilities(readline_curses* rlc, T context, Args... args)
-{
-    add_view_text_possibilities(
-        rlc, lnav::enums::to_underlying(context), args...);
-}
-
-void add_filter_expr_possibilities(readline_curses* rlc,
-                                   int context,
-                                   const std::string& type);
-
-template<typename T,
-         typename... Args,
-         std::enable_if_t<std::is_enum<T>::value, bool> = true>
-void
-add_filter_expr_possibilities(readline_curses* rlc, T context, Args... args)
-{
-    add_filter_expr_possibilities(
-        rlc, lnav::enums::to_underlying(context), args...);
-}
+std::unordered_set<std::string>
+view_text_possibilities(textview_curses& tc);
 
 void add_env_possibilities(ln_mode_t context);
-void add_filter_possibilities(textview_curses* tc);
-void add_mark_possibilities();
-void add_config_possibilities();
-void add_tag_possibilities();
-void add_file_possibilities();
 void add_recent_netlocs_possibilities();
-
-extern struct sqlite_metadata_callbacks lnav_sql_meta_callbacks;
 
 #endif  // LNAV_READLINE_POSSIBILITIES_H

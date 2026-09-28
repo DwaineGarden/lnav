@@ -28,26 +28,26 @@
  */
 
 #include <cstring>
+#include <vector>
 
 #include "views_vtab.hh"
 
 #include <unistd.h>
 
 #include "base/injector.bind.hh"
-#include "base/itertools.hh"
 #include "base/lnav_log.hh"
 #include "base/opt_util.hh"
 #include "config.h"
 #include "lnav.hh"
-#include "lnav_util.hh"
 #include "sql_util.hh"
-#include "view_curses.hh"
 #include "vtab_module_json.hh"
 #include "yajlpp/yajlpp_def.hh"
 
+using namespace lnav::roles::literals;
+
 template<>
 struct from_sqlite<lnav_view_t> {
-    inline lnav_view_t operator()(int argc, sqlite3_value** val, int argi)
+    lnav_view_t operator()(int argc, sqlite3_value** val, int argi)
     {
         const char* view_name = (const char*) sqlite3_value_text(val[argi]);
         auto view_index_opt = view_from_string(view_name);
@@ -123,12 +123,19 @@ struct from_sqlite<std::shared_ptr<lnav::pcre2pp::code>> {
     }
 };
 
-static const typed_json_path_container<breadcrumb::possibility>
-    breadcrumb_possibility_handlers = {
+namespace {
+
+const typed_json_path_container<breadcrumb::possibility>&
+get_breadcrumb_possibility_handlers()
+{
+    static const typed_json_path_container<breadcrumb::possibility> retval = {
         yajlpp::property_handler("display_value")
             .for_field(&breadcrumb::possibility::p_display_value,
                        &attr_line_t::al_string),
-};
+    };
+
+    return retval;
+}
 
 struct resolved_crumb {
     resolved_crumb() = default;
@@ -147,38 +154,146 @@ struct resolved_crumb {
     std::vector<breadcrumb::possibility> rc_possibilities;
 };
 
-static const typed_json_path_container<resolved_crumb> breadcrumb_crumb_handlers
-    = {
+const typed_json_path_container<resolved_crumb>&
+get_breadcrumb_crumb_handlers()
+{
+    static const typed_json_path_container<resolved_crumb> retval = {
         yajlpp::property_handler("display_value")
             .for_field(&resolved_crumb::rc_display_value),
         yajlpp::property_handler("search_placeholder")
             .for_field(&resolved_crumb::rc_search_placeholder),
         yajlpp::property_handler("possibilities#")
             .for_field(&resolved_crumb::rc_possibilities)
-            .with_children(breadcrumb_possibility_handlers),
-};
+            .with_children(get_breadcrumb_possibility_handlers()),
+    };
+
+    return retval;
+}
 
 struct top_line_meta {
-    nonstd::optional<std::string> tlm_time;
-    nonstd::optional<std::string> tlm_file;
-    nonstd::optional<std::string> tlm_anchor;
+    std::optional<std::string> tlm_time;
+    std::optional<std::string> tlm_file;
+    std::optional<std::string> tlm_anchor;
     std::vector<resolved_crumb> tlm_crumbs;
 };
 
-static const typed_json_path_container<top_line_meta> top_line_meta_handlers = {
-    yajlpp::property_handler("time").for_field(&top_line_meta::tlm_time),
-    yajlpp::property_handler("file").for_field(&top_line_meta::tlm_file),
-    yajlpp::property_handler("anchor").for_field(&top_line_meta::tlm_anchor),
-    yajlpp::property_handler("breadcrumbs#")
-        .for_field(&top_line_meta::tlm_crumbs)
-        .with_children(breadcrumb_crumb_handlers),
+const typed_json_path_container<top_line_meta>&
+get_top_line_meta_handlers()
+{
+    static const typed_json_path_container<top_line_meta> retval = {
+        yajlpp::property_handler("time").for_field(&top_line_meta::tlm_time),
+        yajlpp::property_handler("file").for_field(&top_line_meta::tlm_file),
+        yajlpp::property_handler("anchor").for_field(
+            &top_line_meta::tlm_anchor),
+        yajlpp::property_handler("breadcrumbs#")
+            .for_field(&top_line_meta::tlm_crumbs)
+            .with_children(get_breadcrumb_crumb_handlers()),
+    };
+
+    return retval;
+}
+
+const typed_json_path_container<textview_curses::selected_text_info>&
+get_selected_text_handlers()
+{
+    static const typed_json_path_container<line_range> line_range_handlers = {
+        yajlpp::property_handler("start").for_field(&line_range::lr_start),
+        yajlpp::property_handler("end").for_field(&line_range::lr_end),
+    };
+
+    static const typed_json_path_container<textview_curses::selected_text_info>
+        retval = {
+            yajlpp::property_handler("line").for_field(
+                &textview_curses::selected_text_info::sti_line),
+            yajlpp::property_handler("range")
+                .for_child(&textview_curses::selected_text_info::sti_range)
+                .with_children(line_range_handlers),
+            yajlpp::property_handler("value").for_field(
+                &textview_curses::selected_text_info::sti_value),
+            yajlpp::property_handler("href").for_field(
+                &textview_curses::selected_text_info::sti_href),
+        };
+
+    return retval;
+}
+
+enum class row_details_t {
+    hide,
+    show,
 };
 
-struct lnav_views : public tvt_iterator_cursor<lnav_views> {
+enum class word_wrap_t {
+    none,
+    normal,
+};
+
+struct view_options {
+    std::optional<row_details_t> vo_row_details;
+    std::optional<row_details_t> vo_row_time_offset;
+    std::optional<int32_t> vo_overlay_focus;
+    std::optional<word_wrap_t> vo_word_wrap;
+    std::optional<row_details_t> vo_hidden_fields;
+
+    bool empty() const
+    {
+        return !this->vo_row_details.has_value()
+            && !this->vo_row_time_offset.has_value()
+            && !this->vo_overlay_focus.has_value()
+            && !this->vo_word_wrap.has_value()
+            && !this->vo_hidden_fields.has_value();
+    }
+};
+
+const typed_json_path_container<view_options>&
+get_view_options_handlers()
+{
+    static constexpr json_path_handler_base::enum_value_t ROW_DETAILS_ENUM[] = {
+        {"hide"_frag, row_details_t::hide},
+        {"show"_frag, row_details_t::show},
+
+        json_path_handler_base::ENUM_TERMINATOR,
+    };
+
+    static constexpr json_path_handler_base::enum_value_t WORD_WRAP_ENUM[] = {
+        {"none"_frag, word_wrap_t::none},
+        {"normal"_frag, word_wrap_t::normal},
+
+        json_path_handler_base::ENUM_TERMINATOR,
+    };
+
+    static const typed_json_path_container<view_options> retval = {
+        yajlpp::property_handler("row-details")
+            .with_enum_values(ROW_DETAILS_ENUM)
+            .with_description(
+                "Show or hide the details overlay for the focused row")
+            .for_field(&view_options::vo_row_details),
+        yajlpp::property_handler("row-time-offset")
+            .with_enum_values(ROW_DETAILS_ENUM)
+            .with_description(
+                "Show or hide the time-offset from a row to the previous mark")
+            .for_field(&view_options::vo_row_time_offset),
+        yajlpp::property_handler("hidden-fields")
+            .with_enum_values(ROW_DETAILS_ENUM)
+            .with_description(
+                "Show or hide fields that have been hidden by the user")
+            .for_field(&view_options::vo_hidden_fields),
+        yajlpp::property_handler("overlay-focused-line")
+            .with_description("The focused line in an overlay")
+            .for_field(&view_options::vo_overlay_focus),
+        yajlpp::property_handler("word-wrap")
+            .with_enum_values(WORD_WRAP_ENUM)
+            .with_description("How to break long lines")
+            .for_field(&view_options::vo_word_wrap),
+    };
+
+    return retval;
+}
+
+struct lnav_views : tvt_iterator_cursor<lnav_views> {
     static constexpr const char* NAME = "lnav_views";
     static constexpr const char* CREATE_STMT = R"(
 -- Access lnav's views through this table.
-CREATE TABLE lnav_views (
+CREATE TABLE lnav_db.lnav_views (
     name TEXT PRIMARY KEY,  -- The name of the view.
     top INTEGER,            -- The number of the line at the top of the view, starting from zero.
     left INTEGER,           -- The left position of the viewport.
@@ -190,7 +305,12 @@ CREATE TABLE lnav_views (
     search TEXT,            -- The text to search for in the view.
     filtering INTEGER,      -- Indicates if the view is applying filters.
     movement TEXT,          -- The movement mode, either 'top' or 'cursor'.
-    top_meta TEXT           -- A JSON object that contains metadata related to the top line in the view.
+    top_meta TEXT,          -- A JSON object that contains metadata related to the top line in the view.
+    selection INTEGER,      -- The number of the line that is focused for selection.
+    options TEXT,           -- A JSON object that contains optional settings for this view.
+    selected_text TEXT,     -- A JSON object that contains information about the text selected by the mouse in the view.
+    row_details TEXT,       -- A JSON object that contains information about the focused row.
+    view_details TEXT       -- A JSON object that contains view-specific metadata, such as the last SQL query run for the db view.
 );
 )";
 
@@ -204,16 +324,17 @@ CREATE TABLE lnav_views (
     {
         lnav_view_t view_index = (lnav_view_t) std::distance(
             std::begin(lnav_data.ld_views), vc.iter);
-        textview_curses& tc = *vc.iter;
+        const auto& tc = *vc.iter;
         unsigned long width;
         vis_line_t height;
 
         tc.get_dimensions(height, width);
         switch (col) {
-            case 0:
-                sqlite3_result_text(
-                    ctx, lnav_view_strings[view_index], -1, SQLITE_STATIC);
+            case 0: {
+                const auto& vs = lnav_view_strings[view_index];
+                sqlite3_result_text(ctx, vs.data(), vs.length(), SQLITE_STATIC);
                 break;
+            }
             case 1:
                 sqlite3_result_int(ctx, (int) tc.get_top());
                 break;
@@ -229,16 +350,18 @@ CREATE TABLE lnav_views (
             case 5: {
                 auto* time_source
                     = dynamic_cast<text_time_translator*>(tc.get_sub_source());
+                auto sel = tc.get_selection();
 
-                if (time_source != nullptr && tc.get_inner_height() > 0) {
-                    auto top_time_opt = time_source->time_for_row(tc.get_top());
+                if (time_source != nullptr && tc.get_inner_height() > 0 && sel)
+                {
+                    auto top_ri_opt = time_source->time_for_row(sel.value());
 
-                    if (top_time_opt) {
+                    if (top_ri_opt) {
                         char timestamp[64];
 
                         sql_strftime(timestamp,
                                      sizeof(timestamp),
-                                     top_time_opt.value(),
+                                     top_ri_opt->ri_time,
                                      ' ');
                         sqlite3_result_text(
                             ctx, timestamp, -1, SQLITE_TRANSIENT);
@@ -252,11 +375,11 @@ CREATE TABLE lnav_views (
             }
             case 6: {
                 to_sqlite(ctx, tc.map_top_row([](const auto& al) {
-                    return get_string_attr(al.get_attrs(), logline::L_FILE) |
+                    return get_string_attr(al.get_attrs(), L_FILE) |
                         [](const auto wrapper) {
                             auto lf = wrapper.get();
 
-                            return nonstd::make_optional(lf->get_filename());
+                            return std::make_optional(lf->get_filename());
                         };
                 }));
                 break;
@@ -285,7 +408,11 @@ CREATE TABLE lnav_views (
                 break;
             }
             case 11: {
-                static const size_t MAX_POSSIBILITIES = 128;
+                static constexpr size_t MAX_POSSIBILITIES = 128;
+
+                if (sqlite3_vtab_nochange(ctx)) {
+                    return SQLITE_OK;
+                }
 
                 auto* tss = tc.get_sub_source();
 
@@ -293,39 +420,43 @@ CREATE TABLE lnav_views (
                     auto* time_source = dynamic_cast<text_time_translator*>(
                         tc.get_sub_source());
                     auto* ta = dynamic_cast<text_anchors*>(tc.get_sub_source());
+                    auto sel = tc.get_selection();
+                    // Like top_time and top_file, the metadata is for the
+                    // selected line, which is the top in "top" movement mode.
+                    const auto meta_row = sel.value_or(tc.get_top());
                     std::vector<breadcrumb::crumb> crumbs;
 
-                    tss->text_crumbs_for_line(tc.get_top(), crumbs);
+                    tss->text_crumbs_for_line(meta_row, crumbs);
 
                     top_line_meta tlm;
-                    if (time_source != nullptr) {
-                        auto top_time_opt
-                            = time_source->time_for_row(tc.get_top());
+                    if (sel && time_source != nullptr) {
+                        auto top_ri_opt
+                            = time_source->time_for_row(sel.value());
 
-                        if (top_time_opt) {
+                        if (top_ri_opt) {
                             char timestamp[64];
 
                             sql_strftime(timestamp,
                                          sizeof(timestamp),
-                                         top_time_opt.value(),
+                                         top_ri_opt->ri_time,
                                          ' ');
                             tlm.tlm_time = timestamp;
                         }
                     }
                     if (ta != nullptr) {
-                        tlm.tlm_anchor = ta->anchor_for_row(tc.get_top());
+                        tlm.tlm_anchor = ta->anchor_for_row(meta_row);
                     }
                     tlm.tlm_file = tc.map_top_row([](const auto& al) {
-                        return get_string_attr(al.get_attrs(), logline::L_FILE)
-                            | [](const auto wrapper) {
-                                  auto lf = wrapper.get();
+                        return get_string_attr(al.get_attrs(), L_FILE) |
+                            [](const auto wrapper) {
+                                auto lf = wrapper.get();
 
-                                  return nonstd::make_optional(
-                                      lf->get_filename());
-                              };
+                                return std::make_optional(lf->get_filename());
+                            };
                     });
                     for (const auto& crumb : crumbs) {
-                        auto poss = crumb.c_possibility_provider();
+                        auto poss
+                            = crumb.c_possibility_provider(string_fragment{});
                         if (poss.size() > MAX_POSSIBILITIES) {
                             poss.resize(MAX_POSSIBILITIES);
                         }
@@ -334,9 +465,98 @@ CREATE TABLE lnav_views (
                             crumb.c_search_placeholder,
                             std::move(poss));
                     }
-                    to_sqlite(ctx, top_line_meta_handlers.to_json_string(tlm));
+                    to_sqlite(ctx,
+                              get_top_line_meta_handlers().to_json_string(tlm));
                 } else {
                     sqlite3_result_null(ctx);
+                }
+                break;
+            }
+            case 12: {
+                auto sel = tc.get_selection();
+                if (sel) {
+                    sqlite3_result_int(ctx, (int) sel.value());
+                } else {
+                    sqlite3_result_null(ctx);
+                }
+                break;
+            }
+            case 13: {
+                if (sqlite3_vtab_nochange(ctx)) {
+                    return SQLITE_OK;
+                }
+
+                auto* text_accel_p
+                    = dynamic_cast<text_accel_source*>(tc.get_sub_source());
+                auto vo = view_options{};
+
+                vo.vo_word_wrap = tc.get_word_wrap() ? word_wrap_t::normal
+                                                     : word_wrap_t::none;
+                vo.vo_hidden_fields = tc.get_hide_fields()
+                    ? row_details_t::hide
+                    : row_details_t::show;
+                if (tc.get_overlay_source()) {
+                    auto ov_sel = tc.get_overlay_selection();
+
+                    vo.vo_row_details
+                        = tc.get_overlay_source()->get_show_details_in_overlay()
+                        ? row_details_t::show
+                        : row_details_t::hide;
+                    if (ov_sel) {
+                        vo.vo_overlay_focus = ov_sel.value();
+                    }
+                }
+                if (text_accel_p != nullptr) {
+                    vo.vo_row_time_offset
+                        = text_accel_p->is_time_offset_enabled()
+                        ? row_details_t::show
+                        : row_details_t::hide;
+                }
+
+                if (vo.empty()) {
+                    sqlite3_result_null(ctx);
+                } else {
+                    to_sqlite(ctx,
+                              get_view_options_handlers().to_json_string(vo));
+                }
+                break;
+            }
+            case 14: {
+                if (tc.tc_selected_text) {
+                    to_sqlite(ctx,
+                              get_selected_text_handlers().to_json_string(
+                                  tc.tc_selected_text.value()));
+                } else {
+                    sqlite3_result_null(ctx);
+                }
+                break;
+            }
+            case 15: {
+                auto* tdp
+                    = dynamic_cast<text_detail_provider*>(tc.get_sub_source());
+                if (tdp == nullptr) {
+                    sqlite3_result_null(ctx);
+                } else {
+                    auto dets = tdp->text_row_details(tc);
+                    if (!dets) {
+                        sqlite3_result_null(ctx);
+                    } else {
+                        to_sqlite(ctx, std::move(dets.value()));
+                    }
+                }
+                break;
+            }
+            case 16: {
+                auto* tss = tc.get_sub_source();
+                if (tss == nullptr) {
+                    sqlite3_result_null(ctx);
+                } else {
+                    auto dets = tss->text_view_details();
+                    if (!dets) {
+                        sqlite3_result_null(ctx);
+                    } else {
+                        to_sqlite(ctx, dets.value());
+                    }
                 }
                 break;
             }
@@ -372,44 +592,107 @@ CREATE TABLE lnav_views (
                    const char* search,
                    bool do_filtering,
                    string_fragment movement,
-                   const char* top_meta)
+                   const char* top_meta,
+                   std::optional<int64_t> selection,
+                   std::optional<string_fragment> options,
+                   std::optional<string_fragment> selected_text,
+                   std::optional<string_fragment> row_details,
+                   std::optional<string_fragment> view_details)
     {
         auto& tc = lnav_data.ld_views[index];
         auto* time_source
             = dynamic_cast<text_time_translator*>(tc.get_sub_source());
+        auto* text_accel_p
+            = dynamic_cast<text_accel_source*>(tc.get_sub_source());
+        view_options vo;
 
-        if (tc.get_top() != top_row) {
-            tc.set_top(vis_line_t(top_row));
-        } else if (top_time != nullptr && time_source != nullptr) {
-            date_time_scanner dts;
-            struct timeval tv;
+        if (options) {
+            static const intern_string_t OPTIONS_SRC
+                = intern_string::lookup("options");
 
-            if (dts.convert_to_timeval(top_time, -1, nullptr, tv)) {
-                auto last_time_opt = time_source->time_for_row(tc.get_top());
+            auto parse_res = get_view_options_handlers()
+                                 .parser_for(OPTIONS_SRC)
+                                 .of(options.value());
+            if (parse_res.isErr()) {
+                auto errmsg = parse_res.unwrapErr();
 
-                if (last_time_opt) {
-                    auto last_time = last_time_opt.value();
-                    if (tv != last_time) {
-                        time_source->row_for_time(tv) |
-                            [&tc](auto row) { tc.set_top(row); };
-                    }
-                }
-            } else {
-                tab->zErrMsg = sqlite3_mprintf("Invalid time: %s", top_time);
+                set_vtable_errmsg(tab, errmsg[0]);
                 return SQLITE_ERROR;
             }
+
+            vo = parse_res.unwrap();
+        }
+
+        if (tc.get_top() != top_row) {
+            log_debug(
+                "setting top for %s to %lld", tc.get_title().c_str(), top_row);
+            tc.set_top(vis_line_t(top_row));
+            if (!tc.is_selectable()) {
+                selection = top_row;
+            }
+        } else if (top_time != nullptr && time_source != nullptr
+                   && selection == tc.get_selection())
+        {
+            auto sel = tc.get_selection();
+            date_time_scanner dts;
+            timeval tv;
+
+            log_debug("setting top time for %s to %s",
+                      tc.get_title().c_str(),
+                      top_time);
+            if (!dts.convert_to_timeval(top_time, -1, nullptr, tv)) {
+                auto um = lnav::console::user_message::error(
+                              attr_line_t("Invalid ")
+                                  .append_quoted("top_time"_symbol)
+                                  .append(" value"))
+                              .with_reason(
+                                  attr_line_t("Unrecognized time value: ")
+                                      .append(lnav::roles::string(top_time)))
+                              .move();
+                set_vtable_errmsg(tab, um);
+                return SQLITE_ERROR;
+            }
+            if (!sel) {
+                log_debug("  %s has no rows to move to the time",
+                          tc.get_title().c_str());
+            } else {
+                auto last_ri_opt = time_source->time_for_row(sel.value());
+
+                if (last_ri_opt) {
+                    auto last_time = last_ri_opt->ri_time;
+                    if (tv != last_time) {
+                        time_source->row_for_time(tv) |
+                            [&tc, &selection](auto row) {
+                                log_debug("setting top for %s to %d from time",
+                                          tc.get_title().c_str(),
+                                          (int) row);
+                                selection = row;
+                                tc.set_selection(row);
+                            };
+                        if (!tc.is_selectable()) {
+                            selection = tc.get_top();
+                        }
+                    }
+                } else {
+                    log_warning("  could not get for time top row of %s",
+                                tc.get_title().c_str());
+                }
+            }
+        }
+        if (tc.get_selection() != selection) {
+            tc.set_selection(vis_line_t(selection.value_or(-1_vl)));
         }
         if (top_meta != nullptr) {
             static const intern_string_t SQL_SRC
                 = intern_string::lookup("top_meta");
 
-            auto parse_res = top_line_meta_handlers.parser_for(SQL_SRC).of(
-                string_fragment::from_c_str(top_meta));
+            auto parse_res
+                = get_top_line_meta_handlers().parser_for(SQL_SRC).of(
+                    string_fragment::from_c_str(top_meta));
             if (parse_res.isErr()) {
                 auto errmsg = parse_res.unwrapErr();
-                tab->zErrMsg = sqlite3_mprintf(
-                    "Invalid top_meta: %s",
-                    errmsg[0].to_attr_line().get_string().c_str());
+
+                set_vtable_errmsg(tab, errmsg[0]);
                 return SQLITE_ERROR;
             }
 
@@ -417,9 +700,16 @@ CREATE TABLE lnav_views (
 
             if (index == LNV_TEXT && tlm.tlm_file) {
                 if (!lnav_data.ld_text_source.to_front(tlm.tlm_file.value())) {
-                    auto errmsg = parse_res.unwrapErr();
-                    tab->zErrMsg = sqlite3_mprintf("unknown top_meta.file: %s",
-                                                   tlm.tlm_file->c_str());
+                    auto um
+                        = lnav::console::user_message::error(
+                              attr_line_t("Invalid ")
+                                  .append_quoted("top_meta.file"_symbol)
+                                  .append(" value"))
+                              .with_reason(attr_line_t("Unknown text file: ")
+                                               .append(lnav::roles::file(
+                                                   tlm.tlm_file.value())))
+                              .move();
+                    set_vtable_errmsg(tab, um);
                     return SQLITE_ERROR;
                 }
             }
@@ -431,27 +721,36 @@ CREATE TABLE lnav_views (
                 auto req_anchor = tlm.tlm_anchor.value();
                 auto req_anchor_top = ta->row_for_anchor(req_anchor);
                 if (req_anchor_top) {
-                    auto curr_anchor = ta->anchor_for_row(tc.get_top());
+                    auto curr_anchor = ta->anchor_for_row(
+                        tc.get_selection().value_or(tc.get_top()));
 
                     if (!curr_anchor || curr_anchor.value() != req_anchor) {
-                        tc.set_top(req_anchor_top.value());
+                        tc.set_selection(req_anchor_top.value());
                     }
                 } else {
-                    tab->zErrMsg = sqlite3_mprintf(
-                        "unknown top_meta.anchor: %s", req_anchor.c_str());
+                    auto um
+                        = lnav::console::user_message::error(
+                              attr_line_t("Invalid ")
+                                  .append_quoted("top_meta.anchor"_symbol)
+                                  .append(" value"))
+                              .with_reason(
+                                  attr_line_t("Unknown anchor: ")
+                                      .append(lnav::roles::symbol(req_anchor)))
+                              .move();
+                    set_vtable_errmsg(tab, um);
                     return SQLITE_ERROR;
                 }
             }
         }
-        if (movement == "top") {
+        if (movement == "top" && tc.is_selectable()) {
             tc.set_selectable(false);
-        } else if (movement == "cursor") {
+        } else if (movement == "cursor" && !tc.is_selectable()) {
             // First, toggle modes, otherwise get_selection() returns top
             tc.set_selectable(true);
 
             auto cur_sel = tc.get_selection();
             auto cur_top = tc.get_top();
-            auto cur_bot = tc.get_bottom();
+            auto cur_bot = tc.get_bottom() - tc.get_tail_space();
 
             if (cur_sel < cur_top) {
                 tc.set_selection(cur_top);
@@ -459,15 +758,46 @@ CREATE TABLE lnav_views (
                 tc.set_selection(cur_bot);
             }
         }
+        if (vo.vo_row_details && tc.get_overlay_source()) {
+            auto enable = vo.vo_row_details.value() == row_details_t::show;
+            tc.set_show_details_in_overlay(enable);
+            tc.set_needs_update();
+        }
+        if (vo.vo_overlay_focus && tc.get_overlay_source()) {
+            tc.set_overlay_selection(vis_line_t(vo.vo_overlay_focus.value()));
+        }
+        if (vo.vo_word_wrap) {
+            auto wrap_words = vo.vo_word_wrap.value() == word_wrap_t::normal;
+            tc.set_word_wrap(wrap_words);
+            if (wrap_words) {
+                left = 0;  // reset horizontal scroll position
+            }
+        }
+        if (vo.vo_hidden_fields) {
+            tc.set_hide_fields(vo.vo_hidden_fields.value()
+                               == row_details_t::hide);
+        }
+        if (text_accel_p != nullptr && vo.vo_row_time_offset) {
+            switch (vo.vo_row_time_offset.value()) {
+                case row_details_t::show:
+                    text_accel_p->set_time_offset(true);
+                    break;
+                case row_details_t::hide:
+                    text_accel_p->set_time_offset(false);
+                    break;
+            }
+        }
         tc.set_left(left);
         tc.set_paused(is_paused);
-        tc.execute_search(search);
+        tc.execute_search(search != nullptr ? search : "");
         auto* tss = tc.get_sub_source();
         if (tss != nullptr && tss->tss_supports_filtering
             && tss->tss_apply_filters != do_filtering)
         {
             tss->tss_apply_filters = do_filtering;
             tss->text_filters_changed();
+            lnav_data.ld_filter_status_source.update_filtered(tss);
+            lnav_data.ld_status[LNS_FILTER].set_needs_update();
         }
 
         return SQLITE_OK;
@@ -480,7 +810,7 @@ struct lnav_view_stack : public tvt_iterator_cursor<lnav_view_stack> {
     static constexpr const char* NAME = "lnav_view_stack";
     static constexpr const char* CREATE_STMT = R"(
 -- Access lnav's view stack through this table.
-CREATE TABLE lnav_view_stack (
+CREATE TABLE lnav_db.lnav_view_stack (
     name TEXT
 );
 )";
@@ -495,10 +825,11 @@ CREATE TABLE lnav_view_stack (
         auto view = lnav_view_t(tc - lnav_data.ld_views);
 
         switch (col) {
-            case 0:
-                sqlite3_result_text(
-                    ctx, lnav_view_strings[view], -1, SQLITE_STATIC);
+            case 0: {
+                const auto& vs = lnav_view_strings[view];
+                sqlite3_result_text(ctx, vs.data(), vs.length(), SQLITE_STATIC);
                 break;
+            }
         }
 
         return SQLITE_OK;
@@ -514,6 +845,8 @@ CREATE TABLE lnav_view_stack (
 
         lnav_data.ld_last_view = *lnav_data.ld_view_stack.top();
         lnav_data.ld_view_stack.pop_back();
+        clear_preview();
+
         return SQLITE_OK;
     }
 
@@ -556,15 +889,15 @@ struct lnav_view_filter_base {
         iterator& operator++()
         {
             while (this->i_view_index < LNV__MAX) {
-                textview_curses& tc = lnav_data.ld_views[this->i_view_index];
-                text_sub_source* tss = tc.get_sub_source();
+                const auto& tc = lnav_data.ld_views[this->i_view_index];
+                auto* tss = tc.get_sub_source();
 
                 if (tss == nullptr) {
                     this->i_view_index = lnav_view_t(this->i_view_index + 1);
                     continue;
                 }
 
-                filter_stack& fs = tss->get_filters();
+                const auto& fs = tss->get_filters();
 
                 this->i_filter_index += 1;
                 if (this->i_filter_index >= (ssize_t) fs.size()) {
@@ -616,12 +949,12 @@ struct lnav_view_filter_base {
 };
 
 struct lnav_view_filters
-    : public tvt_iterator_cursor<lnav_view_filters>
-    , public lnav_view_filter_base {
+    : tvt_iterator_cursor<lnav_view_filters>
+    , lnav_view_filter_base {
     static constexpr const char* NAME = "lnav_view_filters";
     static constexpr const char* CREATE_STMT = R"(
 -- Access lnav's filters through this table.
-CREATE TABLE lnav_view_filters (
+CREATE TABLE lnav_db.lnav_view_filters (
     view_name TEXT,                    -- The name of the view.
     filter_id INTEGER DEFAULT 0,       -- The filter identifier.
     enabled   INTEGER DEFAULT 1,       -- Indicates if the filter is enabled/disabled.
@@ -633,18 +966,17 @@ CREATE TABLE lnav_view_filters (
 
     int get_column(cursor& vc, sqlite3_context* ctx, int col)
     {
-        textview_curses& tc = lnav_data.ld_views[vc.iter.i_view_index];
-        text_sub_source* tss = tc.get_sub_source();
-        filter_stack& fs = tss->get_filters();
+        auto& tc = lnav_data.ld_views[vc.iter.i_view_index];
+        auto* tss = tc.get_sub_source();
+        auto& fs = tss->get_filters();
         auto tf = *(fs.begin() + vc.iter.i_filter_index);
 
         switch (col) {
-            case 0:
-                sqlite3_result_text(ctx,
-                                    lnav_view_strings[vc.iter.i_view_index],
-                                    -1,
-                                    SQLITE_STATIC);
+            case 0: {
+                const auto& vs = lnav_view_strings[vc.iter.i_view_index];
+                sqlite3_result_text(ctx, vs.data(), vs.length(), SQLITE_STATIC);
                 break;
+            }
             case 1:
                 to_sqlite(ctx, tf->get_index());
                 break;
@@ -687,20 +1019,25 @@ CREATE TABLE lnav_view_filters (
     int insert_row(sqlite3_vtab* tab,
                    sqlite3_int64& rowid_out,
                    lnav_view_t view_index,
-                   nonstd::optional<int64_t> _filter_id,
-                   nonstd::optional<bool> enabled,
-                   nonstd::optional<text_filter::type_t> type,
-                   nonstd::optional<filter_lang_t> lang,
+                   std::optional<int64_t> _filter_id,
+                   std::optional<bool> enabled,
+                   std::optional<text_filter::type_t> type,
+                   std::optional<filter_lang_t> lang,
                    sqlite3_value* pattern_str)
     {
         auto* mod_vt = (vtab_module<lnav_view_filters>::vtab*) tab;
         auto& tc = lnav_data.ld_views[view_index];
         auto* tss = tc.get_sub_source();
+        if (tss == nullptr) {
+            log_warning("ignoring INSERT on lnav_view_filters for %s",
+                        tc.get_title().c_str());
+            return SQLITE_OK;
+        }
         auto& fs = tss->get_filters();
         auto filter_index
             = lang.value_or(filter_lang_t::REGEX) == filter_lang_t::REGEX
             ? fs.next_index()
-            : nonstd::make_optional(size_t{0});
+            : std::make_optional(size_t{0});
         if (!filter_index) {
             throw sqlite_func_error("Too many filters");
         }
@@ -788,10 +1125,7 @@ CREATE TABLE lnav_view_filters (
                 auto set_res = lnav_data.ld_log_source.set_sql_filter(
                     clause, stmt.release());
                 if (set_res.isErr()) {
-                    tab->zErrMsg = sqlite3_mprintf(
-                        "%s%s",
-                        sqlitepp::ERROR_PREFIX,
-                        lnav::to_json(set_res.unwrapErr()).c_str());
+                    set_vtable_errmsg(tab, set_res.unwrapErr());
                     return SQLITE_ERROR;
                 }
                 tf = lnav_data.ld_log_source.get_sql_filter().value();
@@ -840,7 +1174,7 @@ CREATE TABLE lnav_view_filters (
     {
         auto* mod_vt = (vtab_module<lnav_view_filters>::vtab*) tab;
         auto view_index = lnav_view_t(rowid >> 32);
-        auto filter_index = rowid & 0xffffffffLL;
+        auto filter_index = rowid & 0xffffffffULL;
         auto& tc = lnav_data.ld_views[view_index];
         auto* tss = tc.get_sub_source();
         auto& fs = tss->get_filters();
@@ -889,10 +1223,7 @@ CREATE TABLE lnav_view_filters (
             auto set_res = lnav_data.ld_log_source.set_sql_filter(
                 clause, stmt.release());
             if (set_res.isErr()) {
-                tab->zErrMsg = sqlite3_mprintf(
-                    "%s%s",
-                    sqlitepp::ERROR_PREFIX,
-                    lnav::to_json(set_res.unwrapErr()).c_str());
+                set_vtable_errmsg(tab, set_res.unwrapErr());
                 return SQLITE_ERROR;
             }
             *iter = lnav_data.ld_log_source.get_sql_filter().value();
@@ -907,6 +1238,9 @@ CREATE TABLE lnav_view_filters (
             auto conflict_mode = sqlite3_vtab_on_conflict(mod_vt->v_db);
             auto new_cmd = pf->to_command();
             for (auto& filter : fs) {
+                if (filter->get_index() == filter_index) {
+                    continue;
+                }
                 if (filter->to_command() == new_cmd) {
                     switch (conflict_mode) {
                         case SQLITE_FAIL:
@@ -941,13 +1275,215 @@ CREATE TABLE lnav_view_filters (
     }
 };
 
+struct lnav_view_search_base {
+    struct iterator {
+        using difference_type = int;
+        using value_type = textview_curses::named_search;
+        using pointer = textview_curses::named_search*;
+        using reference = textview_curses::named_search&;
+        using iterator_category = std::forward_iterator_tag;
+
+        lnav_view_t i_view_index;
+        int i_search_index;
+
+        iterator(lnav_view_t view = LNV_LOG, int search = -1)
+            : i_view_index(view), i_search_index(search)
+        {
+        }
+
+        iterator& operator++()
+        {
+            while (this->i_view_index < LNV__MAX) {
+                const auto& tc = lnav_data.ld_views[this->i_view_index];
+
+                this->i_search_index += 1;
+                if (this->i_search_index
+                    >= (ssize_t) tc.get_named_searches().size())
+                {
+                    this->i_search_index = -1;
+                    this->i_view_index = lnav_view_t(this->i_view_index + 1);
+                } else {
+                    break;
+                }
+            }
+
+            return *this;
+        }
+
+        bool operator==(const iterator& other) const
+        {
+            return this->i_view_index == other.i_view_index
+                && this->i_search_index == other.i_search_index;
+        }
+
+        bool operator!=(const iterator& other) const
+        {
+            return !(*this == other);
+        }
+    };
+
+    iterator begin()
+    {
+        iterator retval = iterator();
+
+        return ++retval;
+    }
+
+    iterator end() { return {LNV__MAX, -1}; }
+
+    sqlite_int64 get_rowid(iterator iter)
+    {
+        const auto& tc = lnav_data.ld_views[iter.i_view_index];
+        const auto& ns = tc.get_named_searches()[iter.i_search_index];
+
+        sqlite_int64 retval = iter.i_view_index;
+
+        retval = retval << 32;
+        retval = retval | ns.ns_slot;
+
+        return retval;
+    }
+};
+
+struct lnav_view_searches
+    : tvt_iterator_cursor<lnav_view_searches>
+    , lnav_view_search_base {
+    static constexpr const char* NAME = "lnav_view_searches";
+    static constexpr const char* CREATE_STMT = R"(
+-- Access lnav's named searches through this table.
+CREATE TABLE lnav_db.lnav_view_searches (
+    view_name TEXT,      -- The name of the view.
+    enabled   INTEGER,   -- Indicates whether this search is enabled or disabled.
+    name      TEXT,      -- The name of the search.
+    pattern   TEXT       -- The regular expression being searched for.
+);
+)";
+
+    int get_column(cursor& vc, sqlite3_context* ctx, int col)
+    {
+        const auto& tc = lnav_data.ld_views[vc.iter.i_view_index];
+        const auto& ns = tc.get_named_searches()[vc.iter.i_search_index];
+
+        switch (col) {
+            case 0: {
+                const auto& vs = lnav_view_strings[vc.iter.i_view_index];
+                sqlite3_result_text(ctx, vs.data(), vs.length(), SQLITE_STATIC);
+                break;
+            }
+            case 1:
+                sqlite3_result_int(ctx, ns.ns_enabled);
+                break;
+            case 2:
+                to_sqlite(ctx, ns.ns_name);
+                break;
+            case 3:
+                to_sqlite(ctx, ns.ns_pattern);
+                break;
+        }
+
+        return SQLITE_OK;
+    }
+
+    int insert_row(sqlite3_vtab* tab,
+                   sqlite3_int64& rowid_out,
+                   lnav_view_t view_index,
+                   std::optional<bool> enabled,
+                   const char* name,
+                   const char* pattern)
+    {
+        auto& tc = lnav_data.ld_views[view_index];
+
+        if (name == nullptr || pattern == nullptr) {
+            tab->zErrMsg = sqlite3_mprintf(
+                "a name and a pattern are required to create a search");
+            return SQLITE_ERROR;
+        }
+
+        auto create_res = tc.create_named_search(name, pattern);
+        if (create_res.isErr()) {
+            tab->zErrMsg = sqlite3_mprintf(
+                "%s", create_res.unwrapErr().um_message.get_string().c_str());
+            return SQLITE_ERROR;
+        }
+        if (!enabled.value_or(true)) {
+            tc.set_named_search_enabled(name, false);
+        }
+        tc.set_needs_update();
+
+        return SQLITE_OK;
+    }
+
+    int delete_row(sqlite3_vtab* tab, sqlite3_int64 rowid)
+    {
+        auto view_index = lnav_view_t(rowid >> 32);
+        size_t slot = rowid & 0xffffffffLL;
+        auto& tc = lnav_data.ld_views[view_index];
+
+        for (const auto& ns : tc.get_named_searches()) {
+            if (ns.ns_slot == slot) {
+                tc.delete_named_search(ns.ns_name);
+                break;
+            }
+        }
+        tc.set_needs_update();
+
+        return SQLITE_OK;
+    }
+
+    int update_row(sqlite3_vtab* tab,
+                   sqlite3_int64& rowid,
+                   lnav_view_t new_view_index,
+                   std::optional<bool> enabled,
+                   const char* new_name,
+                   const char* new_pattern)
+    {
+        auto view_index = lnav_view_t(rowid >> 32);
+        size_t slot = rowid & 0xffffffffLL;
+        auto& tc = lnav_data.ld_views[view_index];
+        const textview_curses::named_search* ns = nullptr;
+
+        for (const auto& iter : tc.get_named_searches()) {
+            if (iter.ns_slot == slot) {
+                ns = &iter;
+                break;
+            }
+        }
+
+        if (ns == nullptr) {
+            tab->zErrMsg = sqlite3_mprintf("no such named search");
+            return SQLITE_ERROR;
+        }
+
+        if (new_view_index != view_index || new_name == nullptr
+            || ns->ns_name != new_name || new_pattern == nullptr
+            || ns->ns_pattern != new_pattern)
+        {
+            // Changing a pattern in place would mean reallocating the slot
+            // and re-scanning, which is what DELETE followed by INSERT
+            // already does.
+            tab->zErrMsg = sqlite3_mprintf(
+                "Only the 'enabled' column can be updated in the "
+                "lnav_view_searches table, use DELETE and INSERT to change "
+                "the rest");
+            return SQLITE_ERROR;
+        }
+
+        const auto name = ns->ns_name;
+
+        tc.set_named_search_enabled(name, enabled.value_or(true));
+        tc.set_needs_update();
+
+        return SQLITE_OK;
+    }
+};
+
 struct lnav_view_filter_stats
-    : public tvt_iterator_cursor<lnav_view_filter_stats>
-    , public lnav_view_filter_base {
+    : tvt_iterator_cursor<lnav_view_filter_stats>
+    , lnav_view_filter_base {
     static constexpr const char* NAME = "lnav_view_filter_stats";
     static constexpr const char* CREATE_STMT = R"(
 -- Access statistics for filters through this table.
-CREATE TABLE lnav_view_filter_stats (
+CREATE TABLE lnav_db.lnav_view_filter_stats (
     view_name TEXT,     -- The name of the view.
     filter_id INTEGER,  -- The filter identifier.
     hits      INTEGER   -- The number of lines that matched this filter.
@@ -962,12 +1498,11 @@ CREATE TABLE lnav_view_filter_stats (
         auto tf = *(fs.begin() + vc.iter.i_filter_index);
 
         switch (col) {
-            case 0:
-                sqlite3_result_text(ctx,
-                                    lnav_view_strings[vc.iter.i_view_index],
-                                    -1,
-                                    SQLITE_STATIC);
+            case 0: {
+                const auto& vs = lnav_view_strings[vc.iter.i_view_index];
+                sqlite3_result_text(ctx, vs.data(), vs.length(), SQLITE_STATIC);
                 break;
+            }
             case 1:
                 to_sqlite(ctx, tf->get_index());
                 break;
@@ -980,11 +1515,11 @@ CREATE TABLE lnav_view_filter_stats (
     }
 };
 
-struct lnav_view_files : public tvt_iterator_cursor<lnav_view_files> {
+struct lnav_view_files : tvt_iterator_cursor<lnav_view_files> {
     static constexpr const char* NAME = "lnav_view_files";
     static constexpr const char* CREATE_STMT = R"(
 --
-CREATE TABLE lnav_view_files (
+CREATE TABLE lnav_db.lnav_view_files (
     view_name TEXT,     -- The name of the view.
     filepath  TEXT,     -- The path to the file.
     visible   INTEGER   -- Indicates whether or not the file is shown.
@@ -993,7 +1528,7 @@ CREATE TABLE lnav_view_files (
 
     using iterator = logfile_sub_source::iterator;
 
-    struct cursor : public tvt_iterator_cursor<lnav_view_files>::cursor {
+    struct cursor : tvt_iterator_cursor<lnav_view_files>::cursor {
         explicit cursor(sqlite3_vtab* vt)
             : tvt_iterator_cursor<lnav_view_files>::cursor(vt)
         {
@@ -1021,10 +1556,11 @@ CREATE TABLE lnav_view_files (
         auto& ld = *vc.iter;
 
         switch (col) {
-            case 0:
-                sqlite3_result_text(
-                    ctx, lnav_view_strings[LNV_LOG], -1, SQLITE_STATIC);
+            case 0: {
+                const auto& vs = lnav_view_strings[LNV_LOG];
+                sqlite3_result_text(ctx, vs.data(), vs.length(), SQLITE_STATIC);
                 break;
+            }
             case 1:
                 to_sqlite(ctx,
                           ld->ld_filter_state.lfo_filter_state.tfs_logfile
@@ -1065,6 +1601,7 @@ CREATE TABLE lnav_view_files (
 
         auto& ld = *iter;
         if (ld->ld_visible != visible) {
+            ld->get_file_ptr()->set_indexing(visible);
             ld->set_visibility(visible);
             lss.text_filters_changed();
         }
@@ -1073,22 +1610,28 @@ CREATE TABLE lnav_view_files (
     }
 };
 
-static const char* CREATE_FILTER_VIEW = R"(
-CREATE VIEW lnav_view_filters_and_stats AS
-  SELECT * FROM lnav_view_filters LEFT NATURAL JOIN lnav_view_filter_stats
-)";
+auto a = injector::bind_multiple<vtab_module_base>()
+             .add<vtab_module<lnav_views>>()
+             .add<vtab_module<lnav_view_stack>>()
+             .add<vtab_module<lnav_view_filters>>()
+             .add<vtab_module<lnav_view_searches>>()
+             .add<vtab_module<tvt_no_update<lnav_view_filter_stats>>>()
+             .add<vtab_module<lnav_view_files>>();
 
-static auto a = injector::bind_multiple<vtab_module_base>()
-                    .add<vtab_module<lnav_views>>()
-                    .add<vtab_module<lnav_view_stack>>()
-                    .add<vtab_module<lnav_view_filters>>()
-                    .add<vtab_module<tvt_no_update<lnav_view_filter_stats>>>()
-                    .add<vtab_module<lnav_view_files>>();
+}  // namespace
 
 int
 register_views_vtab(sqlite3* db)
 {
+    static const char* CREATE_FILTER_VIEW = R"(
+CREATE VIEW lnav_db.lnav_view_filters_and_stats AS
+  SELECT *
+    FROM lnav_db.lnav_view_filters
+    LEFT NATURAL JOIN lnav_db.lnav_view_filter_stats
+)";
+
     auto_mem<char> errmsg(sqlite3_free);
+    log_info("creating filter view: %s", CREATE_FILTER_VIEW);
     if (sqlite3_exec(db, CREATE_FILTER_VIEW, nullptr, nullptr, errmsg.out())
         != SQLITE_OK)
     {

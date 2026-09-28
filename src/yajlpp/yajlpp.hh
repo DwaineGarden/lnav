@@ -32,7 +32,9 @@
 #ifndef yajlpp_hh
 #define yajlpp_hh
 
+#include <filesystem>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -45,16 +47,16 @@
 #include <stdarg.h>
 #include <string.h>
 
+#include "base/auto_mem.hh"
 #include "base/file_range.hh"
 #include "base/intern_string.hh"
 #include "base/lnav.console.hh"
 #include "base/lnav.console.into.hh"
 #include "base/lnav_log.hh"
 #include "base/opt_util.hh"
+#include "base/short_alloc.h"
 #include "json_ptr.hh"
-#include "optional.hpp"
 #include "pcrepp/pcre2pp.hh"
-#include "relative_time.hh"
 #include "yajl/api/yajl_gen.h"
 #include "yajl/api/yajl_parse.h"
 
@@ -72,6 +74,12 @@ yajl_gen_string(yajl_gen hand, const std::string& str)
 {
     return yajl_gen_string(
         hand, (const unsigned char*) str.c_str(), str.length());
+}
+
+inline yajl_gen_status
+yajl_gen_string(yajl_gen hand, const string_fragment& str)
+{
+    return yajl_gen_string(hand, str.udata(), str.length());
 }
 
 yajl_gen_status yajl_gen_tree(yajl_gen hand, yajl_val val);
@@ -112,6 +120,14 @@ struct factory_container : public positioned_property<std::shared_ptr<T>> {
             return Err(
                 lnav::console::to_user_message(src, from_res.unwrapErr()));
         }
+
+        std::string to_string() const
+        {
+            if (this->pp_value != nullptr) {
+                return this->pp_value->to_string();
+            }
+            return "";
+        }
     };
 
     template<typename... Args>
@@ -131,6 +147,14 @@ struct factory_container : public positioned_property<std::shared_ptr<T>> {
 
         return Err(lnav::console::to_user_message(src, from_res.unwrapErr()));
     }
+
+    std::string to_string() const
+    {
+        if (this->pp_value != nullptr) {
+            return this->pp_value->to_string();
+        }
+        return "";
+    }
 };
 
 class yajlpp_gen_context;
@@ -147,20 +171,18 @@ struct yajlpp_provider_context {
     intern_string_t get_substr_i(T&& name) const
     {
         auto cap = (*this->ypc_extractor)[std::forward<T>(name)].value();
-        char path[cap.length() + 1];
-        size_t len = json_ptr::decode(path, cap.data(), cap.length());
-
-        return intern_string::lookup(path, len);
+        stack_buf allocator;
+        auto path = json_ptr::decode(cap, allocator);
+        return intern_string::lookup(path);
     }
 
     template<typename T>
     std::string get_substr(T&& name) const
     {
         auto cap = (*this->ypc_extractor)[std::forward<T>(name)].value();
-        char path[cap.length() + 1];
-        size_t len = json_ptr::decode(path, cap.data(), cap.length());
-
-        return {path, len};
+        stack_buf allocator;
+        auto path = json_ptr::decode(cap, allocator);
+        return path.to_string();
     }
 };
 
@@ -181,17 +203,24 @@ private:
     std::string ye_msg;
 };
 
+struct relative_time_parse_error;
+
 struct json_path_container;
+
+template<typename T>
+struct typed_json_path_container;
 
 struct json_path_handler_base {
     struct enum_value_t {
         template<typename T>
-        enum_value_t(const char* name, T value)
-            : first(name), second((unsigned int) value)
+        constexpr enum_value_t(string_fragment name, T value)
+            : first(name), second((int) value)
         {
         }
 
-        const char* first;
+        constexpr enum_value_t() : second(0) {}
+
+        string_fragment first;
         int second;
     };
 
@@ -208,19 +237,19 @@ struct json_path_handler_base {
 
     bool is_array() const { return this->jph_is_array; }
 
-    nonstd::optional<int> to_enum_value(const string_fragment& sf) const;
-    const char* to_enum_string(int value) const;
+    std::optional<int> to_enum_value(const string_fragment& sf) const;
+    string_fragment to_enum_string(int value) const;
 
     template<typename T>
-    std::enable_if_t<!detail::is_optional<T>::value, const char*>
+    std::enable_if_t<!detail::is_optional<T>::value, string_fragment>
     to_enum_string(T value) const
     {
         return this->to_enum_string((int) value);
     }
 
     template<typename T>
-    std::enable_if_t<detail::is_optional<T>::value, const char*> to_enum_string(
-        T value) const
+    std::enable_if_t<detail::is_optional<T>::value, string_fragment>
+    to_enum_string(T value) const
     {
         return this->to_enum_string((int) value.value());
     }
@@ -228,13 +257,13 @@ struct json_path_handler_base {
     yajl_gen_status gen(yajlpp_gen_context& ygc, yajl_gen handle) const;
     yajl_gen_status gen_schema(yajlpp_gen_context& ygc) const;
     yajl_gen_status gen_schema_type(yajlpp_gen_context& ygc) const;
-    void walk(
-        const std::function<
-            void(const json_path_handler_base&, const std::string&, void*)>& cb,
-        void* root = nullptr,
-        const std::string& base = "/") const;
+    void walk(const std::function<void(const json_path_handler_base&,
+                                       const std::string&,
+                                       const void*)>& cb,
+              void* root = nullptr,
+              const std::string& base = "/") const;
 
-    enum class schema_type_t : std::uint32_t {
+    enum class schema_type_t : uint32_t {
         ANY,
         BOOLEAN,
         INTEGER,
@@ -255,7 +284,7 @@ struct json_path_handler_base {
     std::function<void(yajlpp_parse_context& ypc,
                        const json_path_handler_base& jph)>
         jph_validator;
-    std::function<void*(void* root, nonstd::optional<std::string> name)>
+    std::function<const void*(void* root, std::optional<std::string> name)>
         jph_field_getter;
     std::function<void*(const yajlpp_provider_context& pe, void* root)>
         jph_obj_provider;
@@ -273,18 +302,21 @@ struct json_path_handler_base {
     size_t jph_min_length{0};
     size_t jph_max_length{INT_MAX};
     const enum_value_t* jph_enum_values{nullptr};
-    long long jph_min_value{LLONG_MIN};
+    string_fragment jph_const_str;
+    double jph_min_value{-std::numeric_limits<double>::infinity()};
+    double jph_exclusive_min_value{-std::numeric_limits<double>::infinity()};
+    double jph_max_value{std::numeric_limits<double>::infinity()};
     bool jph_optional_wrapper{false};
     bool jph_is_array;
     bool jph_is_pattern_property{false};
-    std::vector<std::string> jph_examples;
+    std::vector<string_fragment> jph_examples;
 
     std::function<int(yajlpp_parse_context*)> jph_null_cb;
     std::function<int(yajlpp_parse_context*, int)> jph_bool_cb;
     std::function<int(yajlpp_parse_context*, long long)> jph_integer_cb;
     std::function<int(yajlpp_parse_context*, double)> jph_double_cb;
     std::function<int(
-        yajlpp_parse_context*, const unsigned char* str, size_t len)>
+        yajlpp_parse_context*, const string_fragment& sf, yajl_string_props_t*)>
         jph_str_cb;
 
     void validate_string(yajlpp_parse_context& ypc, string_fragment sf) const;
@@ -292,19 +324,28 @@ struct json_path_handler_base {
     void report_pattern_error(yajlpp_parse_context* ypc,
                               const std::string& value_str) const;
     void report_min_value_error(yajlpp_parse_context* ypc,
-                                long long value) const;
+                                double value) const;
+    void report_max_value_error(yajlpp_parse_context* ypc,
+                                double value) const;
     void report_duration_error(yajlpp_parse_context* ypc,
                                const std::string& value_str,
-                               const relative_time::parse_error& pe) const;
+                               const relative_time_parse_error& pe) const;
     void report_enum_error(yajlpp_parse_context* ypc,
                            const std::string& value_str) const;
     void report_error(yajlpp_parse_context* ypc,
                       const std::string& value_str,
                       lnav::console::user_message um) const;
+    void report_tz_error(yajlpp_parse_context* ypc,
+                         const std::string& value_str,
+                         const char* msg) const;
 
     attr_line_t get_help_text(const std::string& full_path) const;
     attr_line_t get_help_text(yajlpp_parse_context* ypc) const;
 };
+
+constexpr json_path_handler_base::enum_value_t
+    json_path_handler_base::ENUM_TERMINATOR
+    = {};
 
 struct json_path_handler;
 
@@ -316,29 +357,23 @@ public:
     yajlpp_parse_context(intern_string_t source,
                          const struct json_path_container* handlers = nullptr);
 
-    const char* get_path_fragment(int offset,
-                                  char* frag_in,
-                                  size_t& len_out) const;
+    string_fragment get_path_fragment(int offset, stack_buf& allocator) const;
 
     intern_string_t get_path_fragment_i(int offset) const
     {
-        char fragbuf[this->ypc_path.size()];
-        const char* frag;
-        size_t len;
-
-        frag = this->get_path_fragment(offset, fragbuf, len);
-        return intern_string::lookup(frag, len);
+        stack_buf allocator;
+        const auto frag = this->get_path_fragment(offset, allocator);
+        return intern_string::lookup(frag);
     }
 
     std::string get_path_fragment(int offset) const
     {
-        char fragbuf[this->ypc_path.size()];
-        const char* frag;
-        size_t len;
-
-        frag = this->get_path_fragment(offset, fragbuf, len);
-        return std::string(frag, len);
+        stack_buf allocator;
+        const auto frag = this->get_path_fragment(offset, allocator);
+        return frag.to_string();
     }
+
+    string_fragment get_path_as_string_fragment() const;
 
     const intern_string_t get_path() const;
 
@@ -387,11 +422,28 @@ public:
         return this->parse((const unsigned char*) sf.data(), sf.length());
     }
 
+    yajl_status parse(string_fragment_producer& sfp);
+
     int get_line_number() const;
 
     yajl_status complete_parse();
 
-    bool parse_doc(const string_fragment& sf);
+    bool parse_doc(string_fragment_producer& sfp);
+
+    bool parse_doc(const string_fragment& sf)
+    {
+        if (this->parse_frag(sf) != yajl_status_ok) {
+            return false;
+        }
+
+        this->ypc_json_text = sf.udata();
+        this->ypc_json_text_len = sf.length();
+        auto status = this->complete_parse();
+        this->ypc_json_text = nullptr;
+        this->ypc_json_text_len = 0;
+
+        return status == yajl_status_ok;
+    }
 
     void report_error(const lnav::console::user_message& msg) const
     {
@@ -444,7 +496,7 @@ public:
         return lvalue;
     }
 
-    template<typename T, typename MEM_T, MEM_T T::*MEM>
+    template<typename T, typename MEM_T, MEM_T T::* MEM>
     auto& get_obj_member()
     {
         auto obj = (T*) this->ypc_obj_stack.top();
@@ -452,9 +504,19 @@ public:
         return obj->*MEM;
     }
 
+    void fill_in_source()
+    {
+        if (this->ypc_locations != nullptr) {
+            (*this->ypc_locations)[this->get_full_path()] = source_location{
+                this->ypc_source,
+                this->get_line_number(),
+            };
+        }
+    }
+
     const intern_string_t ypc_source;
     int ypc_line_number{1};
-    const struct json_path_container* ypc_handlers;
+    const json_path_container* ypc_handlers;
     std::stack<void*> ypc_obj_stack;
     void* ypc_userdata{nullptr};
     yajl_handle ypc_handle{nullptr};
@@ -463,15 +525,15 @@ public:
     size_t ypc_total_consumed{0};
     yajl_callbacks ypc_callbacks;
     yajl_callbacks ypc_alt_callbacks;
-    std::vector<char> ypc_path;
+    auto_buffer ypc_path;
     std::vector<size_t> ypc_path_index_stack;
     std::vector<size_t> ypc_array_index;
     std::vector<const json_path_handler_base*> ypc_handler_stack;
     size_t ypc_array_handler_count{0};
     bool ypc_ignore_unused{false};
-    const struct json_path_container* ypc_sibling_handlers{nullptr};
-    const struct json_path_handler_base* ypc_current_handler{nullptr};
-    std::set<std::string> ypc_active_paths;
+    const json_path_container* ypc_sibling_handlers{nullptr};
+    const json_path_handler_base* ypc_current_handler{nullptr};
+    std::map<std::string, size_t> ypc_active_paths;
     error_reporter_t ypc_error_reporter{nullptr};
     std::map<intern_string_t, source_location>* ypc_locations{nullptr};
 
@@ -479,10 +541,15 @@ public:
                           int child_start = 0);
 
 private:
+    yajl_status parse_frag(string_fragment sf);
+
     static const yajl_callbacks DEFAULT_CALLBACKS;
 
     static int map_start(void* ctx);
-    static int map_key(void* ctx, const unsigned char* key, size_t len);
+    static int map_key(void* ctx,
+                       const unsigned char* key,
+                       size_t len,
+                       yajl_string_props_t* props);
     static int map_end(void* ctx);
     static int array_start(void* ctx);
     static int array_end(void* ctx);
@@ -497,6 +564,11 @@ public:
     yajl_gen_status operator()(const std::string& str)
     {
         return yajl_gen_string(this->yg_handle, str);
+    }
+
+    yajl_gen_status operator()(const std::filesystem::path& path)
+    {
+        return yajl_gen_string(this->yg_handle, path.string());
     }
 
     yajl_gen_status operator()(const char* str)
@@ -519,8 +591,7 @@ public:
 
     yajl_gen_status operator()(const string_fragment& str)
     {
-        return yajl_gen_string(
-            this->yg_handle, (const unsigned char*) str.data(), str.length());
+        return yajl_gen_string(this->yg_handle, str);
     }
 
     yajl_gen_status operator()(bool value)
@@ -544,7 +615,7 @@ public:
     }
 
     template<typename T>
-    yajl_gen_status operator()(nonstd::optional<T> value)
+    yajl_gen_status operator()(std::optional<T> value)
     {
         if (!value.has_value()) {
             return yajl_gen_status_ok;
@@ -574,7 +645,6 @@ public:
 
     yajl_gen_status operator()() { return yajl_gen_null(this->yg_handle); }
 
-private:
     yajl_gen yg_handle;
 };
 
@@ -640,6 +710,12 @@ public:
     int ygc_depth;
     std::stack<void*> ygc_default_stack;
     std::stack<void*> ygc_obj_stack;
+    // During schema-gen this stacks the handler segments (with
+    // `<capture_name>` placeholders for pattern handlers) used to
+    // build "/foo/<bar>" titles.  During value-gen it is unused by
+    // the framework, so callers like `:config` may push a concrete
+    // map key onto it before invoking gen() to ask map-typed
+    // gen_callbacks to emit only that entry's value.
     std::vector<std::string> ygc_path;
     const json_path_container* ygc_handlers;
     std::map<std::string, const json_path_container*> ygc_schema_definitions;
@@ -673,10 +749,38 @@ struct json_string {
         memcpy((void*) this->js_content.in(), buf, this->js_len);
     }
 
+    explicit json_string(auto_buffer&& buf)
+    {
+        auto buf_pair = buf.release();
+
+        this->js_content = (const unsigned char*) buf_pair.first;
+        this->js_len = buf_pair.second;
+    }
+
+    string_fragment to_string_fragment() const
+    {
+        return string_fragment::from_bytes(this->js_content, this->js_len);
+    }
+
     auto_mem<const unsigned char> js_content;
     size_t js_len{0};
 };
 
 void dump_schema_to(const json_path_container& jpc, const char* internals_dir);
+
+struct yajl_handle_deleter {
+    void operator()(yajl_handle handle) const
+    {
+        if (handle != nullptr) {
+            yajl_free(handle);
+        }
+    }
+};
+
+namespace yajlpp {
+
+auto_mem<yajl_handle_t> alloc_handle(const yajl_callbacks* cb, void* cu);
+
+}  // namespace yajlpp
 
 #endif

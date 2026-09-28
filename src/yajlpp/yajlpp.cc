@@ -29,21 +29,18 @@
  * @file yajlpp.cc
  */
 
+#include <filesystem>
 #include <regex>
 #include <utility>
 
 #include "yajlpp.hh"
 
-#include "base/fs_util.hh"
-#include "base/snippet_highlighters.hh"
+#include "base/math_util.hh"
+#include "base/relative_time.hh"
 #include "config.h"
 #include "fmt/format.h"
-#include "ghc/filesystem.hpp"
 #include "yajl/api/yajl_parse.h"
 #include "yajlpp_def.hh"
-
-const json_path_handler_base::enum_value_t
-    json_path_handler_base::ENUM_TERMINATOR((const char*) nullptr, 0);
 
 yajl_gen_status
 yajl_gen_tree(yajl_gen hand, yajl_val val)
@@ -213,10 +210,8 @@ json_path_handler_base::gen(yajlpp_gen_context& ygc, yajl_gen handle) const
 
     if (this->jph_children) {
         for (const auto& lpath : local_paths) {
-            std::string full_path = lpath;
-            if (this->jph_path_provider) {
-                full_path += "/";
-            }
+            stack_buf allocator;
+            auto full_path = json_ptr::encode(lpath, allocator);
             int start_depth = ygc.ygc_depth;
 
             yajl_gen_string(handle, lpath);
@@ -224,12 +219,11 @@ json_path_handler_base::gen(yajlpp_gen_context& ygc, yajl_gen handle) const
             ygc.ygc_depth += 1;
 
             if (this->jph_obj_provider) {
-                static thread_local auto md
-                    = lnav::pcre2pp::match_data::unitialized();
+                thread_local auto md = lnav::pcre2pp::match_data::unitialized();
 
-                auto find_res = this->jph_regex->capture_from(full_path)
-                                    .into(md)
-                                    .matches();
+                auto find_res
+                    = this->jph_regex->capture_from(full_path).into(md).matches(
+                        PCRE2_NO_UTF_CHECK);
 
                 ygc.ygc_obj_stack.push(this->jph_obj_provider(
                     {&md, yajlpp_provider_context::nindex},
@@ -429,20 +423,40 @@ json_path_handler_base::gen_schema_type(yajlpp_gen_context& ygc) const
                     schema("pattern");
                     schema(this->jph_pattern_re);
                 }
+                if (!this->jph_const_str.empty()) {
+                    schema("const");
+                    schema(this->jph_const_str);
+                }
                 if (this->jph_enum_values) {
                     schema("enum");
 
                     yajlpp_array enum_array(ygc.ygc_handle);
-                    for (int lpc = 0; this->jph_enum_values[lpc].first; lpc++) {
+                    for (int lpc = 0; !this->jph_enum_values[lpc].first.empty();
+                         lpc++)
+                    {
                         enum_array.gen(this->jph_enum_values[lpc].first);
                     }
                 }
                 break;
             case schema_type_t::INTEGER:
             case schema_type_t::NUMBER:
-                if (this->jph_min_value > LLONG_MIN) {
+                if (this->jph_min_value
+                    > -std::numeric_limits<double>::infinity())
+                {
                     schema("minimum");
                     schema(this->jph_min_value);
+                }
+                if (this->jph_exclusive_min_value
+                    > -std::numeric_limits<double>::infinity())
+                {
+                    schema("exclusiveMinimum");
+                    schema(this->jph_exclusive_min_value);
+                }
+                if (this->jph_max_value
+                    < std::numeric_limits<double>::infinity())
+                {
+                    schema("maximum");
+                    schema(this->jph_max_value);
                 }
                 break;
             default:
@@ -455,8 +469,8 @@ json_path_handler_base::gen_schema_type(yajlpp_gen_context& ygc) const
 
 void
 json_path_handler_base::walk(
-    const std::function<
-        void(const json_path_handler_base&, const std::string&, void*)>& cb,
+    const std::function<void(
+        const json_path_handler_base&, const std::string&, const void*)>& cb,
     void* root,
     const std::string& base) const
 {
@@ -465,17 +479,28 @@ json_path_handler_base::walk(
     if (this->jph_path_provider) {
         this->jph_path_provider(root, local_paths);
 
-        for (auto& lpath : local_paths) {
+        for (const auto& lpath : local_paths) {
+            stack_buf allocator;
+            const void* field = nullptr;
+            if (this->jph_field_getter) {
+                field = this->jph_field_getter(root, lpath);
+            }
             cb(*this,
                fmt::format(FMT_STRING("{}{}{}"),
                            base,
-                           lpath,
+                           json_ptr::encode(lpath, allocator),
                            this->jph_children ? "/" : ""),
-               nullptr);
+               field);
         }
         if (this->jph_obj_deleter) {
             local_paths.clear();
             this->jph_path_provider(root, local_paths);
+        }
+        if (this->jph_field_getter) {
+            const auto* field = this->jph_field_getter(root, std::nullopt);
+            if (field != nullptr) {
+                cb(*this, base, field);
+            }
         }
     } else {
         local_paths.emplace_back(this->jph_property);
@@ -483,8 +508,13 @@ json_path_handler_base::walk(
         std::string full_path = base + this->jph_property;
         if (this->jph_children) {
             full_path += "/";
+
+            const void* field = nullptr;
+            if (this->jph_field_getter) {
+                field = this->jph_field_getter(root, this->jph_property);
+            }
+            cb(*this, full_path, field);
         }
-        cb(*this, full_path, nullptr);
     }
 
     if (this->jph_children) {
@@ -493,7 +523,11 @@ json_path_handler_base::walk(
                 static const intern_string_t POSS_SRC
                     = intern_string::lookup("possibilities");
 
-                std::string full_path = base + lpath;
+                stack_buf allocator;
+                auto full_path
+                    = fmt::format(FMT_STRING("{}{}"),
+                                  base,
+                                  json_ptr::encode(lpath, allocator));
                 if (this->jph_children) {
                     full_path += "/";
                 }
@@ -506,16 +540,23 @@ json_path_handler_base::walk(
 
                 ypc.set_path(full_path).with_obj(root).update_callbacks();
                 if (this->jph_obj_provider) {
-                    static thread_local auto md
+                    thread_local auto md
                         = lnav::pcre2pp::match_data::unitialized();
 
-                    std::string full_path = lpath + "/";
+                    stack_buf allocator2;
+                    const auto short_path = fmt::format(
+                        FMT_STRING("{}/"), json_ptr::encode(lpath, allocator2));
 
-                    if (!this->jph_regex->capture_from(full_path)
+                    if (!this->jph_regex->capture_from(short_path)
                              .into(md)
-                             .matches()
+                             .matches(PCRE2_NO_UTF_CHECK)
                              .ignore_error())
                     {
+                        log_error(
+                            "path-handler regex (%s) does not match path: "
+                            "%s",
+                            this->jph_regex->get_pattern().c_str(),
+                            full_path.c_str());
                         ensure(false);
                     }
                     child_root = this->jph_obj_provider(
@@ -526,8 +567,8 @@ json_path_handler_base::walk(
             }
         }
     } else {
-        for (auto& lpath : local_paths) {
-            void* field = nullptr;
+        for (const auto& lpath : local_paths) {
+            const void* field = nullptr;
 
             if (this->jph_field_getter) {
                 field = this->jph_field_getter(root, lpath);
@@ -537,10 +578,10 @@ json_path_handler_base::walk(
     }
 }
 
-nonstd::optional<int>
+std::optional<int>
 json_path_handler_base::to_enum_value(const string_fragment& sf) const
 {
-    for (int lpc = 0; this->jph_enum_values[lpc].first; lpc++) {
+    for (int lpc = 0; !this->jph_enum_values[lpc].first.empty(); lpc++) {
         const auto& ev = this->jph_enum_values[lpc];
 
         if (sf == ev.first) {
@@ -548,13 +589,13 @@ json_path_handler_base::to_enum_value(const string_fragment& sf) const
         }
     }
 
-    return nonstd::nullopt;
+    return std::nullopt;
 }
 
-const char*
+string_fragment
 json_path_handler_base::to_enum_string(int value) const
 {
-    for (int lpc = 0; this->jph_enum_values[lpc].first; lpc++) {
+    for (int lpc = 0; !this->jph_enum_values[lpc].first.empty(); lpc++) {
         const auto& ev = this->jph_enum_values[lpc];
 
         if (ev.second == value) {
@@ -562,7 +603,7 @@ json_path_handler_base::to_enum_string(int value) const
         }
     }
 
-    return "";
+    return {};
 }
 
 std::vector<json_path_handler_base::schema_type_t>
@@ -573,13 +614,12 @@ json_path_handler_base::get_types() const
     if (this->jph_callbacks.yajl_boolean) {
         retval.push_back(schema_type_t::BOOLEAN);
     }
-    if (this->jph_callbacks.yajl_integer) {
-        retval.push_back(schema_type_t::INTEGER);
-    }
     if (this->jph_callbacks.yajl_double || this->jph_callbacks.yajl_number) {
         retval.push_back(schema_type_t::NUMBER);
+    } else if (this->jph_callbacks.yajl_integer) {
+        retval.push_back(schema_type_t::INTEGER);
     }
-    if (this->jph_callbacks.yajl_string) {
+    if (this->jph_callbacks.yajl_string || !this->jph_const_str.empty()) {
         retval.push_back(schema_type_t::STRING);
     }
     if (this->jph_children) {
@@ -593,9 +633,9 @@ json_path_handler_base::get_types() const
 
 yajlpp_parse_context::yajlpp_parse_context(
     intern_string_t source, const struct json_path_container* handlers)
-    : ypc_source(source), ypc_handlers(handlers)
+    : ypc_source(source), ypc_handlers(handlers),
+      ypc_path(auto_buffer::alloc(4096))
 {
-    this->ypc_path.reserve(4096);
     this->ypc_path.push_back('/');
     this->ypc_path.push_back('\0');
     this->ypc_callbacks = DEFAULT_CALLBACKS;
@@ -626,9 +666,12 @@ yajlpp_parse_context::map_start(void* ctx)
 }
 
 int
-yajlpp_parse_context::map_key(void* ctx, const unsigned char* key, size_t len)
+yajlpp_parse_context::map_key(void* ctx,
+                              const unsigned char* key,
+                              size_t len,
+                              yajl_string_props_t* props)
 {
-    yajlpp_parse_context* ypc = (yajlpp_parse_context*) ctx;
+    auto* ypc = (yajlpp_parse_context*) ctx;
     int retval = 1;
 
     require(ypc->ypc_path.size() >= 2);
@@ -637,29 +680,37 @@ yajlpp_parse_context::map_key(void* ctx, const unsigned char* key, size_t len)
     if (ypc->ypc_path.back() != '/') {
         ypc->ypc_path.push_back('/');
     }
-    for (size_t lpc = 0; lpc < len; lpc++) {
-        switch (key[lpc]) {
-            case '~':
-                ypc->ypc_path.push_back('~');
-                ypc->ypc_path.push_back('0');
-                break;
-            case '/':
-                ypc->ypc_path.push_back('~');
-                ypc->ypc_path.push_back('1');
-                break;
-            case '#':
-                ypc->ypc_path.push_back('~');
-                ypc->ypc_path.push_back('2');
-                break;
-            default:
-                ypc->ypc_path.push_back(key[lpc]);
-                break;
+    auto path_start = ypc->ypc_path.size();
+    ypc->ypc_path.expand_to(
+        roundup_size(ypc->ypc_path.size() + len + props->ptr_escapes, 4096));
+    ypc->ypc_path.resize_by(len + props->ptr_escapes);
+    if (props->ptr_escapes > 0) {
+        for (size_t lpc = 0; lpc < len; lpc++) {
+            switch (key[lpc]) {
+                case '~':
+                    ypc->ypc_path[path_start++] = '~';
+                    ypc->ypc_path[path_start++] = '0';
+                    break;
+                case '/':
+                    ypc->ypc_path[path_start++] = '~';
+                    ypc->ypc_path[path_start++] = '1';
+                    break;
+                case '#':
+                    ypc->ypc_path[path_start++] = '~';
+                    ypc->ypc_path[path_start++] = '2';
+                    break;
+                default:
+                    ypc->ypc_path[path_start++] = key[lpc];
+                    break;
+            }
         }
+    } else {
+        memcpy(&ypc->ypc_path[path_start], key, len);
     }
     ypc->ypc_path.push_back('\0');
 
     if (ypc->ypc_alt_callbacks.yajl_map_key != nullptr) {
-        retval = ypc->ypc_alt_callbacks.yajl_map_key(ctx, key, len);
+        retval = ypc->ypc_alt_callbacks.yajl_map_key(ctx, key, len, props);
     }
 
     if (ypc->ypc_handlers != nullptr) {
@@ -694,12 +745,15 @@ yajlpp_parse_context::update_callbacks(const json_path_container* orig_handlers,
 
     if (!this->ypc_active_paths.empty()) {
         std::string curr_path(&this->ypc_path[0], this->ypc_path.size() - 1);
+        auto path_iter = this->ypc_active_paths.find(curr_path);
 
-        if (this->ypc_active_paths.find(curr_path)
-            == this->ypc_active_paths.end())
-        {
+        if (path_iter == this->ypc_active_paths.end()) {
             return;
         }
+        path_iter->second += 1;
+        log_trace("%s: found active path: %s",
+                  this->ypc_source.c_str(),
+                  curr_path.c_str());
     }
 
     if (child_start == 0 && !this->ypc_obj_stack.empty()) {
@@ -711,11 +765,11 @@ yajlpp_parse_context::update_callbacks(const json_path_container* orig_handlers,
     auto path_frag = string_fragment::from_byte_range(
         this->ypc_path.data(), 1 + child_start, this->ypc_path.size() - 1);
     for (const auto& jph : handlers->jpc_children) {
-        static thread_local auto md = lnav::pcre2pp::match_data::unitialized();
+        thread_local auto md = lnav::pcre2pp::match_data::unitialized();
 
         if (jph.jph_regex->capture_from(path_frag)
                 .into(md)
-                .matches()
+                .matches(PCRE2_NO_UTF_CHECK)
                 .ignore_error()
             && (md.remaining().empty() || md.remaining().startswith("/")))
         {
@@ -729,7 +783,8 @@ yajlpp_parse_context::update_callbacks(const json_path_container* orig_handlers,
                     ? static_cast<size_t>(-1)
                     : this->ypc_array_index[this->ypc_array_handler_count - 1];
 
-                if ((cap.sf_end != (int) this->ypc_path.size() - 1)
+                if ((!jph.is_array()
+                     || cap.sf_end != (int) this->ypc_path.size() - 1)
                     && (!jph.is_array()
                         || index != yajlpp_provider_context::nindex))
                 {
@@ -849,7 +904,7 @@ yajlpp_parse_context::array_end(void* ctx)
 int
 yajlpp_parse_context::handle_unused(void* ctx)
 {
-    yajlpp_parse_context* ypc = (yajlpp_parse_context*) ctx;
+    auto* ypc = (yajlpp_parse_context*) ctx;
 
     if (ypc->ypc_ignore_unused) {
         return 1;
@@ -880,7 +935,8 @@ yajlpp_parse_context::handle_unused(void* ctx)
             expected_types.emplace_back("float");
         }
         if (ypc->ypc_callbacks.yajl_string
-            != (int (*)(void*, const unsigned char*, size_t))
+            != (int (*)(
+                void*, const unsigned char*, size_t, yajl_string_props_t*))
                 yajlpp_parse_context::handle_unused)
         {
             expected_types.emplace_back("string");
@@ -915,8 +971,9 @@ yajlpp_parse_context::handle_unused(void* ctx)
 
         attr_line_t help_text;
 
-        if (accepted_handlers->jpc_children.size() == 1
-            && accepted_handlers->jpc_children.front().jph_is_array)
+        if (accepted_handlers == nullptr) {
+        } else if (accepted_handlers->jpc_children.size() == 1
+                   && accepted_handlers->jpc_children.front().jph_is_array)
         {
             const auto& jph = accepted_handlers->jpc_children.front();
 
@@ -949,12 +1006,12 @@ yajlpp_parse_context::handle_unused(void* ctx)
 int
 yajlpp_parse_context::handle_unused_or_delete(void* ctx)
 {
-    yajlpp_parse_context* ypc = (yajlpp_parse_context*) ctx;
+    auto* ypc = (yajlpp_parse_context*) ctx;
 
     if (!ypc->ypc_handler_stack.empty()
         && ypc->ypc_handler_stack.back()->jph_obj_deleter)
     {
-        static thread_local auto md = lnav::pcre2pp::match_data::unitialized();
+        thread_local auto md = lnav::pcre2pp::match_data::unitialized();
 
         auto key_start = ypc->ypc_path_index_stack.back();
         auto path_frag = string_fragment::from_byte_range(
@@ -963,7 +1020,7 @@ yajlpp_parse_context::handle_unused_or_delete(void* ctx)
         ypc->ypc_handler_stack.back()
             ->jph_regex->capture_from(path_frag)
             .into(md)
-            .matches();
+            .matches(PCRE2_NO_UTF_CHECK);
 
         ypc->ypc_handler_stack.back()->jph_obj_deleter(
             provider_ctx, ypc->ypc_obj_stack.top());
@@ -974,18 +1031,18 @@ yajlpp_parse_context::handle_unused_or_delete(void* ctx)
 }
 
 const yajl_callbacks yajlpp_parse_context::DEFAULT_CALLBACKS = {
-    yajlpp_parse_context::handle_unused_or_delete,
-    (int (*)(void*, int)) yajlpp_parse_context::handle_unused,
-    (int (*)(void*, long long)) yajlpp_parse_context::handle_unused,
-    (int (*)(void*, double)) yajlpp_parse_context::handle_unused,
+    handle_unused_or_delete,
+    (int (*)(void*, int)) handle_unused,
+    (int (*)(void*, long long)) handle_unused,
+    (int (*)(void*, double)) handle_unused,
     nullptr,
-    (int (*)(void*, const unsigned char*, size_t))
-        yajlpp_parse_context::handle_unused,
-    yajlpp_parse_context::map_start,
-    yajlpp_parse_context::map_key,
-    yajlpp_parse_context::map_end,
-    yajlpp_parse_context::array_start,
-    yajlpp_parse_context::array_end,
+    (int (*)(void*, const unsigned char*, size_t, yajl_string_props_t*))
+        handle_unused,
+    map_start,
+    map_key,
+    map_end,
+    array_start,
+    array_end,
 };
 
 yajl_status
@@ -994,9 +1051,8 @@ yajlpp_parse_context::parse(const unsigned char* jsonText, size_t jsonTextLen)
     this->ypc_json_text = jsonText;
     this->ypc_json_text_len = jsonTextLen;
 
-    yajl_status retval = yajl_parse(this->ypc_handle, jsonText, jsonTextLen);
-
-    size_t consumed = yajl_get_bytes_consumed(this->ypc_handle);
+    const auto retval = yajl_parse(this->ypc_handle, jsonText, jsonTextLen);
+    const auto consumed = yajl_get_bytes_consumed(this->ypc_handle);
 
     this->ypc_line_number
         += std::count(&jsonText[0], &jsonText[consumed], '\n');
@@ -1020,10 +1076,11 @@ yajlpp_parse_context::parse(const unsigned char* jsonText, size_t jsonTextLen)
 yajl_status
 yajlpp_parse_context::complete_parse()
 {
-    yajl_status retval = yajl_complete_parse(this->ypc_handle);
+    const auto retval = yajl_complete_parse(this->ypc_handle);
 
     if (retval != yajl_status_ok && this->ypc_error_reporter) {
-        auto* msg = yajl_get_error(this->ypc_handle, 0, nullptr, 0);
+        auto* msg = yajl_get_error(
+            this->ypc_handle, 0, this->ypc_json_text, this->ypc_json_text_len);
 
         this->report_error(lnav::console::user_message::error("invalid JSON")
                                .with_reason((const char*) msg)
@@ -1034,15 +1091,14 @@ yajlpp_parse_context::complete_parse()
     return retval;
 }
 
-bool
-yajlpp_parse_context::parse_doc(const string_fragment& sf)
+yajl_status
+yajlpp_parse_context::parse_frag(string_fragment sf)
 {
-    bool retval = true;
-
-    this->ypc_json_text = (const unsigned char*) sf.data();
+    this->ypc_json_text = sf.udata();
     this->ypc_json_text_len = sf.length();
 
-    auto rc = yajl_parse(this->ypc_handle, this->ypc_json_text, sf.length());
+    const auto rc
+        = yajl_parse(this->ypc_handle, this->ypc_json_text, sf.length());
     size_t consumed = yajl_get_bytes_consumed(this->ypc_handle);
     this->ypc_total_consumed += consumed;
     this->ypc_line_number += std::count(
@@ -1061,14 +1117,56 @@ yajlpp_parse_context::parse_doc(const string_fragment& sf)
                     .with_snippet(this->get_snippet()));
             yajl_free_error(this->ypc_handle, msg);
         }
-        retval = false;
-    } else if (this->complete_parse() != yajl_status_ok) {
-        retval = false;
     }
 
     this->ypc_json_text = nullptr;
+    this->ypc_json_text_len = 0;
+
+    return rc;
+}
+
+bool
+yajlpp_parse_context::parse_doc(string_fragment_producer& sfp)
+{
+    auto retval = true;
+
+    while (true) {
+        auto next_res = sfp.next();
+        if (next_res.is<string_fragment_producer::eof>()) {
+            break;
+        }
+        if (next_res.is<string_fragment_producer::error>()) {
+            const auto err = next_res.get<string_fragment_producer::error>();
+            this->report_error(
+                lnav::console::user_message::error("unable to read file")
+                    .with_reason(err.what)
+                    .with_snippet(this->get_snippet()));
+            break;
+        }
+
+        auto sf = next_res.get<string_fragment>();
+
+        if (this->parse_frag(sf) != yajl_status_ok) {
+            log_error("parse frag failed %s", this->ypc_source.c_str());
+            retval = false;
+            break;
+        }
+    }
+    if (retval && this->complete_parse() != yajl_status_ok) {
+        retval = false;
+    }
 
     return retval;
+}
+
+string_fragment
+yajlpp_parse_context::get_path_as_string_fragment() const
+{
+    if (this->ypc_path.size() <= 1) {
+        return string_fragment();
+    }
+    return string_fragment::from_bytes(&this->ypc_path[1],
+                                       this->ypc_path.size() - 2);
 }
 
 const intern_string_t
@@ -1158,12 +1256,10 @@ yajlpp_parse_context::set_path(const std::string& path)
     return *this;
 }
 
-const char*
-yajlpp_parse_context::get_path_fragment(int offset,
-                                        char* frag_in,
-                                        size_t& len_out) const
+string_fragment
+yajlpp_parse_context::get_path_fragment(int offset, stack_buf& allocator) const
 {
-    const char* retval;
+    string_fragment retval;
     size_t start, end;
 
     if (offset < 0) {
@@ -1175,14 +1271,48 @@ yajlpp_parse_context::get_path_fragment(int offset,
     } else {
         end = this->ypc_path.size() - 1;
     }
-    if (this->ypc_handlers) {
-        len_out
-            = json_ptr::decode(frag_in, &this->ypc_path[start], end - start);
-        retval = frag_in;
-    } else {
-        retval = &this->ypc_path[start];
-        len_out = end - start;
+    retval = string_fragment::from_bytes(&this->ypc_path[start], end - start);
+    if (this->ypc_handlers != nullptr) {
+        retval = json_ptr::decode(retval, allocator);
     }
+
+    return retval;
+}
+
+yajl_status
+yajlpp_parse_context::parse(string_fragment_producer& sfp)
+{
+    yajl_status retval = yajl_status_ok;
+    while (retval == yajl_status_ok) {
+        auto next_res = sfp.next();
+        if (next_res.is<string_fragment_producer::eof>()) {
+            break;
+        }
+
+        if (next_res.is<string_fragment_producer::error>()) {
+            const auto err = next_res.get<string_fragment_producer::error>();
+            this->report_error(
+                lnav::console::user_message::error("unable to read file")
+                    .with_reason(err.what)
+                    .with_snippet(this->get_snippet()));
+            break;
+        }
+
+        auto sf = next_res.get<string_fragment>();
+        retval = this->parse(sf);
+        if (retval != yajl_status_ok) {
+            auto* msg
+                = yajl_get_error(this->ypc_handle, 1, sf.udata(), sf.length());
+            auto um = lnav::console::user_message::error("invalid JSON")
+                          .with_snippet(lnav::console::snippet::from(
+                              this->ypc_source, attr_line_t((const char*) msg)))
+                          .with_errno_reason();
+            this->report_error(um);
+            yajl_free_error(this->ypc_handle, msg);
+        }
+    }
+
+    retval = this->complete_parse();
 
     return retval;
 }
@@ -1205,6 +1335,10 @@ yajlpp_gen_context::gen()
 {
     yajlpp_map root(this->ygc_handle);
 
+    if (!this->ygc_handlers->jpc_schema_id.empty()) {
+        root.gen("$schema");
+        root.gen(this->ygc_handlers->jpc_schema_id);
+    }
     for (const auto& jph : this->ygc_handlers->jpc_children) {
         jph.gen(*this, this->ygc_handle);
     }
@@ -1270,12 +1404,27 @@ yajlpp_gen_context::with_context(yajlpp_parse_context& ypc)
         this->ygc_handlers = ypc.ypc_handler_stack.back()->jph_children;
         this->ygc_depth += 1;
     }
+    // For pattern_property_handler leaves (e.g. /vars/<name>),
+    // forward the requested key so map-typed gen_callbacks emit
+    // only that entry's value rather than flat-iterating the whole
+    // map (which yajl_gen would truncate to the first key as a
+    // top-level JSON string).
+    if (ypc.ypc_current_handler != nullptr
+        && ypc.ypc_current_handler->jph_is_pattern_property)
+    {
+        this->ygc_path.emplace_back(ypc.get_path_fragment(-1));
+    }
     return *this;
 }
 
 json_path_handler&
 json_path_handler::with_children(const json_path_container& container)
 {
+    // XXX pattern with children cannot match everything, need to use [^/]+
+    require(!this->jph_is_pattern_property
+            || (this->jph_property.find(".*") == std::string::npos
+                && this->jph_property.find(".+") == std::string::npos));
+
     this->jph_children = &container;
     return *this;
 }
@@ -1323,6 +1472,21 @@ void
 json_path_handler_base::validate_string(yajlpp_parse_context& ypc,
                                         string_fragment sf) const
 {
+    if (!this->jph_const_str.empty()) {
+        if (sf != this->jph_const_str) {
+            ypc.report_error(
+                lnav::console::user_message::error(
+                    attr_line_t("invalid value for option ")
+                        .append_quoted(lnav::roles::symbol(
+                            ypc.get_full_path().to_string())))
+                    .with_reason(attr_line_t("value must be set to ")
+                                     .append_quoted(this->jph_const_str))
+                    .with_snippet(ypc.get_snippet())
+                    .with_help(this->get_help_text(&ypc)));
+        }
+        return;
+    }
+
     if (this->jph_pattern) {
         if (!this->jph_pattern->find_in(sf).ignore_error()) {
             this->report_pattern_error(&ypc, sf.to_string());
@@ -1336,7 +1500,7 @@ json_path_handler_base::validate_string(yajlpp_parse_context& ypc,
                              .with_reason("empty values are not allowed")
                              .with_snippet(ypc.get_snippet())
                              .with_help(this->get_help_text(&ypc)));
-    } else if (sf.length() < this->jph_min_length) {
+    } else if (sf.length() < (ssize_t) this->jph_min_length) {
         ypc.report_error(
             lnav::console::user_message::error(
                 attr_line_t()
@@ -1347,6 +1511,20 @@ json_path_handler_base::validate_string(yajlpp_parse_context& ypc,
                 .with_reason(attr_line_t("value must be at least ")
                                  .append(lnav::roles::number(
                                      fmt::to_string(this->jph_min_length)))
+                                 .append(" characters long"))
+                .with_snippet(ypc.get_snippet())
+                .with_help(this->get_help_text(&ypc)));
+    } else if (sf.length() > (ssize_t) this->jph_max_length) {
+        ypc.report_error(
+            lnav::console::user_message::error(
+                attr_line_t()
+                    .append_quoted(sf)
+                    .append(" is not a valid value for option ")
+                    .append_quoted(
+                        lnav::roles::symbol(ypc.get_full_path().to_string())))
+                .with_reason(attr_line_t("value must be at most ")
+                                 .append(lnav::roles::number(
+                                     fmt::to_string(this->jph_max_length)))
                                  .append(" characters long"))
                 .with_snippet(ypc.get_snippet())
                 .with_help(this->get_help_text(&ypc)));
@@ -1370,6 +1548,33 @@ json_path_handler_base::report_pattern_error(yajlpp_parse_context* ypc,
             .with_help(this->get_help_text(ypc)));
 }
 
+void
+json_path_handler_base::report_tz_error(yajlpp_parse_context* ypc,
+                                        const std::string& value_str,
+                                        const char* msg) const
+{
+    auto help_al = attr_line_t()
+                       .append(lnav::roles::h2("Available time zones"))
+                       .append("\n");
+
+    try {
+        for (const auto& tz : date::get_tzdb().zones) {
+            help_al.append("    ")
+                .append(lnav::roles::symbol(tz.name()))
+                .append("\n");
+        }
+    } catch (const std::runtime_error& e) {
+        log_error("unable to load timezones: %s", e.what());
+    }
+
+    ypc->report_error(lnav::console::user_message::error(
+                          attr_line_t().append_quoted(value_str).append(
+                              " is not a valid timezone"))
+                          .with_snippet(ypc->get_snippet())
+                          .with_reason(msg)
+                          .with_help(help_al));
+}
+
 attr_line_t
 json_path_handler_base::get_help_text(const std::string& full_path) const
 {
@@ -1389,12 +1594,13 @@ json_path_handler_base::get_help_text(const std::string& full_path) const
     if (this->jph_enum_values != nullptr) {
         retval.append(lnav::roles::h2("Allowed Values")).append("\n  ");
 
-        for (int lpc = 0; this->jph_enum_values[lpc].first; lpc++) {
+        for (int lpc = 0; !this->jph_enum_values[lpc].first.empty(); lpc++) {
             const auto& ev = this->jph_enum_values[lpc];
 
             retval.append(lpc == 0 ? "" : ", ")
                 .append(lnav::roles::symbol(ev.first));
         }
+        retval.append("\n");
     }
 
     if (!this->jph_examples.empty()) {
@@ -1419,7 +1625,32 @@ json_path_handler_base::get_help_text(yajlpp_parse_context* ypc) const
 
 void
 json_path_handler_base::report_min_value_error(yajlpp_parse_context* ypc,
-                                               long long value) const
+                                               double value) const
+{
+    attr_line_t reason;
+    if (value <= this->jph_exclusive_min_value) {
+        reason.append("value must be greater than ")
+            .append(lnav::roles::number(
+                fmt::to_string(this->jph_exclusive_min_value)));
+    } else {
+        reason.append("value must be greater than or equal to ")
+            .append(lnav::roles::number(fmt::to_string(this->jph_min_value)));
+    }
+    ypc->report_error(
+        lnav::console::user_message::error(
+            attr_line_t()
+                .append_quoted(fmt::to_string(value))
+                .append(" is not a valid value for option ")
+                .append_quoted(
+                    lnav::roles::symbol(ypc->get_full_path().to_string())))
+            .with_reason(reason)
+            .with_snippet(ypc->get_snippet())
+            .with_help(this->get_help_text(ypc)));
+}
+
+void
+json_path_handler_base::report_max_value_error(yajlpp_parse_context* ypc,
+                                               double value) const
 {
     ypc->report_error(
         lnav::console::user_message::error(
@@ -1428,9 +1659,9 @@ json_path_handler_base::report_min_value_error(yajlpp_parse_context* ypc,
                 .append(" is not a valid value for option ")
                 .append_quoted(
                     lnav::roles::symbol(ypc->get_full_path().to_string())))
-            .with_reason(attr_line_t("value must be greater than or equal to ")
+            .with_reason(attr_line_t("value must be less than or equal to ")
                              .append(lnav::roles::number(
-                                 fmt::to_string(this->jph_min_value))))
+                                 fmt::to_string(this->jph_max_value))))
             .with_snippet(ypc->get_snippet())
             .with_help(this->get_help_text(ypc)));
 }
@@ -1439,7 +1670,7 @@ void
 json_path_handler_base::report_duration_error(
     yajlpp_parse_context* ypc,
     const std::string& value_str,
-    const relative_time::parse_error& pe) const
+    const relative_time_parse_error& pe) const
 {
     ypc->report_error(lnav::console::user_message::error(
                           attr_line_t()
@@ -1495,6 +1726,7 @@ json_path_container::gen_schema(yajlpp_gen_context& ygc) const
 void
 json_path_container::gen_properties(yajlpp_gen_context& ygc) const
 {
+    static const auto FWD_SLASH = lnav::pcre2pp::code::from_const(R"(\[\^/\])");
     auto pattern_count = count_if(
         this->jpc_children.begin(), this->jpc_children.end(), [](auto& jph) {
             return jph.jph_is_pattern_property;
@@ -1524,7 +1756,10 @@ json_path_container::gen_properties(yajlpp_gen_context& ygc) const
                 if (!child_handler.jph_is_pattern_property) {
                     continue;
                 }
-                properties.gen(child_handler.jph_property);
+
+                auto pattern = child_handler.jph_property;
+                pattern = FWD_SLASH.replace(pattern, ".");
+                properties.gen(fmt::format(FMT_STRING("^{}$"), pattern));
                 child_handler.gen_schema(ygc);
             }
         }
@@ -1545,9 +1780,10 @@ dump_schema_to(const json_path_container& jpc, const char* internals_dir)
 {
     yajlpp_gen genner;
     yajlpp_gen_context ygc(genner, jpc);
-    auto internals_dir_path = ghc::filesystem::path(internals_dir);
-    auto schema_file_name = ghc::filesystem::path(jpc.jpc_schema_id).filename();
-    auto schema_path = internals_dir_path / schema_file_name;
+    auto internals_dir_path = std::filesystem::path(internals_dir);
+    auto schema_file_name
+        = jpc.jpc_schema_id.rsplit_pair(string_fragment::tag1{'/'})->second;
+    auto schema_path = internals_dir_path / schema_file_name.to_string();
     auto file = std::unique_ptr<FILE, decltype(&fclose)>(
         fopen(schema_path.c_str(), "w+"), fclose);
 
@@ -1572,3 +1808,17 @@ yajlpp_gen::to_string_fragment()
 
     return string_fragment::from_bytes(buf, len);
 }
+
+namespace yajlpp {
+
+auto_mem<yajl_handle_t>
+alloc_handle(const yajl_callbacks* cb, void* cu)
+{
+    auto_mem<yajl_handle_t> retval(yajl_free);
+
+    retval = yajl_alloc(cb, nullptr, cu);
+
+    return retval;
+}
+
+}  // namespace yajlpp

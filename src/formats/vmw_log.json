@@ -6,13 +6,13 @@
         "url": "https://kb.vmware.com/kb/2004201",
         "regex": {
             "6.0+": {
-                "pattern": "^(?:\\[#\\d+\\] )?(?<timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?:Z|[-+]\\d{2}:\\d{2})) (?<level>\\w+)(?:\\(\\d+\\)+)? (?<prc>[\\w\\-]+)\\[(?<tid>\\w+)\\]:? (?:\\w+ -\\[\\d+\\] )?\\[(?<src>\\w+@\\d+)(?:\\s+sub=(?<sub>.*?(?!\\w+=)))?(?:\\s+item=(?<item>[\\w\\.\\-@/:]+))?(?: req=(?<req>[^ \\]]+))?(?: opI(?:D|d)=(?<opid>(?:req=)?[\\w@ \\-\\.:]+?(?!\\w+=)))?(?: sid=(?<sid>[^ \\]]+))?(?: user=(?<user>[^ \\]<]+(?:<[^>]+>)?))?(?: update=(?<vpxa_update>\\d+))?(?:\\s+reason=(?<reason>[^\\]]+))?\\]\\s*(?<body>.*)$"
+                "pattern": "^(?:\\[#\\d+\\] )?(?<timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?:Z|[-+]\\d{2}:\\d{2})) (?<level>\\w+)(?:\\(\\d+\\)+)? (?<prc>[\\w\\-]+)\\s?\\[?(?<tid>\\w+)\\]?:? (?:\\w+ -\\[\\d+\\] )?\\[(?<src>[a-zA-Z][\\w:]*(?:@\\d+)?)(?:\\s+sub=\\\"?(?<sub>.*?(?!\\w+=))\\\"?)?(?:\\s+item=\\\"?(?<item>[\\w\\.\\-@/:]+)\\\"?)?(?: req=\\\"?(?<req>[^ \\]]+)\\\"?)?(?: opI(?:D|d)=\\\"?(?<opid>(?:req=)?[\\w@ \\-\\.:]+?(?!\\w+=))\\\"?)?(?: sid=\\\"?(?<sid>[^ \\]]+)\\\"?)?(?: user=\\\"(?<user>[^ \\]<]+(?:<[^>]+>)?\\\"?))?(?: update=\\\"?(?<vpxa_update>\\d+)\\\"?)?(?:\\s+reason=\\\"?(?<reason>[^\\]]+)\\\"?)?\\]\\s+(?:\\[(?<file>[^ ]+)\\s+(?<line>\\d+)\\]\\s+)?(?<body>.*)$"
             },
             "6.0+-nosrc": {
                 "pattern": "^(?<timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?:Z|[-+]\\d{2}:\\d{2})) (?<level>\\w+)(?:\\(\\d+\\)+)? (?<prc>[\\w\\-]+)\\[(?<tid>\\w+)\\]:? \\[(?:opI(?:D|d)=(?<opid>[^\\]]+))\\]\\s*(?<body>.*)$"
             },
             "section": {
-                "pattern": "^(?<timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?:Z|[-+]\\d{2}:\\d{2})) (?:- last log rotation time, \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?:Z|[-+]\\d{2}:\\d{2}))?\\s*(ESX KMX Agent started.|(?:- time the service was last started(?: \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.\\d{3}Z)?, )?Section for (?:[^,]+), pid=(?<tid>\\w+).*)"
+                "pattern": "^(?<timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?:Z|[-+]\\d{2}:\\d{2})) (?:- last log rotation time, \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?:Z|[-+]\\d{2}:\\d{2}))?\\s*(ESX KMX Agent started.|(?:- time the service was last started(?: \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.\\d{3}(?:Z|[-+]\\d{2}:\\d{2}))?, )?Section for (?:[^,]+), pid=(?<tid>\\w+).*)"
             },
             "esx-section": {
                 "pattern": "^(?<timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?:Z|[-+]\\d{2}:\\d{2})) (?<level>\\w+)(?:\\(\\d+\\)+) (?<prc>[\\w\\-]+)\\[(?<tid>\\w+)\\]: (?:Logs rotated. \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?:Z|[-+]\\d{2}:\\d{2}))?(?:- last log rotation time, \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?:Z|[-+]\\d{2}:\\d{2}))?\\s*(ESX KMX Agent started.|(?:- time the service was last started(?: \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.\\d{3}Z)?, )?Section for (?:[^,]+), pid=(?:\\w+).*)"
@@ -29,6 +29,9 @@
             "hdr-ftr": {
                 "pattern": "^(?<timestamp>\\d{4}-\\d{2}-\\d{2}(T| )\\d{2}:\\d{2}:\\d{2}(?:.|,)\\d{3}(?:Z|[-+]\\d{2}:\\d{2})) \\[(?<prc>[^\\[]+)\\[(?<tid>\\w+)\\]:\\s+(?<body>.*)\\]$"
             },
+            "is-log": {
+                "pattern": "^(?<timestamp>\\d{4}-\\d{2}-\\d{2}(T| )\\d{2}:\\d{2}:\\d{2}(?:.|,)\\d{3}(?:Z|[-+]\\d{2}:\\d{2})?) (?<level>\\w+) (?<prc>[^\\[]+)\\[(?<tid>\\d+)\\]\\s+\\[(?<file>[^ ]+) (?<line>\\d+)\\]\\s+(?<body>.*)"
+            },
             "pylog": {
                 "pattern": "^(?<timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?(?:Z|[-+]\\d{2}:\\d{2})) (?<prc>[^:]+):\\s+(?<tid>\\d+):\\s+(?<comp>[^:]+):(?<line>\\d+)?\\s+(?<level>\\w+):?\\s+(?<body>.*)(?:\\n.*)?$"
             },
@@ -42,6 +45,9 @@
                 "pattern": "^(?<prc>[^:]+): (?<tid>\\d+): (?<timestamp>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2},\\d{3}) (?<file>[^:]+):(?<line>\\d+) (?<level>[a-zA-Z]+)\\s+(?<body>.*)$"
             }
         },
+        "src-file-field": "file",
+        "src-line-field": "line",
+        "thread-id-field": "tid",
         "level-field": "level",
         "level": {
             "info": "^(?i)(?:info|In)$",
@@ -53,6 +59,102 @@
             "fatal": "^(?i)(?:alert|fatal|panic|Al|Em)$"
         },
         "opid-field": "opid",
+        "opid": {
+            "subid": "tid",
+            "sub-description": {
+                "vum": {
+                    "format": [
+                        {
+                            "field": "sub",
+                            "extractor": "^(?!VumVapi::Utils).*$"
+                        }
+                    ]
+                }
+            },
+            "description": {
+                "vum": {
+                    "format": [
+                        {
+                            "field": "body",
+                            "extractor": "RequireAdminUserAuthz::Invoke Method is (.*)",
+                            "suffix": "("
+                        },
+                        {
+                            "prefix": "",
+                            "field": "body",
+                            "extractor": "PrivCheck: Resource:((?!com)[^,]+)|Entity Priv Result:()"
+                        },
+                        {
+                            "prefix": ") - ",
+                            "field": "body",
+                            "extractor": "PrivCheck: Resource:(?:com[^,]+), User:([^,]+)"
+                        },
+                        {
+                            "prefix": "",
+                            "field": "body",
+                            "extractor": "()Invoking method com\\..*"
+                        }
+                    ]
+                },
+                "esxtokend": {
+                    "format": [
+                        {
+                            "field": "body",
+                            "extractor": "Invoke-MethodId: (.*)"
+                        }
+                    ]
+                },
+                "hostd": {
+                    "format": [
+                        {
+                            "field": "body",
+                            "extractor": "New request: target='([^']+)'"
+                        },
+                        {
+                            "prefix": ".",
+                            "field": "body",
+                            "extractor": "New request: target='[^']+', method='([^']+)'"
+                        }
+                    ]
+                },
+                "vpxd-invoking": {
+                    "format": [
+                        {
+                            "field": "body",
+                            "extractor": "Invoking; <<[^,]+, <[^>]+>, <[^>]+>>, [^,]+, ([^,]+),"
+                        }
+                    ]
+                },
+                "vpxd-lro": {
+                    "format": [
+                        {
+                            "field": "body",
+                            "extractor": "\\[VpxLRO\\] -- BEGIN (?:[^ ]+) -- (?:[^ ]*) -- ([^ ]+)"
+                        }
+                    ]
+                },
+                "vpxd-item": {
+                    "format": [
+                        {
+                            "field": "item"
+                        }
+                    ]
+                },
+                "vsan": {
+                    "format": [
+                        {
+                            "field": "body",
+                            "extractor": "Invoking '[^']+' on '([^']+)'"
+                        },
+                        {
+                            "prefix": ".",
+                            "field": "body",
+                            "extractor": "Invoking '([^']+)' on '[^']+'"
+                        }
+                    ]
+                }
+            }
+        },
         "value": {
             "prc": {
                 "kind": "string",
@@ -64,7 +166,8 @@
             },
             "src": {
                 "kind": "string",
-                "identifier": true
+                "identifier": true,
+                "hidden": true
             },
             "comp": {
                 "kind": "string",
@@ -128,6 +231,10 @@
             "vpx_lro_error": {
                 "pattern": "\\[VpxLRO\\] -- ERROR (?<lro_id>\\S+) -- (?:(?<SessionId>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\\((?<SessionSubId>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\))?)? -- (?<entity>\\S*) -- (?<operation>\\S*):\\s*(?<error>.*)",
                 "level": "error"
+            },
+            "vmw_gtest_results": {
+                "glob": "*/test.log",
+                "pattern": "\\[\\s+(?<test_result>\\w+)\\s+\\]\\s+(?<test_name>\\S+)\\s+\\((?<test_duration>\\d+ \\w+)\\)"
             }
         },
         "tags": {
@@ -139,6 +246,17 @@
                     }
                 ],
                 "pattern": "^Expected equality of these values:"
+            }
+        },
+        "partitions": {
+            "test-partition": {
+                "description": "Partition for gtest sections",
+                "paths": [
+                    {
+                        "glob": "*/test.log"
+                    }
+                ],
+                "pattern": "^\\[ RUN      \\] ([^\\n]+)"
             }
         },
         "sample": [
@@ -235,6 +353,18 @@
             },
             {
                 "line": "2022-06-02T03:20:05.107Z Db(167) Hostd[1001392035]: [Originator@6876 sub=AdapterServer opID=531c52d7-9d8a sid=52806149 user=vpxuser:<no user>] New request: target='vim.HostSystem:ha-host', method='retrieveInternalCapability', session='52806149-fe15-f6ff-7685-353ae5d93dcc'"
+            },
+            {
+                "line": "2022-06-02T11:49:41.274Z INFO vsan-mgmt[51740] [VsanVcObjectHelper::wrapper opID=SWI-2230eb26-8c37] Ready to get single executor result for the key ['_QuerySpaceUsage', 'vsan-cluster-space-report-system', 'domain-c115', '', 'False'] in timeout 600\n2022-06-02T12:23:46.807Z [pool-2-thread-18] INFO  opId= com.vmware.vim.storage.common.task.CustomThreadPoolExecutor - [VLSI-client] Request took 4 millis to execute.\n2022-06-02T12:26:24.319Z INFO vsan-mgmt[16622] [VsanVcPerformanceManagerImpl::QueryClusterHealth opID=21fcddd1] CMMDS primary exists but no stats primary, check node information again.\n2022-06-02T12:26:27.109Z info vsanvcmgmtd[38723] [vSAN@6876 sub=CnsSync] Sync ds:///vmfs/volumes/5f65bf61-0e36b15d-fbd6-005056a00b50/: startVClock = 0, fullSync = true"
+            },
+            {
+                "line": "2023-08-04T11:01:42.873-07:00 info vmware-vum-server[192680] [Originator@6876 sub=Libs] lib/ssl: OpenSSL using FIPS provider"
+            },
+            {
+                "line": "2023-10-28 02:56:46,013 INFO imageService[139745105131968] [imageService 1092] Image service is initialized"
+            },
+            {
+                "line": "2025-06-04T17:06:21.349Z INFO vpxd 20973 [Originator@4413 sub=\"ServiceAccount\" opID=\"SvcAcctInit-5a91f2fc\"] Service account accessor initialized; user: vpxd-svc-acct-90beeaa8-b1b3-46f4-8200-641edac5cacf@VSPHERE.LOCAL, passwordStatus: Ok"
             }
         ]
     }

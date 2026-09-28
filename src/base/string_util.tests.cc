@@ -31,9 +31,26 @@
 
 #include "base/string_util.hh"
 
+#include "base/fts_fuzzy_match.hh"
 #include "base/strnatcmp.h"
 #include "config.h"
 #include "doctest/doctest.h"
+
+TEST_CASE("fuzzy_match")
+{
+    {
+        // escape sequences should be ignored
+        const char* str = "com.example.foo";
+        const char* pattern1 = "c\\.e\\.f";
+        const char* pattern2 = "c.e.f";
+
+        int score1, score2;
+        CHECK(fts::fuzzy_match(pattern1, str, score1));
+        CHECK(fts::fuzzy_match(pattern2, str, score2));
+
+        CHECK(score1 == score2);
+    }
+}
 
 TEST_CASE("endswith")
 {
@@ -41,6 +58,14 @@ TEST_CASE("endswith")
 
     CHECK(endswith(hw, "f") == false);
     CHECK(endswith(hw, "lo") == true);
+}
+
+TEST_CASE("scrub_to_utf8")
+{
+    char buffer[8]{};
+
+    scrub_to_utf8(buffer, sizeof(buffer));
+    CHECK(buffer[0] == '?');
 }
 
 TEST_CASE("truncate_to")
@@ -86,5 +111,48 @@ TEST_CASE("strnatcmp")
         constexpr const char* n2 = "10";
 
         CHECK(strnatcmp(strlen(n1), n1, strlen(n2), n2) < 0);
+    }
+    {
+        constexpr const char* n1 = "servers";
+        constexpr const char* n2 = "servers.alpha";
+
+        CHECK(strnatcasecmp(strlen(n1), n1, strlen(n2), n2) < 0);
+    }
+    {
+        static constexpr const char* TOKENS = "[](){}";
+        const std::string n1 = "[servers]";
+        const std::string n2 = "[servers.alpha]";
+
+        auto lhs = string_fragment::from_str(n1).trim(TOKENS);
+        auto rhs = string_fragment::from_str(n2).trim(TOKENS);
+        CHECK(strnatcasecmp(lhs.length(), lhs.data(), rhs.length(), rhs.data())
+              < 0);
+    }
+
+    {
+        const std::string a = "10.112.81.15";
+        const std::string b = "192.168.202.254";
+
+        int ipcmp = 0;
+        auto rc = ipv4cmp(a.length(), a.c_str(), b.length(), b.c_str(), &ipcmp);
+        CHECK(rc == 1);
+        CHECK(ipcmp == -1);
+    }
+}
+
+TEST_CASE("last_word_str")
+{
+    {
+        std::string s = "foobar baz";
+
+        auto rc = last_word_str(&s[0], s.length(), 6);
+        CHECK(s.length() == rc);
+    }
+    {
+        std::string s = "com.example.foo";
+
+        auto rc = last_word_str(&s[0], s.length(), 6);
+        s.resize(rc);
+        CHECK(s == "foo");
     }
 }

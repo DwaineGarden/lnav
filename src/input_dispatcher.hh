@@ -34,21 +34,12 @@
 
 #include <functional>
 
+#include <notcurses/notcurses.h>
 #include <sys/types.h>
-
-#define KEY_ESCAPE        0x1b
-#define KEY_CTRL_RBRACKET 0x1d
 
 class input_dispatcher {
 public:
-    void new_input(const struct timeval& current_time, int ch);
-
-    void poll(const struct timeval& current_time);
-
-    bool in_escape() const
-    {
-        return this->id_escape_index > 0;
-    }
+    void new_input(const timeval& current_time, notcurses* nc, ncinput& ch);
 
     enum class escape_match_t {
         NONE,
@@ -56,24 +47,13 @@ public:
         FULL,
     };
 
+    size_t id_count{0};
+
     std::function<escape_match_t(const char*)> id_escape_matcher;
-    std::function<bool(int)> id_key_handler;
+    std::function<bool(notcurses*, const ncinput&, const char*)> id_key_handler;
     std::function<void(const char*)> id_escape_handler;
-    std::function<void()> id_mouse_handler;
+    std::function<void(notcurses*, const ncinput&)> id_mouse_handler;
     std::function<void(const char*)> id_unhandled_handler;
-
-private:
-    void reset_escape_buffer(int ch,
-                             const struct timeval& current_time,
-                             ssize_t expected_size = -1);
-    void append_to_escape_buffer(int ch);
-
-    char id_escape_buffer[32];
-    ssize_t id_escape_index{0};
-    ssize_t id_escape_expected_size{-1};
-    struct timeval id_escape_start_time {
-        0, 0
-    };
 };
 
 #endif

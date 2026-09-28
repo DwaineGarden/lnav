@@ -32,10 +32,15 @@
 #include <assert.h>
 #include <stdio.h>
 
+#include "base/is_utf8.hh"
 #include "yajlpp.hh"
 #include "yajlpp_def.hh"
 
 const char* TEST_DATA = R"([{ "foo": 0 }, 2, { "foo": 1 }])";
+
+const char* TEST_UTF_DATA
+    = "{\"path\":\""
+      "\xd8\xb3\xd8\xa7\xd9\x85\xb3\xd9\x88\xd9\x86\xda\xaf-43\"}";
 
 const char* TEST_OBJ_DATA = "{ \"foo\": 0 }";
 
@@ -63,14 +68,82 @@ read_const(yajlpp_parse_context* ypc, long long value)
 }
 
 static int
-dummy_string_handler(void* ctx, const unsigned char* s, size_t len)
+dummy_string_handler(void* ctx,
+                     const unsigned char* s,
+                     size_t len,
+                     yajl_string_props_t*)
 {
     return 1;
 }
 
+static int
+read_json_field(yajlpp_parse_context* ypc,
+                const unsigned char* str,
+                size_t len,
+                yajl_string_props_t*)
+{
+    auto* paths = (std::vector<intern_string_t>*) ypc->ypc_userdata;
+    paths->emplace_back(ypc->get_path());
+    return 1;
+}
+
+static const json_path_container json_log_handlers = {
+    yajlpp::pattern_property_handler(".+").add_cb(read_json_field),
+};
+
 int
 main(int argc, char* argv[])
 {
+    {
+        static const auto STRING_SRC = intern_string::lookup("string");
+        static const auto INPUT = R"({"abc~def": "bar", "abc": "foo"})"_frag;
+
+        std::vector<intern_string_t> paths;
+        yajlpp_parse_context ypc(STRING_SRC);
+        auto_mem<yajl_handle_t> handle(yajl_free);
+        handle = yajl_alloc(&ypc.ypc_callbacks, nullptr, &ypc);
+        ypc.with_handle(handle);
+        ypc.set_static_handler(json_log_handlers.jpc_children[0]);
+        ypc.ypc_userdata = &paths;
+        auto rc = ypc.parse_doc(INPUT);
+        assert(rc);
+        assert(paths[0] == intern_string::lookup("abc~0def"));
+        assert(paths[1] == intern_string::lookup("abc"));
+    }
+
+    {
+        struct test_struct {
+            positioned_property<std::string> ts_path;
+        };
+
+        typed_json_path_container<test_struct> test_obj_handlers = {
+            yajlpp::property_handler("path").for_field(&test_struct::ts_path),
+        };
+
+        auto test_utf_res = is_utf8(string_fragment::from_c_str(TEST_UTF_DATA));
+        assert(!test_utf_res.is_valid());
+        static const auto STRING_SRC = intern_string::lookup("string");
+        {
+            auto parse_res
+                = test_obj_handlers.parser_for(STRING_SRC)
+                      .of(string_fragment::from_c_str(TEST_UTF_DATA));
+            if (parse_res.isErr()) {
+                fprintf(
+                    stderr,
+                    "parse error: %s\n",
+                    parse_res.unwrapErr()[0].to_attr_line().al_string.c_str());
+            }
+            assert(parse_res.isErr());
+        }
+        {
+            const auto INPUT = R"({"path": "/foo/bar"})"_frag;
+            auto parse_res = test_obj_handlers.parser_for(STRING_SRC).of(INPUT);
+            assert(parse_res.isOk());
+            auto val = parse_res.unwrap();
+            printf("val %s\n", val.ts_path.pp_value.c_str());
+        }
+    }
+
     static const auto TEST_SRC = intern_string::lookup("test_data");
 
     {

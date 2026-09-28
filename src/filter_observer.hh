@@ -30,29 +30,41 @@
 #ifndef filter_observer_hh
 #define filter_observer_hh
 
-#include <sys/types.h>
+#include <cstdint>
+#include <memory>
 
+#include "base/file_range.hh"
 #include "logfile.hh"
+#include "shared_buffer.hh"
 #include "textview_curses.hh"
 
 class line_filter_observer : public logline_observer {
 public:
-    line_filter_observer(filter_stack& fs, std::shared_ptr<logfile> lf)
+    line_filter_observer(filter_stack& fs, const std::shared_ptr<logfile>& lf)
         : lfo_filter_stack(fs), lfo_filter_state(lf)
     {
     }
 
+    void logline_clear(const logfile& lf) override;
+
     void logline_restart(const logfile& lf, file_size_t rollback_size) override
     {
-        for (auto& filter : this->lfo_filter_stack) {
+        for (const auto& filter : this->lfo_filter_stack) {
             filter->revert_to_last(this->lfo_filter_state, rollback_size);
         }
     }
 
-    void logline_new_lines(const logfile& lf,
-                           logfile::const_iterator ll_begin,
+    bool logline_new_lines(const logfile& lf,
+                           logfile::const_iterator ll_baegin,
                            logfile::const_iterator ll_end,
-                           shared_buffer_ref& sbr) override;
+                           const shared_buffer_ref& sbr) override;
+
+    bool logline_wants_text() const override
+    {
+        // The same condition logline_new_lines() already early-outs on: with
+        // no filters, the text is never examined.
+        return !this->lfo_filter_stack.empty();
+    }
 
     void logline_eof(const logfile& lf) override;
 

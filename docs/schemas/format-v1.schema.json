@@ -10,7 +10,7 @@
         }
     },
     "patternProperties": {
-        "(\\w+)": {
+        "^(\\w+)$": {
             "description": "The definition of a log file format.",
             "title": "/<format_name>",
             "type": "object",
@@ -20,7 +20,7 @@
                     "title": "/<format_name>/regex",
                     "type": "object",
                     "patternProperties": {
-                        "([^/]+)": {
+                        "^(.+)$": {
                             "description": "The set of patterns used to match log messages",
                             "title": "/<format_name>/regex/<pattern_name>",
                             "type": "object",
@@ -30,11 +30,6 @@
                                     "description": "The regular expression to match a log message and capture fields.",
                                     "type": "string",
                                     "minLength": 1
-                                },
-                                "module-format": {
-                                    "title": "/<format_name>/regex/<pattern_name>/module-format",
-                                    "description": "If true, this pattern will only be used to parse message bodies of container formats, like syslog",
-                                    "type": "boolean"
                                 }
                             },
                             "additionalProperties": false
@@ -54,7 +49,7 @@
                 },
                 "hide-extra": {
                     "title": "/<format_name>/hide-extra",
-                    "description": "Specifies whether extra values in JSON logs should be displayed",
+                    "description": "If 'true', JSON-log values that are not defined in the 'value' object are hidden",
                     "type": "boolean"
                 },
                 "multiline": {
@@ -65,26 +60,58 @@
                 "timestamp-divisor": {
                     "title": "/<format_name>/timestamp-divisor",
                     "description": "The value to divide a numeric timestamp by in a JSON log.",
-                    "type": [
-                        "integer",
-                        "number"
-                    ]
+                    "type": "number",
+                    "exclusiveMinimum": 0.0
                 },
                 "file-pattern": {
                     "title": "/<format_name>/file-pattern",
                     "description": "A regular expression that restricts this format to log files with a matching name",
                     "type": "string"
                 },
-                "mime-types": {
-                    "title": "/<format_name>/mime-types",
-                    "description": "A list of mime-types this format should be used for",
-                    "type": "array",
-                    "items": {
-                        "type": "string",
-                        "enum": [
-                            "application/vnd.tcpdump.pcap"
-                        ]
-                    }
+                "converter": {
+                    "description": "Describes how the file format can be detected and converted to a log that can be understood by lnav",
+                    "title": "/<format_name>/converter",
+                    "type": "object",
+                    "properties": {
+                        "type": {
+                            "title": "/<format_name>/converter/type",
+                            "description": "The MIME type",
+                            "type": "string"
+                        },
+                        "header": {
+                            "description": "File header detection definitions",
+                            "title": "/<format_name>/converter/header",
+                            "type": "object",
+                            "properties": {
+                                "expr": {
+                                    "description": "The expressions used to check if a file header matches this file format",
+                                    "title": "/<format_name>/converter/header/expr",
+                                    "type": "object",
+                                    "patternProperties": {
+                                        "^(\\w+)$": {
+                                            "title": "/<format_name>/converter/header/expr/<header_expr_name>",
+                                            "description": "SQLite expression",
+                                            "type": "string"
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                },
+                                "size": {
+                                    "title": "/<format_name>/converter/header/size",
+                                    "description": "The minimum size required for this header type",
+                                    "type": "integer"
+                                }
+                            },
+                            "additionalProperties": false
+                        },
+                        "command": {
+                            "title": "/<format_name>/converter/command",
+                            "description": "The script used to convert the file",
+                            "type": "string",
+                            "pattern": "[\\w\\.\\-]+"
+                        }
+                    },
+                    "additionalProperties": false
                 },
                 "level-field": {
                     "title": "/<format_name>/level-field",
@@ -99,6 +126,11 @@
                 "timestamp-field": {
                     "title": "/<format_name>/timestamp-field",
                     "description": "The name of the timestamp field in the log message pattern",
+                    "type": "string"
+                },
+                "start-timestamp-field": {
+                    "title": "/<format_name>/start-timestamp-field",
+                    "description": "The name of the field that contains the start time of the operation.  The timestamp-field is treated as the end time and the duration is computed as the difference.",
                     "type": "string"
                 },
                 "subsecond-field": {
@@ -121,10 +153,50 @@
                     "description": "The name of the time field in the log message pattern.  This field should only be specified if the timestamp field only contains a date.",
                     "type": "string"
                 },
+                "timestamp-point-of-reference": {
+                    "title": "/<format_name>/timestamp-point-of-reference",
+                    "description": "The relation of the timestamp to the operation that the message refers to.",
+                    "type": "string",
+                    "enum": [
+                        "end",
+                        "start"
+                    ]
+                },
                 "body-field": {
                     "title": "/<format_name>/body-field",
                     "description": "The name of the body field in the log message pattern",
                     "type": "string"
+                },
+                "thread-id-field": {
+                    "title": "/<format_name>/thread-id-field",
+                    "description": "The name of the thread ID field in the log message pattern",
+                    "type": "string"
+                },
+                "src-file-field": {
+                    "title": "/<format_name>/src-file-field",
+                    "description": "The name of the source file field in the log message pattern",
+                    "type": "string"
+                },
+                "src-line-field": {
+                    "title": "/<format_name>/src-line-field",
+                    "description": "The name of the source line field in the log message pattern",
+                    "type": "string"
+                },
+                "src-location-field": {
+                    "title": "/<format_name>/src-location-field",
+                    "description": "The name of the field that contains the source file and line number",
+                    "type": "string"
+                },
+                "duration-field": {
+                    "title": "/<format_name>/duration-field",
+                    "description": "The name of the duration field in the log message pattern",
+                    "type": "string"
+                },
+                "duration-divisor": {
+                    "title": "/<format_name>/duration-divisor",
+                    "description": "The value to divide a duration by to convert it to seconds.  For example, if the duration field is in milliseconds, the divisor should be 1000.",
+                    "type": "number",
+                    "exclusiveMinimum": 0.0
                 },
                 "url": {
                     "title": "/<format_name>/url",
@@ -155,15 +227,136 @@
                         "type": "string"
                     }
                 },
-                "module-field": {
-                    "title": "/<format_name>/module-field",
-                    "description": "The name of the module field in the log message pattern",
-                    "type": "string"
-                },
                 "opid-field": {
                     "title": "/<format_name>/opid-field",
                     "description": "The name of the operation-id field in the log message pattern",
                     "type": "string"
+                },
+                "opid": {
+                    "description": "Definitions related to operations found in logs",
+                    "title": "/<format_name>/opid",
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "title": "/<format_name>/opid/source",
+                            "description": "The source of the operation ID",
+                            "type": "string",
+                            "enum": [
+                                "from-description",
+                                "from-whole-msg"
+                            ]
+                        },
+                        "subid": {
+                            "title": "/<format_name>/opid/subid",
+                            "description": "The field that holds the ID for a sub-operation",
+                            "type": "string"
+                        },
+                        "description": {
+                            "description": "Define how to construct a description of an operation",
+                            "title": "/<format_name>/opid/description",
+                            "type": "object",
+                            "patternProperties": {
+                                "^([\\w\\.\\-]+)$": {
+                                    "description": "A type of description for this operation",
+                                    "title": "/<format_name>/opid/description/<opid_descriptor>",
+                                    "type": "object",
+                                    "properties": {
+                                        "format": {
+                                            "description": "Defines the elements of this operation description",
+                                            "title": "/<format_name>/opid/description/<opid_descriptor>/format",
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "field": {
+                                                        "title": "/<format_name>/opid/description/<opid_descriptor>/format/field",
+                                                        "description": "The field to include in the operation description",
+                                                        "type": "string"
+                                                    },
+                                                    "extractor": {
+                                                        "title": "/<format_name>/opid/description/<opid_descriptor>/format/extractor",
+                                                        "description": "The regex used to extract content for the operation description",
+                                                        "type": "string"
+                                                    },
+                                                    "prefix": {
+                                                        "title": "/<format_name>/opid/description/<opid_descriptor>/format/prefix",
+                                                        "description": "A string to prepend to this field in the description",
+                                                        "type": "string"
+                                                    },
+                                                    "suffix": {
+                                                        "title": "/<format_name>/opid/description/<opid_descriptor>/format/suffix",
+                                                        "description": "A string to append to this field in the description",
+                                                        "type": "string"
+                                                    },
+                                                    "joiner": {
+                                                        "title": "/<format_name>/opid/description/<opid_descriptor>/format/joiner",
+                                                        "description": "A string to insert between instances of this field when the field is found more than once",
+                                                        "type": "string"
+                                                    }
+                                                },
+                                                "additionalProperties": false
+                                            }
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            },
+                            "additionalProperties": false
+                        },
+                        "sub-description": {
+                            "description": "Define how to construct a description of a sub-operation",
+                            "title": "/<format_name>/opid/sub-description",
+                            "type": "object",
+                            "patternProperties": {
+                                "^([\\w\\.\\-]+)$": {
+                                    "description": "A type of description for this sub-operation",
+                                    "title": "/<format_name>/opid/sub-description/<subid_descriptor>",
+                                    "type": "object",
+                                    "properties": {
+                                        "format": {
+                                            "description": "Defines the elements of this operation description",
+                                            "title": "/<format_name>/opid/sub-description/<subid_descriptor>/format",
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "field": {
+                                                        "title": "/<format_name>/opid/sub-description/<subid_descriptor>/format/field",
+                                                        "description": "The field to include in the operation description",
+                                                        "type": "string"
+                                                    },
+                                                    "extractor": {
+                                                        "title": "/<format_name>/opid/sub-description/<subid_descriptor>/format/extractor",
+                                                        "description": "The regex used to extract content for the operation description",
+                                                        "type": "string"
+                                                    },
+                                                    "prefix": {
+                                                        "title": "/<format_name>/opid/sub-description/<subid_descriptor>/format/prefix",
+                                                        "description": "A string to prepend to this field in the description",
+                                                        "type": "string"
+                                                    },
+                                                    "suffix": {
+                                                        "title": "/<format_name>/opid/sub-description/<subid_descriptor>/format/suffix",
+                                                        "description": "A string to append to this field in the description",
+                                                        "type": "string"
+                                                    },
+                                                    "joiner": {
+                                                        "title": "/<format_name>/opid/sub-description/<subid_descriptor>/format/joiner",
+                                                        "description": "A string to insert between instances of this field when the field is found more than once",
+                                                        "type": "string"
+                                                    }
+                                                },
+                                                "additionalProperties": false
+                                            }
+                                        }
+                                    },
+                                    "additionalProperties": false
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
                 },
                 "ordered-by-time": {
                     "title": "/<format_name>/ordered-by-time",
@@ -175,7 +368,7 @@
                     "title": "/<format_name>/level",
                     "type": "object",
                     "patternProperties": {
-                        "(trace|debug[2345]?|info|stats|notice|warning|error|critical|fatal)": {
+                        "^(trace|debug[2345]?|info|stats|notice|warning|error|critical|fatal)$": {
                             "title": "/<format_name>/level/<level>",
                             "description": "The regular expression used to match the log text for this level.  For JSON logs with numeric levels, this should be the number for the corresponding level.",
                             "type": [
@@ -191,7 +384,7 @@
                     "title": "/<format_name>/value",
                     "type": "object",
                     "patternProperties": {
-                        "([^/]+)": {
+                        "^(.+)$": {
                             "description": "The set of values captured by the log message patterns",
                             "title": "/<format_name>/value/<value_name>",
                             "type": "object",
@@ -208,7 +401,9 @@
                                         "json",
                                         "struct",
                                         "quoted",
-                                        "xml"
+                                        "xml",
+                                        "timestamp",
+                                        "any"
                                     ]
                                 },
                                 "collate": {
@@ -231,7 +426,7 @@
                                             "title": "/<format_name>/value/<value_name>/unit/scaling-factor",
                                             "type": "object",
                                             "patternProperties": {
-                                                "([^/]+)": {
+                                                "^(.+)$": {
                                                     "title": "/<format_name>/value/<value_name>/unit/scaling-factor/<scale>",
                                                     "type": "object",
                                                     "properties": {
@@ -253,6 +448,20 @@
                                                 }
                                             },
                                             "additionalProperties": false
+                                        },
+                                        "suffix": {
+                                            "title": "/<format_name>/value/<value_name>/unit/suffix",
+                                            "description": "The display suffix for this field; lnav uses the suffix to pick a humanization family (e.g. \"B\" for bytes, \"s\" for seconds, \"Hz\" for frequency).  Unknown suffixes are appended verbatim without scaling.",
+                                            "type": "string",
+                                            "examples": [
+                                                "B"
+                                            ]
+                                        },
+                                        "divisor": {
+                                            "title": "/<format_name>/value/<value_name>/unit/divisor",
+                                            "description": "A divisor applied to the raw numeric value to normalize it to the base unit implied by the suffix.  For example, a field storing milliseconds paired with \"suffix\": \"s\" would declare \"divisor\": 1000.",
+                                            "type": "number",
+                                            "exclusiveMinimum": 0.0
                                         }
                                     },
                                     "additionalProperties": false
@@ -292,6 +501,45 @@
                                     "title": "/<format_name>/value/<value_name>/description",
                                     "description": "A description of the field",
                                     "type": "string"
+                                },
+                                "highlights": {
+                                    "description": "The set of highlight definitions",
+                                    "title": "/<format_name>/value/<value_name>/highlights",
+                                    "type": "object",
+                                    "patternProperties": {
+                                        "^(.+)$": {
+                                            "description": "The definition of a highlight",
+                                            "title": "/<format_name>/value/<value_name>/highlights/<highlight_name>",
+                                            "type": "object",
+                                            "properties": {
+                                                "pattern": {
+                                                    "title": "/<format_name>/value/<value_name>/highlights/<highlight_name>/pattern",
+                                                    "description": "A regular expression to highlight in logs of this format.",
+                                                    "type": "string"
+                                                },
+                                                "base-style": {
+                                                    "description": "The style to use for the entire pattern",
+                                                    "title": "/<format_name>/value/<value_name>/highlights/<highlight_name>/base-style",
+                                                    "$ref": "#/definitions/style"
+                                                },
+                                                "captures": {
+                                                    "description": "Styles for individual named capture groups in the pattern",
+                                                    "title": "/<format_name>/value/<value_name>/highlights/<highlight_name>/captures",
+                                                    "type": "object",
+                                                    "patternProperties": {
+                                                        "^(.+)$": {
+                                                            "description": "The definition of a capture highlight",
+                                                            "title": "/<format_name>/value/<value_name>/highlights/<highlight_name>/captures/<hl_cap_name>",
+                                                            "$ref": "#/definitions/style"
+                                                        }
+                                                    },
+                                                    "additionalProperties": false
+                                                }
+                                            },
+                                            "additionalProperties": false
+                                        }
+                                    },
+                                    "additionalProperties": false
                                 }
                             },
                             "additionalProperties": false
@@ -304,7 +552,7 @@
                     "title": "/<format_name>/tags",
                     "type": "object",
                     "patternProperties": {
-                        "([\\w:;\\._\\-]+)": {
+                        "^([\\w:;\\._\\-]+)$": {
                             "description": "The name of the tag to apply",
                             "title": "/<format_name>/tags/<tag_name>",
                             "type": "object",
@@ -367,11 +615,79 @@
                     },
                     "additionalProperties": false
                 },
+                "partitions": {
+                    "description": "The partitions to automatically apply to log messages",
+                    "title": "/<format_name>/partitions",
+                    "type": "object",
+                    "patternProperties": {
+                        "^([\\w:;\\._\\- ]+)$": {
+                            "description": "The type of partition to apply",
+                            "title": "/<format_name>/partitions/<partition_type>",
+                            "type": "object",
+                            "properties": {
+                                "paths": {
+                                    "description": "Restrict partitioning to the given paths",
+                                    "title": "/<format_name>/partitions/<partition_type>/paths",
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "glob": {
+                                                "title": "/<format_name>/partitions/<partition_type>/paths/glob",
+                                                "description": "The glob to match against file paths",
+                                                "type": "string",
+                                                "examples": [
+                                                    "*/system.log*"
+                                                ]
+                                            }
+                                        },
+                                        "additionalProperties": false
+                                    }
+                                },
+                                "pattern": {
+                                    "title": "/<format_name>/partitions/<partition_type>/pattern",
+                                    "description": "The regular expression to match against the body of the log message",
+                                    "type": "string",
+                                    "examples": [
+                                        "\\w+ is down"
+                                    ]
+                                },
+                                "description": {
+                                    "title": "/<format_name>/partitions/<partition_type>/description",
+                                    "description": "A description of this partition",
+                                    "type": "string"
+                                },
+                                "level": {
+                                    "title": "/<format_name>/partitions/<partition_type>/level",
+                                    "description": "Constrain hits to log messages with this level",
+                                    "type": "string",
+                                    "enum": [
+                                        "trace",
+                                        "debug5",
+                                        "debug4",
+                                        "debug3",
+                                        "debug2",
+                                        "debug",
+                                        "info",
+                                        "stats",
+                                        "notice",
+                                        "warning",
+                                        "error",
+                                        "critical",
+                                        "fatal"
+                                    ]
+                                }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
+                },
                 "action": {
                     "title": "/<format_name>/action",
                     "type": "object",
                     "patternProperties": {
-                        "(\\w+)": {
+                        "^(\\w+)$": {
                             "title": "/<format_name>/action/<action_name>",
                             "type": [
                                 "string",
@@ -470,7 +786,7 @@
                                 "title": "/<format_name>/line-format/min-width",
                                 "description": "The minimum width of the field",
                                 "type": "integer",
-                                "minimum": 0
+                                "minimum": 0.0
                             },
                             "auto-width": {
                                 "title": "/<format_name>/line-format/auto-width",
@@ -481,7 +797,7 @@
                                 "title": "/<format_name>/line-format/max-width",
                                 "description": "The maximum width of the field",
                                 "type": "integer",
-                                "minimum": 0
+                                "minimum": 0.0
                             },
                             "align": {
                                 "title": "/<format_name>/line-format/align",
@@ -499,7 +815,8 @@
                                 "enum": [
                                     "abbrev",
                                     "truncate",
-                                    "dot-dot"
+                                    "dot-dot",
+                                    "last-word"
                                 ]
                             },
                             "text-transform": {
@@ -512,6 +829,16 @@
                                     "lowercase",
                                     "capitalize"
                                 ]
+                            },
+                            "prefix": {
+                                "title": "/<format_name>/line-format/prefix",
+                                "description": "Text to prepend to the value",
+                                "type": "string"
+                            },
+                            "suffix": {
+                                "title": "/<format_name>/line-format/suffix",
+                                "description": "Text to append to the value",
+                                "type": "string"
                             }
                         },
                         "additionalProperties": false
@@ -522,7 +849,7 @@
                     "title": "/<format_name>/search-table",
                     "type": "object",
                     "patternProperties": {
-                        "(\\w+)": {
+                        "^(\\w+)$": {
                             "description": "The set of search tables to be automatically defined",
                             "title": "/<format_name>/search-table/<table_name>",
                             "type": "object",
@@ -568,7 +895,7 @@
                     "title": "/<format_name>/highlights",
                     "type": "object",
                     "patternProperties": {
-                        "([^/]+)": {
+                        "^(.+)$": {
                             "description": "The definition of a highlight",
                             "title": "/<format_name>/highlights/<highlight_name>",
                             "type": "object",
@@ -597,6 +924,11 @@
                                     "title": "/<format_name>/highlights/<highlight_name>/blink",
                                     "description": "Highlight this pattern by blinking.",
                                     "type": "boolean"
+                                },
+                                "nestable": {
+                                    "title": "/<format_name>/highlights/<highlight_name>/nestable",
+                                    "description": "This highlight can be nested in another highlight.",
+                                    "type": "boolean"
                                 }
                             },
                             "additionalProperties": false
@@ -611,18 +943,83 @@
                     "enum": [
                         "text",
                         "json",
-                        "csv"
+                        "tabular"
                     ]
                 },
                 "max-unrecognized-lines": {
                     "title": "/<format_name>/max-unrecognized-lines",
                     "description": "The maximum number of lines in a file to use when detecting the format",
                     "type": "integer",
-                    "minimum": 1
+                    "minimum": 1.0
                 }
             },
             "additionalProperties": false
         }
     },
-    "additionalProperties": false
+    "additionalProperties": false,
+    "definitions": {
+        "style": {
+            "title": "style",
+            "type": "object",
+            "$$target": "#/definitions/style",
+            "properties": {
+                "text-align": {
+                    "title": "/text-align",
+                    "description": "How to align text within a cell",
+                    "type": "string",
+                    "enum": [
+                        "start",
+                        "center",
+                        "end"
+                    ]
+                },
+                "color": {
+                    "title": "/color",
+                    "description": "The foreground color value for this style. The value can be the name of an xterm color, the hexadecimal value, a theme variable reference, or 'semantic()' to derive the color from a hash of the matched text.",
+                    "type": "string",
+                    "examples": [
+                        "#fff",
+                        "Green",
+                        "$black",
+                        "semantic()"
+                    ]
+                },
+                "background-color": {
+                    "title": "/background-color",
+                    "description": "The background color value for this style. The value can be the name of an xterm color, the hexadecimal value, a theme variable reference, or 'semantic()' to derive the color from a hash of the matched text.",
+                    "type": "string",
+                    "examples": [
+                        "#2d2a2e",
+                        "Green"
+                    ]
+                },
+                "underline": {
+                    "title": "/underline",
+                    "description": "Indicates that the text should be underlined.",
+                    "type": "boolean"
+                },
+                "bold": {
+                    "title": "/bold",
+                    "description": "Indicates that the text should be bolded.",
+                    "type": "boolean"
+                },
+                "italic": {
+                    "title": "/italic",
+                    "description": "Indicates that the text should be italicized.",
+                    "type": "boolean"
+                },
+                "strike": {
+                    "title": "/strike",
+                    "description": "Indicates that the text should be struck.",
+                    "type": "boolean"
+                },
+                "nestable": {
+                    "title": "/nestable",
+                    "description": "This highlight can be nested in another highlight.",
+                    "type": "boolean"
+                }
+            },
+            "additionalProperties": false
+        }
+    }
 }

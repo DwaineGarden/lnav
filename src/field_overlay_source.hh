@@ -30,57 +30,116 @@
 #ifndef LNAV_FIELD_OVERLAY_SOURCE_H
 #define LNAV_FIELD_OVERLAY_SOURCE_H
 
-#include <utility>
+#include <functional>
+#include <optional>
+#include <stack>
 #include <vector>
 
+#include "base/lrucache.hpp"
+#include "hasher.hh"
 #include "listview_curses.hh"
 #include "log_data_helper.hh"
 #include "logfile_sub_source.hh"
-#include "textfile_sub_source.hh"
+#include "text_overlay_menu.hh"
 
-class field_overlay_source : public list_overlay_source {
+/** What has been found while the files are being discovered and indexed. */
+struct discovery_stats {
+    size_t ds_files{0};
+    size_t ds_log_files{0};
+    size_t ds_text_files{0};
+    size_t ds_errors{0};
+    /** The number of files for each detected format, largest first. */
+    std::vector<std::pair<std::string, size_t>> ds_formats;
+};
+
+class field_overlay_source : public text_overlay_menu {
 public:
-    explicit field_overlay_source(logfile_sub_source& lss,
-                                  textfile_sub_source& tss)
+    explicit field_overlay_source(logfile_sub_source& lss, text_sub_source& tss)
         : fos_lss(lss), fos_tss(tss), fos_log_helper(lss)
     {
     }
 
     void add_key_line_attrs(int key_size, bool last_line = false);
 
-    bool list_value_for_overlay(const listview_curses& lv,
-                                int y,
-                                int bottom,
-                                vis_line_t row,
-                                attr_line_t& value_out) override;
+    void reset() override;
 
-    void build_field_lines(const listview_curses& lv);
+    bool list_static_overlay(const listview_curses& lv,
+                             media_t media,
+                             int y,
+                             int bottom,
+                             attr_line_t& value_out) override;
+
+    std::optional<attr_line_t> list_header_for_overlay(
+        const listview_curses& lv, media_t media, vis_line_t vl) override;
+
+    void list_value_for_overlay(const listview_curses& lv,
+                                vis_line_t row,
+                                std::vector<attr_line_t>& value_out) override;
+
+    void build_field_lines(const listview_curses& lv, vis_line_t row);
+    /**
+     * Append a row for each named search that matched the message loaded into
+     * fos_log_helper, along with the text it matched.
+     */
+    void build_search_lines(const listview_curses& lv, vis_line_t row);
     void build_meta_line(const listview_curses& lv,
                          std::vector<attr_line_t>& dst,
                          vis_line_t row);
 
+    void set_show_details_in_overlay(bool val) override
+    {
+        this->fos_contexts.top().c_show = val;
+    }
+
+    bool get_show_details_in_overlay() const override
+    {
+        return this->fos_contexts.top().c_show;
+    }
+
     struct context {
-        context(std::string prefix, bool show, bool show_discovered)
+        context(std::string prefix,
+                bool show,
+                bool show_discovered,
+                bool show_applicable_annotations)
             : c_prefix(std::move(prefix)), c_show(show),
-              c_show_discovered(show_discovered)
+              c_show_discovered(show_discovered),
+              c_show_applicable_annotations(show_applicable_annotations)
         {
         }
 
         std::string c_prefix;
         bool c_show{false};
         bool c_show_discovered{true};
+        bool c_show_applicable_annotations{true};
     };
 
-    bool fos_show_status{true};
     std::stack<context> fos_contexts;
     logfile_sub_source& fos_lss;
-    textfile_sub_source& fos_tss;
+    text_sub_source& fos_tss;
+    uint32_t fos_index_generation{0};
+    cache::lru_cache<vis_line_t, std::optional<attr_line_t>> fos_anno_cache{
+        256};
     log_data_helper fos_log_helper;
     int fos_known_key_size{0};
     int fos_unknown_key_size{0};
+    std::vector<attr_line_t> fos_static_lines;
+    hasher::array_t fos_static_lines_state;
+    /** Shown in place of the log messages until all files have been found. */
+    std::function<discovery_stats()> fos_discovery_stats;
     std::vector<attr_line_t> fos_lines;
-    vis_line_t fos_meta_lines_row{0_vl};
     std::vector<attr_line_t> fos_meta_lines;
+    std::optional<content_line_t> fos_header_line;
+    std::optional<logfile_sub_source::line_context_t> fos_header_line_context;
+    bool fos_header_has_time_offset{false};
+    bool fos_header_has_time_preview{false};
+    bool fos_header_has_hidden_fields{false};
+
+    struct row_info {
+        std::optional<logline_value_meta> ri_meta;
+        std::string ri_value;
+    };
+
+    std::map<size_t, row_info> fos_row_to_field_meta;
 };
 
 #endif  // LNAV_FIELD_OVERLAY_SOURCE_H

@@ -27,24 +27,24 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <optional>
+
 #include "humanize.network.hh"
 
 #include "config.h"
+#include "itertools.hh"
 #include "pcrepp/pcre2pp.hh"
 
-namespace humanize {
-namespace network {
-namespace path {
+namespace humanize::network::path {
 
-nonstd::optional<::network::path>
+std::optional<::network::path>
 from_str(string_fragment sf)
 {
     static const auto REMOTE_PATTERN = lnav::pcre2pp::code::from_const(
         "^(?:(?<username>[\\w\\._\\-]+)@)?"
-        "(?:\\[(?<ipv6>[^\\]]+)\\]|(?<hostname>[^\\[/:]+)):"
+        "(?:\\[(?<ipv6>[^\\]]+)\\]|(?<hostname>[^\\[/:]{2,})):"
         "(?<path>.*)$");
-    static thread_local auto REMOTE_MATCH_DATA
-        = REMOTE_PATTERN.create_match_data();
+    thread_local auto REMOTE_MATCH_DATA = REMOTE_PATTERN.create_match_data();
 
     auto match_res = REMOTE_PATTERN.capture_from(sf)
                          .into(REMOTE_MATCH_DATA)
@@ -52,11 +52,11 @@ from_str(string_fragment sf)
                          .ignore_error();
 
     if (!match_res) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
-    const auto username = REMOTE_MATCH_DATA["username"].map(
-        [](auto sf) { return sf.to_string(); });
+    const auto username = REMOTE_MATCH_DATA["username"]
+        | lnav::itertools::map([](auto sf) { return sf.to_string(); });
     const auto ipv6 = REMOTE_MATCH_DATA["ipv6"];
     const auto hostname = REMOTE_MATCH_DATA["hostname"];
     const auto locality_hostname = ipv6 ? ipv6.value() : hostname.value();
@@ -66,11 +66,9 @@ from_str(string_fragment sf)
         path = string_fragment::from_const(".");
     }
     return ::network::path{
-        {username, locality_hostname.to_string(), nonstd::nullopt},
+        {username, locality_hostname.to_string(), std::nullopt},
         path.to_string(),
     };
 }
 
-}  // namespace path
-}  // namespace network
-}  // namespace humanize
+}  // namespace humanize::network::path

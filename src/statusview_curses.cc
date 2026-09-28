@@ -35,17 +35,59 @@
 #include "statusview_curses.hh"
 
 #include "base/ansi_scrubber.hh"
+#include "base/itertools.hh"
 #include "config.h"
 
 void
+status_field::no_op_action(status_field&)
+{
+}
+
+bool
 status_field::set_value(std::string value)
 {
-    auto& sa = this->sf_value.get_attrs();
+    if (value == this->sf_value.al_string) {
+        return false;
+    }
 
-    sa.clear();
+    this->sf_value.with_ansi_string(value);
+    return true;
+}
 
-    scrub_ansi_string(value, &sa);
-    this->sf_value.with_string(value);
+bool
+status_field::set_value(const string_fragment& value)
+{
+    if (value == this->sf_value.al_string) {
+        return false;
+    }
+
+    this->sf_value.with_ansi_string(value);
+    return true;
+}
+
+bool
+status_field::set_value(const char* fmt, ...)
+{
+    char buffer[256];
+    va_list args;
+
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    auto retval = this->set_value(std::string(buffer));
+    va_end(args);
+
+    return retval;
+}
+
+bool
+status_field::set_value(const attr_line_t& value)
+{
+    if (value.al_string == this->sf_value.al_string) {
+        return false;
+    }
+
+    this->sf_value = value;
+    return true;
 }
 
 void
@@ -60,11 +102,11 @@ status_field::do_cylon()
         ? cycle_pos
         : (this->sf_width - (cycle_pos - this->sf_width) - 1);
     auto stop = std::min(start + 3, this->sf_width);
-    struct line_range lr(std::max<long>(start, 0L), stop);
-    auto& vc = view_colors::singleton();
+    line_range lr(std::max<long>(start, 0L), stop);
+    const auto& vc = view_colors::singleton();
 
     auto attrs = vc.attrs_for_role(role_t::VCR_ACTIVE_STATUS);
-    attrs.ta_attrs |= A_REVERSE;
+    attrs |= text_attrs::style::reverse;
     sa.emplace_back(lr, VC_STYLE.value(attrs));
 
     this->sf_cylon_pos += 1;
@@ -74,7 +116,7 @@ void
 status_field::set_stitch_value(role_t left, role_t right)
 {
     auto& sa = this->sf_value.get_attrs();
-    struct line_range lr(0, 1);
+    line_range lr(0, 1);
 
     this->sf_value.get_string() = "::";
     sa.clear();
@@ -84,36 +126,43 @@ status_field::set_stitch_value(role_t left, role_t right)
     sa.emplace_back(lr, VC_ROLE.value(right));
 }
 
-void
+bool
 statusview_curses::do_update()
 {
-    int top, field, field_count, left = 0, right;
-    auto& vc = view_colors::singleton();
-    unsigned long width, height;
-
-    if (!this->vc_visible || this->sc_window == nullptr) {
-        return;
+    if (!this->vc_needs_update) {
+        return view_curses::do_update();
     }
 
-    getmaxyx(this->sc_window, height, width);
+    int left = 0;
+    auto& vc = view_colors::singleton();
+    unsigned int width, height;
+
+    this->sc_displayed_fields.clear();
+    if (!this->vc_visible || this->vc_window == nullptr) {
+        return false;
+    }
+
+    ncplane_dim_yx(this->vc_window, &height, &width);
     this->window_change();
 
-    top = this->sc_top < 0 ? height + this->sc_top : this->sc_top;
-    right = width;
-    auto attrs = vc.attrs_for_role(
-        this->sc_enabled ? this->sc_default_role : role_t::VCR_INACTIVE_STATUS);
+    int top = this->vc_y < 0 ? height + this->vc_y : this->vc_y;
+    int right = width;
+    const auto attrs = vc.attrs_for_role(
+        this->sc_enabled ? this->vc_default_role : role_t::VCR_INACTIVE_STATUS);
 
-    auto pair = vc.ensure_color_pair(attrs.ta_fg_color, attrs.ta_bg_color);
-    wattr_set(this->sc_window, attrs.ta_attrs, pair, nullptr);
-    wmove(this->sc_window, top, 0);
-    wclrtoeol(this->sc_window);
-    whline(this->sc_window, ' ', width);
+    nccell clear_cell;
+    nccell_init(&clear_cell);
+    nccell_prime(
+        this->vc_window, &clear_cell, " ", 0, view_colors::to_channels(attrs));
+    ncplane_cursor_move_yx(this->vc_window, top, 0);
+    ncplane_hline(this->vc_window, &clear_cell, width);
+    nccell_release(this->vc_window, &clear_cell);
 
     if (this->sc_source != nullptr) {
-        field_count = this->sc_source->statusview_fields();
-        for (field = 0; field < field_count; field++) {
+        auto field_count = this->sc_source->statusview_fields();
+        for (size_t field = 0; field < field_count; field++) {
             auto& sf = this->sc_source->statusview_value_for_field(field);
-            struct line_range lr(0, sf.get_width());
+            auto lr = line_range{0, static_cast<int>(sf.get_width())};
             int x;
 
             if (sf.is_cylon()) {
@@ -122,19 +171,18 @@ statusview_curses::do_update()
             auto val = sf.get_value();
             if (!this->sc_enabled) {
                 for (auto& sa : val.get_attrs()) {
-                    if (sa.sa_type == &VC_STYLE) {
-                        auto sa_attrs = sa.sa_value.get<text_attrs>();
-                        sa_attrs.ta_attrs &= ~(A_REVERSE | A_COLOR);
-                        sa_attrs.ta_fg_color = nonstd::nullopt;
-                        sa_attrs.ta_bg_color = nonstd::nullopt;
-                        sa.sa_value = sa_attrs;
-                    } else if (sa.sa_type == &VC_ROLE) {
+                    if (sa.sa_type == &VC_ROLE) {
                         if (sa.sa_value.get<role_t>()
                             == role_t::VCR_ALERT_STATUS)
                         {
                             sa.sa_value.get<role_t>()
                                 = role_t::VCR_INACTIVE_ALERT_STATUS;
-                        } else {
+                        } else if (sa.sa_value.get<role_t>()
+                                   == role_t::VCR_WARN_STATUS)
+                        {
+                            sa.sa_value.get<role_t>()
+                                = role_t::VCR_INACTIVE_WARN_STATUS;
+                        } else if (this->sc_disable_styles) {
                             sa.sa_value = role_t::VCR_NONE;
                         }
                     }
@@ -154,8 +202,8 @@ statusview_curses::do_update()
                 left += sf.get_width();
             }
 
-            if (val.length() > sf.get_width()) {
-                static const std::string ELLIPSIS = "\xE2\x8B\xAF";
+            if (val.utf8_length_or_length() > sf.get_width()) {
+                static constexpr auto ELLIPSIS = "\xE2\x8B\xAF"_frag;
 
                 if (sf.get_width() > 11) {
                     size_t half_width = sf.get_width() / 2 - 1;
@@ -170,17 +218,29 @@ statusview_curses::do_update()
 
             auto default_role = sf.get_role();
             if (!this->sc_enabled) {
-                if (default_role == role_t::VCR_ALERT_STATUS) {
+                if (!this->sc_disable_styles
+                    && (default_role == role_t::VCR_STATUS_SUBTITLE
+                        || default_role == role_t::VCR_STATUS_TITLE))
+                {
+                } else if (default_role == role_t::VCR_ALERT_STATUS) {
                     default_role = role_t::VCR_INACTIVE_ALERT_STATUS;
+                } else if (default_role == role_t::VCR_WARN_STATUS) {
+                    default_role = role_t::VCR_INACTIVE_WARN_STATUS;
                 } else if (default_role != role_t::VCR_STATUS_INFO) {
                     default_role = role_t::VCR_INACTIVE_STATUS;
                 }
             }
 
-            mvwattrline(this->sc_window, top, x, val, lr, default_role);
+            auto write_res
+                = mvwattrline(this->vc_window, top, x, val, lr, default_role);
+            this->sc_displayed_fields.emplace_back(
+                line_range{x, static_cast<int>(x + write_res.mr_chars_out)},
+                field);
         }
     }
-    wmove(this->sc_window, top + 1, 0);
+    this->vc_needs_update = false;
+
+    return true;
 }
 
 void
@@ -192,21 +252,18 @@ statusview_curses::window_change()
 
     int field_count = this->sc_source->statusview_fields();
     int total_shares = 0;
-    unsigned long width, height;
     double remaining = 0;
     std::vector<status_field*> resizable;
 
-    getmaxyx(this->sc_window, height, width);
-    // Silence the compiler. Remove this if height is used at a later stage.
-    (void) height;
+    auto width = ncplane_dim_x(this->vc_window);
     remaining = width - 2;
 
     for (int field = 0; field < field_count; field++) {
         auto& sf = this->sc_source->statusview_value_for_field(field);
 
-        remaining -= sf.get_share() ? sf.get_min_width() : sf.get_width();
+        remaining -= sf.get_share() > 0 ? sf.get_min_width() : sf.get_width();
         total_shares += sf.get_share();
-        if (sf.get_share()) {
+        if (sf.get_share() > 0) {
             resizable.emplace_back(&sf);
         }
     }
@@ -216,7 +273,14 @@ statusview_curses::window_change()
     }
 
     std::stable_sort(begin(resizable), end(resizable), [](auto l, auto r) {
-        return r->get_share() < l->get_share();
+        if (r->get_share() < l->get_share()) {
+            return true;
+        }
+        if (r->get_share() == l->get_share()) {
+            return l->get_value().column_width()
+                < r->get_value().column_width();
+        }
+        return false;
     });
     for (auto* sf : resizable) {
         double divisor = total_shares / sf->get_share();
@@ -235,6 +299,33 @@ statusview_curses::window_change()
         remaining -= (actual_width - sf->get_min_width());
         total_shares -= sf->get_share();
 
-        sf->set_width(actual_width);
+        if (sf->get_width() != actual_width) {
+            sf->set_width(actual_width);
+            this->set_needs_update();
+        }
     }
+}
+
+bool
+statusview_curses::handle_mouse(mouse_event& me)
+{
+    auto find_res = this->sc_displayed_fields
+        | lnav::itertools::find_if([&me](const auto& elem) {
+                        return me.is_click_in(mouse_button_t::BUTTON_LEFT,
+                                              elem.df_range.lr_start,
+                                              elem.df_range.lr_end);
+                    });
+
+    if (find_res) {
+        auto& sf = this->sc_source->statusview_value_for_field(
+            find_res.value()->df_field_index);
+
+        sf.on_click(sf);
+    } else if (me.me_state == mouse_button_state_t::BUTTON_STATE_DRAGGED) {
+        if (this->sc_source->on_drag) {
+            this->sc_source->on_drag(me);
+        }
+    }
+
+    return true;
 }

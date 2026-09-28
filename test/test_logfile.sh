@@ -1,13 +1,27 @@
 #! /bin/bash
 
+export TZ=UTC
 echo ${top_srcdir}
 echo ${top_builddir}
+
+run_cap_test ${lnav_test} -n \
+    -c ':goto 3' \
+    ${test_dir}/logfile_invalid_utf8.0
 
 printf '#Date:\t20\x800-2-02\n0\n' | run_cap_test \
     env TEST_COMMENT="short timestamp" ${lnav_test} -n
 
 printf '000\n000\n#Fields: 0\n0\n#Fields: 0\n0' | run_cap_test \
     env TEST_COMMENT="invalid w3c log" ${lnav_test} -n
+
+printf '#Date:\t3/9/3/0\x85 2\n0\n' | run_cap_test \
+    env TEST_COMMENT="invalid w3c timestamp" ${lnav_test} -n
+
+printf '[8.0000]0\n' | run_cap_test \
+    env TEST_COMMENT="zero timestamp" ${lnav_test} -n
+
+printf '#Fields: date time 0 date\n2000/2 00:00 0 2000/80' | run_cap_test \
+    env TEST_COMMENT="invalid w3c #1451" ${lnav_test} -n
 
 cat > rollover_in.0 <<EOF
 2600/2 0 00:00:00 0:
@@ -37,30 +51,30 @@ run_cap_test ${lnav_test} -n \
     -c ';SELECT * FROM logline' \
     ${test_dir}/logfile_block.1
 
-run_test ${lnav_test} -d /tmp/lnav.err -n -w logfile_stdin.0.log \
-    -c ':shexec sleep 1 && touch -t 200711030923 logfile_stdin.0.log' <<EOF
-2013-06-06T19:13:20.123  Hi
-EOF
-
-check_output "piping to stdin is not working?" <<EOF
-2013-06-06T19:13:20.123  Hi
-EOF
-
 if test x"${TSHARK_CMD}" != x""; then
   run_test env TZ=UTC ${lnav_test} -n ${test_dir}/dhcp.pcapng
 
   check_output "pcap file is not recognized" <<EOF
-2004-12-05T19:16:24.317 0.0.0.0 → 255.255.255.255 DHCP 314 DHCP Discover - Transaction ID 0x3d1d
-2004-12-05T19:16:24.317 192.168.0.1 → 192.168.0.10 DHCP 342 DHCP Offer    - Transaction ID 0x3d1d
-2004-12-05T19:16:24.387 0.0.0.0 → 255.255.255.255 DHCP 314 DHCP Request  - Transaction ID 0x3d1e
-2004-12-05T19:16:24.387 192.168.0.1 → 192.168.0.10 DHCP 342 DHCP ACK      - Transaction ID 0x3d1e
+2004-12-05 19:16:24.317453 0.0.0.0 → 255.255.255.255 DHCP 314 DHCP Discover - Transaction ID 0x3d1d
+2004-12-05 19:16:24.317748 192.168.0.1 → 192.168.0.10 DHCP 342 DHCP Offer    - Transaction ID 0x3d1d
+2004-12-05 19:16:24.387484 0.0.0.0 → 255.255.255.255 DHCP 314 DHCP Request  - Transaction ID 0x3d1e
+2004-12-05 19:16:24.387798 192.168.0.1 → 192.168.0.10 DHCP 342 DHCP ACK      - Transaction ID 0x3d1e
 EOF
 
-  run_test ${lnav_test} -n ${test_dir}/dhcp-trunc.pcapng
+  # make sure piped binary data is left alone
+  run_test cat ${test_dir}/dhcp.pcapng | env TZ=UTC ${lnav_test} -n
 
-  check_error_output "truncated pcap file is not recognized" <<EOF
-error: unable to open file: {test_dir}/dhcp-trunc.pcapng -- tshark: The file "{test_dir}/dhcp-trunc.pcapng" appears to have been cut short in the middle of a packet.
+  check_output "pcap file is not recognized" <<EOF
+2004-12-05 19:16:24.317453 0.0.0.0 → 255.255.255.255 DHCP 314 DHCP Discover - Transaction ID 0x3d1d
+2004-12-05 19:16:24.317748 192.168.0.1 → 192.168.0.10 DHCP 342 DHCP Offer    - Transaction ID 0x3d1d
+2004-12-05 19:16:24.387484 0.0.0.0 → 255.255.255.255 DHCP 314 DHCP Request  - Transaction ID 0x3d1e
+2004-12-05 19:16:24.387798 192.168.0.1 → 192.168.0.10 DHCP 342 DHCP ACK      - Transaction ID 0x3d1e
 EOF
+
+  run_cap_test ${lnav_test} -n ${test_dir}/dhcp-trunc.pcapng
+
+  gunzip -c ${test_dir}/capture.btsnoop.gz > capture.btsnoop
+  run_cap_test ${lnav_test} -n -c ':goto 790' capture.btsnoop
 fi
 
 
@@ -88,17 +102,20 @@ if locale -a | grep fr_FR; then
 
     check_output "french locale is not recognized" <<EOF
 log_time
-2007-08-19 11:08:37.000
+2007-08-19 11:08:37.000000
 EOF
 fi
 
+unset YES_COLOR
 if test x"${LIBARCHIVE_LIBS}" != x""; then
-    run_test env TMPDIR=tmp ${lnav_test} -n \
+    rm -rf logfile-tmp
+    mkdir logfile-tmp
+    run_test env TMPDIR=logfile-tmp ${lnav_test} -n \
       -c ':config /tuning/archive-manager/min-free-space -1' \
       ${srcdir}/logfile_syslog.0
 
     check_error_output "invalid min-free-space allowed?" <<EOF
-✘ error: “-1” is not a valid value for option “/tuning/archive-manager/min-free-space”
+  error: “-1” is not a valid value for option “/tuning/archive-manager/min-free-space”
  reason: value must be greater than or equal to 0
  --> input:1
  = help: Property Synopsis
@@ -107,16 +124,16 @@ if test x"${LIBARCHIVE_LIBS}" != x""; then
            The minimum free space, in bytes, to maintain when unpacking archives
 EOF
 
-    rm -rf tmp/lnav-*
+    rm -rf logfile-tmp/lnav-*
     if test x"${XZ_CMD}" != x""; then
         ${XZ_CMD} -z -c ${srcdir}/logfile_syslog.1 > logfile_syslog.1.xz
 
-        run_test env TMPDIR=tmp ${lnav_test} -n \
+        run_test env TMPDIR=logfile-tmp ${lnav_test} -n \
             -c ':config /tuning/archive-manager/min-free-space 1125899906842624' \
             -c ':config /tuning/archive-manager/cache-ttl 1d' \
             ${srcdir}/logfile_syslog.0
 
-        run_test env TMPDIR=tmp ${lnav_test} -d /tmp/lnav.err -n \
+        run_test env TMPDIR=logfile-tmp ${lnav_test} -d /tmp/lnav.err -n \
             logfile_syslog.1.xz
 
         sed -e "s|lnav-user-[0-9]*-work|lnav-user-NNN-work|g" \
@@ -126,15 +143,16 @@ EOF
             `test_err_filename` > test_logfile.big.out
         mv test_logfile.big.out `test_err_filename`
         check_error_output "decompression worked?" <<EOF
-✘ error: unable to open file: /logfile_syslog.1.xz
- reason: available space on disk (NNN) is below the minimum-free threshold (1.0PB).  Unable to unpack 'logfile_syslog.1.xz' to 'tmp/lnav-user-NNN-work/archives/arc-NNN-logfile_syslog.1.xz'
+ error: unable to open file: /logfile_syslog.1.xz
+ reason: failed to extract archive “/logfile_syslog.1.xz”
+ |        reason: available space on disk (NNN) is below the minimum-free threshold (1.1PB).  Unable to unpack 'logfile_syslog.1.xz' to 'logfile-tmp/lnav-user-NNN-work/archives/arc-NNN-logfile_syslog.1.xz'
 EOF
 
-        run_test env TMPDIR=tmp ${lnav_test} -n \
+        run_test env TMPDIR=logfile-tmp ${lnav_test} -n \
             -c ':config /tuning/archive-manager/min-free-space 33554432' \
             ${srcdir}/logfile_syslog.0
 
-        run_test env TMPDIR=tmp ${lnav_test} -n \
+        run_test env TMPDIR=logfile-tmp ${lnav_test} -n \
             logfile_syslog.1.xz
 
         check_output "decompression not working" <<EOF
@@ -149,8 +167,8 @@ EOF
 
     dd if=test-logs.tgz of=test-logs-trunc.tgz bs=4096 count=20
 
-    mkdir -p tmp
-    run_test env TMPDIR=tmp ${lnav_test} \
+    mkdir -p logfile-tmp
+    run_test env TMPDIR=logfile-tmp ${lnav_test} \
         -c ':config /tuning/archive-manager/cache-ttl 1d' \
         -n test-logs.tgz
 
@@ -161,26 +179,26 @@ EOF
 10.112.81.15 - - [15/Feb/2013:06:00:31 +0000] "-" 400 0 "-" "-"
 EOF
 
-    if ! test -f tmp/*/archives/*-test-logs.tgz/test/logfile_access_log.0; then
+    if ! test -f logfile-tmp/*/archives/*-test-logs.tgz/test/logfile_access_log.0; then
         echo "archived file not unpacked"
         exit 1
     fi
 
-    if test -w tmp/*/archives/*-test-logs.tgz/test/logfile_access_log.0; then
+    if test -w logfile-tmp/*/archives/*-test-logs.tgz/test/logfile_access_log.0; then
         echo "archived file is writable"
         exit 1
     fi
 
-    env TMPDIR=tmp ${lnav_test} -d /tmp/lnav.err \
+    env TMPDIR=logfile-tmp ${lnav_test} -d /tmp/lnav.err \
         -c ':config /tuning/archive-manager/cache-ttl 0d' \
         -n -q ${srcdir}/logfile_syslog.0
 
-    if test -f tmp/lnav*/archives/*-test-logs.tgz/test/logfile_access_log.0; then
+    if test -f logfile-tmp/lnav*/archives/*-test-logs.tgz/test/logfile_access_log.0; then
         echo "archive cache not deleted?"
         exit 1
     fi
 
-    run_test env TMPDIR=tmp ${lnav_test} -n\
+    run_test env TMPDIR=logfile-tmp ${lnav_test} -n\
         -c ';SELECT view_name, basename(filepath), visible FROM lnav_view_files' \
         test-logs.tgz
 
@@ -190,15 +208,18 @@ log       logfile_access_log.0       1
 log       logfile_access_log.1       1
 EOF
 
-    run_test env TMPDIR=tmp ${lnav_test} -n \
+    run_test env TMPDIR=logfile-tmp ${lnav_test} -n \
         test-logs-trunc.tgz
 
-    sed -e "s|${builddir}||g" `test_err_filename` | head -2 \
+    sed -e "s|${builddir}||g" \
+        -e 's/truncated gzip input/truncated/g' \
+        -e 's/Truncated tar archive detected while reading data/truncated/g' \
+        `test_err_filename` | head -2 \
         > test_logfile.trunc.out
     mv test_logfile.trunc.out `test_err_filename`
     check_error_output "truncated tgz not reported correctly" <<EOF
-✘ error: unable to open file: /test-logs-trunc.tgz
- reason: failed to extract 'src/lnav' from archive '/test-logs-trunc.tgz' -- truncated gzip input
+  error: unable to open file: /test-logs-trunc.tgz
+ reason: failed to extract archive “/test-logs-trunc.tgz”
 EOF
 
     mkdir -p rotmp
@@ -213,9 +234,12 @@ EOF
         > test_logfile.rotmp.out
     cp test_logfile.rotmp.out `test_err_filename`
     check_error_output "archive not unpacked" <<EOF
-✘ error: unable to open file: /test-logs.tgz
- reason: unable to create directory: rotmp/lnav-user-NNN-work/archives -- Permission denied
+  error: unable to open file: /test-logs.tgz
+ reason: failed to extract archive “/test-logs.tgz”
 EOF
+
+    run_cap_test env TMPDIR=logfile-tmp ${lnav_test} -n \
+        ${srcdir}/abs-archive.tar.gz
 fi
 
 touch unreadable.log
@@ -228,7 +252,7 @@ sed -e "s|/.*/unreadable.log|unreadable.log|g" `test_err_filename` | head -3 \
 
 mv test_logfile.unreadable.out `test_err_filename`
 check_error_output "able to read an unreadable log file?" <<EOF
-✘ error: file exists, but is not readable: unreadable.log
+  error: file exists, but is not readable: unreadable.log
  reason: Permission denied
 EOF
 
@@ -273,6 +297,44 @@ on_error_fail_with "Didn't infer w3c_log log format?"
 run_test ./drive_logfile ${srcdir}/logfile_empty.0
 
 on_error_fail_with "Didn't handle empty log?"
+
+run_test ./drive_logfile -o -f w3c_log ${srcdir}/logfile_w3c.0
+
+check_output "ordered w3c file needs a time order?" <<EOF
+identity
+EOF
+
+run_test ./drive_logfile -o -f bro_conn_log ${srcdir}/logfile_bro_conn.log.0
+
+cp ${test_file_base}_${test_num}.tmp logfile_bro_conn_order.full
+awk '$2 < prev { exit 1 } { prev = $2 }' logfile_bro_conn_order.full
+on_error_fail_with "bro time order is not sorted?"
+
+head -20 ${srcdir}/logfile_bro_conn.log.0 > logfile_bro_conn_append.0
+tail -n +21 ${srcdir}/logfile_bro_conn.log.0 > logfile_bro_conn_append.tail
+run_test ./drive_logfile -o -f bro_conn_log -a logfile_bro_conn_append.tail \
+    logfile_bro_conn_append.0
+
+cmp logfile_bro_conn_order.full ${test_file_base}_${test_num}.tmp
+on_error_fail_with "appended bro lines not merged into the time order?"
+
+cat ${srcdir}/logfile_w3c.0 > logfile_w3c_append.0
+cat > logfile_w3c_append.tail <<EOF
+2002-05-02 17:40:00 172.22.255.255 - 172.30.255.255 80 GET /older.jpg - 200 x
+2002-05-02 17:50:00 172.22.255.255 - 172.30.255.255 80 GET /newer.jpg - 200 x
+EOF
+run_test ./drive_logfile -o -f w3c_log -a logfile_w3c_append.tail \
+    logfile_w3c_append.0
+
+check_output "older appended w3c line not put first in the time order?" <<EOF
+5 1020361200000000
+0 1020361335000000 ignored
+1 1020361335000000 ignored
+2 1020361335000000 ignored
+3 1020361335000000 ignored
+4 1020361335000000
+6 1020361800000000
+EOF
 
 
 run_test ./drive_logfile -t -f w3c_log ${srcdir}/logfile_w3c.2
@@ -377,8 +439,6 @@ TCF 2014-04-06 11:01:11.475557: 0: <--- R 2  ["P1"] <eom>
 EOF
 
 
-# The TCSH format converts to local time, so we need to specify a TZ
-export TZ="UTC"
 run_test ./drive_logfile -t -f tcsh_history ${srcdir}/logfile_tcsh_history.0
 
 check_output "TCSH timestamp interpreted incorrectly?" <<EOF
@@ -395,6 +455,10 @@ Jul 20 22:59:26 2009 -- 000
 Jul 20 22:59:29 2009 -- 000
 Jul 20 22:59:29 2009 -- 000
 EOF
+
+run_cap_test env TZ=America/Los_Angeles ./drive_logfile -t -f access_log ${srcdir}/logfile_access_log.0
+
+run_cap_test env TZ=America/Los_Angeles ${lnav_test} -n ${srcdir}/logfile_access_log.0
 
 run_test ./drive_logfile -t -f generic_log ${srcdir}/logfile_tai64n.0
 
@@ -427,6 +491,12 @@ Nov 03 08:09:33 2007 -- 816
 EOF
 
 
+# A line whose timestamp has less precision than the rest is rejected, and
+# the lines after it keep being parsed with the format that was working.
+run_cap_test ${lnav_test} -nN -I ${test_dir} \
+    -c ";SELECT log_line, log_time, log_body FROM relock_log" \
+    ${test_dir}/logfile_relock.0
+
 run_test ./drive_logfile -t -f epoch_log ${srcdir}/logfile_epoch.0
 
 check_output "epoch_log timestamp interpreted incorrectly?" <<EOF
@@ -443,6 +513,15 @@ EOF
 check_output "epoch_log timestamp interpreted incorrectly?" <<EOF
 Apr 09 19:58:07 2015 -- 123
 Apr 09 19:58:07 2015 -- 456
+EOF
+
+
+run_test ./drive_logfile -t -f sim_ps_log ${srcdir}/logfile_sim_ps.0
+
+check_output "sim_ps_log timestamp interpreted incorrectly?" <<EOF
+Jan 01 00:00:00 1970 -- 000
+Jan 01 00:00:12 1970 -- 345
+Jan 02 01:01:01 1970 -- 234
 EOF
 
 
@@ -522,6 +601,13 @@ Jul 02 10:22:40 2012 -- 672
 Oct 08 16:56:38 2014 -- 344
 EOF
 
+run_test ./drive_logfile -t -f generic_log ${srcdir}/logfile_generic_nanos.0
+
+check_output "generic_log nanosecond timestamp not parsed?" <<EOF
+Jan 01 00:00:00 2025 -- 123
+Jan 01 01:00:00 2025 -- 987
+EOF
+
 run_test ./drive_logfile -v -f generic_log ${srcdir}/logfile_generic.0
 
 check_output "generic_log level interpreted incorrectly?" <<EOF
@@ -542,6 +628,12 @@ check_output "generic_log (2) level interpreted incorrectly?" <<EOF
 error 0x0
 error 0x0
 EOF
+
+run_cap_test ./drive_logfile -t -f generic_log ${test_dir}/logfile_with_zones.0
+
+run_cap_test env TZ=America/Los_Angeles ./drive_logfile -t -f generic_log ${test_dir}/logfile_with_zones.0
+
+run_cap_test env TZ=America/New_York ./drive_logfile -t -f generic_log ${test_dir}/logfile_with_zones.0
 
 touch -t 200711030923 ${srcdir}/logfile_glog.0
 run_test ./drive_logfile -t -f glog_log ${srcdir}/logfile_glog.0
@@ -588,14 +680,17 @@ info 0x0
 error 0x0
 EOF
 
-run_test ${lnav_test} -d /tmp/lnav.err -nt -w logfile_stdin.log <<EOF
-Hi
-EOF
+run_cap_test ./drive_logfile -t -f logfmt_log ${srcdir}/logfile_grafana.0
 
-check_output "piping to stdin is not working?" <<EOF
-2013-06-06T19:13:20.123  Hi
-2013-06-06T19:13:20.123  ---- END-OF-STDIN ----
-EOF
+run_cap_test ./drive_logfile -t -f postgres_log ${srcdir}/logfile_postgres.0
+
+run_cap_test ./drive_logfile -t -f mysql_slow_log ${srcdir}/logfile_mysql_slow.0
+
+run_cap_test ./drive_logfile -t -f mysql_error_log ${srcdir}/logfile_mysql_error.0
+
+run_cap_test ./drive_logfile -t -f mysql_gen_log ${srcdir}/logfile_mysql_gen.0
+
+run_cap_test ./drive_logfile -t -f asterisk_log ${srcdir}/logfile_asterisk.0
 
 run_test ${lnav_test} -C ${test_dir}/logfile_bad_access_log.0
 
@@ -635,8 +730,8 @@ EOF
 run_test ${lnav_test} -n -I ${test_dir} ${srcdir}/logfile_epoch.0
 
 check_output "rewriting machine-oriented timestamp didn't work?" <<EOF
-2015-04-10 02:58:07.123000 Hello, World!
-2015-04-10 02:58:07.456000 Goodbye, World!
+2015-04-10 02:58:07.123 Hello, World!
+2015-04-10 02:58:07.456 Goodbye, World!
 EOF
 
 run_test ${lnav_test} -n -I ${test_dir} ${srcdir}/logfile_crlf.0
@@ -701,3 +796,157 @@ run_cap_test ${lnav_test} -n \
 run_cap_test ${lnav_test} -n \
     -c ';SELECT basename(filepath),descriptor,mimetype,content FROM lnav_file_metadata' \
     logfile_syslog.1.gz
+
+run_cap_test ${lnav_test} -n \
+    -c ':filter-in Air Mob' \
+    ${test_dir}/logfile_ansi.1
+
+# The file options saved by :set-file-timezone go in the config dir, so these
+# tests get a HOME of their own.
+saved_home="${HOME}"
+export HOME="./file-tz"
+rm -rf "./file-tz"
+mkdir -p $HOME
+
+touch -t 200711030000 ${srcdir}/logfile_syslog.0
+
+run_cap_test ${lnav_test} -n \
+    -c ':set-file-timezone America/Los_Angeles' \
+    ${test_dir}/logfile_syslog.0
+
+# make sure the file options were saved and restored
+run_cap_test ${lnav_test} -n \
+    ${test_dir}/logfile_syslog.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";SELECT options_path, options FROM lnav_file" \
+    ${test_dir}/logfile_syslog.0
+
+rm -rf "./file-tz"
+mkdir -p $HOME
+
+run_cap_test ${lnav_test} -n \
+    -c ':set-file-timezone America/New_York' \
+    ${test_dir}/logfile_syslog.0
+
+run_cap_test ${lnav_test} -n \
+    -c ':clear-file-timezone' \
+    -c ':set-file-timezone America/Los_Angeles' \
+    ${test_dir}/logfile_syslog.0
+
+# A zone that is already set is not replaced without clearing it first.
+run_cap_test env TEST_COMMENT="set-file-timezone when one is set" \
+    ${lnav_test} -n \
+    -c ':set-file-timezone America/Chicago' \
+    ${test_dir}/logfile_syslog.0
+
+# A zone saved by an earlier run is cleared without giving a pattern.
+run_cap_test env TEST_COMMENT="clear a saved file timezone" ${lnav_test} -n \
+    -c ':clear-file-timezone' \
+    -c ";SELECT options_path, options FROM lnav_file" \
+    ${test_dir}/logfile_syslog.0
+
+# There is nothing left to clear.
+run_cap_test env TEST_COMMENT="clear-file-timezone with nothing set" \
+    ${lnav_test} -n \
+    -c ':clear-file-timezone' \
+    ${test_dir}/logfile_syslog.0
+
+run_cap_test ${lnav_test} -n \
+    -c ':set-file-timezone bad' \
+    ${test_dir}/logfile_syslog.0
+
+run_cap_test ${lnav_test} -n \
+    -c ';SELECT log_time FROM all_logs' \
+    ${test_dir}/logfile_yday.0
+
+rm -rf "./file-tz"
+mkdir -p $HOME
+
+touch -t 202411030000 ${test_dir}/logfile_dst.0
+
+run_cap_test env TZ=America/Los_Angeles ${lnav_test} -n \
+    -c ':set-file-timezone America/Los_Angeles' \
+    ${test_dir}/logfile_dst.0
+
+export HOME="${saved_home}"
+
+cat ${test_dir}/logfile_generic.0 | run_cap_test ${lnav_test} -n \
+    -c ':test-comment generic before piper'
+
+run_cap_test ${lnav_test} -n ${test_dir}/logfile_logfmt.0
+
+run_cap_test ${lnav_test} -n ${test_dir}/logfile_laravel.0
+
+run_cap_test ${lnav_test} -n ${test_dir}/logfile_laravel.1
+
+run_cap_test ${lnav_test} -n ${test_dir}/logfile_asterisk.0
+
+run_cap_test ${lnav_test} -n ${test_dir}/\#with
+
+run_cap_test ${lnav_test} -n \
+    -S "2011-11-03 00:19:26.831473" \
+    ${test_dir}/logfile_bro_http.log.0
+
+run_cap_test ${lnav_test} -n \
+    -S "2011-11-05 00:19:26.831473" \
+    ${test_dir}/logfile_bro_http.log.0
+
+run_cap_test ${lnav_test} -n \
+    -S "2023-03-24T14:26:17" \
+    ${test_dir}/logfile_bunyan.0
+
+# The search for the start of the range reads blocks of the file that end in
+# the middle of a line, which should not be mistaken for an earlier message.
+awk 'BEGIN {
+    for (i = 0; i < 150000; i++) {
+        s = i % 60; m = int(i / 60) % 60; h = int(i / 3600) % 24;
+        printf "2018-10-%02d %02d:%02d:%02d,000 INFO msg %d\n",
+            22 + int(i / 86400), h, m, s, i;
+    }
+}' > since-partial-line.log
+run_cap_test env TZ=UTC ${lnav_test} -n \
+    -S "2018-10-23T09:20:00" \
+    -c ';SELECT count(*), min(log_time) FROM all_logs' \
+    since-partial-line.log
+
+run_cap_test env TZ=UTC ${lnav_test} -n \
+    -I ${test_dir} \
+    ${test_dir}/logfile_ts_value.0
+
+run_cap_test env TZ=America/Los_Angeles ${lnav_test} -n \
+    -I ${test_dir} \
+    ${test_dir}/logfile_ts_value.0
+
+run_cap_test env TZ=UTC ${lnav_test} -n \
+    -I ${test_dir} \
+    -c ';select session_start from ts_value_log' \
+    -c ':write-csv-to -' \
+    ${test_dir}/logfile_ts_value.0
+
+# filter-context: filter to "sudo" messages, then add 1 message of context
+run_cap_test ${lnav_test} -n \
+    -c ':filter-in sudo' \
+    -c ':filter-context 1' \
+    ${test_dir}/logfile_syslog.0 ${test_dir}/logfile_syslog.1
+
+run_cap_test ${lnav_test} -n \
+    -c ':set-min-log-level error' \
+    -c ':filter-context 1' \
+    ${test_dir}/logfile_postgres.1
+
+run_cap_test ${lnav_test} -n \
+    ${test_dir}/logfile_win_events_csv.0
+
+# indexing stops at /tuning/logfile/max-lines, without keeping part of the
+# JSON message that crossed it
+${lnav_test} -nN -c ':config /tuning/logfile/max-lines 4'
+
+run_cap_test ${lnav_test} -n \
+    ${test_dir}/logfile_bunyan.0
+
+${lnav_test} -nN -c ':reset-config /tuning/logfile/max-lines'
+
+# the limit cannot be raised above what the log view can address
+run_cap_test ${lnav_test} -nN \
+    -c ':config /tuning/logfile/max-lines 134217729'

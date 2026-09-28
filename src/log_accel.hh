@@ -36,8 +36,6 @@
 
 #include <stdint.h>
 
-#include "base/lnav_log.hh"
-
 /**
  * Helper class for figuring out changes in the log message rate.
  */
@@ -45,7 +43,7 @@ class log_accel {
 public:
     /*< The direction of the message rate: steady, accelerating, or decelerating
      */
-    enum direction_t {
+    enum class direction_t {
         A_STEADY,
         A_DECEL,
         A_ACCEL,
@@ -82,7 +80,7 @@ private:
      * The amount of historical data to include in the average acceleration
      * computation.
      */
-    static const int HISTORY_SIZE = 8;
+    static constexpr int HISTORY_SIZE = 8;
     /**
      * The minimum range of velocities seen.  This value should limit false-
      * positives for small millisecond level fluctuations.
@@ -94,7 +92,7 @@ private:
     bool la_last_point_set{false};
     int64_t la_min_velocity{INT64_MAX};
     int64_t la_max_velocity{INT64_MIN};
-    int64_t la_velocity[HISTORY_SIZE];
+    int64_t la_velocity[HISTORY_SIZE] = {};
     int la_velocity_size{0};
 };
 

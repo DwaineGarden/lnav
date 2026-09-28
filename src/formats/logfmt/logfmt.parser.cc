@@ -33,14 +33,14 @@
 
 #include "base/intern_string.hh"
 #include "config.h"
-#include "scn/scn.h"
+#include "scn/scan.h"
 
 logfmt::parser::parser(string_fragment sf) : p_next_input(sf) {}
 
 static bool
-is_not_eq(char ch)
+is_not_key(char ch)
 {
-    return ch != '=';
+    return !isalnum(ch) && ch != '_' && ch != '-' && ch != '.';
 }
 
 struct bare_value_predicate {
@@ -181,20 +181,29 @@ logfmt::parser::step()
         return end_of_input{};
     }
 
-    auto pair_opt = remaining.split_while(is_not_eq);
-
-    if (!pair_opt) {
+    auto [before, after] = remaining.split_when(string_fragment::tag1{'='});
+    if (before.empty()) {
         return error{remaining.sf_begin, "expecting key followed by '='"};
     }
 
-    auto key_frag = pair_opt->first;
-    auto after_eq = pair_opt->second.consume(string_fragment::tag1{'='});
-
-    if (!after_eq) {
-        return error{pair_opt->second.sf_begin, "expecting '='"};
+    if (before.startswith("<") && before.count(' ') > 0) {
+        return error{before.sf_begin, "xml node"};
     }
 
-    auto value_start = after_eq.value();
+    if (before.sf_end == remaining.sf_end) {
+        this->p_next_input = after;
+        return before;
+    }
+
+    auto [plain, key] = before.rsplit_when(is_not_key);
+    if (!plain.empty()) {
+        this->p_next_input = key;
+        this->p_next_input.sf_end = after.sf_end;
+        return plain;
+    }
+
+    auto key_frag = before;
+    auto value_start = after;
 
     if (value_start.startswith("\"")) {
         string_fragment::quoted_string_body qsb;
@@ -222,8 +231,8 @@ logfmt::parser::step()
     auto value_pair = value_start.split_while(bvp);
 
     if (value_pair) {
-        static const auto TRUE_FRAG = string_fragment::from_const("true");
-        static const auto FALSE_FRAG = string_fragment::from_const("false");
+        static constexpr auto TRUE_FRAG = "true"_frag;
+        static constexpr auto FALSE_FRAG = "false"_frag;
 
         this->p_next_input = value_pair->second;
         if (bvp.is_integer()) {
@@ -232,7 +241,7 @@ logfmt::parser::step()
             auto int_scan_res
                 = scn::scan_value<int64_t>(value_pair->first.to_string_view());
             if (int_scan_res) {
-                retval.iv_value = int_scan_res.value();
+                retval.iv_value = int_scan_res->value();
             }
             retval.iv_str_value = value_pair->first;
 
@@ -244,7 +253,7 @@ logfmt::parser::step()
             auto float_scan_res
                 = scn::scan_value<double>(value_pair->first.to_string_view());
             if (float_scan_res) {
-                retval.fv_value = float_scan_res.value();
+                retval.fv_value = float_scan_res->value();
             }
             retval.fv_str_value = value_pair->first;
 

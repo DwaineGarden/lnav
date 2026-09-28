@@ -32,15 +32,14 @@
 #include <map>
 #include <string>
 
-#include "log_format_loader.hh"
+#include "log_format.hh"
 
-#include <errno.h>
-#include <fcntl.h>
 #include <glob.h>
 #include <libgen.h>
 #include <sys/stat.h>
 
 #include "base/auto_fd.hh"
+#include "base/from_trait.hh"
 #include "base/fs_util.hh"
 #include "base/paths.hh"
 #include "base/string_util.hh"
@@ -51,8 +50,14 @@
 #include "default-formats.h"
 #include "file_format.hh"
 #include "fmt/format.h"
+#include "format.scripts.hh"
 #include "lnav_config.hh"
+#include "lnav_util.hh"
+#include "log_format.hh"
 #include "log_format_ext.hh"
+#include "log_format_loader.hh"
+#include "log_level.hh"
+#include "sql_execute.hh"
 #include "sql_util.hh"
 #include "yajlpp/yajlpp.hh"
 #include "yajlpp/yajlpp_def.hh"
@@ -70,7 +75,7 @@ static log_formats_map_t LOG_FORMATS;
 struct loader_userdata {
     yajlpp_parse_context* ud_parse_context{nullptr};
     std::string ud_file_schema;
-    ghc::filesystem::path ud_format_path;
+    std::filesystem::path ud_format_path;
     std::vector<intern_string_t>* ud_format_names{nullptr};
     std::vector<lnav::console::user_message>* ud_errors{nullptr};
 };
@@ -139,7 +144,10 @@ value_def_provider(const yajlpp_provider_context& ypc, external_log_format* elf)
 
     if (iter == elf->elf_value_defs.end()) {
         retval = std::make_shared<external_log_format::value_def>(
-            value_name, value_kind_t::VALUE_TEXT, -1, elf);
+            value_name,
+            value_kind_t::VALUE_TEXT,
+            logline_value_meta::external_column{},
+            elf);
         elf->elf_value_defs[value_name] = retval;
         elf->elf_value_def_order.emplace_back(retval);
     } else {
@@ -162,6 +170,26 @@ format_tag_def_provider(const yajlpp_provider_context& ypc,
         auto tag_with_hash = fmt::format(FMT_STRING("#{}"), tag_name);
         retval = std::make_shared<format_tag_def>(tag_with_hash);
         elf->lf_tag_defs[tag_name] = retval;
+    } else {
+        retval = iter->second;
+    }
+
+    return retval.get();
+}
+
+static format_partition_def*
+format_partition_def_provider(const yajlpp_provider_context& ypc,
+                              external_log_format* elf)
+{
+    const intern_string_t partition_name = ypc.get_substr_i(0);
+
+    auto iter = elf->lf_partition_defs.find(partition_name);
+    std::shared_ptr<format_partition_def> retval;
+
+    if (iter == elf->lf_partition_defs.end()) {
+        retval = std::make_shared<format_partition_def>(
+            partition_name.to_string());
+        elf->lf_partition_defs[partition_name] = retval;
     } else {
         retval = iter->second;
     }
@@ -204,62 +232,8 @@ read_format_bool(yajlpp_parse_context* ypc, int val)
     auto elf = (external_log_format*) ypc->ypc_obj_stack.top();
     auto field_name = ypc->get_path_fragment(1);
 
-    if (field_name == "convert-to-local-time") {
-        elf->lf_date_time.dts_local_time = val;
-    } else if (field_name == "json") {
-        if (val) {
-            elf->elf_type = external_log_format::elf_type_t::ELF_TYPE_JSON;
-        }
-    }
-
-    return 1;
-}
-
-static int
-read_format_double(yajlpp_parse_context* ypc, double val)
-{
-    auto elf = (external_log_format*) ypc->ypc_obj_stack.top();
-    auto field_name = ypc->get_path_fragment(1);
-
-    if (field_name == "timestamp-divisor") {
-        if (val <= 0) {
-            ypc->report_error(
-                lnav::console::user_message::error(
-                    attr_line_t()
-                        .append_quoted(fmt::to_string(val))
-                        .append(" is not a valid value for ")
-                        .append_quoted(lnav::roles::symbol(
-                            ypc->get_full_path().to_string())))
-                    .with_reason("value cannot be less than or equal to zero")
-                    .with_snippet(ypc->get_snippet())
-                    .with_help(ypc->ypc_current_handler->get_help_text(ypc)));
-        }
-        elf->elf_timestamp_divisor = val;
-    }
-
-    return 1;
-}
-
-static int
-read_format_int(yajlpp_parse_context* ypc, long long val)
-{
-    auto elf = (external_log_format*) ypc->ypc_obj_stack.top();
-    auto field_name = ypc->get_path_fragment(1);
-
-    if (field_name == "timestamp-divisor") {
-        if (val <= 0) {
-            ypc->report_error(
-                lnav::console::user_message::error(
-                    attr_line_t()
-                        .append_quoted(fmt::to_string(val))
-                        .append(" is not a valid value for ")
-                        .append_quoted(lnav::roles::symbol(
-                            ypc->get_full_path().to_string())))
-                    .with_reason("value cannot be less than or equal to zero")
-                    .with_snippet(ypc->get_snippet())
-                    .with_help(ypc->ypc_current_handler->get_help_text(ypc)));
-        }
-        elf->elf_timestamp_divisor = val;
+    if (field_name == "json" && val) {
+        elf->lf_file_type = log_format::file_type_t::JSON;
     }
 
     return 1;
@@ -268,7 +242,8 @@ read_format_int(yajlpp_parse_context* ypc, long long val)
 static int
 read_format_field(yajlpp_parse_context* ypc,
                   const unsigned char* str,
-                  size_t len)
+                  size_t len,
+                  yajl_string_props_t*)
 {
     auto elf = (external_log_format*) ypc->ypc_obj_stack.top();
     auto leading_slash = len > 0 && str[0] == '/';
@@ -277,22 +252,19 @@ read_format_field(yajlpp_parse_context* ypc,
     auto field_name = ypc->get_path_fragment(1);
 
     if (field_name == "timestamp-format") {
-        elf->lf_timestamp_format.push_back(intern_string::lookup(value)->get());
-    } else if (field_name == "module-field") {
-        elf->elf_module_id_field = intern_string::lookup(value);
-        elf->elf_container = true;
-    } else if (field_name == "mime-types") {
-        auto value_opt = ypc->ypc_current_handler->to_enum_value(value);
-        if (value_opt) {
-            elf->elf_mime_types.insert((file_format_t) *value_opt);
-        }
+        /* an empty format interns to the null entry */
+        const auto ts_format = intern_string_t{intern_string::lookup(value)};
+        elf->lf_timestamp_format.push_back(ts_format.get());
     }
 
     return 1;
 }
 
 static int
-read_levels(yajlpp_parse_context* ypc, const unsigned char* str, size_t len)
+read_levels(yajlpp_parse_context* ypc,
+            const unsigned char* str,
+            size_t len,
+            yajl_string_props_t*)
 {
     auto elf = (external_log_format*) ypc->ypc_obj_stack.top();
     auto regex = std::string((const char*) str, len);
@@ -331,7 +303,10 @@ read_level_int(yajlpp_parse_context* ypc, long long val)
 }
 
 static int
-read_action_def(yajlpp_parse_context* ypc, const unsigned char* str, size_t len)
+read_action_def(yajlpp_parse_context* ypc,
+                const unsigned char* str,
+                size_t len,
+                yajl_string_props_t*)
 {
     auto elf = (external_log_format*) ypc->ypc_obj_stack.top();
     auto action_name = ypc->get_path_fragment(2);
@@ -359,7 +334,10 @@ read_action_bool(yajlpp_parse_context* ypc, int val)
 }
 
 static int
-read_action_cmd(yajlpp_parse_context* ypc, const unsigned char* str, size_t len)
+read_action_cmd(yajlpp_parse_context* ypc,
+                const unsigned char* str,
+                size_t len,
+                yajl_string_props_t*)
 {
     auto elf = (external_log_format*) ypc->ypc_obj_stack.top();
     auto action_name = ypc->get_path_fragment(2);
@@ -372,7 +350,7 @@ read_action_cmd(yajlpp_parse_context* ypc, const unsigned char* str, size_t len)
     return 1;
 }
 
-static external_log_format::sample&
+static external_log_format::sample_t&
 ensure_sample(external_log_format* elf, int index)
 {
     elf->elf_samples.resize(index + 1);
@@ -380,7 +358,7 @@ ensure_sample(external_log_format* elf, int index)
     return elf->elf_samples[index];
 }
 
-static external_log_format::sample*
+static external_log_format::sample_t*
 sample_provider(const yajlpp_provider_context& ypc, external_log_format* elf)
 {
     auto& sample = ensure_sample(elf, ypc.ypc_index);
@@ -391,7 +369,8 @@ sample_provider(const yajlpp_provider_context& ypc, external_log_format* elf)
 static int
 read_json_constant(yajlpp_parse_context* ypc,
                    const unsigned char* str,
-                   size_t len)
+                   size_t len,
+                   yajl_string_props_t*)
 {
     auto val = std::string((const char*) str, len);
     auto elf = (external_log_format*) ypc->ypc_obj_stack.top();
@@ -411,51 +390,63 @@ static const struct json_path_container pattern_handlers = {
             "The regular expression to match a log message and capture fields.")
         .with_min_length(1)
         .for_field(&external_log_format::pattern::p_pcre),
-    yajlpp::property_handler("module-format")
-        .with_synopsis("<bool>")
-        .with_description(
-            "If true, this pattern will only be used to parse message bodies "
-            "of container formats, like syslog")
-        .for_field(&external_log_format::pattern::p_module_format),
 };
 
-static const json_path_handler_base::enum_value_t SUBSECOND_UNIT_ENUM[] = {
-    {"milli", log_format::subsecond_unit::milli},
-    {"micro", log_format::subsecond_unit::micro},
-    {"nano", log_format::subsecond_unit::nano},
+static constexpr json_path_handler_base::enum_value_t SUBSECOND_UNIT_ENUM[] = {
+    {"milli"_frag, log_format::subsecond_unit::milli},
+    {"micro"_frag, log_format::subsecond_unit::micro},
+    {"nano"_frag, log_format::subsecond_unit::nano},
 
     json_path_handler_base::ENUM_TERMINATOR,
 };
 
-static const json_path_handler_base::enum_value_t ALIGN_ENUM[] = {
-    {"left", external_log_format::json_format_element::align_t::LEFT},
-    {"right", external_log_format::json_format_element::align_t::RIGHT},
+static constexpr json_path_handler_base::enum_value_t TS_POR_ENUM[] = {
+    {"end"_frag, timestamp_point_of_reference_t::end},
+    {"start"_frag, timestamp_point_of_reference_t::start},
 
     json_path_handler_base::ENUM_TERMINATOR,
 };
 
-static const json_path_handler_base::enum_value_t OVERFLOW_ENUM[] = {
-    {"abbrev", external_log_format::json_format_element::overflow_t::ABBREV},
-    {"truncate",
+static constexpr json_path_handler_base::enum_value_t ALIGN_ENUM[] = {
+    {"left"_frag, external_log_format::json_format_element::align_t::LEFT},
+    {"right"_frag, external_log_format::json_format_element::align_t::RIGHT},
+
+    json_path_handler_base::ENUM_TERMINATOR,
+};
+
+static constexpr json_path_handler_base::enum_value_t OVERFLOW_ENUM[] = {
+    {"abbrev"_frag,
+     external_log_format::json_format_element::overflow_t::ABBREV},
+    {"truncate"_frag,
      external_log_format::json_format_element::overflow_t::TRUNCATE},
-    {"dot-dot", external_log_format::json_format_element::overflow_t::DOTDOT},
+    {"dot-dot"_frag,
+     external_log_format::json_format_element::overflow_t::DOTDOT},
+    {"last-word"_frag,
+     external_log_format::json_format_element::overflow_t::LASTWORD},
 
     json_path_handler_base::ENUM_TERMINATOR,
 };
 
-static const json_path_handler_base::enum_value_t TRANSFORM_ENUM[] = {
-    {"none", external_log_format::json_format_element::transform_t::NONE},
-    {"uppercase",
+static constexpr json_path_handler_base::enum_value_t TRANSFORM_ENUM[] = {
+    {"none"_frag, external_log_format::json_format_element::transform_t::NONE},
+    {"uppercase"_frag,
      external_log_format::json_format_element::transform_t::UPPERCASE},
-    {"lowercase",
+    {"lowercase"_frag,
      external_log_format::json_format_element::transform_t::LOWERCASE},
-    {"capitalize",
+    {"capitalize"_frag,
      external_log_format::json_format_element::transform_t::CAPITALIZE},
 
     json_path_handler_base::ENUM_TERMINATOR,
 };
 
-static const struct json_path_container line_format_handlers = {
+static constexpr json_path_handler_base::enum_value_t OPID_SOURCE_ENUM[] = {
+    {"from-description"_frag, log_format::opid_source_t::from_description},
+    {"from-whole-msg"_frag, log_format::opid_source_t::from_whole_msg},
+
+    json_path_handler_base::ENUM_TERMINATOR,
+};
+
+static const json_path_container line_format_handlers = {
     yajlpp::property_handler("field")
         .with_synopsis("<field-name>")
         .with_description(
@@ -511,25 +502,37 @@ static const struct json_path_container line_format_handlers = {
         .with_enum_values(TRANSFORM_ENUM)
         .for_field(
             &external_log_format::json_format_element::jfe_text_transform),
+
+    yajlpp::property_handler("prefix")
+        .with_synopsis("<str>")
+        .with_description("Text to prepend to the value")
+        .for_field(&external_log_format::json_format_element::jfe_prefix),
+
+    yajlpp::property_handler("suffix")
+        .with_synopsis("<str>")
+        .with_description("Text to append to the value")
+        .for_field(&external_log_format::json_format_element::jfe_suffix),
 };
 
-static const json_path_handler_base::enum_value_t KIND_ENUM[] = {
-    {"string", value_kind_t::VALUE_TEXT},
-    {"integer", value_kind_t::VALUE_INTEGER},
-    {"float", value_kind_t::VALUE_FLOAT},
-    {"boolean", value_kind_t::VALUE_BOOLEAN},
-    {"json", value_kind_t::VALUE_JSON},
-    {"struct", value_kind_t::VALUE_STRUCT},
-    {"quoted", value_kind_t::VALUE_QUOTED},
-    {"xml", value_kind_t::VALUE_XML},
+static constexpr json_path_handler_base::enum_value_t KIND_ENUM[] = {
+    {"string"_frag, value_kind_t::VALUE_TEXT},
+    {"integer"_frag, value_kind_t::VALUE_INTEGER},
+    {"float"_frag, value_kind_t::VALUE_FLOAT},
+    {"boolean"_frag, value_kind_t::VALUE_BOOLEAN},
+    {"json"_frag, value_kind_t::VALUE_JSON},
+    {"struct"_frag, value_kind_t::VALUE_STRUCT},
+    {"quoted"_frag, value_kind_t::VALUE_QUOTED},
+    {"xml"_frag, value_kind_t::VALUE_XML},
+    {"timestamp"_frag, value_kind_t::VALUE_TIMESTAMP},
+    {"any"_frag, value_kind_t::VALUE_ANY},
 
     json_path_handler_base::ENUM_TERMINATOR,
 };
 
-static const json_path_handler_base::enum_value_t SCALE_OP_ENUM[] = {
-    {"identity", scale_op_t::SO_IDENTITY},
-    {"multiply", scale_op_t::SO_MULTIPLY},
-    {"divide", scale_op_t::SO_DIVIDE},
+static constexpr json_path_handler_base::enum_value_t SCALE_OP_ENUM[] = {
+    {"identity"_frag, scale_op_t::SO_IDENTITY},
+    {"multiply"_frag, scale_op_t::SO_MULTIPLY},
+    {"divide"_frag, scale_op_t::SO_DIVIDE},
 
     json_path_handler_base::ENUM_TERMINATOR,
 };
@@ -558,6 +561,124 @@ static const struct json_path_container unit_handlers = {
     yajlpp::property_handler("scaling-factor")
         .with_description("Transforms the numeric value by the given factor")
         .with_children(scale_handlers),
+
+    yajlpp::property_handler("suffix")
+        .with_synopsis("<suffix>")
+        .with_description(
+            "The display suffix for this field; lnav uses the suffix to "
+            "pick a humanization family (e.g. \"B\" for bytes, \"s\" for "
+            "seconds, \"Hz\" for frequency).  Unknown suffixes are "
+            "appended verbatim without scaling.")
+        .with_example("B"_frag)
+        .for_field(&external_log_format::value_def::vd_meta,
+                   &logline_value_meta::lvm_unit_suffix),
+
+    yajlpp::property_handler("divisor")
+        .with_synopsis("<number>")
+        .with_exclusive_min_value(0)
+        .with_description(
+            "A divisor applied to the raw numeric value to normalize it "
+            "to the base unit implied by the suffix.  For example, a "
+            "field storing milliseconds paired with \"suffix\": \"s\" "
+            "would declare \"divisor\": 1000.")
+        .for_field(&external_log_format::value_def::vd_meta,
+                   &logline_value_meta::lvm_unit_divisor),
+};
+
+static const json_path_container capture_highlight_handlers = {
+    yajlpp::pattern_property_handler(R"((?<hl_cap_name>[^/]+))")
+        .with_description("The definition of a capture highlight")
+        .with_obj_provider<style_config,
+                           std::map<intern_string_t, style_config>>(
+            [](const yajlpp_provider_context& ypc,
+               std::map<intern_string_t, style_config>* root) {
+                auto* retval = &(*root)[ypc.get_substr_i(0)];
+
+                return retval;
+            })
+        .with_children(style_config_handlers),
+};
+
+static const json_path_container highlighter_def_handlers = {
+    yajlpp::property_handler("pattern")
+        .with_synopsis("<regex>")
+        .with_description(
+            "A regular expression to highlight in logs of this format.")
+        .for_field(&external_log_format::highlighter_def::hd_pattern),
+
+    yajlpp::property_handler("base-style")
+        .with_description("The style to use for the entire pattern")
+        .for_child(&external_log_format::highlighter_def::hd_base_style)
+        .with_children(style_config_handlers),
+
+    yajlpp::property_handler("captures")
+        .with_description(
+            "Styles for individual named capture groups in the pattern")
+        .for_child(&external_log_format::highlighter_def::hd_capture_styles)
+        .with_children(capture_highlight_handlers),
+};
+
+static const json_path_container legacy_highlight_handlers = {
+    yajlpp::property_handler("pattern")
+        .with_synopsis("<regex>")
+        .with_description(
+            "A regular expression to highlight in logs of this format.")
+        .for_field(&external_log_format::highlighter_def::hd_pattern),
+    yajlpp::property_handler("color")
+        .with_synopsis("#<hex>|<name>")
+        .with_description("The color to use when highlighting this pattern.")
+        .for_field(&external_log_format::highlighter_def::hd_base_style,
+                   &style_config::sc_color),
+    yajlpp::property_handler("background-color")
+        .with_synopsis("#<hex>|<name>")
+        .with_description(
+            "The background color to use when highlighting this pattern.")
+        .for_field(&external_log_format::highlighter_def::hd_base_style,
+                   &style_config::sc_background_color),
+    yajlpp::property_handler("underline")
+        .with_synopsis("<enabled>")
+        .with_description("Highlight this pattern with an underline.")
+        .for_field(&external_log_format::highlighter_def::hd_base_style,
+                   &style_config::sc_underline),
+    yajlpp::property_handler("blink")
+        .with_synopsis("<enabled>")
+        .with_description("Highlight this pattern by blinking.")
+        .for_field(&external_log_format::highlighter_def::hd_base_style,
+                   &style_config::sc_blink),
+    yajlpp::property_handler("nestable")
+        .with_synopsis("<enabled>")
+        .with_description("This highlight can be nested in another highlight.")
+        .for_field(&external_log_format::highlighter_def::hd_base_style,
+                   &style_config::sc_nestable),
+};
+
+static const json_path_container legacy_highlight_def_handlers = {
+    yajlpp::pattern_property_handler(R"((?<highlight_name>[^/]+))")
+        .with_description("The definition of a highlight")
+        .with_obj_provider<external_log_format::highlighter_def,
+                           external_log_format>(
+            [](const yajlpp_provider_context& ypc, external_log_format* root) {
+                auto* retval
+                    = &(root->elf_highlighter_patterns[ypc.get_substr_i(0)]);
+
+                return retval;
+            })
+        .with_children(legacy_highlight_handlers),
+};
+
+static const json_path_container value_highlight_handlers = {
+    yajlpp::pattern_property_handler(R"((?<highlight_name>[^/]+))")
+        .with_description("The definition of a highlight")
+        .with_obj_provider<external_log_format::highlighter_def,
+                           external_log_format::value_def>(
+            [](const yajlpp_provider_context& ypc,
+               external_log_format::value_def* root) {
+                auto* retval
+                    = &(root->vd_highlighter_patterns[ypc.get_substr_i(0)]);
+
+                return retval;
+            })
+        .with_children(highlighter_def_handlers),
 };
 
 static const struct json_path_container value_def_handlers = {
@@ -588,7 +709,8 @@ static const struct json_path_container value_def_handlers = {
         .with_synopsis("<bool>")
         .with_description("Indicates whether or not this field should be "
                           "treated as a foreign key for row in another table")
-        .for_field(&external_log_format::value_def::vd_foreign_key),
+        .for_field(&external_log_format::value_def::vd_meta,
+                   &logline_value_meta::lvm_foreign_key),
 
     yajlpp::property_handler("hidden")
         .with_synopsis("<bool>")
@@ -607,83 +729,41 @@ static const struct json_path_container value_def_handlers = {
         .with_description(
             "A command that will rewrite this field when pretty-printing")
         .for_field(&external_log_format::value_def::vd_rewriter)
-        .with_example(";SELECT :sc_status || ' (' || (SELECT message FROM "
-                      "http_status_codes WHERE status = :sc_status) || ') '"),
+        .with_example(
+            ";SELECT :sc_status || ' (' || (SELECT message FROM "
+            "http_status_codes WHERE status = :sc_status) || ') '"_frag),
 
     yajlpp::property_handler("description")
         .with_synopsis("<string>")
         .with_description("A description of the field")
         .for_field(&external_log_format::value_def::vd_description),
-};
 
-static const struct json_path_container highlighter_def_handlers = {
-    yajlpp::property_handler("pattern")
-        .with_synopsis("<regex>")
-        .with_description(
-            "A regular expression to highlight in logs of this format.")
-        .for_field(&external_log_format::highlighter_def::hd_pattern),
-
-    yajlpp::property_handler("color")
-        .with_synopsis("#<hex>|<name>")
-        .with_description("The color to use when highlighting this pattern.")
-        .for_field(&external_log_format::highlighter_def::hd_color),
-
-    yajlpp::property_handler("background-color")
-        .with_synopsis("#<hex>|<name>")
-        .with_description(
-            "The background color to use when highlighting this pattern.")
-        .for_field(&external_log_format::highlighter_def::hd_background_color),
-
-    yajlpp::property_handler("underline")
-        .with_synopsis("<enabled>")
-        .with_description("Highlight this pattern with an underline.")
-        .for_field(&external_log_format::highlighter_def::hd_underline),
-
-    yajlpp::property_handler("blink")
-        .with_synopsis("<enabled>")
-        .with_description("Highlight this pattern by blinking.")
-        .for_field(&external_log_format::highlighter_def::hd_blink),
-};
-
-static const json_path_handler_base::enum_value_t LEVEL_ENUM[] = {
-    {level_names[LEVEL_TRACE], LEVEL_TRACE},
-    {level_names[LEVEL_DEBUG5], LEVEL_DEBUG5},
-    {level_names[LEVEL_DEBUG4], LEVEL_DEBUG4},
-    {level_names[LEVEL_DEBUG3], LEVEL_DEBUG3},
-    {level_names[LEVEL_DEBUG2], LEVEL_DEBUG2},
-    {level_names[LEVEL_DEBUG], LEVEL_DEBUG},
-    {level_names[LEVEL_INFO], LEVEL_INFO},
-    {level_names[LEVEL_STATS], LEVEL_STATS},
-    {level_names[LEVEL_NOTICE], LEVEL_NOTICE},
-    {level_names[LEVEL_WARNING], LEVEL_WARNING},
-    {level_names[LEVEL_ERROR], LEVEL_ERROR},
-    {level_names[LEVEL_CRITICAL], LEVEL_CRITICAL},
-    {level_names[LEVEL_FATAL], LEVEL_FATAL},
-
-    json_path_handler_base::ENUM_TERMINATOR,
+    yajlpp::property_handler("highlights")
+        .with_description("The set of highlight definitions")
+        .with_children(value_highlight_handlers),
 };
 
 static const struct json_path_container sample_handlers = {
     yajlpp::property_handler("description")
         .with_synopsis("<text>")
         .with_description("A description of this sample.")
-        .for_field(&external_log_format::sample::s_description),
+        .for_field(&external_log_format::sample_t::s_description),
     yajlpp::property_handler("line")
         .with_synopsis("<log-line>")
         .with_description(
             "A sample log line that should match a pattern in this format.")
-        .for_field(&external_log_format::sample::s_line),
+        .for_field(&external_log_format::sample_t::s_line),
 
     yajlpp::property_handler("level")
         .with_enum_values(LEVEL_ENUM)
         .with_description("The expected level for this sample log line.")
-        .for_field(&external_log_format::sample::s_level),
+        .for_field(&external_log_format::sample_t::s_level),
 };
 
-static const json_path_handler_base::enum_value_t TYPE_ENUM[] = {
-    {"text", external_log_format::elf_type_t::ELF_TYPE_TEXT},
-    {"json", external_log_format::elf_type_t::ELF_TYPE_JSON},
-    {"csv", external_log_format::elf_type_t::ELF_TYPE_CSV},
+static constexpr json_path_handler_base::enum_value_t TYPE_ENUM[] = {
+    {"text"_frag, log_format::file_type_t::TEXT},
+    {"json"_frag, log_format::file_type_t::JSON},
+    {"tabular"_frag, log_format::file_type_t::TABULAR},
 
     json_path_handler_base::ENUM_TERMINATOR,
 };
@@ -719,7 +799,7 @@ static const struct json_path_container tag_path_handlers = {
     yajlpp::property_handler("glob")
         .with_synopsis("<glob>")
         .with_description("The glob to match against file paths")
-        .with_example("*/system.log*")
+        .with_example("*/system.log*"_frag)
         .for_field(&format_tag_def::path_restriction::p_glob),
 };
 
@@ -732,7 +812,7 @@ static const struct json_path_container format_tag_def_handlers = {
         .with_synopsis("<regex>")
         .with_description("The regular expression to match against the body of "
                           "the log message")
-        .with_example("\\w+ is down")
+        .with_example("\\w+ is down"_frag)
         .for_field(&format_tag_def::ftd_pattern),
     yajlpp::property_handler("description")
         .with_synopsis("<string>")
@@ -752,18 +832,33 @@ static const struct json_path_container tag_handlers = {
         .with_children(format_tag_def_handlers),
 };
 
-static const struct json_path_container highlight_handlers = {
-    yajlpp::pattern_property_handler(R"((?<highlight_name>[^/]+))")
-        .with_description("The definition of a highlight")
-        .with_obj_provider<external_log_format::highlighter_def,
-                           external_log_format>(
-            [](const yajlpp_provider_context& ypc, external_log_format* root) {
-                auto* retval
-                    = &(root->elf_highlighter_patterns[ypc.get_substr_i(0)]);
+static const struct json_path_container format_partition_def_handlers = {
+    yajlpp::property_handler("paths#")
+        .with_description("Restrict partitioning to the given paths")
+        .for_field(&format_partition_def::fpd_paths)
+        .with_children(tag_path_handlers),
+    yajlpp::property_handler("pattern")
+        .with_synopsis("<regex>")
+        .with_description("The regular expression to match against the body of "
+                          "the log message")
+        .with_example("\\w+ is down"_frag)
+        .for_field(&format_partition_def::fpd_pattern),
+    yajlpp::property_handler("description")
+        .with_synopsis("<string>")
+        .with_description("A description of this partition")
+        .for_field(&format_partition_def::fpd_description),
+    json_path_handler("level")
+        .with_synopsis("<log-level>")
+        .with_description("Constrain hits to log messages with this level")
+        .with_enum_values(LEVEL_ENUM)
+        .for_field(&format_partition_def::fpd_level),
+};
 
-                return retval;
-            })
-        .with_children(highlighter_def_handlers),
+static const struct json_path_container partition_handlers = {
+    yajlpp::pattern_property_handler(R"((?<partition_type>[\w:;\._\- ]+))")
+        .with_description("The type of partition to apply")
+        .with_obj_provider(format_partition_def_provider)
+        .with_children(format_partition_def_handlers),
 };
 
 static const struct json_path_container action_def_handlers = {
@@ -810,13 +905,97 @@ static const struct json_path_container search_table_handlers = {
         .with_children(search_table_def_handlers),
 };
 
-static const json_path_handler_base::enum_value_t MIME_TYPE_ENUM[] = {
-    {
-        "application/vnd.tcpdump.pcap",
-        file_format_t::PCAP,
-    },
+static const struct json_path_container header_expr_handlers = {
+    yajlpp::pattern_property_handler(R"((?<header_expr_name>\w+))")
+        .with_description("SQLite expression")
+        .for_field(&external_log_format::header_exprs::he_exprs),
+};
 
-    json_path_handler_base::ENUM_TERMINATOR,
+static const struct json_path_container header_handlers = {
+    yajlpp::property_handler("expr")
+        .with_description("The expressions used to check if a file header "
+                          "matches this file format")
+        .for_child(&external_log_format::header::h_exprs)
+        .with_children(header_expr_handlers),
+    yajlpp::property_handler("size")
+        .with_description("The minimum size required for this header type")
+        .for_field(&external_log_format::header::h_size),
+};
+
+static const struct json_path_container converter_handlers = {
+    yajlpp::property_handler("type")
+        .with_description("The MIME type")
+        .for_field(&external_log_format::converter::c_type),
+    yajlpp::property_handler("header")
+        .with_description("File header detection definitions")
+        .for_child(&external_log_format::converter::c_header)
+        .with_children(header_handlers),
+    yajlpp::property_handler("command")
+        .with_description("The script used to convert the file")
+        .with_pattern(R"([\w\.\-]+)")
+        .for_field(&external_log_format::converter::c_command),
+};
+
+static const struct json_path_container opid_descriptor_handlers = {
+    yajlpp::property_handler("field")
+        .with_synopsis("<name>")
+        .with_description("The field to include in the operation description")
+        .for_field(&log_format::opid_descriptor::od_field),
+    yajlpp::property_handler("extractor")
+        .with_synopsis("<regex>")
+        .with_description(
+            "The regex used to extract content for the operation description")
+        .for_field(&log_format::opid_descriptor::od_extractor),
+    yajlpp::property_handler("prefix")
+        .with_description(
+            "A string to prepend to this field in the description")
+        .for_field(&log_format::opid_descriptor::od_prefix),
+    yajlpp::property_handler("suffix")
+        .with_description("A string to append to this field in the description")
+        .for_field(&log_format::opid_descriptor::od_suffix),
+    yajlpp::property_handler("joiner")
+        .with_description("A string to insert between instances of this field "
+                          "when the field is found more than once")
+        .for_field(&log_format::opid_descriptor::od_joiner),
+};
+
+static const struct json_path_container opid_description_format_handlers = {
+    yajlpp::property_handler("format#")
+        .with_description("Defines the elements of this operation description")
+        .for_field(&log_format::opid_descriptors::od_descriptors)
+        .with_children(opid_descriptor_handlers),
+};
+
+static const struct json_path_container opid_description_handlers = {
+    yajlpp::pattern_property_handler(R"((?<opid_descriptor>[\w\.\-]+))")
+        .with_description("A type of description for this operation")
+        .for_field(&log_format::lf_opid_description_def)
+        .with_children(opid_description_format_handlers),
+};
+
+static const struct json_path_container subid_description_handlers = {
+    yajlpp::pattern_property_handler(R"((?<subid_descriptor>[\w\.\-]+))")
+        .with_description("A type of description for this sub-operation")
+        .for_field(&log_format::lf_subid_description_def)
+        .with_children(opid_description_format_handlers),
+};
+
+static const struct json_path_container opid_handlers = {
+    yajlpp::property_handler("source")
+        .with_description("The source of the operation ID")
+        .with_enum_values(OPID_SOURCE_ENUM)
+        .for_field(&log_format::lf_opid_source),
+    yajlpp::property_handler("subid")
+        .with_description("The field that holds the ID for a sub-operation")
+        .for_field(&external_log_format::elf_subid_field),
+    yajlpp::property_handler("description")
+        .with_description(
+            "Define how to construct a description of an operation")
+        .with_children(opid_description_handlers),
+    yajlpp::property_handler("sub-description")
+        .with_description(
+            "Define how to construct a description of a sub-operation")
+        .with_children(subid_description_handlers),
 };
 
 const struct json_path_container format_handlers = {
@@ -828,28 +1007,33 @@ const struct json_path_container format_handlers = {
     json_path_handler("json", read_format_bool)
         .with_description(
             R"(Indicates that log files are JSON-encoded (deprecated, use "file-type": "json"))"),
-    json_path_handler("convert-to-local-time", read_format_bool)
+    json_path_handler("convert-to-local-time")
         .with_description("Indicates that displayed timestamps should "
-                          "automatically be converted to local time"),
-    json_path_handler("hide-extra", read_format_bool)
-        .with_description(
-            "Specifies whether extra values in JSON logs should be displayed")
+                          "automatically be converted to local time")
+        .for_field(&external_log_format::lf_date_time,
+                   &date_time_scanner::dts_local_time),
+    json_path_handler("hide-extra")
+        .with_description("If 'true', JSON-log values that are not defined in "
+                          "the 'value' object are hidden")
         .for_field(&external_log_format::jlf_hide_extra),
-    json_path_handler("multiline", read_format_bool)
+    json_path_handler("multiline")
         .with_description("Indicates that log messages can span multiple lines")
         .for_field(&log_format::lf_multiline),
-    json_path_handler("timestamp-divisor", read_format_double)
-        .add_cb(read_format_int)
+    json_path_handler("timestamp-divisor")
         .with_synopsis("<number>")
+        .with_exclusive_min_value(0)
         .with_description(
-            "The value to divide a numeric timestamp by in a JSON log."),
+            "The value to divide a numeric timestamp by in a JSON log.")
+        .for_field(&external_log_format::elf_timestamp_divisor),
     json_path_handler("file-pattern")
         .with_description("A regular expression that restricts this format to "
                           "log files with a matching name")
         .for_field(&external_log_format::elf_filename_pcre),
-    json_path_handler("mime-types#", read_format_field)
-        .with_description("A list of mime-types this format should be used for")
-        .with_enum_values(MIME_TYPE_ENUM),
+    json_path_handler("converter")
+        .with_description("Describes how the file format can be detected and "
+                          "converted to a log that can be understood by lnav")
+        .for_child(&external_log_format::elf_converter)
+        .with_children(converter_handlers),
     json_path_handler("level-field")
         .with_description(
             "The name of the level field in the log message pattern")
@@ -862,6 +1046,12 @@ const struct json_path_container format_handlers = {
         .with_description(
             "The name of the timestamp field in the log message pattern")
         .for_field(&log_format::lf_timestamp_field),
+    json_path_handler("start-timestamp-field")
+        .with_description(
+            "The name of the field that contains the start time of the "
+            "operation.  The timestamp-field is treated as the end time "
+            "and the duration is computed as the difference.")
+        .for_field(&log_format::lf_start_timestamp_field),
     json_path_handler("subsecond-field")
         .with_description("The path to the property in a JSON-lines log "
                           "message that contains the sub-second time value")
@@ -876,28 +1066,60 @@ const struct json_path_container format_handlers = {
             "field should only be specified if the timestamp field only "
             "contains a date.")
         .for_field(&log_format::lf_time_field),
+    json_path_handler("timestamp-point-of-reference")
+        .with_description("The relation of the timestamp to the operation that "
+                          "the message refers to.")
+        .with_enum_values(TS_POR_ENUM)
+        .for_field(&external_log_format::lf_timestamp_point_of_reference),
     json_path_handler("body-field")
         .with_description(
             "The name of the body field in the log message pattern")
         .for_field(&external_log_format::elf_body_field),
+    json_path_handler("thread-id-field")
+        .with_description(
+            "The name of the thread ID field in the log message pattern")
+        .for_field(&external_log_format::elf_thread_id_field),
+    json_path_handler("src-file-field")
+        .with_description(
+            "The name of the source file field in the log message pattern")
+        .for_field(&external_log_format::elf_src_file_field),
+    json_path_handler("src-line-field")
+        .with_description(
+            "The name of the source line field in the log message pattern")
+        .for_field(&external_log_format::elf_src_line_field),
+    json_path_handler("src-location-field")
+        .with_description("The name of the field that contains the source file "
+                          "and line number")
+        .for_field(&external_log_format::elf_src_loc_field),
+    json_path_handler("duration-field")
+        .with_description(
+            "The name of the duration field in the log message pattern")
+        .for_field(&external_log_format::elf_duration_field),
+    json_path_handler("duration-divisor")
+        .with_synopsis("<number>")
+        .with_exclusive_min_value(0)
+        .with_description("The value to divide a duration by to convert it to "
+                          "seconds.  For example, if the duration field is in "
+                          "milliseconds, the divisor should be 1000.")
+        .for_field(&external_log_format::elf_duration_divisor),
     json_path_handler("url",
                       lnav::pcre2pp::code::from_const("^url#?").to_shared())
         .add_cb(read_format_field)
         .with_description("A URL with more information about this log format"),
     json_path_handler("title", read_format_field)
         .with_description("The human-readable name for this log format"),
-    json_path_handler("description", read_format_field)
+    json_path_handler("description")
         .with_description("A longer description of this log format")
         .for_field(&external_log_format::lf_description),
     json_path_handler("timestamp-format#", read_format_field)
         .with_description("An array of strptime(3)-like timestamp formats"),
-    json_path_handler("module-field", read_format_field)
-        .with_description(
-            "The name of the module field in the log message pattern"),
-    json_path_handler("opid-field", read_format_field)
+    json_path_handler("opid-field")
         .with_description(
             "The name of the operation-id field in the log message pattern")
         .for_field(&external_log_format::elf_opid_field),
+    yajlpp::property_handler("opid")
+        .with_description("Definitions related to operations found in logs")
+        .with_children(opid_handlers),
     yajlpp::property_handler("ordered-by-time")
         .with_synopsis("<bool>")
         .with_description(
@@ -915,6 +1137,11 @@ const struct json_path_container format_handlers = {
     yajlpp::property_handler("tags")
         .with_description("The tags to automatically apply to log messages")
         .with_children(tag_handlers),
+
+    yajlpp::property_handler("partitions")
+        .with_description(
+            "The partitions to automatically apply to log messages")
+        .with_children(partition_handlers),
 
     yajlpp::property_handler("action").with_children(action_handlers),
     yajlpp::property_handler("sample#")
@@ -935,13 +1162,13 @@ const struct json_path_container format_handlers = {
 
     yajlpp::property_handler("highlights")
         .with_description("The set of highlight definitions")
-        .with_children(highlight_handlers),
+        .with_children(legacy_highlight_def_handlers),
 
     yajlpp::property_handler("file-type")
         .with_synopsis("text|json|csv")
         .with_description("The type of file that contains the log messages")
         .with_enum_values(TYPE_ENUM)
-        .for_field(&external_log_format::elf_type),
+        .for_field(&log_format::lf_file_type),
 
     yajlpp::property_handler("max-unrecognized-lines")
         .with_synopsis("<lines>")
@@ -952,7 +1179,10 @@ const struct json_path_container format_handlers = {
 };
 
 static int
-read_id(yajlpp_parse_context* ypc, const unsigned char* str, size_t len)
+read_id(yajlpp_parse_context* ypc,
+        const unsigned char* str,
+        size_t len,
+        yajl_string_props_t*)
 {
     auto* ud = static_cast<loader_userdata*>(ypc->ypc_userdata);
     auto file_id = std::string((const char*) str, len);
@@ -996,64 +1226,104 @@ const struct json_path_container root_format_handler = json_path_container{
 static void
 write_sample_file()
 {
+    const auto dstdir = lnav::paths::dotlnav();
     for (const auto& bsf : lnav_format_json) {
-        auto sample_path = lnav::paths::dotlnav()
+        auto sample_path = dstdir
             / fmt::format(FMT_STRING("formats/default/{}.sample"),
                           bsf.get_name());
-        auto sf = bsf.to_string_fragment();
-        auto_fd sample_fd;
 
-        if ((sample_fd = lnav::filesystem::openp(
-                 sample_path, O_WRONLY | O_TRUNC | O_CREAT, 0644))
-                == -1
-            || (write(sample_fd.get(), sf.data(), sf.length()) == -1))
-        {
+        const auto& name_sf = bsf.get_name();
+        auto stat_res = lnav::filesystem::stat_file(sample_path);
+        if (stat_res.isOk()) {
+            auto st = stat_res.unwrap();
+            if (st.st_mtime >= lnav::filesystem::self_mtime()) {
+                log_debug("skipping writing sample: %.*s (mtimes %ld >= %lld)",
+                          name_sf.length(),
+                          name_sf.data(),
+                          st.st_mtime,
+                          lnav::filesystem::self_mtime());
+                continue;
+            }
+            log_debug("sample file needs to be updated: %.*s",
+                      name_sf.length(),
+                      name_sf.data());
+        } else {
+            log_debug("sample file does not exist: %.*s",
+                      name_sf.length(),
+                      name_sf.data());
+        }
+
+        auto sfp = bsf.to_string_fragment_producer();
+        auto write_res = lnav::filesystem::write_file(
+            sample_path,
+            *sfp,
+            {lnav::filesystem::write_file_options::read_only});
+
+        if (write_res.isErr()) {
+            auto msg = write_res.unwrapErr();
             fprintf(stderr,
                     "error:unable to write default format file: %s -- %s\n",
                     sample_path.c_str(),
-                    strerror(errno));
+                    msg.c_str());
         }
     }
 
     for (const auto& bsf : lnav_sh_scripts) {
-        auto sh_path = lnav::paths::dotlnav()
+        auto sh_path = dstdir
             / fmt::format(FMT_STRING("formats/default/{}"), bsf.get_name());
-        auto sf = bsf.to_string_fragment();
-        auto_fd sh_fd;
+        auto stat_res = lnav::filesystem::stat_file(sh_path);
+        if (stat_res.isOk()) {
+            auto st = stat_res.unwrap();
+            if (st.st_mtime >= lnav::filesystem::self_mtime()) {
+                continue;
+            }
+        }
 
-        if ((sh_fd = lnav::filesystem::openp(
-                 sh_path, O_WRONLY | O_TRUNC | O_CREAT, 0755))
-                == -1
-            || write(sh_fd.get(), sf.data(), sf.length()) == -1)
-        {
+        auto sfp = bsf.to_string_fragment_producer();
+        auto write_res = lnav::filesystem::write_file(
+            sh_path,
+            *sfp,
+            {
+                lnav::filesystem::write_file_options::executable,
+                lnav::filesystem::write_file_options::read_only,
+            });
+
+        if (write_res.isErr()) {
+            auto msg = write_res.unwrapErr();
             fprintf(stderr,
                     "error:unable to write default text file: %s -- %s\n",
                     sh_path.c_str(),
-                    strerror(errno));
+                    msg.c_str());
         }
     }
 
     for (const auto& bsf : lnav_scripts) {
-        struct script_metadata meta;
-        auto sf = bsf.to_string_fragment();
-        auto_fd script_fd;
+        script_metadata meta;
+        auto sf = bsf.to_string_fragment_producer()->to_string();
 
+        meta.sm_name = bsf.get_name().to_string();
         extract_metadata(sf, meta);
         auto path
             = fmt::format(FMT_STRING("formats/default/{}.lnav"), meta.sm_name);
-        auto script_path = lnav::paths::dotlnav() / path;
+        auto script_path = dstdir / path;
         auto stat_res = lnav::filesystem::stat_file(script_path);
-        if (stat_res.isOk() && stat_res.unwrap().st_size == sf.length()) {
-            // Assume it's the right contents and move on...
-            continue;
+        if (stat_res.isOk()) {
+            auto st = stat_res.unwrap();
+            if (st.st_mtime >= lnav::filesystem::self_mtime()) {
+                continue;
+            }
         }
-        if ((script_fd = lnav::filesystem::openp(
-                 script_path, O_WRONLY | O_TRUNC | O_CREAT, 0755))
-                == -1
-            || write(script_fd.get(), sf.data(), sf.length()) == -1)
-        {
+
+        auto write_res = lnav::filesystem::write_file(
+            script_path,
+            sf,
+            {
+                lnav::filesystem::write_file_options::executable,
+                lnav::filesystem::write_file_options::read_only,
+            });
+        if (write_res.isErr()) {
             fprintf(stderr,
-                    "error:unable to write default text file: %s -- %s\n",
+                    "error:unable to write default script file: %s -- %s\n",
                     script_path.c_str(),
                     strerror(errno));
         }
@@ -1064,17 +1334,17 @@ static void
 format_error_reporter(const yajlpp_parse_context& ypc,
                       const lnav::console::user_message& msg)
 {
-    struct loader_userdata* ud = (loader_userdata*) ypc.ypc_userdata;
+    auto* ud = (loader_userdata*) ypc.ypc_userdata;
 
     ud->ud_errors->emplace_back(msg);
 }
 
 std::vector<intern_string_t>
-load_format_file(const ghc::filesystem::path& filename,
+load_format_file(const std::filesystem::path& filename,
                  std::vector<lnav::console::user_message>& errors)
 {
     std::vector<intern_string_t> retval;
-    struct loader_userdata ud;
+    loader_userdata ud;
     auto_fd fd;
 
     log_info("loading formats from file: %s", filename.c_str());
@@ -1136,8 +1406,8 @@ load_format_file(const ghc::filesystem::path& filename,
                       .append(
                           fmt::format(FMT_STRING("    \"$schema\": \"{}\","),
                                       *SUPPORTED_FORMAT_SCHEMAS.begin()))
-                      .with_attr_for_all(
-                          VC_ROLE.value(role_t::VCR_QUOTED_CODE));
+                      .with_attr_for_all(VC_ROLE.value(role_t::VCR_QUOTED_CODE))
+                      .move();
 
             errors.emplace_back(
                 lnav::console::user_message::warning(
@@ -1158,8 +1428,34 @@ load_format_file(const ghc::filesystem::path& filename,
     return retval;
 }
 
+std::vector<intern_string_t>
+validate_format_file(const std::filesystem::path& filename,
+                     std::vector<lnav::console::user_message>& errors)
+{
+    // Parse into an empty registry so that a format that is already
+    // installed is not merged with the one being checked.  ensure_format()
+    // would otherwise hand back the loaded definition and build() would
+    // validate the two spliced together.
+    auto saved_formats = std::exchange(LOG_FORMATS, log_formats_map_t{});
+    auto restore = lnav::finally([&saved_formats]() {
+        LOG_FORMATS = std::move(saved_formats);
+    });
+
+    auto retval = load_format_file(filename, errors);
+    for (const auto& name : retval) {
+        auto iter = LOG_FORMATS.find(name);
+
+        if (iter == LOG_FORMATS.end()) {
+            continue;
+        }
+        iter->second->build(errors);
+    }
+
+    return retval;
+}
+
 static void
-load_from_path(const ghc::filesystem::path& path,
+load_from_path(const std::filesystem::path& path,
                std::vector<lnav::console::user_message>& errors)
 {
     auto format_path = path / "formats/*/*.json";
@@ -1168,7 +1464,7 @@ load_from_path(const ghc::filesystem::path& path,
     log_info("loading formats from path: %s", format_path.c_str());
     if (glob(format_path.c_str(), 0, nullptr, gl.inout()) == 0) {
         for (int lpc = 0; lpc < (int) gl->gl_pathc; lpc++) {
-            auto filepath = ghc::filesystem::path(gl->gl_pathv[lpc]);
+            auto filepath = std::filesystem::path(gl->gl_pathv[lpc]);
 
             if (startswith(filepath.filename().string(), "config.")) {
                 log_info("  not loading config as format: %s",
@@ -1192,12 +1488,14 @@ load_from_path(const ghc::filesystem::path& path,
 }
 
 void
-load_formats(const std::vector<ghc::filesystem::path>& extra_paths,
+load_formats(const std::vector<std::filesystem::path>& extra_paths,
              std::vector<lnav::console::user_message>& errors)
 {
+    auto op_guard = lnav_opid_guard::once(__FUNCTION__);
+
     auto default_source = lnav::paths::dotlnav() / "default";
     std::vector<intern_string_t> retval;
-    struct loader_userdata ud;
+    loader_userdata ud;
     yajl_handle handle;
 
     write_sample_file();
@@ -1213,21 +1511,10 @@ load_formats(const std::vector<ghc::filesystem::path>& extra_paths,
         ypc_builtin.with_obj(ud)
             .with_handle(handle)
             .with_error_reporter(format_error_reporter)
-            .ypc_userdata
-            = &ud;
+            .ypc_userdata = &ud;
         yajl_config(handle, yajl_allow_comments, 1);
-        auto sf = bsf.to_string_fragment();
-        if (ypc_builtin.parse(sf) != yajl_status_ok) {
-            auto* msg = yajl_get_error(handle, 1, sf.udata(), sf.length());
-
-            errors.emplace_back(
-                lnav::console::user_message::error("invalid json")
-                    .with_snippet(lnav::console::snippet::from(
-                        ypc_builtin.ypc_source, attr_line_t((const char*) msg)))
-                    .with_errno_reason());
-            yajl_free_error(handle, msg);
-        }
-        ypc_builtin.complete_parse();
+        auto sf = bsf.to_string_fragment_producer();
+        ypc_builtin.parse(*sf);
         yajl_free(handle);
     }
 
@@ -1235,17 +1522,10 @@ load_formats(const std::vector<ghc::filesystem::path>& extra_paths,
         load_from_path(extra_path, errors);
     }
 
-    uint8_t mod_counter = 0;
-
     std::vector<std::shared_ptr<external_log_format>> alpha_ordered_formats;
     for (auto iter = LOG_FORMATS.begin(); iter != LOG_FORMATS.end(); ++iter) {
         auto& elf = iter->second;
         elf->build(errors);
-
-        if (elf->elf_has_module_format) {
-            mod_counter += 1;
-            elf->lf_mod_index = mod_counter;
-        }
 
         for (auto& check_iter : LOG_FORMATS) {
             if (iter->first == check_iter.first) {
@@ -1264,6 +1544,18 @@ load_formats(const std::vector<ghc::filesystem::path>& extra_paths,
 
         alpha_ordered_formats.push_back(elf);
     }
+
+    // Prioritize formats that have a filename pattern over those that don't so
+    // that they are tried first when detecting a file's format.
+    std::stable_sort(alpha_ordered_formats.begin(),
+                     alpha_ordered_formats.end(),
+                     [](const auto& lhs, const auto& rhs) {
+                         auto lhs_has_pattern
+                             = lhs->elf_filename_pcre.pp_value != nullptr;
+                         auto rhs_has_pattern
+                             = rhs->elf_filename_pcre.pp_value != nullptr;
+                         return lhs_has_pattern && !rhs_has_pattern;
+                     });
 
     auto& graph_ordered_formats = external_log_format::GRAPH_ORDERED_FORMATS;
 
@@ -1311,9 +1603,8 @@ load_formats(const std::vector<ghc::filesystem::path>& extra_paths,
         }
     }
 
-    log_info("Format order:") for (auto& graph_ordered_format :
-                                   graph_ordered_formats)
-    {
+    log_info("Format order:");
+    for (auto& graph_ordered_format : graph_ordered_formats) {
         log_info("  %s", graph_ordered_format->get_name().get());
     }
 
@@ -1328,7 +1619,8 @@ load_formats(const std::vector<ghc::filesystem::path>& extra_paths,
 static void
 exec_sql_in_path(sqlite3* db,
                  const std::map<std::string, scoped_value_t>& global_vars,
-                 const ghc::filesystem::path& path,
+                 const std::filesystem::path& path,
+                 const std::set<std::filesystem::path>& skip_paths,
                  std::vector<lnav::console::user_message>& errors)
 {
     auto format_path = path / "formats/*/*.sql";
@@ -1337,7 +1629,14 @@ exec_sql_in_path(sqlite3* db,
     log_info("executing SQL files in path: %s", format_path.c_str());
     if (glob(format_path.c_str(), 0, nullptr, gl.inout()) == 0) {
         for (int lpc = 0; lpc < (int) gl->gl_pathc; lpc++) {
-            auto filename = ghc::filesystem::path(gl->gl_pathv[lpc]);
+            auto filename = std::filesystem::path(gl->gl_pathv[lpc]);
+
+            if (skip_paths.count(filename) > 0) {
+                log_info("skipping SQL file that is being installed: %s",
+                         filename.c_str());
+                continue;
+            }
+
             auto read_res = lnav::filesystem::read_file(filename);
 
             if (read_res.isOk()) {
@@ -1360,21 +1659,24 @@ exec_sql_in_path(sqlite3* db,
 void
 load_format_extra(sqlite3* db,
                   const std::map<std::string, scoped_value_t>& global_vars,
-                  const std::vector<ghc::filesystem::path>& extra_paths,
+                  const std::vector<std::filesystem::path>& extra_paths,
+                  const std::set<std::filesystem::path>& skip_paths,
                   std::vector<lnav::console::user_message>& errors)
 {
     for (const auto& extra_path : extra_paths) {
-        exec_sql_in_path(db, global_vars, extra_path, errors);
+        exec_sql_in_path(db, global_vars, extra_path, skip_paths, errors);
     }
 }
 
 static void
-extract_metadata(string_fragment contents, struct script_metadata& meta_out)
+extract_metadata(string_fragment contents, script_metadata& meta_out)
 {
     static const auto SYNO_RE = lnav::pcre2pp::code::from_const(
         "^#\\s+@synopsis:(.*)$", PCRE2_MULTILINE);
     static const auto DESC_RE = lnav::pcre2pp::code::from_const(
         "^#\\s+@description:(.*)$", PCRE2_MULTILINE);
+    static const auto OUTPUT_FORMAT_RE = lnav::pcre2pp::code::from_const(
+        "^#\\s+@output-format:\\s+(.*)$", PCRE2_MULTILINE);
 
     auto syno_md = SYNO_RE.create_match_data();
     auto syno_match_res
@@ -1387,6 +1689,29 @@ extract_metadata(string_fragment contents, struct script_metadata& meta_out)
         = DESC_RE.capture_from(contents).into(desc_md).matches().ignore_error();
     if (desc_match_res) {
         meta_out.sm_description = desc_md[1]->trim().to_string();
+    }
+
+    auto out_format_md = OUTPUT_FORMAT_RE.create_match_data();
+    auto out_format_res = OUTPUT_FORMAT_RE.capture_from(contents)
+                              .into(out_format_md)
+                              .matches()
+                              .ignore_error();
+    if (out_format_res) {
+        auto out_format_frag = out_format_md[1]->trim();
+        auto from_res = from<text_format_t>(out_format_frag);
+        if (from_res.isErr()) {
+            log_error("%s (%s): invalid @output-format '%.*s'",
+                      meta_out.sm_name.c_str(),
+                      meta_out.sm_path.c_str(),
+                      out_format_frag.length(),
+                      out_format_frag.data());
+        } else {
+            meta_out.sm_output_format = from_res.unwrap();
+            log_info("%s (%s): setting output format to %d",
+                     meta_out.sm_name.c_str(),
+                     meta_out.sm_path.c_str(),
+                     meta_out.sm_output_format);
+        }
     }
 
     if (!meta_out.sm_synopsis.empty()) {
@@ -1434,36 +1759,40 @@ extract_metadata_from_file(struct script_metadata& meta_inout)
 }
 
 static void
-find_format_in_path(const ghc::filesystem::path& path,
+find_format_in_path(const std::filesystem::path& path,
                     available_scripts& scripts)
 {
-    auto format_path = path / "formats/*/*.lnav";
-    static_root_mem<glob_t, globfree> gl;
+    for (const auto& format_path :
+         {path / "formats/*/*.lnav", path / "configs/*/*.lnav"})
+    {
+        static_root_mem<glob_t, globfree> gl;
 
-    log_debug("Searching for script in path: %s", format_path.c_str());
-    if (glob(format_path.c_str(), 0, nullptr, gl.inout()) == 0) {
-        for (int lpc = 0; lpc < (int) gl->gl_pathc; lpc++) {
-            const char* filename = basename(gl->gl_pathv[lpc]);
-            auto script_name = std::string(filename, strlen(filename) - 5);
-            struct script_metadata meta;
+        log_debug("Searching for script in path: %s", format_path.c_str());
+        if (glob(format_path.c_str(), 0, nullptr, gl.inout()) == 0) {
+            for (size_t lpc = 0; lpc < gl->gl_pathc; lpc++) {
+                const char* filename = basename(gl->gl_pathv[lpc]);
+                auto script_name = std::string(filename, strlen(filename) - 5);
+                struct script_metadata meta;
 
-            meta.sm_path = gl->gl_pathv[lpc];
-            meta.sm_name = script_name;
-            extract_metadata_from_file(meta);
-            scripts.as_scripts[script_name].push_back(meta);
+                meta.sm_path = gl->gl_pathv[lpc];
+                meta.sm_name = script_name;
+                extract_metadata_from_file(meta);
+                scripts.as_scripts[script_name].push_back(meta);
 
-            log_debug("  found script: %s", meta.sm_path.c_str());
+                log_info("  found script: %s", meta.sm_path.c_str());
+            }
         }
     }
 }
 
-void
-find_format_scripts(const std::vector<ghc::filesystem::path>& extra_paths,
-                    available_scripts& scripts)
+available_scripts
+find_format_scripts(const std::vector<std::filesystem::path>& extra_paths)
 {
+    available_scripts retval;
     for (const auto& extra_path : extra_paths) {
-        find_format_in_path(extra_path, scripts);
+        find_format_in_path(extra_path, retval);
     }
+    return retval;
 }
 
 void

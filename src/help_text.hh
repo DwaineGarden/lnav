@@ -30,9 +30,12 @@
 #ifndef LNAV_HELP_TEXT_HH
 #define LNAV_HELP_TEXT_HH
 
+#include <array>
 #include <map>
 #include <string>
 #include <vector>
+
+#include "base/intern_string.hh"
 
 enum class help_context_t {
     HC_NONE,
@@ -44,6 +47,8 @@ enum class help_context_t {
     HC_SQL_INFIX,
     HC_SQL_FUNCTION,
     HC_SQL_TABLE_VALUED_FUNCTION,
+    HC_PRQL_TRANSFORM,
+    HC_PRQL_FUNCTION,
 };
 
 enum class help_function_type_t {
@@ -59,48 +64,84 @@ enum class help_nargs_t {
 };
 
 enum class help_parameter_format_t {
+    HPF_NONE,
     HPF_STRING,
+    HPF_TEXT,
+    HPF_MULTILINE_TEXT,
     HPF_REGEX,
+    HPF_SQL,
+    HPF_SQL_EXPR,
     HPF_INTEGER,
     HPF_NUMBER,
-    HPF_DATETIME,
-    HPF_ENUM,
+    HPF_ADJUSTED_TIME,
+    HPF_LOCATION,
+    HPF_FILENAME,
+    HPF_LOCAL_FILENAME,
+    HPF_LOADED_FILE,
+    HPF_FORMAT_FIELD,
+    HPF_NUMERIC_FIELD,
+    HPF_DIRECTORY,
+    HPF_TIME_FILTER_POINT,
+    HPF_ALL_FILTERS,
+    HPF_ENABLED_FILTERS,
+    HPF_DISABLED_FILTERS,
+    HPF_HIGHLIGHTS,
+    HPF_NAMED_SEARCHES,
+    HPF_ENABLED_NAMED_SEARCHES,
+    HPF_DISABLED_NAMED_SEARCHES,
+    HPF_HIGHLIGHTED_FIELD,
+    HPF_TIMEZONE,
+    HPF_FILE_WITH_ZONE,
+    HPF_CONFIG_PATH,
+    HPF_CONFIG_VALUE,
+    HPF_TAG,
+    HPF_LINE_TAG,
+    HPF_LOGLINE_TABLE,
+    HPF_SEARCH_TABLE,
+    HPF_VISIBLE_FILES,
+    HPF_HIDDEN_FILES,
+    HPF_BREAKPOINT,
+    HPF_KNOWN_BREAKPOINT,
+    HPF_KNOWN_APP,
+    HPF_TIMELINE_METRIC,
+    HPF_ACTIVE_TIMELINE_METRIC,
 };
 
 struct help_example {
-    const char* he_description{nullptr};
-    const char* he_cmd{nullptr};
+    enum class language {
+        undefined,
+        prql,
+    };
+
+    const char* he_description{""};
+    const char* he_cmd{""};
+    language he_language{language::undefined};
 };
 
 struct help_text {
     help_context_t ht_context{help_context_t::HC_NONE};
-    const char* ht_name{nullptr};
-    const char* ht_summary{nullptr};
+    const char* ht_name{""};
+    const char* ht_summary{""};
     const char* ht_flag_name{nullptr};
     const char* ht_group_start{nullptr};
     const char* ht_group_end{nullptr};
-    const char* ht_description{nullptr};
-    std::vector<struct help_text> ht_parameters;
-    std::vector<struct help_text> ht_results;
-    std::vector<struct help_example> ht_example;
+    const char* ht_description{""};
+    std::vector<help_text> ht_parameters;
+    std::vector<help_text> ht_results;
+    std::vector<help_example> ht_example;
     help_nargs_t ht_nargs{help_nargs_t::HN_REQUIRED};
     help_parameter_format_t ht_format{help_parameter_format_t::HPF_STRING};
-    std::vector<const char*> ht_enum_values;
+    std::vector<string_fragment> ht_enum_values;
     std::vector<const char*> ht_tags;
     std::vector<const char*> ht_opposites;
     help_function_type_t ht_function_type{help_function_type_t::HFT_REGULAR};
+    std::vector<const char*> ht_prql_path;
+    const char* ht_default_value{nullptr};
     void* ht_impl{nullptr};
 
     help_text() = default;
 
-    help_text(const char* name, const char* summary = nullptr) noexcept
-        : ht_name(name), ht_summary(summary)
-    {
-        if (name[0] == ':') {
-            this->ht_context = help_context_t::HC_COMMAND;
-            this->ht_name = &name[1];
-        }
-    }
+    help_text(const char* name, const char* summary = "") noexcept;
 
     help_text& command() noexcept
     {
@@ -145,6 +186,18 @@ struct help_text {
         return *this;
     }
 
+    help_text& prql_transform() noexcept
+    {
+        this->ht_context = help_context_t::HC_PRQL_TRANSFORM;
+        return *this;
+    }
+
+    help_text& prql_function() noexcept
+    {
+        this->ht_context = help_context_t::HC_PRQL_FUNCTION;
+        return *this;
+    }
+
     help_text& with_summary(const char* summary) noexcept
     {
         this->ht_summary = summary;
@@ -177,6 +230,27 @@ struct help_text {
 
     help_text& with_example(const help_example& example) noexcept;
 
+    help_text& with_default_value(const char* defval)
+    {
+        this->ht_default_value = defval;
+        return *this;
+    }
+
+    bool is_flag() const
+    {
+        return this->ht_nargs == help_nargs_t::HN_OPTIONAL
+            && this->ht_format == help_parameter_format_t::HPF_NONE;
+    }
+
+    bool is_enum() const { return !this->ht_enum_values.empty(); }
+
+    help_text& flag() noexcept
+    {
+        this->ht_nargs = help_nargs_t::HN_OPTIONAL;
+        this->ht_format = help_parameter_format_t::HPF_NONE;
+        return *this;
+    }
+
     help_text& optional() noexcept
     {
         this->ht_nargs = help_nargs_t::HN_OPTIONAL;
@@ -201,14 +275,37 @@ struct help_text {
         return *this;
     }
 
+    bool is_trailing_arg() const;
+
     help_text& with_enum_values(
-        const std::initializer_list<const char*>& enum_values) noexcept;
+        const std::initializer_list<string_fragment>& enum_values) noexcept;
+
+    template<std::size_t N>
+    help_text& with_enum_values(
+        const std::array<string_fragment, N>& enum_values) noexcept
+    {
+        this->ht_enum_values.reserve(N);
+        for (const auto& val : enum_values) {
+            this->ht_enum_values.emplace_back(val);
+        }
+
+        return *this;
+    }
+
+    help_text& with_enum_values(const std::vector<string_fragment>& ev)
+    {
+        this->ht_enum_values = ev;
+        return *this;
+    }
 
     help_text& with_tags(
         const std::initializer_list<const char*>& tags) noexcept;
 
     help_text& with_opposites(
         const std::initializer_list<const char*>& opps) noexcept;
+
+    help_text& with_prql_path(
+        const std::initializer_list<const char*>& prql) noexcept;
 
     template<typename F>
     help_text& with_impl(F impl)
@@ -219,7 +316,7 @@ struct help_text {
 
     void index_tags();
 
-    static std::multimap<std::string, help_text*> TAGGED;
+    static std::multimap<std::string, help_text*>& tag_map();
 };
 
 #endif

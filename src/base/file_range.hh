@@ -43,6 +43,18 @@ public:
     struct metadata {
         bool m_valid_utf{true};
         bool m_has_ansi{false};
+
+        metadata& operator|=(const metadata& meta)
+        {
+            if (!meta.m_valid_utf) {
+                this->m_valid_utf = false;
+            }
+            if (meta.m_has_ansi) {
+                this->m_has_ansi = true;
+            }
+
+            return *this;
+        }
     };
 
     file_off_t fr_offset{0};
@@ -55,7 +67,7 @@ public:
         this->fr_size = 0;
     }
 
-    ssize_t next_offset() const { return this->fr_offset + this->fr_size; }
+    file_ssize_t next_offset() const { return this->fr_offset + this->fr_size; }
 
     bool empty() const { return this->fr_size == 0; }
 };
@@ -71,8 +83,21 @@ struct source_location {
     {
     }
 
+    bool operator==(const source_location& rhs) const
+    {
+        return this->sl_source == rhs.sl_source
+            && this->sl_line_number == rhs.sl_line_number;
+    }
+
     intern_string_t sl_source;
     int32_t sl_line_number;
 };
+
+#define INTERNAL_SRC_LOC \
+    (+[]() { \
+        static const intern_string_t PATH \
+            = intern_string::lookup("__" __FILE__); \
+        return source_location{PATH, __LINE__}; \
+    })()
 
 #endif

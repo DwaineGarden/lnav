@@ -1,0 +1,23 @@
+{
+    "$schema": "https://lnav.org/schemas/format-v1.schema.json",
+    "access_log": {
+        "value": {
+            "sc_status": {
+                "highlights": {
+                    "ok": {
+                        "pattern": "^200$",
+                        "color": "green"
+                    },
+                    "forbidden": {
+                        "pattern": "^403$",
+                        "color": "#af0000"
+                    },
+                    "redirect": {
+                        "pattern": "^(?:301|302)$",
+                        "color": "#00afff"
+                    }
+                }
+            }
+        }
+    }
+}

@@ -6,6 +6,8 @@ CXXFLAGS =
 SUBDIRS = \
     fmtlib \
     third-party/base64/lib \
+    third-party/date/src \
+    third-party/notcurses/src/lib \
     third-party/scnlib/src \
     pcrepp \
     base \
@@ -42,6 +44,8 @@ default-formats.cc: $(BIN2C_PATH) $(FORMAT_FILES)
 	$(BIN2C_V)$(BIN2C_PATH) -n lnav_format_json default-formats $(FORMAT_FILES)
 
 include keymaps/keymaps.am
+include prql/prql.am
+include terminfos/terminfos.am
 include themes/themes.am
 
 CONFIG_FILES = \
@@ -53,7 +57,15 @@ CONFIG_FILES = \
 default-config.cc: $(BIN2C_PATH) $(CONFIG_FILES)
 	$(BIN2C_V)$(BIN2C_PATH) -n lnav_config_json default-config $(CONFIG_FILES)
 
+prql-modules.cc: $(BIN2C_PATH) $(PRQL_FILES)
+	$(BIN2C_V)$(BIN2C_PATH) -n lnav_prql_modules prql-modules $(PRQL_FILES)
+
+terminfo-files.cc: $(BIN2C_PATH) $(TERMINFO_FILES)
+	$(BIN2C_V)$(BIN2C_PATH) -n lnav_terminfo_files terminfo-files $(TERMINFO_FILES)
+
 include scripts/scripts.am
+
+include static-files/static-files.am
 
 builtin-scripts.cc: $(BIN2C_PATH) $(BUILTIN_LNAVSCRIPTS)
 	$(BIN2C_V)$(BIN2C_PATH) -n lnav_scripts builtin-scripts $(BUILTIN_LNAVSCRIPTS)
@@ -61,17 +73,23 @@ builtin-scripts.cc: $(BIN2C_PATH) $(BUILTIN_LNAVSCRIPTS)
 builtin-sh-scripts.cc: $(BIN2C_PATH) $(BUILTIN_SHSCRIPTS)
 	$(BIN2C_V)$(BIN2C_PATH) -n lnav_sh_scripts builtin-sh-scripts $(BUILTIN_SHSCRIPTS)
 
+static-files.cc: $(BIN2C_PATH) $(STATIC_FILES)
+	$(BIN2C_V)$(BIN2C_PATH) -n lnav_static_files -p $(srcdir)/static-files/ static-files $(STATIC_FILES)
+
 %-sh.cc: $(srcdir)/%.sh $(BIN2C_PATH)
 	$(BIN2C_V)$(BIN2C_PATH) $(*)-sh $<
 
 %-txt.cc: $(srcdir)/%.txt $(BIN2C_PATH)
 	$(BIN2C_V)$(BIN2C_PATH) $(*)-txt $<
 
-%-md.cc: $(srcdir)/%.md $(BIN2C_PATH)
+%-md.cc: %.md $(BIN2C_PATH)
 	$(BIN2C_V)$(BIN2C_PATH) $(*)-md $<
 
 %-sql.cc: $(srcdir)/%.sql $(BIN2C_PATH)
 	$(BIN2C_V)$(BIN2C_PATH) $(*)-sql $<
+
+%-prql.cc: $(srcdir)/%.prql $(BIN2C_PATH)
+	$(BIN2C_V)$(BIN2C_PATH) $(*)-prql $<
 
 %-lnav.cc: $(srcdir)/%.lnav $(BIN2C_PATH)
 	$(BIN2C_V)$(BIN2C_PATH) $(*)-lnav $<
@@ -79,14 +97,17 @@ builtin-sh-scripts.cc: $(BIN2C_PATH) $(BUILTIN_SHSCRIPTS)
 %-json.cc: $(srcdir)/%.json $(BIN2C_PATH)
 	$(BIN2C_V)$(BIN2C_PATH) $(*)-json $<
 
+%.o: $(srcdir)/%.rc
+	$(WINDRES) $< -O COFF -o $@
+
 include time_formats.am
 
-time_fmts.cc: ptimec$(BUILD_EXEEXT)
+time_fmts.cc: ptimec$(BUILD_EXEEXT) time_formats.am
 	$(PTIME_V)./ptimec$(BUILD_EXEEXT) $(TIME_FORMATS) > $@
 
 if HAVE_RE2C
 %.cc: %.re
-	$(RE2C_V)$(RE2C_CMD) --bit-vectors -W --tags -8 -o $@ $<
+	$(RE2C_V)$(RE2C_CMD) --bit-vectors -W -8 -c -o $@ $<
 	$(REC2_V)test $@ -ef $(srcdir)/$*.cc || cp $@ $(srcdir)/$*.cc
 endif
 
@@ -95,6 +116,8 @@ LNAV_BUILT_FILES = \
     ansi-palette-json.cc \
     builtin-scripts.cc \
     builtin-sh-scripts.cc \
+    static-files.cc \
+    css-color-names-json.cc \
     default-config.cc \
     default-formats.cc \
     diseases-json.cc \
@@ -102,6 +125,8 @@ LNAV_BUILT_FILES = \
     words-json.cc \
     help-md.cc \
     init-sql.cc \
+    prql-modules.cc \
+    terminfo-files.cc \
     time_fmts.cc \
     xml-entities-json.cc \
     xterm-palette-json.cc
@@ -112,10 +137,41 @@ AM_LIBS = $(CODE_COVERAGE_LIBS)
 AM_CFLAGS = $(CODE_COVERAGE_CFLAGS)
 AM_CXXFLAGS = $(CODE_COVERAGE_CXXFLAGS) $(USER_CXXFLAGS)
 
+if HAVE_CARGO
+RUST_DEPS_CPPFLAGS = -DHAVE_RUST_DEPS=1
+PRQLC_DIR = third-party/lnav-rs-ext/target
+RUST_DEPS_LIBS = $(PRQLC_DIR)/release/liblnav_rs_ext.a
+RUST_DEPS_TRIGGER = $(PRQLC_DIR)/release/liblnav_rs_ext.a.dep
+
+if HAVE_CXXBRIDGE
+$(srcdir)/third-party/lnav-rs-ext/lnav_rs_ext.cxx.hh: $(srcdir)/third-party/lnav-rs-ext/src/lib.rs
+	(cd $(srcdir)/third-party/lnav-rs-ext/ && $(CXXBRIDGE) --header src/lib.rs) > $@
+
+$(srcdir)/third-party/lnav-rs-ext/lnav_rs_ext.cxx.cc: $(srcdir)/third-party/lnav-rs-ext/src/lib.rs
+	(cd $(srcdir)/third-party/lnav-rs-ext/ && $(CXXBRIDGE) src/lib.rs) > $@
+endif
+
+$(RUST_DEPS_LIBS): $(srcdir)/third-party/lnav-rs-ext/src/lib.rs \
+  $(srcdir)/third-party/lnav-rs-ext/src/ext_access.rs $(srcdir)/third-party/lnav-rs-ext/Cargo.lock \
+  $(srcdir)/third-party/lnav-rs-ext/src/ext_access.rs $(srcdir)/third-party/lnav-rs-ext/Cargo.toml
+	mkdir -p $(PRQLC_DIR)
+	env CARGO_TARGET_DIR=third-party/lnav-rs-ext/target $(CARGO_CMD) build --manifest-path \
+	    $(srcdir)/third-party/lnav-rs-ext/Cargo.toml --package lnav-rs-ext --release
+	touch $(RUST_DEPS_LIBS)
+
+RUST_CPP = \
+    third-party/lnav-rs-ext/lnav_rs_ext.cxx.cc
+
+else
+RUST_DEPS =
+RUST_DEPS_CPPFLAGS =
+RUST_DEPS_LIBS =
+RUST_CPP =
+endif
+
 AM_LDFLAGS = \
 	$(STATIC_LDFLAGS) \
 	$(LIBARCHIVE_LDFLAGS) \
-	$(READLINE_LDFLAGS) \
 	$(SQLITE3_LDFLAGS) \
 	$(PCRE_LDFLAGS)
 
@@ -125,15 +181,23 @@ AM_CPPFLAGS = \
 	-I$(srcdir)/fmtlib \
 	-I$(srcdir)/third-party \
 	-I$(srcdir)/third-party/base64/include \
+	-I$(srcdir)/third-party/cpp-HyperLogLog/include \
+	-I$(srcdir)/third-party/date/include \
+	-I$(srcdir)/third-party/digestible/include \
+	-I$(srcdir)/third-party/parallel_hashmap \
+	-I$(srcdir)/third-party/notcurses/include \
+	-I$(srcdir)/third-party/lnav-rs-ext \
 	-I$(srcdir)/third-party/rapidyaml \
+	-I$(srcdir)/third-party/hat-trie/include \
 	-I$(top_srcdir)/src/third-party/scnlib/include \
+	-I$(top_srcdir)/src/third-party/scnlib/src/deps \
 	-Wall \
 	$(CODE_COVERAGE_CPPFLAGS) \
 	$(LIBARCHIVE_CFLAGS) \
-	$(READLINE_CFLAGS) \
 	$(SQLITE3_CFLAGS) \
 	$(PCRE_CFLAGS) \
-	$(LIBCURL_CPPFLAGS)
+	$(LIBCURL_CPPFLAGS) \
+	$(RUST_DEPS_CPPFLAGS)
 
 LDADD = \
 	libdiag.a \
@@ -141,6 +205,7 @@ LDADD = \
 	base/libbase.a \
 	formats/logfmt/liblogfmt.a \
 	fmtlib/libcppfmt.a \
+	third-party/date/src/libdatepp.a \
 	third-party/scnlib/src/libscnlib.a \
 	pcrepp/libpcrepp.a \
 	pugixml/libpugixml.a \
@@ -150,88 +215,119 @@ LDADD = \
 	yajl/libyajl.a \
 	yajlpp/libyajlpp.a \
 	third-party/base64/lib/libbase64.a \
-	$(READLINE_LIBS) \
-	$(CURSES_LIB) \
+	third-party/notcurses/src/lib/liblnavnotcurses.a \
+    $(RUST_DEPS_LIBS) \
 	$(SQLITE3_LIBS) \
 	$(LIBARCHIVE_LIBS) \
-	$(LIBCURL)
+	$(LIBCURL) \
+	-lunistring
 
 # emojis.json is from https://gist.github.com/oliveratgithub/0bf11a9aff0d6da7b46f1490f86a71eb/
 # xml-entities.json is from https://html.spec.whatwg.org/entities.json
+# css-color-names.json is from https://github.com/bahamas10/css-color-names/blob/master/css-color-names.json
 
 dist_noinst_DATA = \
-	alpha-release.sh \
 	animals.json \
 	ansi-palette.json \
+	css-color-names.json \
 	diseases.json \
 	emojis.json \
 	$(BUILTIN_LNAVSCRIPTS) \
 	$(BUILTIN_SHSCRIPTS) \
 	$(CONFIG_FILES) \
 	$(FORMAT_FILES) \
+	$(PRQL_FILES) \
+	$(STATIC_FILES) \
+	$(TERMINFO_FILES) \
 	words.json \
 	xml-entities.json \
 	xterm-palette.json
 
 noinst_HEADERS = \
+    third-party/md4c/entity.h \
     third-party/md4c/md4c.h \
+    third-party/md4c/md4c-html.h \
+    third-party/lnav-rs-ext/lnav_ffi.hh \
+    third-party/lnav-rs-ext/lnav_rs_ext.h \
+    third-party/lnav-rs-ext/lnav_rs_ext.hpp \
+    third-party/lnav-rs-ext/lnav_rs_ext.cxx.hh \
+    third-party/lnav-rs-ext/rust/cxx.h \
     third-party/rapidyaml/ryml_all.hpp \
+	all_ids_vtabs.hh \
 	all_logs_vtab.hh \
+	apps.cfg.hh \
+	apps.hh \
 	archive_manager.hh \
 	archive_manager.cfg.hh \
 	big_array.hh \
 	bin2c.hh \
 	bookmarks.hh \
+	bookmarks.json.hh \
 	bottom_status_source.hh \
 	bound_tags.hh \
 	breadcrumb.hh \
 	breadcrumb_curses.hh \
 	byte_array.hh \
+	cmd.parser.hh \
 	column_namer.hh \
 	command_executor.hh \
+	crashd.client.hh \
 	curl_looper.hh \
 	data_scanner.hh \
 	data_scanner_re.re \
 	data_parser.hh \
+	db_status_source.hh \
 	db_sub_source.hh \
 	doc_status_source.hh \
 	document.sections.hh \
 	dump_internals.hh \
 	elem_to_json.hh \
 	environ_vtab.hh \
+	ext.longpoll.hh \
+	external_editor.hh \
+	external_editor.cfg.hh \
+	external_opener.hh \
+	external_opener.cfg.hh \
 	field_overlay_source.hh \
 	file_collection.hh \
+	file_converter_manager.hh \
 	file_format.hh \
+	file_options.hh \
 	file_vtab.cfg.hh \
 	files_sub_source.hh \
 	filter_observer.hh \
 	filter_status_source.hh \
 	filter_sub_source.hh \
+	format.scripts.hh \
 	fstat_vtab.hh \
-	fts_fuzzy_match.hh \
 	grep_highlighter.hh \
 	grep_proc.hh \
+	hasher.hh \
 	help.md \
-	help.txt \
 	help_text.hh \
 	help_text_formatter.hh \
 	highlighter.hh \
 	hist_source.hh \
+	hist_source_T.hh \
 	hotkeys.hh \
 	init.sql \
 	input_dispatcher.hh \
-	itertools.similar.hh \
-	k_merge_tree.h \
 	line_buffer.hh \
 	listview_curses.hh \
 	lnav.hh \
 	lnav.events.hh \
+	lnav.exec-phase.hh \
 	lnav.indexing.hh \
+	file_split.hh \
 	lnav.management_cli.hh \
-	lnav_commands.hh \
+    lnav.prompt.hh \
+    lnav.script.parser.hh \
+	cmds.hh \
 	lnav_config.hh \
 	lnav_config_fwd.hh \
 	lnav_util.hh \
+	log.annotate.hh \
+	log.annotate.cfg.hh \
 	log.watch.hh \
 	log_accel.hh \
 	log_actions.hh \
@@ -246,34 +342,38 @@ noinst_HEADERS = \
 	log_level_re.re \
 	log_search_table.hh \
 	log_search_table_fwd.hh \
+	log_stmt_vtab.hh \
 	logfile.hh \
 	logfile.cfg.hh \
 	logfile_fwd.hh \
 	logfile_sub_source.hh \
 	logfile_sub_source.cfg.hh \
+	logline_window.hh \
 	mapbox/recursive_wrapper.hpp \
 	mapbox/variant.hpp \
 	mapbox/variant_io.hpp \
 	mapbox/variant_visitor.hpp \
 	md2attr_line.hh \
 	md4cpp.hh \
-	optional.hpp \
-	pcap_manager.hh \
-	piper_proc.hh \
+	msg.text.hh \
+	piper.header.hh \
+	piper.looper.hh \
+	piper.looper.cfg.hh \
+	piper.match.hh \
 	plain_text_source.hh \
 	pollable.hh \
 	pretty_printer.hh \
 	preview_status_source.hh \
+	progress_source.hh \
 	ptimec.hh \
+	ptimec_spec.hh \
 	readline_callbacks.hh \
-	readline_context.hh \
-	readline_curses.hh \
+	lnav.commands.hh \
 	readline_highlighters.hh \
 	readline_possibilities.hh \
 	regex101.client.hh \
 	regex101.import.hh \
 	regexp_vtab.hh \
-	relative_time.hh \
 	ring_span.hh \
 	safe/accessmode.h \
 	safe/defaulttypes.h \
@@ -284,15 +384,16 @@ noinst_HEADERS = \
 	session_data.hh \
 	shared_buffer.hh \
 	shlex.hh \
-	shlex.resolver.hh \
-	simdutf8check.h \
 	spectro_impls.hh \
 	spectro_source.hh \
 	sqlitepp.hh \
 	sqlitepp.client.hh \
+	sql.formatter.hh \
+	sql_execute.hh \
 	sql_help.hh \
 	sql_util.hh \
 	sqlite-extension-func.hh \
+	src_ref.hh \
 	static_file_vtab.hh \
 	styling.hh \
 	statusview_curses.hh \
@@ -303,15 +404,22 @@ noinst_HEADERS = \
 	term_extra.hh \
 	text_anonymizer.hh \
 	text_format.hh \
+	text_overlay_menu.hh \
+	textinput_curses.hh \
+	textinput.history.hh \
 	textfile_highlighters.hh \
 	textfile_sub_source.hh \
+	textfile_sub_source.cfg.hh \
 	textview_curses.hh \
 	textview_curses_fwd.hh \
 	time_T.hh \
+	timeline_source.hh \
+	timeline_status_source.hh \
 	timer.hh \
 	top_status_source.hh \
 	top_status_source.cfg.hh \
 	unique_path.hh \
+	url_handler.cfg.hh \
 	url_loader.hh \
 	view_curses.hh \
 	view_helpers.hh \
@@ -320,7 +428,6 @@ noinst_HEADERS = \
 	view_helpers.hist.hh \
 	views_vtab.hh \
 	vis_line.hh \
-	vt52_curses.hh \
 	vtab_module.hh \
 	vtab_module_json.hh \
 	log_vtab_impl.hh \
@@ -329,12 +436,6 @@ noinst_HEADERS = \
 	xpath_vtab.hh \
 	xterm_mouse.hh \
 	spookyhash/SpookyV2.h \
-	ghc/filesystem.hpp \
-	ghc/fs_fwd.hpp \
-	ghc/fs_impl.hpp \
-	ghc/fs_std.hpp \
-	ghc/fs_std_fwd.hpp \
-	ghc/fs_std_impl.hpp \
     ww898/cp_utf8.hpp
 
 nodist_libdiag_a_SOURCES = \
@@ -360,12 +461,30 @@ THIRD_PARTY_SRCS = \
     third-party/CLI/Split.hpp \
     third-party/CLI/TypeTools.hpp \
     third-party/CLI/ConfigFwd.hpp \
+    third-party/cpp-HyperLogLog/include/hyperloglog.hpp \
+    third-party/digestible/include/digestible/digestible.h \
     third-party/doctest-root/doctest/doctest.h \
     third-party/intervaltree/IntervalTree.h \
+    third-party/md4c/entity.c \
     third-party/md4c/md4c.c \
+    third-party/md4c/md4c-html.c \
+    third-party/parallel_hashmap/meminfo.h \
+    third-party/parallel_hashmap/phmap.h \
+    third-party/parallel_hashmap/phmap_base.h \
+    third-party/parallel_hashmap/phmap_bits.h \
+    third-party/parallel_hashmap/phmap_config.h \
+    third-party/parallel_hashmap/phmap_dump.h \
+    third-party/parallel_hashmap/phmap_fwd_decl.h \
+    third-party/parallel_hashmap/phmap_utils.h \
     third-party/robin_hood/robin_hood.h \
 	third-party/sqlite/ext/dbdump.c \
-	third-party/sqlite/ext/series.c
+	third-party/sqlite/ext/series.c \
+    third-party/tlx/die/core.hpp \
+    third-party/tlx/container/btree.hpp \
+    third-party/tlx/container/btree_map.hpp \
+    third-party/tlx/container/btree_multimap.hpp \
+    third-party/tlx/container/btree_multiset.hpp \
+    third-party/tlx/container/btree_set.hpp
 
 libdatascanner_a_SOURCES = \
 	data_scanner.cc \
@@ -373,31 +492,51 @@ libdatascanner_a_SOURCES = \
 
 libdiag_a_SOURCES = \
 	$(THIRD_PARTY_SRCS) \
+	$(RUST_CPP) \
 	all_logs_vtab.cc \
 	archive_manager.cc \
+	apps.cc \
+	bin2c_rt.cc \
 	bookmarks.cc \
 	bottom_status_source.cc \
+	breadcrumb.cc \
 	breadcrumb_curses.cc \
+	cmd.parser.cc \
+	cmds.bookmarks.cc \
+	cmds.breakpoints.cc \
+	cmds.display.cc \
+	cmds.filtering.cc \
+	cmds.io.cc \
+	cmds.metadata.cc \
+	cmds.scripting.cc \
+	cmds.search.cc \
 	collation-functions.cc \
 	column_namer.cc \
 	command_executor.cc \
+	crashd.client.cc \
 	curl_looper.cc \
+	db_status_source.cc \
 	db_sub_source.cc \
 	document.sections.cc \
 	dump_internals.cc \
+	file_split.cc \
 	elem_to_json.cc \
 	environ_vtab.cc \
+	ext.longpoll.cc \
 	extension-functions.cc \
+	external_editor.cc \
+	external_opener.cc \
 	field_overlay_source.cc \
 	file_collection.cc \
+	file_converter_manager.cc \
 	file_format.cc \
+	file_options.cc \
 	files_sub_source.cc \
 	filter_observer.cc \
 	filter_status_source.cc \
 	filter_sub_source.cc \
 	fstat_vtab.cc \
     fs-extension-functions.cc \
-    fts_fuzzy_match.cc \
 	grep_proc.cc \
 	help_text.cc \
 	help_text_formatter.cc \
@@ -408,9 +547,13 @@ libdiag_a_SOURCES = \
 	json-extension-functions.cc \
 	line_buffer.cc \
 	listview_curses.cc \
-	lnav_commands.cc \
+	lnav.exec-phase.cc \
+	lnav.prompt.cc \
+	lnav.script.parser.cc \
+	cmds.std.cc \
 	lnav_config.cc \
 	lnav_util.cc \
+	log.annotate.cc \
 	log.watch.cc \
 	log_accel.cc \
 	log_actions.cc \
@@ -421,25 +564,30 @@ libdiag_a_SOURCES = \
 	log_level.cc \
 	log_level_re.cc \
 	log_search_table.cc \
+	log_stmt_vtab.cc \
 	logfile.cc \
 	logfile_sub_source.cc \
+	logline_window.cc \
 	md2attr_line.cc \
 	md4cpp.cc \
+	msg.text.cc \
 	network-extension-functions.cc \
 	data_parser.cc \
-	pcap_manager.cc \
+	piper.header.cc \
+	piper.looper.cc \
+	piper.match.cc \
 	plain_text_source.cc \
 	pollable.cc \
 	pretty_printer.cc \
+	preview_status_source.cc \
+	progress_source.cc \
 	ptimec_rt.cc \
 	readline_callbacks.cc \
-	readline_curses.cc \
 	readline_highlighters.cc \
 	readline_possibilities.cc \
 	regex101.client.cc \
 	regex101.import.cc \
 	regexp_vtab.cc \
-	relative_time.cc \
 	session.export.cc \
 	session_data.cc \
 	shared_buffer.cc \
@@ -452,24 +600,29 @@ libdiag_a_SOURCES = \
 	statusview_curses.cc \
 	string-extension-functions.cc \
 	styling.cc \
+	term_extra.cc \
 	text_anonymizer.cc \
 	text_format.cc \
+	text_overlay_menu.cc \
 	textfile_sub_source.cc \
 	timer.cc \
-	piper_proc.cc \
+	sql.formatter.cc \
 	sql_commands.cc \
 	sql_util.cc \
+	src_ref.cc \
 	state-extension-functions.cc \
 	sysclip.cc \
+	textinput_curses.cc \
+	textinput.history.cc \
 	textfile_highlighters.cc \
 	textview_curses.cc \
 	time-extension-functions.cc \
+	timeline_source.cc \
 	top_status_source.cc \
 	unique_path.cc \
 	view_curses.cc \
 	view_helpers.cc \
 	views_vtab.cc \
-	vt52_curses.cc \
 	vtab_module.cc \
 	log_vtab_impl.cc \
 	xml_util.cc \
@@ -479,7 +632,16 @@ libdiag_a_SOURCES = \
 	spookyhash/SpookyV2.cpp
 
 PLUGIN_SRCS = \
-	file_vtab.cc
+	all_ids_vtabs.cc \
+	breakpoint_vtab.cc \
+	file_vtab.cc \
+	metrics_vtab.cc
+
+if HAVE_WINDRES
+WIN_OBJS = lnavres.$(OBJEXT)
+else
+WIN_OBJS =
+endif
 
 lnav_SOURCES = \
     lnav.cc \
@@ -487,6 +649,8 @@ lnav_SOURCES = \
     lnav.indexing.cc \
     lnav.management_cli.cc \
     $(PLUGIN_SRCS)
+
+lnav_LDADD = $(WIN_OBJS) $(LDADD)
 
 lnav_test_SOURCES = \
     lnav.cc \
@@ -496,15 +660,27 @@ lnav_test_SOURCES = \
     test_override.c \
     $(PLUGIN_SRCS)
 
-ptimec$(BUILD_EXEEXT): ptimec.c
-	$(AM_V_CC) $(CC_FOR_BUILD) $(CPPFLAGS_FOR_BUILD) $(LDFLAGS_FOR_BUILD) -g3 -o $@ $?
+if CROSS_COMPILING
+ptimec$(BUILD_EXEEXT): ptimec.cc
+	$(AM_V_CXX) $(CXX_FOR_BUILD) $(CPPFLAGS_FOR_BUILD) $(LDFLAGS_FOR_BUILD) -g3 -o $@ $? -fPIE
+else
+ptimec$(BUILD_EXEEXT): ptimec.cc
+	$(AM_V_CXX) $(CXX) $(CPPFLAGS) $(LDFLAGS) -g3 -o $@ $? -fPIE
+endif
 
 if HAVE_RE2C
 RE2C_FILES = data_scanner_re.cc log_level_re.cc
 endif
 
 EXTRA_DIST = \
-	ptimec.c
+    lnav.ico \
+    lnavres.rc \
+    third-party/lnav-rs-ext/Cargo.lock \
+    third-party/lnav-rs-ext/Cargo.toml \
+    third-party/lnav-rs-ext/cbindgen.toml \
+    third-party/lnav-rs-ext/src/lib.rs \
+    third-party/lnav-rs-ext/src/ext_access.rs \
+	ptimec.cc
 
 CLEANFILES = \
 	ptimec$(BUILD_EXEEXT)
@@ -515,6 +691,8 @@ DISTCLEANFILES = \
     ansi-palette-json.h \
     builtin-scripts.h \
     builtin-sh-scripts.h \
+    static-files.h \
+    css-color-names-json.h \
     default-config.h \
     default-formats.h \
     diseases-json.h \
@@ -522,10 +700,18 @@ DISTCLEANFILES = \
     words-json.h \
     help-md.h \
     init-sql.h \
+    prql-modules.h \
+    terminfo-files.h \
     time_fmts.h \
     xml-entities-json.h \
     xterm-palette-json.h \
 	$(RE2C_FILES)
+
+if HAVE_CARGO
+clean-local:
+	env CARGO_TARGET_DIR=third-party/lnav-rs-ext/target $(CARGO_CMD) clean --manifest-path \
+    	    $(srcdir)/third-party/lnav-rs-ext/Cargo.toml
+endif
 
 distclean-local:
 	$(RM_V)rm -rf *.dSYM
@@ -534,15 +720,18 @@ uncrusty:
 	(cd $(srcdir) && uncrustify -c ../lnav.cfg --replace $(SOURCES) \
 		$(HEADERS))
 
-if !DISABLE_DOCUMENTATION
-all-local: $(LNAV_BUILT_FILES) lnav
+if !CROSS_COMPILING
+all-local: $(LNAV_BUILT_FILES) lnav $(RUST_DEPS)
 	if test -w $(srcdir)/internals; then \
 		env DUMP_INTERNALS_DIR=$(srcdir)/internals DUMP_CRASH=1 ./lnav Makefile; \
 		mv $(srcdir)/internals/*.schema.json $(top_srcdir)/docs/schemas; \
 	fi
 else
-all-local: $(LNAV_BUILT_FILES)
+all-local: $(LNAV_BUILT_FILES) $(RUST_DEPS)
 endif
 
-install-exec-hook:
-	bash $(srcdir)/alpha-release.sh
+check-local:
+if HAVE_CHECK_JSONSCHEMA
+	$(CHECK_JSONSCHEMA) --schemafile $(top_srcdir)/docs/schemas/format-v1.schema.json $(FORMAT_FILES)
+	$(CHECK_JSONSCHEMA) --schemafile $(top_srcdir)/docs/schemas/config-v1.schema.json $(CONFIG_FILES)
+endif

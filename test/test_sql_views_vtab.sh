@@ -1,7 +1,13 @@
 #! /bin/bash
 
+export TZ=UTC
 export YES_COLOR=1
 unset XDG_CONFIG_HOME
+
+run_cap_test ${lnav_test} -n \
+    -c ";UPDATE lnav_top_view SET selection=6" \
+    -c ";UPDATE lnav_top_view SET selection=6" \
+    ${test_dir}/logfile_caddy_log.1
 
 run_test ${lnav_test} -n \
     -c ";SELECT view_name,basename(filepath),visible FROM lnav_view_files" \
@@ -14,8 +20,33 @@ log,logfile_access_log.0,1
 log,logfile_access_log.1,1
 EOF
 
+touch -t 200711030923 ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";SELECT view_name,basename(filepath),visible FROM lnav_view_files" \
+    -c ":write-csv-to -" \
+    ${test_dir}/logfile_access_log.0 \
+    ${test_dir}/logfile_access_log_dupe.0
+
+touch -t 200711030923 ${test_dir}/logfile_spark.0
+touch -t 200811030923 ${test_dir}/logfile_spark_dupe.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";SELECT view_name,basename(filepath),visible FROM lnav_view_files" \
+    -c ":write-csv-to -" \
+    ${test_dir}/logfile_spark.0 \
+    ${test_dir}/logfile_spark_dupe.0
+
 run_cap_test ${lnav_test} -n \
     -c ";UPDATE lnav_view_files SET visible=0 WHERE endswith(filepath, 'log.0')" \
+    ${test_dir}/logfile_access_log.*
+
+run_cap_test ${lnav_test} -n \
+    -c ";INSERT INTO lnav_view_files VALUES ('log', '/abc/def', 1)" \
+    ${test_dir}/logfile_access_log.*
+
+run_cap_test ${lnav_test} -n \
+    -c ";DELETE FROM lnav_view_files" \
     ${test_dir}/logfile_access_log.*
 
 run_test ${lnav_test} -n \
@@ -33,6 +64,9 @@ run_cap_test ${lnav_test} -n \
     -c ";INSERT INTO lnav_view_stack VALUES ('help')" \
     -c ";DELETE FROM lnav_view_stack WHERE name = 'log'" \
     ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -nN \
+    -c ";INSERT INTO lnav_view_filters VALUES ('log', 0, 1, 'out', 'bad', '')"
 
 run_cap_test ${lnav_test} -n \
     -c ";INSERT INTO lnav_view_filters VALUES ('log', 0, 1, 'out', 'regex', '')" \
@@ -94,6 +128,11 @@ run_cap_test ${lnav_test} -n \
     -c ";UPDATE lnav_view_filters SET pattern = 'vmkboot'" \
     ${test_dir}/logfile_access_log.0
 
+run_cap_test ${lnav_test} -n \
+    -c ":filter-out vmk" \
+    -c ";UPDATE lnav_view_filters SET enabled = 0" \
+    ${test_dir}/logfile_access_log.0
+
 run_test ${lnav_test} -n \
     -c ":filter-out vmk" \
     -c ";SELECT * FROM lnav_view_filter_stats" \
@@ -104,6 +143,12 @@ check_output "view filter stats is not working?" <<EOF
 view_name,filter_id,hits
 log,1,2
 EOF
+
+run_cap_test ${lnav_test} -n \
+    -c ":filter-in hello" \
+    -c ";SELECT * FROM lnav_view_filter_stats" \
+    -c ":write-csv-to -" \
+    ${test_dir}/logfile_filter.1
 
 run_test ${lnav_test} -n \
     -c ";INSERT INTO lnav_view_filters (view_name, language, pattern) VALUES ('log', 'sql', ':sc_bytes = 134')" \
@@ -121,7 +166,7 @@ run_test ${lnav_test} -n \
 
 check_output "delete from lnav_views table works?" <<EOF
 count(*)
-8
+9
 EOF
 
 
@@ -133,7 +178,7 @@ run_test ${lnav_test} -n \
 
 check_output "insert into lnav_views table works?" <<EOF
 count(*)
-8
+9
 EOF
 
 run_cap_test ${lnav_test} -n \
@@ -157,9 +202,22 @@ run_cap_test ${lnav_test} -n \
     -c ";UPDATE lnav_views SET top_time = '2014-10-08T00:00:00' WHERE name = 'log'" \
     ${test_dir}/logfile_generic.0
 
+# A valid time for a view with nothing in it has nothing to move to.
+run_cap_test env TEST_COMMENT="top_time on an empty view" ${lnav_test} -n \
+    -c ";UPDATE lnav_views SET top_time = '2014-10-08T00:00:00' WHERE name = 'log'" \
+    -c ";SELECT name, selection FROM lnav_views WHERE name = 'log'" \
+    ${test_dir}/textfile_0.md
+
 run_cap_test ${lnav_test} -n \
     -c ";UPDATE lnav_views SET search = 'warn' WHERE name = 'log'" \
     -c ";SELECT search FROM lnav_views WHERE name = 'log'" \
+    ${test_dir}/logfile_generic.0
+
+# A NULL search is the same as no search.
+run_cap_test env TEST_COMMENT="NULL search" ${lnav_test} -n \
+    -c ";UPDATE lnav_views SET search = 'warn' WHERE name = 'log'" \
+    -c ";UPDATE lnav_views SET search = NULL WHERE name = 'log'" \
+    -c ";SELECT quote(search) AS search FROM lnav_views WHERE name = 'log'" \
     ${test_dir}/logfile_generic.0
 
 run_cap_test ${lnav_test} -n \
@@ -171,3 +229,151 @@ run_cap_test ${lnav_test} -n \
 run_cap_test ${lnav_test} -n \
     -c ";UPDATE lnav_views SET top_meta = json_object('anchor', '#build') WHERE name = 'text'" \
     ${top_srcdir}/README.md
+
+run_cap_test ${lnav_test} -n \
+    -c ":goto 5" \
+    -c ";SELECT top_meta FROM lnav_top_view" \
+    -c ":write-json-to -" \
+    ${test_dir}/logfile_xml_msg.0
+
+run_cap_test ${lnav_test} -n -I ${test_dir} \
+    -c ";UPDATE lnav_views SET options = json_object('row-details', 'show') WHERE name = 'log'" \
+    -c ":goto 2" \
+    ${test_dir}/logfile_xml_msg.0
+
+run_cap_test ${lnav_test} -n -I ${test_dir} \
+    -c ";UPDATE lnav_views SET options = json_object('row-details', 'show') WHERE name = 'log'" \
+    -c ":goto 9" \
+    ${test_dir}/logfile_bunyan.0
+
+run_cap_test ${lnav_test} -n -I ${test_dir} \
+    -c ";UPDATE lnav_views SET options = json_object('row-details', 'show') WHERE name = 'log'" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";UPDATE lnav_views SET options = json_object('row-time-offset', 'show') WHERE name = 'log'" \
+    ${test_dir}/logfile_w3c_big.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";UPDATE lnav_views SET top_meta = json_object('file', 'bad') WHERE name = 'text'" \
+    ${test_dir}/textfile_ansi.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";SELECT * FROM lnav_views" \
+    -c ":write-json-to -" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";INSERT INTO lnav_view_filters (view_name, language, pattern) VALUES ('text', 'sql', ':sc_bytes = 134')" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";INSERT INTO lnav_view_filters (view_name, language, pattern) VALUES ('log', 'sql', ':sc_bytes # 134')" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";SELECT * FROM access_log" \
+    -c ";CREATE TABLE row_deets AS SELECT row_details FROM lnav_views WHERE name = 'db'" \
+    -c ";SELECT json(row_details) as row_details FROM row_deets" \
+    -c ":write-json-to -" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";SELECT * FROM lnav_top_view" \
+    -c ":write-json-to -" \
+    ${test_dir}/textfile_patch.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ":create-named-search one cgi" \
+    -c ";SELECT view_name, name, pattern FROM lnav_view_searches" \
+    ${test_dir}/logfile_access_log.0
+
+# A line matched by more than one search lists every name.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ":create-named-search one cgi" \
+    -c ";SELECT log_line, log_named_searches FROM access_log" \
+    ${test_dir}/logfile_access_log.0
+
+# Deleting one search drops only its own name from the column.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ":create-named-search one cgi" \
+    -c ":delete-named-search one" \
+    -c ";SELECT log_line, log_named_searches FROM access_log" \
+    ${test_dir}/logfile_access_log.0
+
+# The column is NULL when nothing is searching for the line.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search one cgi" \
+    -c ";SELECT log_line, log_named_searches FROM access_log" \
+    ${test_dir}/logfile_access_log.0
+
+# A multi-line message whose match falls only on a continuation line must
+# still be attributed to the search -- log_line is the message's first line,
+# but the search matched further down.
+run_cap_test ${lnav_test} -n -I ${test_dir} \
+    -c ":create-named-search multi extra-multi" \
+    -c ";SELECT log_line, log_named_searches FROM all_logs WHERE log_named_searches IS NOT NULL" \
+    ${test_dir}/logfile_json.json
+
+run_cap_test ${lnav_test} -n \
+    -c ";INSERT INTO lnav_view_searches (view_name, name, pattern) VALUES ('log', 'sql', 'tramp')" \
+    -c ";SELECT name, pattern FROM lnav_view_searches" \
+    -c ";SELECT log_line, log_named_searches FROM access_log" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ":create-named-search one cgi" \
+    -c ";DELETE FROM lnav_view_searches WHERE name = 'one'" \
+    -c ";SELECT name FROM lnav_view_searches" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ";UPDATE lnav_view_searches SET pattern = 'cgi' WHERE name = 'every'" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ";INSERT INTO lnav_view_searches (view_name, name, pattern) VALUES ('log', 'every', 'cgi')" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";INSERT INTO lnav_view_searches (view_name, name, pattern) VALUES ('log', 'bad', '(unclosed')" \
+    ${test_dir}/logfile_access_log.0
+
+# A name with a space in it could not be restored from the session, since the
+# saved command would parse it as a name and part of a pattern.
+run_cap_test ${lnav_test} -n \
+    -c ";INSERT INTO lnav_view_searches (view_name, name, pattern) VALUES ('log', 'my search', 'vmw')" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ";INSERT INTO lnav_view_searches (view_name, name, pattern) VALUES ('log', '', 'vmw')" \
+    ${test_dir}/logfile_access_log.0
+
+# The enabled column can be updated to turn a search off and back on.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search one cgi" \
+    -c ";UPDATE lnav_view_searches SET enabled = 0 WHERE name = 'one'" \
+    -c ";SELECT view_name, enabled, name, pattern FROM lnav_view_searches" \
+    -c ";SELECT log_line, log_named_searches FROM access_log" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search one cgi" \
+    -c ":disable-named-search one" \
+    -c ";UPDATE lnav_view_searches SET enabled = 1 WHERE name = 'one'" \
+    -c ";SELECT enabled, name FROM lnav_view_searches" \
+    -c ";SELECT log_line, log_named_searches FROM access_log" \
+    ${test_dir}/logfile_access_log.0
+
+# A search can be created in the disabled state.
+run_cap_test ${lnav_test} -n \
+    -c ";INSERT INTO lnav_view_searches (view_name, enabled, name, pattern) VALUES ('log', 0, 'one', 'cgi')" \
+    -c ";SELECT enabled, name FROM lnav_view_searches" \
+    -c ";SELECT log_line, log_named_searches FROM access_log" \
+    ${test_dir}/logfile_access_log.0

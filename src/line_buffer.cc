@@ -44,10 +44,7 @@
 #include <algorithm>
 #include <set>
 
-#ifdef HAVE_X86INTRIN_H
-#    include "simdutf8check.h"
-#endif
-
+#include "base/auto_mem.hh"
 #include "base/auto_pid.hh"
 #include "base/fs_util.hh"
 #include "base/injector.bind.hh"
@@ -57,11 +54,18 @@
 #include "base/math_util.hh"
 #include "base/paths.hh"
 #include "fmtlib/fmt/format.h"
+#include "hasher.hh"
 #include "line_buffer.hh"
-#include "lnav_util.hh"
+#include "log_level.hh"
+#include "piper.header.hh"
+#include "scn/scan.h"
+#include "yajlpp/yajlpp_def.hh"
 
 using namespace std::chrono_literals;
 
+/* A gzip member is a 10-byte header, at least a 2-byte deflate block, and an
+ * 8-byte trailer; anything smaller cannot carry a usable ISIZE. */
+static const ssize_t GZ_MIN_MEMBER_SIZE = 18;
 static const ssize_t INITIAL_REQUEST_SIZE = 16 * 1024;
 static const ssize_t DEFAULT_INCREMENT = 128 * 1024;
 static const ssize_t INITIAL_COMPRESSED_BUFFER_SIZE = 5 * 1024 * 1024;
@@ -71,7 +75,14 @@ const ssize_t line_buffer::DEFAULT_LINE_BUFFER_SIZE = 256 * 1024;
 const ssize_t line_buffer::MAX_LINE_BUFFER_SIZE
     = 4 * 4 * line_buffer::DEFAULT_LINE_BUFFER_SIZE;
 
-class io_looper : public isc::service<io_looper> {};
+class io_looper : public isc::service<io_looper, 4> {
+protected:
+    std::optional<std::chrono::milliseconds> compute_timeout(
+        mstime_t current_time) const override
+    {
+        return std::nullopt;
+    }
+};
 
 struct io_looper_tag {};
 
@@ -97,7 +108,7 @@ class lock_hack {
 public:
     class guard {
     public:
-        guard() : g_lock(lock_hack::singleton()) { this->g_lock.lock(); }
+        guard() : g_lock(singleton()) { this->g_lock.lock(); }
 
         ~guard() { this->g_lock.unlock(); }
 
@@ -135,7 +146,7 @@ private:
 #define SYNCPOINT_SIZE (1024 * 1024)
 line_buffer::gz_indexed::gz_indexed()
 {
-    if ((this->inbuf = (Bytef*) malloc(Z_BUFSIZE)) == NULL) {
+    if ((this->inbuf = auto_mem<Bytef>::malloc(Z_BUFSIZE)) == nullptr) {
         throw std::bad_alloc();
     }
 }
@@ -160,13 +171,9 @@ line_buffer::gz_indexed::init_stream()
     }
 
     // initialize inflate struct
-    this->strm.zalloc = Z_NULL;
-    this->strm.zfree = Z_NULL;
-    this->strm.opaque = Z_NULL;
+    int rc = inflateInit2(&this->strm, GZ_HEADER_MODE);
     this->strm.avail_in = 0;
-    this->strm.next_in = Z_NULL;
-    this->strm.avail_out = 0;
-    int rc = inflateInit2(&strm, GZ_HEADER_MODE);
+    this->raw_stream = false;
     if (rc != Z_OK) {
         throw(rc);  // FIXME: exception wrapper
     }
@@ -191,7 +198,7 @@ line_buffer::gz_indexed::continue_stream()
 }
 
 void
-line_buffer::gz_indexed::open(int fd, header_data& hd)
+line_buffer::gz_indexed::open(int fd, lnav::gzip::header& hd)
 {
     this->close();
     this->init_stream();
@@ -225,7 +232,6 @@ line_buffer::gz_indexed::open(int fd, header_data& hd)
 
             inflate(&this->strm, Z_BLOCK);
             inflateEnd(&this->strm);
-
             this->strm.next_out = Z_NULL;
             this->strm.next_in = Z_NULL;
             this->strm.next_in = Z_NULL;
@@ -238,9 +244,19 @@ line_buffer::gz_indexed::open(int fd, header_data& hd)
                     log_debug("%d: no gzip header data", fd);
                     break;
                 case 1:
-                    hd.hd_mtime.tv_sec = gz_hd.time;
-                    hd.hd_name = std::string((char*) name);
-                    hd.hd_comment = std::string((char*) comment);
+                    hd.h_mtime.tv_sec = gz_hd.time;
+                    name[sizeof(name) - 1] = '\0';
+                    comment[sizeof(comment) - 1] = '\0';
+                    hd.h_name = std::string((char*) name);
+                    hd.h_comment = std::string((char*) comment);
+                    log_info(
+                        "%d: read gzip header (mtime=%ld; name='%s'; "
+                        "comment='%s'; crc=%x)",
+                        fd,
+                        hd.h_mtime.tv_sec,
+                        hd.h_name.c_str(),
+                        hd.h_comment.c_str(),
+                        gz_hd.hcrc);
                     break;
                 default:
                     log_error("%d: failed to read gzip header data", fd);
@@ -277,13 +293,27 @@ line_buffer::gz_indexed::stream_data(void* buf, size_t size)
             int flush = last > this->strm.total_in ? Z_SYNC_FLUSH : Z_BLOCK;
             auto err = inflate(&this->strm, flush);
             if (err == Z_STREAM_END) {
+                if (this->raw_stream) {
+                    // A raw stream stops on the last byte of the deflate
+                    // data, so the member's trailer is still waiting to be
+                    // read.  Step over it, or the next read starts on the
+                    // trailer and tries to take it for the header of another
+                    // member.
+                    this->strm.total_in += GZ_TRAILER_SIZE;
+                }
                 // Reached end of stream; re-init for a possible subsequent
                 // stream
                 continue_stream();
             } else if (err != Z_OK) {
-                log_error(" inflate-error: %d  %s",
+                log_error(" inflate-error at offset %lu: %d  %s",
+                          this->strm.total_in,
                           (int) err,
                           this->strm.msg ? this->strm.msg : "");
+                this->parent->lb_decompress_error = fmt::format(
+                    FMT_STRING("inflate-error at offset {}: {}  {}"),
+                    this->strm.total_in,
+                    err,
+                    this->strm.msg ? this->strm.msg : "");
                 break;
             }
 
@@ -331,6 +361,7 @@ line_buffer::gz_indexed::seek(off_t offset)
         inflateEnd(&this->strm);
         if (dict) {
             dict->apply(&this->strm);
+            this->raw_stream = true;
         } else {
             init_stream();
         }
@@ -353,7 +384,7 @@ int
 line_buffer::gz_indexed::read(void* buf, size_t offset, size_t size)
 {
     if (offset != this->strm.total_out) {
-        // log_debug("doing seek!  %d %d", offset, this->strm.total_out);
+        // log_debug("doing seek!  %zu %lu", offset, this->strm.total_out);
         this->seek(offset);
     }
 
@@ -362,13 +393,52 @@ line_buffer::gz_indexed::read(void* buf, size_t offset, size_t size)
     return bytes;
 }
 
+/**
+ * @return The uncompressed size recorded in a gzip file's trailer, or nullopt
+ * if it cannot be trusted.
+ *
+ * The last four bytes of a gzip member are ISIZE: the uncompressed size
+ * modulo 2^32.  For anything under 4GB that is exact and it is available
+ * before a single byte is decompressed, which is the only way to give a
+ * meaningful progress bar -- the decompressor's own position races ahead of
+ * indexing in multi-megabyte jumps and is useless as a proxy.
+ *
+ * Two cases make it a lie, and both are caught by the caller noticing that
+ * indexing has passed it: a file of 4GB or more, where the value wraps, and
+ * concatenated members, where only the last member's size is recorded.
+ */
+static std::optional<file_ssize_t>
+read_gz_isize(int fd)
+{
+    unsigned char trailer[4];
+    struct stat st;
+
+    if (fstat(fd, &st) == -1 || st.st_size < GZ_MIN_MEMBER_SIZE) {
+        return std::nullopt;
+    }
+
+    auto rc = pread(fd, trailer, sizeof(trailer), st.st_size - sizeof(trailer));
+    if (rc != (ssize_t) sizeof(trailer)) {
+        return std::nullopt;
+    }
+
+    return (file_ssize_t) trailer[0] | ((file_ssize_t) trailer[1] << 8)
+        | ((file_ssize_t) trailer[2] << 16) | ((file_ssize_t) trailer[3] << 24);
+}
+
 line_buffer::line_buffer()
 {
+    this->lb_gz_file.writeAccess()->parent = this;
+
     ensure(this->invariant());
 }
 
 line_buffer::~line_buffer()
 {
+    if (this->lb_loader_future.valid()) {
+        this->lb_loader_future.wait();
+    }
+
     auto empty_fd = auto_fd();
 
     // Make sure any shared refs take ownership of the data.
@@ -408,7 +478,34 @@ line_buffer::set_fd(auto_fd& fd)
             char gz_id[2 + 1 + 1 + 4];
 
             if (pread(fd, gz_id, sizeof(gz_id), 0) == sizeof(gz_id)) {
-                if (gz_id[0] == '\037' && gz_id[1] == '\213') {
+                auto piper_hdr_opt = lnav::piper::read_header(fd, gz_id);
+
+                if (piper_hdr_opt) {
+                    static const intern_string_t SRC
+                        = intern_string::lookup("piper");
+
+                    auto meta_buf = std::move(piper_hdr_opt.value());
+
+                    auto meta_sf = string_fragment::from_bytes(meta_buf.in(),
+                                                               meta_buf.size());
+                    auto meta_parse_res
+                        = lnav::piper::header_handlers.parser_for(SRC).of(
+                            meta_sf);
+                    if (meta_parse_res.isErr()) {
+                        log_error("failed to parse piper header: %s",
+                                  meta_parse_res.unwrapErr()[0]
+                                      .to_attr_line()
+                                      .get_string()
+                                      .c_str());
+                        throw error(EINVAL);
+                    }
+
+                    this->lb_line_metadata = true;
+                    this->lb_file_offset
+                        = lnav::piper::HEADER_SIZE + meta_buf.size();
+                    this->lb_piper_header_size = this->lb_file_offset;
+                    this->lb_header = meta_parse_res.unwrap();
+                } else if (gz_id[0] == '\037' && gz_id[1] == '\213') {
                     int gzfd = dup(fd);
 
                     log_perror(fcntl(gzfd, F_SETFD, FD_CLOEXEC));
@@ -416,15 +513,23 @@ line_buffer::set_fd(auto_fd& fd)
                         close(gzfd);
                         throw error(errno);
                     }
-                    this->lb_gz_file.writeAccess()->open(gzfd, this->lb_header);
+                    lnav::gzip::header hdr;
+
+                    this->lb_gz_file.writeAccess()->open(gzfd, hdr);
                     this->lb_compressed = true;
-                    this->lb_file_time = this->lb_header.hd_mtime.tv_sec;
+                    this->lb_file_time = hdr.h_mtime.tv_sec;
                     if (this->lb_file_time < 0) {
                         this->lb_file_time = 0;
                     }
-                    this->lb_compressed_offset
-                        = lseek(this->lb_fd, 0, SEEK_CUR);
-                    this->resize_buffer(INITIAL_COMPRESSED_BUFFER_SIZE);
+                    this->lb_compressed_offset = 0;
+                    this->lb_uncompressed_size = read_gz_isize(fd);
+                    if (!hdr.empty()) {
+                        this->lb_header = std::move(hdr);
+                    }
+                    if (this->lb_decompress_extra) {
+                        this->resize_buffer(this->buffer_size_for(
+                            INITIAL_COMPRESSED_BUFFER_SIZE));
+                    }
                 }
 #ifdef HAVE_BZLIB_H
                 else if (gz_id[0] == 'B' && gz_id[1] == 'Z')
@@ -439,7 +544,9 @@ line_buffer::set_fd(auto_fd& fd)
                      * Loading data from a bzip2 file is pretty slow, so we try
                      * to keep as much in memory as possible.
                      */
-                    this->resize_buffer(INITIAL_COMPRESSED_BUFFER_SIZE);
+                    if (this->lb_decompress_extra) {
+                        this->resize_buffer(INITIAL_COMPRESSED_BUFFER_SIZE);
+                    }
 
                     this->lb_compressed_offset = 0;
                 }
@@ -458,9 +565,15 @@ line_buffer::set_fd(auto_fd& fd)
 void
 line_buffer::resize_buffer(size_t new_max)
 {
-    if (new_max <= MAX_LINE_BUFFER_SIZE
-        && new_max > (size_t) this->lb_buffer.capacity())
+    if (((this->lb_compressed && new_max <= MAX_COMPRESSED_BUFFER_SIZE)
+         || (!this->lb_compressed && new_max <= MAX_LINE_BUFFER_SIZE))
+        && !this->lb_buffer.has_capacity_for(new_max))
     {
+        log_info("fd(%d): increasing line buffer size from %zd to %zd at %lld",
+                 this->lb_fd.get(),
+                 this->lb_buffer.capacity(),
+                 new_max,
+                 this->lb_file_offset);
         /* Still need more space, try a realloc. */
         this->lb_share_manager.invalidate_refs();
         this->lb_buffer.expand_to(new_max);
@@ -468,9 +581,11 @@ line_buffer::resize_buffer(size_t new_max)
 }
 
 void
-line_buffer::ensure_available(file_off_t start, ssize_t max_length)
+line_buffer::ensure_available(file_off_t start,
+                              ssize_t max_length,
+                              scan_direction dir)
 {
-    ssize_t prefill, available;
+    ssize_t prefill;
 
     require(this->lb_compressed || max_length <= MAX_LINE_BUFFER_SIZE);
 
@@ -496,19 +611,40 @@ line_buffer::ensure_available(file_off_t start, ssize_t max_length)
         this->lb_share_manager.invalidate_refs();
         prefill = 0;
         this->lb_buffer.clear();
-        if ((this->lb_file_size != (ssize_t) -1)
-            && (start + this->lb_buffer.capacity() > this->lb_file_size))
-        {
+
+        switch (dir) {
+            case scan_direction::forward:
+                break;
+            case scan_direction::backward: {
+                auto padded_max_length = max_length * 4;
+                if (this->lb_buffer.has_capacity_for(padded_max_length)) {
+                    start = std::max(
+                        file_off_t{0},
+                        static_cast<file_off_t>(start
+                                                - (this->lb_buffer.capacity()
+                                                   - padded_max_length)));
+                }
+                break;
+            }
+        }
+
+        if (this->lb_file_size == (ssize_t) -1) {
+            this->lb_file_offset = start;
+        } else {
             require(start <= this->lb_file_size);
             /*
              * If the start is near the end of the file, move the offset back a
              * bit so we can get more of the file in the cache.
              */
-            this->lb_file_offset = this->lb_file_size
-                - std::min(this->lb_file_size,
-                           (file_ssize_t) this->lb_buffer.capacity());
-        } else {
-            this->lb_file_offset = start;
+            if (start + (ssize_t) this->lb_buffer.capacity()
+                > this->lb_file_size)
+            {
+                this->lb_file_offset = this->lb_file_size
+                    - std::min(this->lb_file_size.load(),
+                               (file_ssize_t) this->lb_buffer.capacity());
+            } else {
+                this->lb_file_offset = start;
+            }
         }
     } else {
         /* The request is in the cached range.  Record how much extra data is in
@@ -517,11 +653,10 @@ line_buffer::ensure_available(file_off_t start, ssize_t max_length)
         prefill = start - this->lb_file_offset;
     }
     require(this->lb_file_offset <= start);
-    require(prefill <= this->lb_buffer.size());
+    require(prefill <= (ssize_t) this->lb_buffer.size());
 
-    available = this->lb_buffer.capacity() - (start - this->lb_file_offset);
-    require(available <= this->lb_buffer.capacity());
-
+    ssize_t available
+        = this->lb_buffer.capacity() - (start - this->lb_file_offset);
     if (max_length > available) {
         // log_debug("need more space!");
         /*
@@ -544,18 +679,27 @@ line_buffer::ensure_available(file_off_t start, ssize_t max_length)
     }
     this->lb_line_starts.clear();
     this->lb_line_is_utf.clear();
+    this->lb_line_col_widths.clear();
 }
 
 bool
 line_buffer::load_next_buffer()
 {
+    static auto op = lnav_operation{"load_next_buffer"};
+    auto op_guard = lnav_opid_guard::internal(op);
+
     // log_debug("loader here!");
     auto retval = false;
-    auto start = this->lb_loader_file_offset.value();
+    const auto start = this->lb_loader_file_offset.value();
     ssize_t rc = 0;
     safe::WriteAccess<safe_gz_indexed> gi(this->lb_gz_file);
 
-    // log_debug("BEGIN preload read");
+#if 0
+    log_debug("BEGIN fd(%d) preload read of %zu at %lld",
+              this->lb_fd.get(),
+              this->lb_alt_buffer.value().available(),
+              start + this->lb_alt_buffer->size());
+#endif
     /* ... read in the new data. */
     if (!this->lb_cached_fd && *gi) {
         if (this->lb_file_size != (ssize_t) -1 && this->in_range(start)
@@ -568,12 +712,17 @@ line_buffer::load_next_buffer()
                           start + this->lb_alt_buffer.value().size(),
                           this->lb_alt_buffer.value().available());
             this->lb_compressed_offset = gi->get_source_offset();
-            if (rc != -1 && (rc < this->lb_alt_buffer.value().available())
-                && (start + this->lb_alt_buffer.value().size() + rc
+            ensure(this->lb_compressed_offset >= 0);
+            if (rc != -1
+                && rc < (ssize_t) this->lb_alt_buffer.value().available()
+                && (start + (ssize_t) this->lb_alt_buffer.value().size() + rc
                     > this->lb_file_size))
             {
                 this->lb_file_size
                     = (start + this->lb_alt_buffer.value().size() + rc);
+                log_info("fd(%d): set file size to %llu",
+                         this->lb_fd.get(),
+                         this->lb_file_size.load());
             }
 #if 0
             log_debug("async decomp end  %d+%d:%d",
@@ -624,26 +773,32 @@ line_buffer::load_next_buffer()
                 count = BZ2_bzread(bz_file,
                                    scratch,
                                    std::min((size_t) seek_to, sizeof(scratch)));
+                if (count <= 0) {
+                    break;
+                }
                 seek_to -= count;
             }
             rc = BZ2_bzread(bz_file,
                             this->lb_alt_buffer->end(),
                             this->lb_alt_buffer->available());
-            this->lb_compressed_offset = lseek(bzfd, 0, SEEK_SET);
+            this->lb_compressed_offset = 0;
             BZ2_bzclose(bz_file);
 
-            if (rc != -1 && (rc < (this->lb_alt_buffer.value().available()))
-                && (start + this->lb_alt_buffer.value().size() + rc
+            if (rc != -1
+                && (rc < (ssize_t) (this->lb_alt_buffer.value().available()))
+                && (start + (ssize_t) this->lb_alt_buffer.value().size() + rc
                     > this->lb_file_size))
             {
                 this->lb_file_size
                     = (start + this->lb_alt_buffer.value().size() + rc);
+                log_info("fd(%d): set file size to %llu",
+                         this->lb_fd.get(),
+                         this->lb_file_size.load());
             }
         }
     }
 #endif
-    else
-    {
+    else {
         rc = pread(this->lb_cached_fd ? this->lb_cached_fd.value().get()
                                       : this->lb_fd.get(),
                    this->lb_alt_buffer.value().end(),
@@ -652,7 +807,7 @@ line_buffer::load_next_buffer()
     }
     // XXX For some reason, cygwin is giving us a bogus return value when
     // up to the end of the file.
-    if (rc > (this->lb_alt_buffer.value().available())) {
+    if (rc > (ssize_t) this->lb_alt_buffer.value().available()) {
         rc = -1;
 #ifdef ENODATA
         errno = ENODATA;
@@ -688,59 +843,49 @@ line_buffer::load_next_buffer()
             retval = true;
             break;
     }
-    // log_debug("END preload read");
 
-    if (start > this->lb_last_line_offset) {
-        auto* line_start = this->lb_alt_buffer.value().begin();
+    if (start > this->lb_last_line_offset.load(std::memory_order_relaxed)) {
+        const auto* line_start = this->lb_alt_buffer.value().begin();
+        if (this->lb_line_metadata && start == 0
+            && this->lb_alt_buffer->size() > this->lb_piper_header_size)
+        {
+            line_start += this->lb_piper_header_size;
+        }
 
         do {
-            const char* msg = nullptr;
-            int faulty_bytes = 0;
-            bool valid_utf = true;
-            char* lf = nullptr;
-
             auto before = line_start - this->lb_alt_buffer->begin();
-            auto remaining = this->lb_alt_buffer.value().size() - before;
-            auto utf_scan_res = is_utf8((unsigned char*) line_start,
-                                        remaining,
-                                        &msg,
-                                        &faulty_bytes,
-                                        '\n');
-            if (msg != nullptr) {
-                lf = (char*) memchr(line_start, '\n', remaining);
-                utf_scan_res.usr_end = lf - line_start;
-                valid_utf = false;
-            }
-            if (utf_scan_res.usr_end >= 0) {
-                lf = line_start + utf_scan_res.usr_end;
-            }
+            const auto remaining = this->lb_alt_buffer.value().size() - before;
+            const auto frag
+                = string_fragment::from_bytes(line_start, remaining);
+            auto utf_scan_res = is_utf8(frag, '\n');
+            const auto* lf = utf_scan_res.remaining_ptr();
             this->lb_alt_line_starts.emplace_back(before);
-            this->lb_alt_line_is_utf.emplace_back(valid_utf);
+            this->lb_alt_line_is_utf.emplace_back(utf_scan_res.is_valid());
             this->lb_alt_line_has_ansi.emplace_back(utf_scan_res.usr_has_ansi);
+            this->lb_alt_line_col_widths.emplace_back(
+                utf_scan_res.usr_column_width_guess);
 
-            if (lf != nullptr) {
-                line_start = lf + 1;
-            } else {
-                line_start = nullptr;
-            }
+            line_start = lf;
         } while (line_start != nullptr
                  && line_start < this->lb_alt_buffer->end());
     }
+    // log_debug("END preload read");
 
     return retval;
 }
 
 bool
-line_buffer::fill_range(file_off_t start, ssize_t max_length)
+line_buffer::fill_range(file_off_t start,
+                        ssize_t max_length,
+                        scan_direction dir)
 {
-    bool retval = false;
+    auto retval = false;
 
     require(start >= 0);
 
-    // log_debug("fill range %d %d", start, max_length);
 #if 0
-    log_debug("(%p) fill range %d %d (%d) %d",
-              this,
+    log_debug("BEGIN (%d) fill range %lld %zu (%lld) %zd",
+              this->lb_fd.get(),
               start,
               max_length,
               this->lb_file_offset,
@@ -750,28 +895,29 @@ line_buffer::fill_range(file_off_t start, ssize_t max_length)
         && start >= this->lb_loader_file_offset.value())
     {
 #if 0
-        log_debug("getting preload! %d %d",
+        log_debug("fd(%d) getting preload! %d %d",
+                  this->lb_fd.get(),
                   start,
                   this->lb_loader_file_offset.value());
 #endif
-        nonstd::optional<std::chrono::system_clock::time_point> wait_start;
+        std::optional<std::chrono::system_clock::time_point> wait_start;
 
         if (this->lb_loader_future.wait_for(std::chrono::seconds(0))
             != std::future_status::ready)
         {
-            wait_start
-                = nonstd::make_optional(std::chrono::system_clock::now());
+            wait_start = std::make_optional(std::chrono::system_clock::now());
         }
         retval = this->lb_loader_future.get();
-        if (false && wait_start) {
+        if (wait_start) {
             auto diff = std::chrono::system_clock::now() - wait_start.value();
-            log_debug("wait done! %d", diff.count());
+            this->lb_stats.s_preload_wait_time +=
+                std::chrono::duration_cast<std::chrono::milliseconds>(diff);
         }
         // log_debug("got preload");
         this->lb_loader_future = {};
         this->lb_share_manager.invalidate_refs();
         this->lb_file_offset = this->lb_loader_file_offset.value();
-        this->lb_loader_file_offset = nonstd::nullopt;
+        this->lb_loader_file_offset = std::nullopt;
         this->lb_buffer.swap(this->lb_alt_buffer.value());
         this->lb_alt_buffer.value().clear();
         this->lb_line_starts = std::move(this->lb_alt_line_starts);
@@ -780,13 +926,20 @@ line_buffer::fill_range(file_off_t start, ssize_t max_length)
         this->lb_alt_line_is_utf.clear();
         this->lb_line_has_ansi = std::move(this->lb_alt_line_has_ansi);
         this->lb_alt_line_has_ansi.clear();
+        this->lb_line_col_widths = std::move(this->lb_alt_line_col_widths);
+        this->lb_alt_line_col_widths.clear();
         this->lb_stats.s_used_preloads += 1;
+        this->lb_next_line_start_index = 0;
+        this->lb_next_buffer_offset = 0;
     }
-    if (this->in_range(start) && this->in_range(start + max_length - 1)) {
+    if (this->in_range(start)
+        && (max_length == 0 || this->in_range(start + max_length - 1)))
+    {
+        // log_debug("fd(%d) cached!", this->lb_fd.get());
         /* Cache already has the data, nothing to do. */
         retval = true;
-        if (!lnav::pid::in_child && this->lb_seekable && this->lb_buffer.full()
-            && !this->lb_loader_file_offset)
+        if (this->lb_do_preloading && !lnav::pid::in_child && this->lb_seekable
+            && this->lb_buffer.full() && !this->lb_loader_file_offset)
         {
             // log_debug("loader available start=%d", start);
             auto last_lf_iter = std::find(
@@ -816,7 +969,9 @@ line_buffer::fill_range(file_off_t start, ssize_t max_length)
                 this->lb_loader_future = prom->get_future();
                 this->lb_stats.s_requested_preloads += 1;
                 isc::to<io_looper&, io_looper_tag>().send(
-                    [this, prom](auto& ioloop) mutable {
+                    [this, prom, curr_opid = lnav_current_opid()](
+                        auto& ioloop) mutable {
+                        auto op_guard = lnav_opid_guard::resume(curr_opid);
                         prom->set_value(this->load_next_buffer());
                     });
             }
@@ -824,8 +979,9 @@ line_buffer::fill_range(file_off_t start, ssize_t max_length)
     } else if (this->lb_fd != -1) {
         ssize_t rc;
 
+        // log_debug("fd(%d) doing read", this->lb_fd.get());
         /* Make sure there is enough space, then */
-        this->ensure_available(start, max_length);
+        this->ensure_available(start, max_length, dir);
 
         safe::WriteAccess<safe_gz_indexed> gi(this->lb_gz_file);
 
@@ -838,18 +994,26 @@ line_buffer::fill_range(file_off_t start, ssize_t max_length)
                 rc = 0;
             } else {
                 this->lb_stats.s_decompressions += 1;
-                if (false && this->lb_last_line_offset > 0) {
+                if (false
+                    && this->lb_last_line_offset.load(std::memory_order_relaxed)
+                        > 0)
+                {
                     this->lb_stats.s_hist[(this->lb_file_offset * 10)
-                                          / this->lb_last_line_offset]
-                        += 1;
+                                          / this->lb_last_line_offset.load(
+                                              std::memory_order_relaxed)] += 1;
                 }
                 rc = gi->read(this->lb_buffer.end(),
                               this->lb_file_offset + this->lb_buffer.size(),
                               this->lb_buffer.available());
                 this->lb_compressed_offset = gi->get_source_offset();
-                if (rc != -1 && (rc < this->lb_buffer.available())) {
+                ensure(this->lb_compressed_offset >= 0);
+                if (rc != -1 && (rc < (ssize_t) this->lb_buffer.available())) {
                     this->lb_file_size
                         = (this->lb_file_offset + this->lb_buffer.size() + rc);
+                    log_info("fd(%d): rc (%zd) -- set file size to %llu",
+                             this->lb_fd.get(),
+                             rc,
+                             this->lb_file_size.load());
                 }
             }
 #if 0
@@ -901,17 +1065,23 @@ line_buffer::fill_range(file_off_t start, ssize_t max_length)
                         bz_file,
                         scratch,
                         std::min((size_t) seek_to, sizeof(scratch)));
+                    if (count <= 0) {
+                        break;
+                    }
                     seek_to -= count;
                 }
                 rc = BZ2_bzread(bz_file,
                                 this->lb_buffer.end(),
                                 this->lb_buffer.available());
-                this->lb_compressed_offset = lseek(bzfd, 0, SEEK_SET);
+                this->lb_compressed_offset = 0;
                 BZ2_bzclose(bz_file);
 
-                if (rc != -1 && (rc < (this->lb_buffer.available()))) {
+                if (rc != -1 && (rc < (ssize_t) this->lb_buffer.available())) {
                     this->lb_file_size
                         = (this->lb_file_offset + this->lb_buffer.size() + rc);
+                    log_info("fd(%d): set file size to %llu",
+                             this->lb_fd.get(),
+                             this->lb_file_size.load());
                 }
             }
         }
@@ -919,10 +1089,13 @@ line_buffer::fill_range(file_off_t start, ssize_t max_length)
         else if (this->lb_seekable)
         {
             this->lb_stats.s_preads += 1;
-            if (false && this->lb_last_line_offset > 0) {
+            if (false
+                && this->lb_last_line_offset.load(std::memory_order_relaxed)
+                    > 0)
+            {
                 this->lb_stats.s_hist[(this->lb_file_offset * 10)
-                                      / this->lb_last_line_offset]
-                    += 1;
+                                      / this->lb_last_line_offset.load(
+                                          std::memory_order_relaxed)] += 1;
             }
 #if 0
             log_debug("%d: pread %lld",
@@ -942,7 +1115,7 @@ line_buffer::fill_range(file_off_t start, ssize_t max_length)
         }
         // XXX For some reason, cygwin is giving us a bogus return value when
         // up to the end of the file.
-        if (rc > (this->lb_buffer.available())) {
+        if (rc > (ssize_t) this->lb_buffer.available()) {
             rc = -1;
 #ifdef ENODATA
             errno = ENODATA;
@@ -965,7 +1138,10 @@ line_buffer::fill_range(file_off_t start, ssize_t max_length)
                      * For compressed files, increase the buffer size so we
                      * don't have to spend as much time uncompressing the data.
                      */
-                    this->resize_buffer(MAX_COMPRESSED_BUFFER_SIZE);
+                    if (this->lb_decompress_extra) {
+                        this->resize_buffer(
+                            this->buffer_size_for(MAX_COMPRESSED_BUFFER_SIZE));
+                    }
                 }
                 break;
 
@@ -992,8 +1168,8 @@ line_buffer::fill_range(file_off_t start, ssize_t max_length)
                 break;
         }
 
-        if (!lnav::pid::in_child && this->lb_seekable && this->lb_buffer.full()
-            && !this->lb_loader_file_offset)
+        if (this->lb_do_preloading && !lnav::pid::in_child && this->lb_seekable
+            && this->lb_buffer.full() && !this->lb_loader_file_offset)
         {
             // log_debug("loader available2 start=%d", start);
             auto last_lf_iter = std::find(
@@ -1027,13 +1203,16 @@ line_buffer::fill_range(file_off_t start, ssize_t max_length)
                 this->lb_loader_future = prom->get_future();
                 this->lb_stats.s_requested_preloads += 1;
                 isc::to<io_looper&, io_looper_tag>().send(
-                    [this, prom](auto& ioloop) mutable {
+                    [this, prom, curr_opid = lnav_current_opid()](
+                        auto& ioloop) mutable {
+                        auto op_guard = lnav_opid_guard::resume(curr_opid);
                         prom->set_value(this->load_next_buffer());
                     });
             }
         }
         ensure(this->lb_buffer.size() <= this->lb_buffer.capacity());
     }
+    // log_debug("END fill_range");
 
     return retval;
 }
@@ -1041,17 +1220,27 @@ line_buffer::fill_range(file_off_t start, ssize_t max_length)
 Result<line_info, std::string>
 line_buffer::load_next_line(file_range prev_line)
 {
+    const char* line_start = nullptr;
     bool done = false;
     line_info retval;
 
     require(this->lb_fd != -1);
+
+    if (this->lb_line_metadata && prev_line.fr_offset == 0) {
+        prev_line.fr_offset = this->lb_piper_header_size;
+    }
+    if (this->lb_bom_size > 0 && prev_line.fr_offset == 0) {
+        prev_line.fr_offset = this->lb_bom_size;
+    }
 
     auto offset = prev_line.next_offset();
     ssize_t request_size = INITIAL_REQUEST_SIZE;
     retval.li_file_range.fr_offset = offset;
     if (this->lb_buffer.empty() || !this->in_range(offset)) {
         this->fill_range(offset, this->lb_buffer.capacity());
-    } else if (offset == this->lb_file_offset + this->lb_buffer.size()) {
+    } else if (offset
+               == this->lb_file_offset + (ssize_t) this->lb_buffer.size())
+    {
         if (!this->fill_range(offset, INITIAL_REQUEST_SIZE)) {
             retval.li_file_range.fr_offset = offset;
             retval.li_file_range.fr_size = 0;
@@ -1063,61 +1252,120 @@ line_buffer::load_next_line(file_range prev_line)
             return Ok(retval);
         }
     }
+    if (prev_line.next_offset() == 0) {
+        // Skip a leading UTF-8 BOM so files produced by Excel,
+        // PowerShell, and other Windows-oriented tools don't leak the
+        // three-byte marker into the first line.  The bytes stay in
+        // lb_buffer but are rendered invisible by fast-forwarding the
+        // first line's start offset (mirrors lb_piper_header_size).
+        if (this->lb_buffer.size() >= 3 && (uint8_t) this->lb_buffer[0] == 0xEF
+            && (uint8_t) this->lb_buffer[1] == 0xBB
+            && (uint8_t) this->lb_buffer[2] == 0xBF)
+        {
+            this->lb_bom_size = 3;
+            prev_line.fr_offset = this->lb_bom_size;
+            offset = prev_line.next_offset();
+            retval.li_file_range.fr_offset = offset;
+        }
+        auto is_utf_res = is_utf8(string_fragment::from_bytes(
+            this->lb_buffer.begin(), this->lb_buffer.size()));
+        this->lb_is_utf8 = is_utf_res.is_valid();
+        if (!this->lb_is_utf8) {
+            log_warning("fd(%d): input is not utf8 -- %s",
+                        this->lb_fd.get(),
+                        is_utf_res.usr_message);
+        }
+    }
     while (!done) {
         auto old_retval_size = retval.li_file_range.fr_size;
-        const char *line_start, *lf;
+        const char* lf = nullptr;
 
         /* Find the data in the cache and */
         line_start = this->get_range(offset, retval.li_file_range.fr_size);
         /* ... look for the end-of-line or end-of-file. */
         ssize_t utf8_end = -1;
 
-        bool found_in_cache = false;
+        if (!retval.li_utf8_scan_result.is_valid()) {
+            retval.li_utf8_scan_result = {};
+        }
+        auto found_in_cache = false;
+        auto has_ansi = false;
+        auto valid_utf8 = true;
+        auto col_width = size_t{0};
         if (!this->lb_line_starts.empty()) {
             auto buffer_offset = offset - this->lb_file_offset;
 
-            auto start_iter = std::lower_bound(this->lb_line_starts.begin(),
-                                               this->lb_line_starts.end(),
-                                               buffer_offset);
-            if (start_iter != this->lb_line_starts.end()) {
+            if (this->lb_next_buffer_offset == buffer_offset) {
+                require(this->lb_next_line_start_index
+                        < this->lb_line_starts.size());
+                auto start_iter = this->lb_line_starts.begin()
+                    + this->lb_next_line_start_index;
                 auto next_line_iter = start_iter + 1;
-
-                // log_debug("found offset %d %d", buffer_offset, *start_iter);
                 if (next_line_iter != this->lb_line_starts.end()) {
                     utf8_end = *next_line_iter - 1 - *start_iter;
                     found_in_cache = true;
+                    lf = line_start + utf8_end;
+                    has_ansi = this->lb_line_has_ansi
+                                   [this->lb_next_line_start_index];
+                    valid_utf8
+                        = this->lb_line_is_utf[this->lb_next_line_start_index];
+                    col_width = this->lb_line_col_widths
+                                    [this->lb_next_line_start_index];
+
+                    // log_debug("hit cache");
+                    this->lb_next_buffer_offset = *next_line_iter;
+                    this->lb_next_line_start_index += 1;
                 } else {
                     // log_debug("no next iter");
                 }
             } else {
-                // log_debug("no buffer_offset found");
+                auto start_iter = std::lower_bound(this->lb_line_starts.begin(),
+                                                   this->lb_line_starts.end(),
+                                                   buffer_offset);
+                if (start_iter != this->lb_line_starts.end()) {
+                    auto next_line_iter = start_iter + 1;
+
+                    // log_debug("found offset %d %d", buffer_offset,
+                    // *start_iter);
+                    if (next_line_iter != this->lb_line_starts.end()) {
+                        auto start_index = std::distance(
+                            this->lb_line_starts.begin(), start_iter);
+                        utf8_end = *next_line_iter - 1 - *start_iter;
+                        found_in_cache = true;
+                        lf = line_start + utf8_end;
+                        has_ansi = this->lb_line_has_ansi[start_index];
+                        valid_utf8 = this->lb_line_is_utf[start_index];
+                        col_width = this->lb_line_col_widths[start_index];
+
+                        this->lb_next_line_start_index = start_index + 1;
+                        this->lb_next_buffer_offset = *next_line_iter;
+                    } else {
+                        // log_debug("no next iter");
+                    }
+                } else {
+                    // log_debug("no buffer_offset found");
+                }
             }
         }
 
-        if (!found_in_cache) {
-            const char* msg;
-            int faulty_bytes;
-
-            auto scan_res = is_utf8((unsigned char*) line_start,
-                                    retval.li_file_range.fr_size,
-                                    &msg,
-                                    &faulty_bytes,
-                                    '\n');
-            if (msg != nullptr) {
-                lf = (char*) memchr(
-                    line_start, '\n', retval.li_file_range.fr_size);
-                utf8_end = lf - line_start;
-                retval.li_valid_utf = false;
-            } else {
-                utf8_end = scan_res.usr_end;
-            }
-            retval.li_has_ansi = scan_res.usr_has_ansi;
-        }
-
-        if (utf8_end >= 0) {
-            lf = line_start + utf8_end;
+        if (found_in_cache && valid_utf8) {
+            retval.li_utf8_scan_result.usr_has_ansi = has_ansi;
+            retval.li_utf8_scan_result.usr_column_width_guess = col_width;
         } else {
-            lf = nullptr;
+            auto frag = string_fragment::from_bytes(
+                line_start, retval.li_file_range.fr_size);
+            auto scan_res = is_utf8(frag, '\n');
+            lf = scan_res.remaining_ptr();
+            if (lf != nullptr) {
+                lf -= 1;
+            }
+            retval.li_utf8_scan_result = scan_res;
+            if (!scan_res.is_valid()) {
+                log_warning("fd(%d): line is not utf8 -- %lld:%d",
+                            this->lb_fd.get(),
+                            retval.li_file_range.fr_offset,
+                            scan_res.usr_valid_frag.length());
+            }
         }
 
         auto got_new_data = old_retval_size != retval.li_file_range.fr_size;
@@ -1143,13 +1391,16 @@ line_buffer::load_next_line(file_range prev_line)
                 retval.li_file_range.fr_size = lf - line_start;
                 // delim
                 retval.li_file_range.fr_size += 1;
-                if (offset >= this->lb_last_line_offset) {
-                    this->lb_last_line_offset
-                        = offset + retval.li_file_range.fr_size;
+                if (offset >= this->lb_last_line_offset.load(
+                        std::memory_order_relaxed))
+                {
+                    this->lb_last_line_offset.store(
+                        offset + retval.li_file_range.fr_size,
+                        std::memory_order_relaxed);
                 }
             } else {
                 if (retval.li_file_range.fr_size >= MAX_LINE_BUFFER_SIZE) {
-                    log_warning("Line exceeded max size: offset=%d", offset);
+                    log_warning("Line exceeded max size: offset=%zd", offset);
                     retval.li_file_range.fr_size = MAX_LINE_BUFFER_SIZE - 1;
                     retval.li_partial = false;
                 } else {
@@ -1170,23 +1421,30 @@ line_buffer::load_next_line(file_range prev_line)
                      *   2. file is written
                      *   3. read_line() - returns the middle of partial line.
                      */
-                    this->lb_last_line_offset = offset;
-                } else if (offset >= this->lb_last_line_offset) {
-                    this->lb_last_line_offset
-                        = offset + retval.li_file_range.fr_size;
+                    this->lb_last_line_offset.store(offset,
+                                                    std::memory_order_relaxed);
+                } else if (offset >= this->lb_last_line_offset.load(
+                               std::memory_order_relaxed))
+                {
+                    this->lb_last_line_offset.store(
+                        offset + retval.li_file_range.fr_size,
+                        std::memory_order_relaxed);
                 }
             }
 
             offset += retval.li_file_range.fr_size;
-
             done = true;
         } else {
             if (!this->is_pipe() || !this->is_pipe_closed()) {
                 retval.li_partial = true;
             }
-            request_size
-                = std::min<ssize_t>(this->lb_buffer.size() + DEFAULT_INCREMENT,
-                                    MAX_LINE_BUFFER_SIZE);
+            // Sized from the line, not from the buffer.  ensure_available()
+            // reclaims whatever sits in front of this line by shifting it
+            // down, so the only thing that warrants a realloc is a line that
+            // will not fit in the buffer at all.
+            request_size = std::min<ssize_t>(
+                retval.li_file_range.fr_size + DEFAULT_INCREMENT,
+                MAX_LINE_BUFFER_SIZE);
         }
 
         if (!done
@@ -1198,25 +1456,53 @@ line_buffer::load_next_line(file_range prev_line)
         }
     }
 
-    ensure(retval.li_file_range.fr_size <= this->lb_buffer.size());
+    ensure(retval.li_file_range.fr_size <= (ssize_t) this->lb_buffer.size());
     ensure(this->invariant());
 #if 0
     log_debug("got line part %d %d",
               retval.li_file_range.fr_offset,
               (int) retval.li_partial);
 #endif
+
+    retval.li_file_range.fr_metadata.m_has_ansi
+        = retval.li_utf8_scan_result.usr_has_ansi;
+    retval.li_file_range.fr_metadata.m_valid_utf
+        = retval.li_utf8_scan_result.is_valid();
+
+    if (this->lb_line_metadata && retval.li_file_range.fr_size > 0) {
+        auto sv = std::string_view{
+            line_start,
+            (size_t) retval.li_file_range.fr_size,
+        };
+
+        auto scan_res = scn::scan<int64_t, int64_t, char>(sv, "{}.{}:{};");
+        if (scan_res) {
+            auto& [tv_sec, tv_usec, level] = scan_res->values();
+            retval.li_timestamp.tv_sec = tv_sec;
+            retval.li_timestamp.tv_usec = tv_usec;
+            retval.li_timestamp.tv_sec
+                = lnav::to_local_time(date::sys_seconds{std::chrono::seconds{
+                                          retval.li_timestamp.tv_sec}})
+                      .time_since_epoch()
+                      .count();
+            retval.li_level = abbrev2level(&level, 1);
+        }
+    }
+
     return Ok(retval);
 }
 
 Result<shared_buffer_ref, std::string>
-line_buffer::read_range(const file_range fr)
+line_buffer::read_range(file_range fr, scan_direction dir)
 {
     shared_buffer_ref retval;
     const char* line_start;
     file_ssize_t avail;
 
-    if (this->lb_last_line_offset != -1
-        && fr.fr_offset > this->lb_last_line_offset)
+#if 0
+    if (this->lb_last_line_offset.load(std::memory_order_relaxed) != -1
+        && fr.fr_offset
+            > this->lb_last_line_offset.load(std::memory_order_relaxed))
     {
         /*
          * Don't return anything past the last known line.  The caller needs
@@ -1226,13 +1512,15 @@ line_buffer::read_range(const file_range fr)
             fmt::format(FMT_STRING("attempt to read past the known end of the "
                                    "file: read-offset={}; last_line_offset={}"),
                         fr.fr_offset,
-                        this->lb_last_line_offset));
+                        this->lb_last_line_offset.load(
+                            std::memory_order_relaxed)));
     }
+#endif
 
     if (!(this->in_range(fr.fr_offset)
           && this->in_range(fr.fr_offset + fr.fr_size - 1)))
     {
-        if (!this->fill_range(fr.fr_offset, fr.fr_size)) {
+        if (!this->fill_range(fr.fr_offset, fr.fr_size, dir)) {
             return Err(std::string("unable to read file"));
         }
     }
@@ -1242,17 +1530,151 @@ line_buffer::read_range(const file_range fr)
         return Err(fmt::format(
             FMT_STRING("short-read (need: {}; avail: {})"), fr.fr_size, avail));
     }
+    if (this->lb_line_metadata) {
+        const auto* new_start
+            = static_cast<const char*>(memchr(line_start, ';', fr.fr_size));
+        if (new_start) {
+            auto offset = new_start - line_start + 1;
+            line_start += offset;
+            fr.fr_size -= offset;
+        }
+    }
     retval.share(this->lb_share_manager, line_start, fr.fr_size);
     retval.get_metadata() = fr.fr_metadata;
 
     return Ok(std::move(retval));
 }
 
+Result<auto_buffer, std::string>
+line_buffer::peek_range(file_range fr,
+                        lnav::enums::bitset<peek_options> options)
+{
+    static const std::string SHORT_READ_MSG = "short read";
+
+    require(this->lb_seekable);
+
+    auto buf = auto_buffer::alloc(fr.fr_size);
+
+    if (this->lb_cached_fd) {
+        auto rc = pread(this->lb_cached_fd.value().get(),
+                        buf.data(),
+                        fr.fr_size,
+                        fr.fr_offset);
+        if (rc == -1) {
+            return Err(lnav::from_errno().message());
+        }
+        if (!options.is_set<peek_options::allow_short_read>()
+            && rc != fr.fr_size)
+        {
+            return Err(SHORT_READ_MSG);
+        }
+        buf.resize(rc);
+
+        return Ok(std::move(buf));
+    }
+
+    if (this->lb_compressed) {
+        safe::WriteAccess<safe_gz_indexed> gi(this->lb_gz_file);
+
+        if (*gi) {
+            auto rc = gi->read(buf.data(), fr.fr_offset, fr.fr_size);
+
+            if (rc == -1) {
+                return Err(lnav::from_errno().message());
+            }
+            if (rc != fr.fr_size) {
+                this->lb_file_size = gi->strm.total_out;
+                log_info("fd(%d): set file size to %llu",
+                         this->lb_fd.get(),
+                         this->lb_file_size.load());
+                if (!options.is_set<peek_options::allow_short_read>()) {
+                    return Err(SHORT_READ_MSG);
+                }
+            }
+            buf.resize(rc);
+            return Ok(std::move(buf));
+        }
+#ifdef HAVE_BZLIB_H
+        if (this->lb_bz_file) {
+            lock_hack::guard guard;
+            char scratch[32 * 1024];
+            BZFILE* bz_file;
+            file_off_t seek_to;
+            int bzfd;
+
+            /*
+             * Unfortunately, there is no bzseek, so we need to reopen the
+             * file every time we want to do a read.
+             */
+            bzfd = dup(this->lb_fd);
+            if (lseek(this->lb_fd, 0, SEEK_SET) < 0) {
+                close(bzfd);
+                throw error(errno);
+            }
+            if ((bz_file = BZ2_bzdopen(bzfd, "r")) == nullptr) {
+                close(bzfd);
+                if (errno == 0) {
+                    throw std::bad_alloc();
+                } else {
+                    throw error(errno);
+                }
+            }
+
+            seek_to = fr.fr_offset;
+            while (seek_to > 0) {
+                int count;
+
+                count = BZ2_bzread(bz_file,
+                                   scratch,
+                                   std::min((size_t) seek_to, sizeof(scratch)));
+                if (count <= 0) {
+                    break;
+                }
+                seek_to -= count;
+            }
+            auto rc = BZ2_bzread(bz_file, buf.data(), fr.fr_size);
+            this->lb_compressed_offset = 0;
+            BZ2_bzclose(bz_file);
+
+            if (rc == -1) {
+                return Err(lnav::from_errno().message());
+            }
+            if (rc != fr.fr_size) {
+                if (options.is_set<peek_options::allow_short_read>()) {
+                    this->lb_file_size = fr.fr_offset + fr.fr_size;
+                    log_info("fd(%d): set file size to %llu",
+                             this->lb_fd.get(),
+                             this->lb_file_size.load());
+                } else {
+                    return Err(SHORT_READ_MSG);
+                }
+            }
+            buf.resize(rc);
+            return Ok(std::move(buf));
+        }
+#else
+        assert(!this->lb_bz_file);
+#endif
+    }
+
+    auto rc = pread(this->lb_fd, buf.data(), fr.fr_size, fr.fr_offset);
+    if (rc == -1) {
+        return Err(lnav::from_errno().message());
+    }
+    if (!options.is_set<peek_options::allow_short_read>() && rc != fr.fr_size) {
+        return Err(SHORT_READ_MSG);
+    }
+    buf.resize(rc);
+    return Ok(std::move(buf));
+}
+
 file_range
 line_buffer::get_available()
 {
-    return {this->lb_file_offset,
-            static_cast<file_ssize_t>(this->lb_buffer.size())};
+    return {
+        this->lb_file_offset,
+        static_cast<file_ssize_t>(this->lb_buffer.size()),
+    };
 }
 
 line_buffer::gz_indexed::indexDict::indexDict(const z_stream& s,
@@ -1317,7 +1739,7 @@ line_buffer::quiesce()
     }
 }
 
-static ghc::filesystem::path
+static std::filesystem::path
 line_buffer_cache_path()
 {
     return lnav::paths::workdir() / "buffer-cache";
@@ -1348,7 +1770,7 @@ line_buffer::enable_cache()
                                 .to_string();
     auto cache_dir = line_buffer_cache_path() / cached_base_name.substr(0, 2);
 
-    ghc::filesystem::create_directories(cache_dir);
+    std::filesystem::create_directories(cache_dir);
 
     auto cached_file_name = fmt::format(FMT_STRING("{}.bin"), cached_base_name);
     auto cached_file_path = cache_dir / cached_file_name;
@@ -1361,14 +1783,14 @@ line_buffer::enable_cache()
     auto fl = lnav::filesystem::file_lock(cached_file_path);
     auto guard = lnav::filesystem::file_lock::guard(&fl);
 
-    if (ghc::filesystem::exists(cached_done_path)) {
-        log_info("%d:using existing cache file");
+    if (std::filesystem::exists(cached_done_path)) {
+        log_info("%d:using existing cache file", this->lb_fd.get());
         auto open_res = lnav::filesystem::open_file(cached_file_path, O_RDWR);
         if (open_res.isOk()) {
             this->lb_cached_fd = open_res.unwrap();
             return;
         }
-        ghc::filesystem::remove(cached_done_path);
+        std::filesystem::remove(cached_done_path);
     }
 
     auto create_res = lnav::filesystem::create_file(
@@ -1383,10 +1805,10 @@ line_buffer::enable_cache()
     auto write_fd = create_res.unwrap();
     auto done = false;
 
-    static const ssize_t FILL_LENGTH = 1024 * 1024;
+    static constexpr ssize_t FILL_LENGTH = 1024 * 1024;
     auto off = file_off_t{0};
     while (!done) {
-        log_debug("%d: caching file content at %d", this->lb_fd.get(), off);
+        log_debug("%d: caching file content at %lld", this->lb_fd.get(), off);
         if (!this->fill_range(off, FILL_LENGTH)) {
             log_debug("%d: caching finished", this->lb_fd.get());
             done = true;
@@ -1395,6 +1817,9 @@ line_buffer::enable_cache()
 
             const auto* data = this->get_range(off, avail);
             auto rc = write(write_fd, data, avail);
+            if (rc == -1 && errno == EINTR) {
+                continue;
+            }
             if (rc != avail) {
                 log_error("%d: short write!", this->lb_fd.get());
                 return;
@@ -1409,33 +1834,64 @@ line_buffer::enable_cache()
     this->lb_cached_fd = std::move(write_fd);
 }
 
-void
+std::future<void>
 line_buffer::cleanup_cache()
 {
-    (void) std::async(std::launch::async, []() {
-        auto now = std::chrono::system_clock::now();
-        auto cache_path = line_buffer_cache_path();
-        std::vector<ghc::filesystem::path> to_remove;
+    return std::async(
+        std::launch::async, +[]() {
+            auto now = std::filesystem::file_time_type::clock::now();
+            auto cache_path = line_buffer_cache_path();
+            std::vector<std::filesystem::path> to_remove;
+            std::error_code ec;
 
-        for (const auto& cache_subdir :
-             ghc::filesystem::directory_iterator(cache_path))
-        {
-            for (const auto& entry :
-                 ghc::filesystem::directory_iterator(cache_subdir))
+            for (const auto& cache_subdir :
+                 std::filesystem::directory_iterator(cache_path, ec))
             {
-                auto mtime = ghc::filesystem::last_write_time(entry.path());
-                auto exp_time = mtime + 1h;
-                if (now < exp_time) {
-                    continue;
+                for (const auto& entry :
+                     std::filesystem::directory_iterator(cache_subdir, ec))
+                {
+                    auto mtime = std::filesystem::last_write_time(entry.path());
+                    auto exp_time = mtime + 1h;
+                    if (now < exp_time) {
+                        continue;
+                    }
+
+                    to_remove.emplace_back(entry.path());
                 }
-
-                to_remove.emplace_back(entry.path());
             }
-        }
 
-        for (auto& entry : to_remove) {
-            log_debug("removing compressed file cache: %s", entry.c_str());
-            ghc::filesystem::remove_all(entry);
-        }
-    });
+            for (auto& entry : to_remove) {
+                log_debug("removing compressed file cache: %s", entry.c_str());
+                std::filesystem::remove_all(entry, ec);
+            }
+        });
+}
+
+void
+line_buffer::send_initial_load()
+{
+    if (!this->lb_seekable) {
+        log_warning("file is not seekable, not doing preload");
+        return;
+    }
+
+    if (this->lb_loader_future.valid()) {
+        log_warning("preload is already active");
+        return;
+    }
+
+    log_debug("fd(%d): sending initial load", this->lb_fd.get());
+    if (!this->lb_alt_buffer) {
+        // log_debug("allocating new buffer!");
+        this->lb_alt_buffer = auto_buffer::alloc(this->lb_buffer.capacity());
+    }
+    this->lb_loader_file_offset = 0;
+    auto prom = std::make_shared<std::promise<bool>>();
+    this->lb_loader_future = prom->get_future();
+    this->lb_stats.s_requested_preloads += 1;
+    isc::to<io_looper&, io_looper_tag>().send(
+        [this, prom, curr_opid = lnav_current_opid()](auto& ioloop) mutable {
+            auto op_guard = lnav_opid_guard::resume(curr_opid);
+            prom->set_value(this->load_next_buffer());
+        });
 }

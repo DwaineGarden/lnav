@@ -29,8 +29,9 @@
 
 #include "log_data_table.hh"
 
+#include "column_namer.hh"
 #include "config.h"
-#include "scn/scn.h"
+#include "scn/scan.h"
 
 log_data_table::log_data_table(logfile_sub_source& lss,
                                log_vtab_manager& lvm,
@@ -64,10 +65,11 @@ log_data_table::get_columns_int()
     }
     lf->read_full_message(lf->begin() + cl_copy, line_values.lvv_sbr);
     line_values.lvv_sbr.erase_ansi();
-    format->annotate(cl_copy, sa, line_values, false);
+    format->annotate(lf.get(), cl_copy, sa, line_values);
     body = find_string_attr_range(sa, &SA_BODY);
     if (body.lr_end == -1) {
         this->ldt_schema_id.clear();
+        this->ldt_bloom_bits = 0;
         return;
     }
 
@@ -102,11 +104,16 @@ log_data_table::get_columns_int()
                 collator = "naturalnocase";
                 break;
         }
-        metas.emplace_back(
-            intern_string::lookup(colname), kind, cols.size(), format.get());
-        cols.emplace_back(colname, sql_type, collator);
+        metas.emplace_back(intern_string::lookup(colname),
+                           kind,
+                           logline_value_meta::table_column{cols.size()},
+                           format.get());
+        cols.emplace_back(
+            intern_string::lookup(colname), sql_type, intern_string::lookup(collator));
     }
     this->ldt_schema_id = dp.dp_schema_id;
+    this->ldt_bloom_bits = 1UL << (dp.dp_schema_id.in()[0] % 56);
+    this->ldt_bloom_bits |= 1UL << (dp.dp_schema_id.in()[1] % 56);
 }
 
 bool
@@ -119,24 +126,29 @@ log_data_table::next(log_cursor& lc, logfile_sub_source& lss)
     content_line_t cl;
 
     cl = lss.at(lc.lc_curr_line);
-    std::shared_ptr<logfile> lf = lss.find(cl);
+    auto* lf = lss.find_file_ptr(cl);
+    if (lf->get_format()->get_name() != this->ldt_format_impl->get_name()) {
+        return false;
+    }
     auto lf_iter = lf->begin() + cl;
 
     if (!lf_iter->is_message()) {
         return false;
     }
 
-    if (lf_iter->has_schema() && !lf_iter->match_schema(this->ldt_schema_id)) {
+    if (lf_iter->has_schema()
+        && !lf_iter->match_bloom_bits(this->ldt_bloom_bits))
+    {
         return false;
     }
 
     string_attrs_t sa;
-    struct line_range body;
+    line_range body;
     logline_value_vector line_values;
 
     lf->read_full_message(lf_iter, line_values.lvv_sbr);
     line_values.lvv_sbr.erase_ansi();
-    lf->get_format()->annotate(cl, sa, line_values, false);
+    lf->get_format()->annotate(lf, cl, sa, line_values);
     body = find_string_attr_range(sa, &SA_BODY);
     if (body.lr_end == -1) {
         return false;
@@ -146,7 +158,10 @@ log_data_table::next(log_cursor& lc, logfile_sub_source& lss)
     data_parser dp(&ds);
     dp.parse();
 
-    lf_iter->set_schema(dp.dp_schema_id);
+    uint64_t bloom_bits = 1UL << (dp.dp_schema_id.in()[0] % 56);
+    bloom_bits |= 1UL << (dp.dp_schema_id.in()[1] % 56);
+    lf_iter->merge_bloom_bits(bloom_bits);
+    lf_iter->set_schema_computed(true);
 
     /* The cached schema ID in the log line is not complete, so we still */
     /* need to check for a full match. */
@@ -163,12 +178,13 @@ log_data_table::next(log_cursor& lc, logfile_sub_source& lss)
 void
 log_data_table::extract(logfile* lf,
                         uint64_t line_number,
+                        string_attrs_t& sa,
                         logline_value_vector& values)
 {
     auto& line = values.lvv_sbr;
     auto meta_iter = this->ldt_value_metas.begin();
 
-    this->ldt_format_impl->extract(lf, line_number, values);
+    this->ldt_format_impl->extract(lf, line_number, sa, values);
     for (const auto& ldt_pair : this->ldt_pairs) {
         const auto& pvalue = ldt_pair.get_pair_value();
         auto lr = line_range{
@@ -180,7 +196,7 @@ log_data_table::extract(logfile* lf,
             case DT_NUMBER: {
                 auto num_view = line.to_string_view(lr);
                 auto num_scan_res = scn::scan_value<double>(num_view);
-                auto num = num_scan_res ? num_scan_res.value() : 0.0;
+                auto num = num_scan_res ? num_scan_res->value() : 0.0;
 
                 values.lvv_values.emplace_back(*meta_iter, num);
                 break;

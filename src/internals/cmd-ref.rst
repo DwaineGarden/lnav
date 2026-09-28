@@ -1,22 +1,36 @@
 
+.. _add_source_path:
+
+:add-source-path *path*
+^^^^^^^^^^^^^^^^^^^^^^^
+
+  Add a path to the source code that generated log messages.  Adding source allows lnav to more accurately extract values from log messages
+
+  **Parameters**
+    * **path** --- The path to the source code to index
+
+
+----
+
+
 .. _adjust_log_time:
 
 :adjust-log-time *timestamp*
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-  Change the timestamps of the top file to be relative to the given date
+  Change the timestamps of the focused file to be relative to the given date
 
   **Parameters**
-    * **timestamp\*** --- The new timestamp for the top line in the view
+    * **timestamp\*** --- The new timestamp for the focused line in the view
 
   **Examples**
-    To set the top timestamp to a given date:
+    To set the focused timestamp to a given date:
 
     .. code-block::  lnav
 
       :adjust-log-time 2017-01-02T05:33:00
 
-    To set the top timestamp back an hour:
+    To set the focused timestamp back an hour:
 
     .. code-block::  lnav
 
@@ -44,7 +58,20 @@
       :alt-msg Press t to switch to the text view
 
   **See Also**
-    :ref:`echo`, :ref:`eval`, :ref:`export_session_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
+    :ref:`cd`, :ref:`echo`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
+
+----
+
+
+.. _annotate:
+
+:annotate
+^^^^^^^^^
+
+  Analyze the focused log message and attach annotations
+
+  **See Also**
+    :ref:`comment`, :ref:`partition_name`, :ref:`tag`
 
 ----
 
@@ -67,7 +94,89 @@
       :append-to /tmp/interesting-lines.txt
 
   **See Also**
-    :ref:`echo`, :ref:`echoln`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
+    :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`export_session_to`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
+
+----
+
+
+.. _breakpoint:
+
+:breakpoint *point*
+^^^^^^^^^^^^^^^^^^^
+
+  Set a breakpoint for the given [<format>:]<file>:<line> tuples or the current line
+
+  **Parameters**
+    * **point** --- The file and line number of the breakpoint.  If the format is different from the currently focused one, the format name should be used as the prefix
+
+  **Examples**
+    To set a breakpoint for a log message at foo.cc:32:
+
+    .. code-block::  lnav
+
+      :breakpoint foo.cc:32
+
+
+----
+
+
+.. _cd:
+
+:cd *dir*
+^^^^^^^^^
+
+  Change the current directory
+
+  **Parameters**
+    * **dir\*** --- The new current directory
+
+  **See Also**
+    :ref:`alt_msg`, :ref:`echo`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
+
+----
+
+
+.. _clear_adjusted_log_time:
+
+:clear-adjusted-log-time
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Clear the adjusted time for the focused line in the view
+
+
+----
+
+
+.. _clear_all_sticky_headers:
+
+:clear-all-sticky-headers
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Clear all sticky header bookmarks in the current view
+
+  **See Also**
+    :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`hide_unmarked_lines`, :ref:`mark`, :ref:`next_mark`, :ref:`prev_mark`, :ref:`set_text_view_mode`, :ref:`toggle_sticky_header`
+
+----
+
+
+.. _clear_breakpoint:
+
+:clear-breakpoint *pattern*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Clear the breakpoints that match the given glob pattern
+
+  **Parameters**
+    * **pattern** --- The glob pattern to use when matching the breakpoint definition of the format <format>:<file>:<line>
+
+  **Examples**
+    To clear all breakpoints:
+
+    .. code-block::  lnav
+
+      :clear-breakpoint *
+
 
 ----
 
@@ -77,10 +186,26 @@
 :clear-comment
 ^^^^^^^^^^^^^^
 
-  Clear the comment attached to the top log line
+  Clear the comment attached to the focused log line
 
   **See Also**
-    :ref:`comment`, :ref:`tag`
+    :ref:`annotate`, :ref:`comment`, :ref:`partition_name`, :ref:`tag`
+
+----
+
+
+.. _clear_file_timezone:
+
+:clear-file-timezone *pattern*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Clear the timezone setting for the given glob pattern or all files whose message timestamps do not have a timezone.
+
+  **Parameters**
+    * **pattern\*** --- The glob pattern to match against files that should no longer use this timezone
+
+  **See Also**
+    :ref:`set_file_timezone`
 
 ----
 
@@ -93,7 +218,7 @@
   Clear the filter expression
 
   **See Also**
-    :ref:`filter_expr`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
+    :ref:`filter_context`, :ref:`filter_expr`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
 
 ----
 
@@ -116,7 +241,30 @@
       :clear-highlight foobar
 
   **See Also**
-    :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`highlight`
+    :ref:`clear_all_sticky_headers`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`highlight`, :ref:`set_text_view_mode`, :ref:`toggle_sticky_header`
+
+----
+
+
+.. _clear_highlight_field:
+
+:clear-highlight-field *field*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Remove a field highlight
+
+  **Parameters**
+    * **field\*** --- The name of highlighted field
+
+  **Examples**
+    To clear the highlights for the 'sc_status' field:
+
+    .. code-block::  lnav
+
+      :clear-highlight-field sc_status
+
+  **See Also**
+    :ref:`clear_all_sticky_headers`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`highlight_field`, :ref:`set_text_view_mode`, :ref:`toggle_sticky_header`
 
 ----
 
@@ -129,7 +277,7 @@
   Clear the mark expression
 
   **See Also**
-    :ref:`hide_unmarked_lines`, :ref:`mark_expr`, :ref:`mark`, :ref:`next_mark`, :ref:`prev_mark`
+    :ref:`clear_all_sticky_headers`, :ref:`hide_unmarked_lines`, :ref:`mark_expr`, :ref:`mark`, :ref:`next_mark`, :ref:`prev_mark`, :ref:`toggle_sticky_header`
 
 ----
 
@@ -139,19 +287,42 @@
 :clear-partition
 ^^^^^^^^^^^^^^^^
 
-  Clear the partition the top line is a part of
+  Clear the partition the focused line is a part of
 
+  **See Also**
+    :ref:`annotate`, :ref:`comment`, :ref:`partition_name`, :ref:`tag`
+
+----
+
+
+.. _clear_timeline_metric:
+
+:clear-timeline-metric *label*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Remove a sparkline from the timeline view header
+
+  **Parameters**
+    * **label\*** --- The label of the metric to remove
+
+  **See Also**
+    :ref:`clear_all_sticky_headers`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`set_text_view_mode`, :ref:`timeline_metric_sql`, :ref:`timeline_metric`, :ref:`toggle_sticky_header`
 
 ----
 
 
 .. _close:
 
-:close
-^^^^^^
+:close *path*
+^^^^^^^^^^^^^
 
-  Close the top file in the view
+  Close the given file(s) or the focused file in the view
 
+  **Parameters**
+    * **path** --- A path or glob pattern that specifies the files to close
+
+  **See Also**
+    :ref:`append_to`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`export_session_to`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
 
 ----
 
@@ -161,20 +332,20 @@
 :comment *text*
 ^^^^^^^^^^^^^^^
 
-  Attach a comment to the top log line.  The comment will be displayed right below the log message it is associated with. The comment can be formatted using markdown and you can add new-lines with '\n'.
+  Attach a comment to the focused log line.  The comment will be displayed right below the log message it is associated with. The comment can contain Markdown directives for styling and linking.
 
   **Parameters**
     * **text\*** --- The comment text
 
   **Examples**
-    To add the comment 'This is where it all went wrong' to the top line:
+    To add the comment 'This is where it all went wrong' to the focused line:
 
     .. code-block::  lnav
 
       :comment This is where it all went wrong
 
   **See Also**
-    :ref:`clear_comment`, :ref:`tag`
+    :ref:`annotate`, :ref:`clear_comment`, :ref:`partition_name`, :ref:`tag`
 
 ----
 
@@ -209,12 +380,26 @@
 ----
 
 
+.. _convert_time_to:
+
+:convert-time-to *zone*
+^^^^^^^^^^^^^^^^^^^^^^^
+
+  Convert the focused timestamp to the given timezone
+
+  **Parameters**
+    * **zone\*** --- The timezone name
+
+
+----
+
+
 .. _create_logline_table:
 
 :create-logline-table *table-name*
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-  Create an SQL table using the top line of the log view as a template
+  Create an SQL table using the focused line of the log view as a template
 
   **Parameters**
     * **table-name\*** --- The name for the new table
@@ -227,7 +412,31 @@
       :create-logline-table task_durations
 
   **See Also**
-    :ref:`create_search_table`, :ref:`create_search_table`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_view_to`
+    :ref:`create_search_table`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_view_to`
+
+----
+
+
+.. _create_named_search:
+
+:create-named-search *name* *\[pattern\]*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Give a name to a search so that it stays active and highlighted while other searches are run
+
+  **Parameters**
+    * **name\*** --- The name to give to the search
+    * **pattern** --- The regular expression to search for.  If not given, the currently active search is used and then cleared.
+
+  **Examples**
+    To name the currently active search 'req':
+
+    .. code-block::  lnav
+
+      :create-named-search req
+
+  **See Also**
+    :ref:`delete_named_search`, :ref:`focus_search`
 
 ----
 
@@ -251,7 +460,7 @@
       :create-search-table task_durations duration=(?<duration>\d+)
 
   **See Also**
-    :ref:`create_logline_table`, :ref:`create_logline_table`, :ref:`delete_search_table`, :ref:`delete_search_table`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_view_to`
+    :ref:`create_logline_table`, :ref:`delete_search_table`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_view_to`
 
 ----
 
@@ -272,7 +481,7 @@
 :delete-filter *pattern*
 ^^^^^^^^^^^^^^^^^^^^^^^^
 
-  Delete the filter created with [1m:filter-in[0m or [1m:filter-out[0m
+  Delete the filter created with ':filter-in' or ':filter-out'
 
   **Parameters**
     * **pattern\*** --- The regular expression to match
@@ -285,7 +494,7 @@
       :delete-filter last message repeated
 
   **See Also**
-    :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
+    :ref:`filter_context`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
 
 ----
 
@@ -308,7 +517,30 @@
       :delete-logline-table task_durations
 
   **See Also**
-    :ref:`create_logline_table`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`create_search_table`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_view_to`
+    :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_view_to`
+
+----
+
+
+.. _delete_named_search:
+
+:delete-named-search *name*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Delete a search created with create-named-search
+
+  **Parameters**
+    * **name\*** --- The name of the search to delete
+
+  **Examples**
+    To delete the named search 'req':
+
+    .. code-block::  lnav
+
+      :delete-named-search req
+
+  **See Also**
+    :ref:`create_named_search`, :ref:`focus_search`
 
 ----
 
@@ -318,10 +550,10 @@
 :delete-search-table *table-name*
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-  Create an SQL table based on a regex search
+  Delete a search table
 
   **Parameters**
-    * **table-name\*** --- The name of the table to create
+    * **table-name** --- The name of the table to delete
 
   **Examples**
     To delete the search table named 'task_durations':
@@ -331,7 +563,7 @@
       :delete-search-table task_durations
 
   **See Also**
-    :ref:`create_logline_table`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`create_search_table`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_view_to`
+    :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_view_to`
 
 ----
 
@@ -354,7 +586,21 @@
       :delete-tags #BUG123 #needs-review
 
   **See Also**
-    :ref:`comment`, :ref:`tag`
+    :ref:`annotate`, :ref:`comment`, :ref:`partition_name`, :ref:`tag`
+
+----
+
+
+.. _disable_breakpoint:
+
+:disable-breakpoint *point*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Disable a breakpoint for the given [<format>:]<file>:<line> tuples or the current line
+
+  **Parameters**
+    * **point** --- The file and line number of the breakpoint
+
 
 ----
 
@@ -377,7 +623,30 @@
       :disable-filter last message repeated
 
   **See Also**
-    :ref:`enable_filter`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
+    :ref:`enable_filter`, :ref:`filter_context`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
+
+----
+
+
+.. _disable_named_search:
+
+:disable-named-search *name*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Stop highlighting the hits of a named search without deleting it
+
+  **Parameters**
+    * **name\*** --- The name of the search to disable
+
+  **Examples**
+    To disable the named search 'req':
+
+    .. code-block::  lnav
+
+      :disable-named-search req
+
+  **See Also**
+    :ref:`enable_named_search`, :ref:`focus_search`
 
 ----
 
@@ -390,7 +659,7 @@
   Disable word-wrapping for the current view
 
   **See Also**
-    :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`highlight`
+    :ref:`clear_all_sticky_headers`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`set_text_view_mode`, :ref:`toggle_sticky_header`
 
 ----
 
@@ -414,7 +683,21 @@
       :echo Hello, World!
 
   **See Also**
-    :ref:`alt_msg`, :ref:`append_to`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`write_view_to`
+    :ref:`alt_msg`, :ref:`append_to`, :ref:`cd`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
+
+----
+
+
+.. _enable_breakpoint:
+
+:enable-breakpoint *point*
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Enable or create a breakpoint for the given [<format>:]<file>:<line> tuples or the current line
+
+  **Parameters**
+    * **point** --- The file and line number of the breakpoint
+
 
 ----
 
@@ -437,7 +720,30 @@
       :enable-filter last message repeated
 
   **See Also**
-    :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
+    :ref:`filter_context`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
+
+----
+
+
+.. _enable_named_search:
+
+:enable-named-search *name*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Enable a named search that was disabled with disable-named-search
+
+  **Parameters**
+    * **name\*** --- The name of the search to enable
+
+  **Examples**
+    To enable the named search 'req':
+
+    .. code-block::  lnav
+
+      :enable-named-search req
+
+  **See Also**
+    :ref:`disable_named_search`, :ref:`focus_search`
 
 ----
 
@@ -450,7 +756,7 @@
   Enable word-wrapping for the current view
 
   **See Also**
-    :ref:`disable_word_wrap`, :ref:`hide_fields`, :ref:`highlight`
+    :ref:`clear_all_sticky_headers`, :ref:`disable_word_wrap`, :ref:`hide_fields`, :ref:`set_text_view_mode`, :ref:`toggle_sticky_header`
 
 ----
 
@@ -473,7 +779,7 @@
       :eval ;SELECT * FROM ${table}
 
   **See Also**
-    :ref:`alt_msg`, :ref:`echo`, :ref:`export_session_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
+    :ref:`alt_msg`, :ref:`cd`, :ref:`echo`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
 
 ----
 
@@ -489,7 +795,70 @@
     * **path\*** --- The path to the file to write
 
   **See Also**
-    :ref:`alt_msg`, :ref:`append_to`, :ref:`echo`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`write_view_to`
+    :ref:`alt_msg`, :ref:`append_to`, :ref:`cd`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`external_access_login`, :ref:`external_access`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
+
+----
+
+
+.. _external_access:
+
+:external-access *port* *api-key*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Open a port to give remote access to this lnav instance
+
+  **Parameters**
+    * **port\*** --- The port number to listen on
+    * **api-key\*** --- The API key
+
+  **See Also**
+    :ref:`alt_msg`, :ref:`cd`, :ref:`echo`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
+
+----
+
+
+.. _external_access_login:
+
+:external-access-login *\[app\]*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Use the external-opener to open a URL that refers to lnav's external-access server
+
+  **Parameters**
+    * **app** --- The app to launch
+
+  **See Also**
+    :ref:`alt_msg`, :ref:`cd`, :ref:`echo`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
+
+----
+
+
+.. _filter_context:
+
+:filter-context *count* *\[after\]*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Show extra lines around filtered-in lines, similar to grep's -C option
+
+  **Parameters**
+    * **count\*** --- The number of lines of context to show before and after matched lines
+    * **after** --- The number of lines of context to show after matched lines (overrides count)
+
+  **Examples**
+    To show 2 lines of context around filtered-in lines:
+
+    .. code-block::  lnav
+
+      :filter-context 2
+
+    To show 3 lines before and 1 line after each match:
+
+    .. code-block::  lnav
+
+      :filter-context 3 1
+
+  **See Also**
+    :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
 
 ----
 
@@ -518,7 +887,7 @@
       :filter-expr :log_body REGEXP 'id\d+' AND :log_body REGEXP 'foo'
 
   **See Also**
-    :ref:`clear_filter_expr`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
+    :ref:`clear_filter_expr`, :ref:`filter_context`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
 
 ----
 
@@ -541,7 +910,7 @@
       :filter-in dhclient
 
   **See Also**
-    :ref:`delete_filter`, :ref:`disable_filter`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
+    :ref:`delete_filter`, :ref:`disable_filter`, :ref:`filter_context`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
 
 ----
 
@@ -564,7 +933,56 @@
       :filter-out last message repeated
 
   **See Also**
-    :ref:`delete_filter`, :ref:`disable_filter`, :ref:`filter_in`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
+    :ref:`delete_filter`, :ref:`disable_filter`, :ref:`filter_context`, :ref:`filter_in`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
+
+----
+
+
+.. _focus_next_search:
+
+:focus-next-search
+^^^^^^^^^^^^^^^^^^
+
+  Focus the search after the one that is focused now, wrapping around to all of them
+
+  **See Also**
+    :ref:`focus_prev_search`, :ref:`focus_search`, :ref:`goto`, :ref:`next_location`, :ref:`next_mark`, :ref:`next_section`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`prev_section`, :ref:`relative_goto`
+
+----
+
+
+.. _focus_prev_search:
+
+:focus-prev-search
+^^^^^^^^^^^^^^^^^^
+
+  Focus the search before the one that is focused now, wrapping around to all of them
+
+  **See Also**
+    :ref:`focus_next_search`, :ref:`focus_search`, :ref:`goto`, :ref:`next_location`, :ref:`next_mark`, :ref:`next_section`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`prev_section`, :ref:`relative_goto`
+
+----
+
+
+.. _focus_search:
+
+:focus-search *\[name\]*
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Narrow the search hotkeys to a single search so that only its hits are moved through
+
+  **Parameters**
+    * **name** --- The name of the search to focus.  If not given, the hotkeys move through the hits of all of the searches again.
+
+  **Examples**
+    To move through the hits of 'req' alone:
+
+    .. code-block::  lnav
+
+      :focus-search req
+
+  **See Also**
+    :ref:`goto`, :ref:`next_location`, :ref:`next_mark`, :ref:`next_section`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`prev_section`, :ref:`relative_goto`
 
 ----
 
@@ -605,7 +1023,7 @@
       :goto #screenshots
 
   **See Also**
-    :ref:`next_location`, :ref:`next_mark`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`relative_goto`
+    :ref:`focus_search`, :ref:`next_location`, :ref:`next_mark`, :ref:`next_section`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`prev_section`, :ref:`relative_goto`
 
 ----
 
@@ -629,7 +1047,7 @@
   Hide log message fields by replacing them with an ellipsis
 
   **Parameters**
-    * **field-name** --- The name of the field to hide in the format for the top log line.  A qualified name can be used where the field name is prefixed by the format name and a dot to hide any field.
+    * **field-name** --- The name of the field to hide in the format for the focused log line.  A qualified name can be used where the field name is prefixed by the format name and a dot to hide any field.
 
   **Examples**
     To hide the log_procname fields in all formats:
@@ -645,7 +1063,7 @@
       :hide-fields syslog_log.log_procname
 
   **See Also**
-    :ref:`enable_word_wrap`, :ref:`highlight`, :ref:`show_fields`
+    :ref:`clear_all_sticky_headers`, :ref:`enable_word_wrap`, :ref:`set_text_view_mode`, :ref:`show_fields`, :ref:`toggle_sticky_header`
 
 ----
 
@@ -664,6 +1082,29 @@
 ----
 
 
+.. _hide_in_timeline:
+
+:hide-in-timeline *row-type*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Hide rows of the given type(s) in the timeline view
+
+  **Parameters**
+    * **row-type** --- The type of row to hide
+
+  **Examples**
+    To hide logfile and thread rows:
+
+    .. code-block::  lnav
+
+      :hide-in-timeline logfile thread
+
+  **See Also**
+    :ref:`clear_all_sticky_headers`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`set_text_view_mode`, :ref:`show_in_timeline`, :ref:`toggle_sticky_header`
+
+----
+
+
 .. _hide_lines_after:
 
 :hide-lines-after *date*
@@ -675,7 +1116,7 @@
     * **date\*** --- An absolute or relative date
 
   **Examples**
-    To hide the lines after the top line in the view:
+    To hide the lines after the focused line in the view:
 
     .. code-block::  lnav
 
@@ -688,7 +1129,7 @@
       :hide-lines-after 6am
 
   **See Also**
-    :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`show_lines_before_and_after`, :ref:`toggle_filtering`
+    :ref:`filter_context`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`show_lines_before_and_after`, :ref:`toggle_filtering`
 
 ----
 
@@ -704,7 +1145,7 @@
     * **date\*** --- An absolute or relative date
 
   **Examples**
-    To hide the lines before the top line in the view:
+    To hide the lines before the focused line in the view:
 
     .. code-block::  lnav
 
@@ -717,7 +1158,7 @@
       :hide-lines-before 6am
 
   **See Also**
-    :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_unmarked_lines`, :ref:`show_lines_before_and_after`, :ref:`toggle_filtering`
+    :ref:`filter_context`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_unmarked_lines`, :ref:`show_lines_before_and_after`, :ref:`toggle_filtering`
 
 ----
 
@@ -730,7 +1171,7 @@
   Hide lines that have not been bookmarked
 
   **See Also**
-    :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`mark`, :ref:`next_mark`, :ref:`prev_mark`, :ref:`toggle_filtering`
+    :ref:`clear_all_sticky_headers`, :ref:`filter_context`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`mark`, :ref:`next_mark`, :ref:`prev_mark`, :ref:`toggle_filtering`, :ref:`toggle_sticky_header`
 
 ----
 
@@ -753,7 +1194,37 @@
       :highlight \d{3,}
 
   **See Also**
-    :ref:`clear_highlight`, :ref:`enable_word_wrap`, :ref:`hide_fields`
+    :ref:`clear_all_sticky_headers`, :ref:`clear_highlight`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`set_text_view_mode`, :ref:`toggle_sticky_header`
+
+----
+
+
+.. _highlight_field:
+
+:highlight-field *\[--color\]* *\[--bold\]* *\[--underline\]* *\[--italic\]* *\[--strike\]* *\[--blink\]* *field* *\[pattern\]*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Highlight a field that matches the given pattern
+
+  **Parameters**
+    * **--color** --- The foreground color to apply
+    * **--bold** --- Make the text bold
+    * **--underline** --- Underline the text
+    * **--italic** --- Italicize the text
+    * **--strike** --- Strikethrough the text
+    * **--blink** --- Make the text blink
+    * **field\*** --- The name of the field to highlight
+    * **pattern** --- The regular expression to match
+
+  **Examples**
+    To color status values that start with '2' green:
+
+    .. code-block::  lnav
+
+      :highlight-field --color=green sc_status ^2.*
+
+  **See Also**
+    :ref:`clear_all_sticky_headers`, :ref:`clear_highlight_field`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`set_text_view_mode`, :ref:`toggle_sticky_header`
 
 ----
 
@@ -774,10 +1245,10 @@
 :mark
 ^^^^^
 
-  Toggle the bookmark state for the top line in the current view
+  Toggle the bookmark state for the focused line in the current view
 
   **See Also**
-    :ref:`hide_unmarked_lines`, :ref:`next_mark`, :ref:`prev_mark`
+    :ref:`clear_all_sticky_headers`, :ref:`hide_unmarked_lines`, :ref:`next_mark`, :ref:`prev_mark`, :ref:`toggle_sticky_header`
 
 ----
 
@@ -800,7 +1271,7 @@
       :mark-expr :log_procname = 'dhclient' AND :log_body LIKE '%eth0%'
 
   **See Also**
-    :ref:`clear_mark_expr`, :ref:`hide_unmarked_lines`, :ref:`mark`, :ref:`next_mark`, :ref:`prev_mark`
+    :ref:`clear_all_sticky_headers`, :ref:`clear_mark_expr`, :ref:`hide_unmarked_lines`, :ref:`mark`, :ref:`next_mark`, :ref:`prev_mark`, :ref:`toggle_sticky_header`
 
 ----
 
@@ -813,7 +1284,7 @@
   Move to the next position in the location history
 
   **See Also**
-    :ref:`goto`, :ref:`next_mark`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`relative_goto`
+    :ref:`focus_search`, :ref:`goto`, :ref:`next_mark`, :ref:`next_section`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`prev_section`, :ref:`relative_goto`
 
 ----
 
@@ -836,19 +1307,57 @@
       :next-mark error
 
   **See Also**
-    :ref:`goto`, :ref:`hide_unmarked_lines`, :ref:`mark`, :ref:`next_location`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`prev_mark`, :ref:`relative_goto`
+    :ref:`clear_all_sticky_headers`, :ref:`focus_search`, :ref:`goto`, :ref:`hide_unmarked_lines`, :ref:`mark`, :ref:`next_location`, :ref:`next_section`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`prev_section`, :ref:`relative_goto`, :ref:`toggle_sticky_header`
+
+----
+
+
+.. _next_search_hit:
+
+:next-search-hit *\[name\]*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Move to the next hit of the focused search, or of all of the searches when none is focused
+
+  **Parameters**
+    * **name** --- The name of the search to move through instead of the focused one
+
+  **Examples**
+    To move to the next hit of 'req':
+
+    .. code-block::  lnav
+
+      :next-search-hit req
+
+  **See Also**
+    :ref:`focus_search`, :ref:`goto`, :ref:`next_location`, :ref:`next_mark`, :ref:`next_section`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`prev_search_hit`, :ref:`prev_section`, :ref:`relative_goto`
+
+----
+
+
+.. _next_section:
+
+:next-section
+^^^^^^^^^^^^^
+
+  Move to the next section in the document
+
+  **See Also**
+    :ref:`focus_search`, :ref:`goto`, :ref:`next_location`, :ref:`next_mark`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`prev_section`, :ref:`relative_goto`
 
 ----
 
 
 .. _open:
 
-:open *path*
-^^^^^^^^^^^^
+:open *\[--since\]* *\[--until\]* *path*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
   Open the given file(s) in lnav.  Opening files on machines accessible via SSH can be done using the syntax: [user@]host:/path/to/logs
 
   **Parameters**
+    * **--since** --- The low cutoff time
+    * **--until** --- The high cutoff time
     * **path** --- The path to the file to open
 
   **Examples**
@@ -864,6 +1373,8 @@
 
       :open dean@host1.example.com:/var/log/syslog.log
 
+  **See Also**
+    :ref:`append_to`, :ref:`close`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
 
 ----
 
@@ -873,18 +1384,20 @@
 :partition-name *name*
 ^^^^^^^^^^^^^^^^^^^^^^
 
-  Mark the top line in the log view as the start of a new partition with the given name
+  Mark the focused line in the log view as the start of a new partition with the given name
 
   **Parameters**
     * **name\*** --- The name for the new partition
 
   **Examples**
-    To mark the top line as the start of the partition named 'boot #1':
+    To mark the focused line as the start of the partition named 'boot #1':
 
     .. code-block::  lnav
 
       :partition-name boot #1
 
+  **See Also**
+    :ref:`annotate`, :ref:`clear_partition`, :ref:`comment`, :ref:`tag`
 
 ----
 
@@ -894,20 +1407,20 @@
 :pipe-line-to *shell-cmd*
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-  Pipe the top line to the given shell command
+  Pipe the focused line to the given shell command.  Any fields defined by the format will be set as environment variables.
 
   **Parameters**
     * **shell-cmd\*** --- The shell command-line to execute
 
   **Examples**
-    To write the top line to 'sed' for processing:
+    To write the focused line to 'sed' for processing:
 
     .. code-block::  lnav
 
       :pipe-line-to sed -e 's/foo/bar/g'
 
   **See Also**
-    :ref:`append_to`, :ref:`echo`, :ref:`echoln`, :ref:`export_session_to`, :ref:`pipe_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
+    :ref:`append_to`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`export_session_to`, :ref:`open`, :ref:`pipe_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
 
 ----
 
@@ -930,7 +1443,7 @@
       :pipe-to sed -e s/foo/bar/g
 
   **See Also**
-    :ref:`append_to`, :ref:`echo`, :ref:`echoln`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
+    :ref:`append_to`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`export_session_to`, :ref:`open`, :ref:`pipe_line_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
 
 ----
 
@@ -943,7 +1456,7 @@
   Move to the previous position in the location history
 
   **See Also**
-    :ref:`goto`, :ref:`next_location`, :ref:`next_mark`, :ref:`prev_mark`, :ref:`relative_goto`
+    :ref:`focus_search`, :ref:`goto`, :ref:`next_location`, :ref:`next_mark`, :ref:`next_section`, :ref:`prev_mark`, :ref:`prev_section`, :ref:`relative_goto`
 
 ----
 
@@ -966,7 +1479,43 @@
       :prev-mark error
 
   **See Also**
-    :ref:`goto`, :ref:`hide_unmarked_lines`, :ref:`mark`, :ref:`next_location`, :ref:`next_mark`, :ref:`next_mark`, :ref:`prev_location`, :ref:`relative_goto`
+    :ref:`clear_all_sticky_headers`, :ref:`focus_search`, :ref:`goto`, :ref:`hide_unmarked_lines`, :ref:`mark`, :ref:`next_location`, :ref:`next_mark`, :ref:`next_section`, :ref:`prev_location`, :ref:`prev_section`, :ref:`relative_goto`, :ref:`toggle_sticky_header`
+
+----
+
+
+.. _prev_search_hit:
+
+:prev-search-hit *\[name\]*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Move to the previous hit of the focused search, or of all of the searches when none is focused
+
+  **Parameters**
+    * **name** --- The name of the search to move through instead of the focused one
+
+  **Examples**
+    To move to the previous hit of 'req':
+
+    .. code-block::  lnav
+
+      :prev-search-hit req
+
+  **See Also**
+    :ref:`focus_search`, :ref:`goto`, :ref:`next_location`, :ref:`next_mark`, :ref:`next_search_hit`, :ref:`next_section`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`prev_section`, :ref:`relative_goto`
+
+----
+
+
+.. _prev_section:
+
+:prev-section
+^^^^^^^^^^^^^
+
+  Move to the previous section in the document
+
+  **See Also**
+    :ref:`focus_search`, :ref:`goto`, :ref:`next_location`, :ref:`next_mark`, :ref:`next_section`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`relative_goto`
 
 ----
 
@@ -979,7 +1528,7 @@
   Open the given prompt
 
   **Parameters**
-    * **type\*** --- The type of prompt -- command, script, search, sql, user
+    * **type\*** --- The type of prompt
     * **--alt** --- Perform the alternate action for this prompt by default
     * **prompt** --- The prompt to display
     * **initial-value** --- The initial value to fill in for the prompt
@@ -1020,7 +1569,7 @@
   Forcefully rebuild file indexes
 
   **See Also**
-    :ref:`alt_msg`, :ref:`echo`, :ref:`eval`, :ref:`export_session_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
+    :ref:`alt_msg`, :ref:`cd`, :ref:`echo`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
 
 ----
 
@@ -1043,7 +1592,7 @@
       :redirect-to /tmp/script-output.txt
 
   **See Also**
-    :ref:`alt_msg`, :ref:`append_to`, :ref:`echo`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`write_view_to`
+    :ref:`alt_msg`, :ref:`append_to`, :ref:`cd`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
 
 ----
 
@@ -1083,7 +1632,20 @@
       :relative-goto -10%
 
   **See Also**
-    :ref:`goto`, :ref:`next_location`, :ref:`next_mark`, :ref:`prev_location`, :ref:`prev_mark`
+    :ref:`focus_search`, :ref:`goto`, :ref:`next_location`, :ref:`next_mark`, :ref:`next_section`, :ref:`prev_location`, :ref:`prev_mark`, :ref:`prev_section`
+
+----
+
+
+.. _reload_view:
+
+:reload-view
+^^^^^^^^^^^^
+
+  Re-run the operation that populated the current view
+
+  **See Also**
+    
 
 ----
 
@@ -1154,6 +1716,23 @@
 ----
 
 
+.. _set_file_timezone:
+
+:set-file-timezone *zone* *\[pattern\]*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Set the timezone to use for log messages that do not include a timezone.  The timezone is applied to the given glob pattern or all files whose message timestamps do not have a timezone.
+
+  **Parameters**
+    * **zone\*** --- The timezone name
+    * **pattern** --- The glob pattern to match against files that should use this timezone
+
+  **See Also**
+    :ref:`clear_file_timezone`
+
+----
+
+
 .. _set_min_log_level:
 
 :set-min-log-level *log-level*
@@ -1171,6 +1750,39 @@
 
       :set-min-log-level error
 
+
+----
+
+
+.. _set_text_view_mode:
+
+:set-text-view-mode *mode*
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Set the display mode for text files
+
+  **Parameters**
+    * **mode\*** --- The display mode
+
+  **See Also**
+    :ref:`clear_all_sticky_headers`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`toggle_sticky_header`
+
+----
+
+
+.. _sh:
+
+:sh *--name=<name>* *cmdline*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Execute the given command-line and display the captured output
+
+  **Parameters**
+    * **--name=<name>\*** --- The name to give to the captured output
+    * **cmdline\*** --- The command-line to execute.
+
+  **See Also**
+    :ref:`alt_msg`, :ref:`cd`, :ref:`echo`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
 
 ----
 
@@ -1193,7 +1805,7 @@
       :show-fields log_procname
 
   **See Also**
-    :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`highlight`
+    :ref:`clear_all_sticky_headers`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`set_text_view_mode`, :ref:`toggle_sticky_header`
 
 ----
 
@@ -1212,6 +1824,29 @@
 ----
 
 
+.. _show_in_timeline:
+
+:show-in-timeline *row-type*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Show rows of the given type(s) that were previously hidden in the timeline view
+
+  **Parameters**
+    * **row-type** --- The type of row to show
+
+  **Examples**
+    To show logfile and thread rows:
+
+    .. code-block::  lnav
+
+      :show-in-timeline logfile thread
+
+  **See Also**
+    :ref:`clear_all_sticky_headers`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`hide_in_timeline`, :ref:`set_text_view_mode`, :ref:`show_only_in_timeline`, :ref:`toggle_sticky_header`
+
+----
+
+
 .. _show_lines_before_and_after:
 
 :show-lines-before-and-after
@@ -1220,7 +1855,30 @@
   Show lines that were hidden by the 'hide-lines' commands
 
   **See Also**
-    :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
+    :ref:`filter_context`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`toggle_filtering`
+
+----
+
+
+.. _show_only_in_timeline:
+
+:show-only-in-timeline *row-type*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Show only rows of the given type(s) in the timeline view, hiding all of the others.  With no arguments, only the type of the focused row is shown.
+
+  **Parameters**
+    * **row-type** --- The type of row to show
+
+  **Examples**
+    To show only opid rows:
+
+    .. code-block::  lnav
+
+      :show-only-in-timeline opid
+
+  **See Also**
+    :ref:`clear_all_sticky_headers`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`set_text_view_mode`, :ref:`toggle_sticky_header`
 
 ----
 
@@ -1230,7 +1888,7 @@
 :show-only-this-file
 ^^^^^^^^^^^^^^^^^^^^
 
-  Show only the file for the top line in the view
+  Show only the file for the focused line in the view
 
 
 ----
@@ -1244,7 +1902,7 @@
   Show lines that have not been bookmarked
 
   **See Also**
-    :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`hide_unmarked_lines`, :ref:`mark`, :ref:`next_mark`, :ref:`prev_mark`, :ref:`toggle_filtering`
+    :ref:`clear_all_sticky_headers`, :ref:`filter_context`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`, :ref:`mark`, :ref:`next_mark`, :ref:`prev_mark`, :ref:`toggle_filtering`, :ref:`toggle_sticky_header`
 
 ----
 
@@ -1317,20 +1975,78 @@
 :tag *tag*
 ^^^^^^^^^^
 
-  Attach tags to the top log line
+  Attach tags to the focused log line
 
   **Parameters**
     * **tag** --- The tags to attach
 
   **Examples**
-    To add the tags '#BUG123' and '#needs-review' to the top line:
+    To add the tags '#BUG123' and '#needs-review' to the focused line:
 
     .. code-block::  lnav
 
       :tag #BUG123 #needs-review
 
   **See Also**
-    :ref:`comment`, :ref:`delete_tags`, :ref:`untag`
+    :ref:`annotate`, :ref:`comment`, :ref:`delete_tags`, :ref:`partition_name`, :ref:`untag`
+
+----
+
+
+.. _timeline_metric:
+
+:timeline-metric *name*
+^^^^^^^^^^^^^^^^^^^^^^^
+
+  Add a sparkline to the timeline view header for the given metric
+
+  **Parameters**
+    * **name\*** --- The metric name in 'source.metric' form, as it appears in the all_metrics table. Existing labels are replaced.
+
+  **Examples**
+    To show the cpu_pct column from cpu.csv:
+
+    .. code-block::  lnav
+
+      :timeline-metric cpu.cpu_pct
+
+  **See Also**
+    :ref:`clear_all_sticky_headers`, :ref:`clear_timeline_metric`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`set_text_view_mode`, :ref:`toggle_sticky_header`
+
+----
+
+
+.. _timeline_metric_sql:
+
+:timeline-metric-sql *label* *query*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Add a sparkline driven by a SQL query. The query must return two columns named log_time and value; it is wrapped as SELECT * FROM (<sql>) WHERE log_time BETWEEN ...
+
+  **Parameters**
+    * **label\*** --- The label to display for this metric
+    * **query\*** --- A SQL SELECT returning log_time, value
+
+  **Examples**
+    Plot rss from procstate rows:
+
+    .. code-block::  lnav
+
+      :timeline-metric-sql rss SELECT log_time, rss FROM procstate_procs WHERE proc='lnav'
+
+  **See Also**
+    :ref:`clear_all_sticky_headers`, :ref:`clear_timeline_metric`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`set_text_view_mode`, :ref:`toggle_sticky_header`
+
+----
+
+
+.. _toggle_breakpoint:
+
+:toggle-breakpoint
+^^^^^^^^^^^^^^^^^^
+
+  Toggle a breakpoint for the focused line in the LOG view
+
 
 ----
 
@@ -1343,7 +2059,20 @@
   Toggle the filtering flag for the current view
 
   **See Also**
-    :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`
+    :ref:`filter_context`, :ref:`filter_in`, :ref:`filter_out`, :ref:`hide_lines_after`, :ref:`hide_lines_before`, :ref:`hide_unmarked_lines`
+
+----
+
+
+.. _toggle_sticky_header:
+
+:toggle-sticky-header
+^^^^^^^^^^^^^^^^^^^^^
+
+  Toggle the sticky header state for the focused line in the current view
+
+  **See Also**
+    :ref:`clear_all_sticky_headers`, :ref:`enable_word_wrap`, :ref:`hide_fields`, :ref:`hide_unmarked_lines`, :ref:`mark`, :ref:`next_mark`, :ref:`prev_mark`, :ref:`set_text_view_mode`
 
 ----
 
@@ -1395,20 +2124,20 @@
 :untag *tag*
 ^^^^^^^^^^^^
 
-  Detach tags from the top log line
+  Detach tags from the focused log line
 
   **Parameters**
     * **tag** --- The tags to detach
 
   **Examples**
-    To remove the tags '#BUG123' and '#needs-review' from the top line:
+    To remove the tags '#BUG123' and '#needs-review' from the focused line:
 
     .. code-block::  lnav
 
       :untag #BUG123 #needs-review
 
   **See Also**
-    :ref:`comment`, :ref:`tag`
+    :ref:`annotate`, :ref:`comment`, :ref:`partition_name`, :ref:`tag`
 
 ----
 
@@ -1432,7 +2161,7 @@
       :write-table-to /tmp/table.txt
 
   **See Also**
-    :ref:`alt_msg`, :ref:`append_to`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`echo`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`write_view_to`, :ref:`write_view_to`
+    :ref:`alt_msg`, :ref:`append_to`, :ref:`cd`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
 
 ----
 
@@ -1456,7 +2185,45 @@
       :write-csv-to /tmp/table.csv
 
   **See Also**
-    :ref:`alt_msg`, :ref:`append_to`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`echo`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`redirect_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`write_view_to`, :ref:`write_view_to`
+    :ref:`alt_msg`, :ref:`append_to`, :ref:`cd`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
+
+----
+
+
+.. _write_debug_log_to:
+
+:write-debug-log-to *path*
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Write lnav's internal debug log to the given path.  This can be useful if the `-d` flag was not passed on the command line
+
+  **Parameters**
+    * **path\*** --- The destination path for the debug log
+
+
+----
+
+
+.. _write_json_cols_to:
+
+:write-json-cols-to *\[--anonymize\]* *path*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+  Write SQL results to the given file in a column-oriented JSON format.  In addition, columns that contain JSON values will be flattened to their own columns.  For example, a column containing values shaped like `{"a": 1, "b": 2}` will be split into two separate columns named 'a' and 'b'. This format can be useful for feeding into charting libraries.
+
+  **Parameters**
+    * **--anonymize** --- Anonymize the JSON values
+    * **path\*** --- The path to the file to write
+
+  **Examples**
+    To write SQL results as JSON to /tmp/table.json:
+
+    .. code-block::  lnav
+
+      :write-json-cols-to /tmp/table.json
+
+  **See Also**
+    :ref:`alt_msg`, :ref:`append_to`, :ref:`cd`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
 
 ----
 
@@ -1480,19 +2247,20 @@
       :write-json-to /tmp/table.json
 
   **See Also**
-    :ref:`alt_msg`, :ref:`append_to`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`echo`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`write_view_to`, :ref:`write_view_to`
+    :ref:`alt_msg`, :ref:`append_to`, :ref:`cd`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
 
 ----
 
 
 .. _write_jsonlines_to:
 
-:write-jsonlines-to *\[--anonymize\]* *path*
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+:write-jsonlines-to *\[--all\]* *\[--anonymize\]* *path*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-  Write SQL results to the given file in JSON Lines format
+  Write SQL results or log lines to the given file in JSON Lines format
 
   **Parameters**
+    * **--all** --- Write all visible log lines instead of only marked lines
     * **--anonymize** --- Anonymize the JSON values
     * **path\*** --- The path to the file to write
 
@@ -1504,20 +2272,20 @@
       :write-jsonlines-to /tmp/table.json
 
   **See Also**
-    :ref:`alt_msg`, :ref:`append_to`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`echo`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`write_view_to`, :ref:`write_view_to`
+    :ref:`alt_msg`, :ref:`append_to`, :ref:`cd`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
 
 ----
 
 
 .. _write_raw_to:
 
-:write-raw-to *\[--view={log,db}\]* *\[--anonymize\]* *path*
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+:write-raw-to *\[--view\]* *\[--anonymize\]* *path*
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
   In the log view, write the original log file content of the marked messages to the file.  In the DB view, the contents of the cells are written to the output file.
 
   **Parameters**
-    * **--view={log,db}** --- The view to use as the source of data
+    * **--view** --- The view to use as the source of data
     * **--anonymize** --- Anonymize the lines
     * **path\*** --- The path to the file to write
 
@@ -1529,7 +2297,7 @@
       :write-raw-to /tmp/table.txt
 
   **See Also**
-    :ref:`alt_msg`, :ref:`append_to`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`echo`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`write_view_to`, :ref:`write_view_to`
+    :ref:`alt_msg`, :ref:`append_to`, :ref:`cd`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
 
 ----
 
@@ -1553,7 +2321,7 @@
       :write-screen-to /tmp/table.txt
 
   **See Also**
-    :ref:`alt_msg`, :ref:`append_to`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`echo`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`write_view_to`, :ref:`write_view_to`
+    :ref:`alt_msg`, :ref:`append_to`, :ref:`cd`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`, :ref:`xopen`
 
 ----
 
@@ -1577,7 +2345,7 @@
       :write-to /tmp/interesting-lines.txt
 
   **See Also**
-    :ref:`alt_msg`, :ref:`append_to`, :ref:`echo`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_view_to`, :ref:`write_view_to`
+    :ref:`alt_msg`, :ref:`append_to`, :ref:`cd`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_view_to`, :ref:`xopen`
 
 ----
 
@@ -1601,7 +2369,30 @@
       :write-view-to /tmp/table.txt
 
   **See Also**
-    :ref:`alt_msg`, :ref:`append_to`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`echo`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`export_session_to`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_csv_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_to`
+    :ref:`alt_msg`, :ref:`append_to`, :ref:`cd`, :ref:`create_logline_table`, :ref:`create_search_table`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`eval`, :ref:`export_session_to`, :ref:`external_access_login`, :ref:`external_access`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`rebuild`, :ref:`redirect_to`, :ref:`sh`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`xopen`
+
+----
+
+
+.. _xopen:
+
+:xopen *path*
+^^^^^^^^^^^^^
+
+  Use an external command to open the given file(s)
+
+  **Parameters**
+    * **path** --- The path to the file to open
+
+  **Examples**
+    To open the file '/path/to/file':
+
+    .. code-block::  lnav
+
+      :xopen /path/to/file
+
+  **See Also**
+    :ref:`append_to`, :ref:`dot_dump`, :ref:`dot_read`, :ref:`dot_save`, :ref:`echo`, :ref:`echoln`, :ref:`export_session_to`, :ref:`open`, :ref:`pipe_line_to`, :ref:`pipe_to`, :ref:`redirect_to`, :ref:`write_csv_to`, :ref:`write_json_cols_to`, :ref:`write_json_to`, :ref:`write_jsonlines_to`, :ref:`write_raw_to`, :ref:`write_screen_to`, :ref:`write_table_to`, :ref:`write_to`, :ref:`write_view_to`
 
 ----
 
@@ -1611,10 +2402,10 @@
 :zoom-to *zoom-level*
 ^^^^^^^^^^^^^^^^^^^^^
 
-  Zoom the histogram view to the given level
+  Zoom the current view to the given level
 
   **Parameters**
-    * **zoom-level\*** --- The zoom level
+    * **zoom-level\*** --- The zoom level, or '+'/'-' to step in or out from the current level
 
   **Examples**
     To set the zoom level to '1-week':
@@ -1622,6 +2413,12 @@
     .. code-block::  lnav
 
       :zoom-to 1-week
+
+    To zoom in by one level from the current zoom:
+
+    .. code-block::  lnav
+
+      :zoom-to +
 
 
 ----

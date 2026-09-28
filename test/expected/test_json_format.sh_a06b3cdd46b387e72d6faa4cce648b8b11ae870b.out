@@ -1,25 +1,31 @@
  
-[2013-09-06T20:00:48.124] ⋮ trace testbork bork bork
+[2013-09-06T20:00:48.124817Z] [33m⋮[0m <c.e.foo.bar.bazzer  > trace testbork bork bork
  
-[2013-09-06T20:00:49.124] ⋮ Starting up servicebork bork bork
+[2013-09-06T20:00:49.124817Z] [33m⋮[0m <com.example.demoµs  > Starting up [32mservice[0mbork bork bork
  
-[2013-09-06T22:00:49.124] ⋮ Shutting down servicebork bork bork
+[2013-09-06T22:00:49.124817Z] [33m⋮[0m Shutting down servicebork bork bork
   user: mailto:steve@example.com
  
-[2013-09-06T22:00:59.124] ⋮ Details...bork bork bork
+[2013-09-06T22:00:59.124817Z] [33m⋮[0m [1mD[0metails...
+bork bork bork
  
-[2013-09-06T22:00:59.124] ⋮ Details...bork bork bork
+[2013-09-06T22:00:59.124817Z] [33m⋮[0m [1mDe[0mtails...
+bork bork bork
+[offset: 531] {"ts": "xxx", "lvl": "DEBUG3", "msg": "bad ts...\n"}
+unknown error
+                                       {"ts": "xxx", "lvl": "DEBUG3", 
+                     (right here) ------^
  
-[2013-09-06T22:00:59.124] ⋮ Details...bork bork bork
+[2013-09-06T22:00:59.124817Z] [33m⋮[0m Details...
+bork bork bork
  
-[2013-09-06T22:00:59.124] ⋮ Details...bork bork bork
+[2013-09-06T22:00:59.124817Z] [33m⋮[0m Details...
+bork bork bork
  
-[2013-09-06T22:00:59.124] ⋮ Details...bork bork bork
+[2013-09-06 22:01:00Z] [33m⋮[0m Details...bork bork bork
  
-[2013-09-06T22:01:49.124] ⋮ 1 beat per secondbork bork bork
- 
-[33m[[0m[33m2013-09-06T22:01:49.124[0m[33m] [0m[33m⋮[0m[33m [0m[33mnot looking goodbork bork bork[0m
- 
-[31m[[0m[31m2013-09-06T22:01:49.124[0m[31m] [0m[31m⋮[0m[31m [0m[31mlooking bad[0m[31mbork bork bork[0m
- 
-[31m[[0m[31m2013-09-06T22:01:49.124[0m[31m] [0m[31m⋮[0m[31m [0m[31msooo bad[0m[31mbork bork bork[0m
+[2013-09-06T22:01:49.124817Z] [33m⋮[0m 1 beat per secondbork bork bork
+[33m [0m
+[33m[[0m[33m2013-09-06T22:01:49.124817Z[0m[33m] [0m[33m⋮[0m[33m [0m[33mnot looking goodbork bork bork[0m
+[31m [0m
+[31m[[0m[31m2013-09-06T22:01:49.124817Z[0m[31m] [0m[31m⋮[0m[31m [0m[31mlooking badbork bork bork[0m

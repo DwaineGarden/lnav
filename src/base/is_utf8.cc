@@ -60,245 +60,302 @@
   error.
 */
 utf8_scan_result
-is_utf8(const unsigned char* str,
-        size_t len,
-        const char** message,
-        int* faulty_bytes,
-        nonstd::optional<unsigned char> terminator)
+is_utf8(string_fragment str, std::optional<unsigned char> terminator)
 {
-    bool has_ansi = false;
-    ssize_t i = 0;
+    constexpr auto CHUNK_WIDTH = 16;
+    const auto* ustr = str.udata();
+    utf8_scan_result retval;
+    ssize_t i = 0, valid_end = 0;
+    auto in_len = str.length();
+    // Reading the optional inside the chunk loop below splits it into basic
+    // blocks and costs the wide load, so it is read exactly once here.  A
+    // disengaged terminator stands in as NUL, which is safe because NUL is
+    // outside the printable range and so already fails the range test.
+    const unsigned char term = terminator.value_or('\0');
+    // How far the byte loop has to get before another chunk test can pay
+    // off.  A terminator `k` bytes into a chunk would otherwise cost `k + 1`
+    // chunk tests, since the byte loop advances one byte and the next test
+    // looks at a window that still holds it.  Only worth doing for the
+    // terminator: a multi-byte character also fails the test, but the byte
+    // loop steps over it in one go and the fast path can resume right after.
+    ssize_t dirty_until = 0;
 
-    *message = nullptr;
-    *faulty_bytes = 0;
-    while (i < len) {
-        if (str[i] == '\x1b') {
-            has_ansi = true;
+    while (i < in_len) {
+        // Scan for the common case of just ASCII characters
+        if (i >= dirty_until && i + CHUNK_WIDTH <= in_len) {
+            auto found_non_ascii = false;
+            auto found_term = false;
+            for (auto lpc = 0; lpc < CHUNK_WIDTH; lpc++) {
+                if (ustr[i + lpc] < ' ' || ustr[i + lpc] > '~') {
+                    found_non_ascii = true;
+                }
+                if (ustr[i + lpc] == term) {
+                    found_term = true;
+                }
+            }
+            if (found_term) {
+                dirty_until = i + CHUNK_WIDTH;
+            }
+            if (!found_term && !found_non_ascii) {
+                i += CHUNK_WIDTH;
+                if (retval.usr_message == nullptr) {
+                    // Past an error this loop is only still running to find
+                    // the terminator and finish the column count; the valid
+                    // prefix ended back at the offending byte.
+                    valid_end = i;
+                }
+                retval.usr_column_width_guess += CHUNK_WIDTH;
+                continue;
+            }
         }
 
-        if (terminator && str[i] == terminator.value()) {
-            *message = nullptr;
-            return {i, has_ansi};
+        if (terminator && ustr[i] == terminator.value()) {
+            retval.usr_remaining = str.substr(i + 1);
+            break;
         }
 
-        if (str[i] <= 0x7F) /* 00..7F */ {
+        retval.usr_column_width_guess += 1;
+        if (retval.usr_message != nullptr) {
             i += 1;
-        } else if (str[i] >= 0xC2 && str[i] <= 0xDF) /* C2..DF 80..BF */ {
-            if (i + 1 < len) /* Expect a 2nd byte */ {
-                if (str[i + 1] < 0x80 || str[i + 1] > 0xBF) {
-                    *message
+            continue;
+        }
+
+        valid_end = i;
+        if (ustr[i] <= 0x7F) /* 00..7F */ {
+            if (ustr[i] == '\x00') {
+                retval.usr_message = "Null bytes are not allowed";
+                retval.usr_faulty_bytes = 1;
+                continue;
+            }
+            if (ustr[i] == '\t') {
+                retval.usr_column_width_guess += 7;
+            } else if (ustr[i] == '\x1b' || ustr[i] == '\b') {
+                retval.usr_has_ansi = true;
+            }
+            i += 1;
+        } else if (ustr[i] >= 0xC2 && ustr[i] <= 0xDF) /* C2..DF 80..BF */ {
+            if (i + 1 < in_len) /* Expect a 2nd byte */ {
+                if (ustr[i + 1] < 0x80 || ustr[i + 1] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte between C2 and DF, expecting a "
                           "2nd byte between 80 and BF";
-                    *faulty_bytes = 2;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 2;
+                    continue;
                 }
             } else {
-                *message
+                retval.usr_message
                     = "After a first byte between C2 and DF, expecting a 2nd "
                       "byte.";
-                *faulty_bytes = 1;
-                return {i, has_ansi};
+                retval.usr_faulty_bytes = 1;
+                continue;
             }
             i += 2;
-        } else if (str[i] == 0xE0) /* E0 A0..BF 80..BF */ {
-            if (i + 2 < len) /* Expect a 2nd and 3rd byte */ {
-                if (str[i + 1] < 0xA0 || str[i + 1] > 0xBF) {
-                    *message
+        } else if (ustr[i] == 0xE0) /* E0 A0..BF 80..BF */ {
+            if (i + 2 < in_len) /* Expect a 2nd and 3rd byte */ {
+                if (ustr[i + 1] < 0xA0 || ustr[i + 1] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte of E0, expecting a 2nd byte "
                           "between A0 and BF.";
-                    *faulty_bytes = 2;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 2;
+                    continue;
                 }
-                if (str[i + 2] < 0x80 || str[i + 2] > 0xBF) {
-                    *message
+                if (ustr[i + 2] < 0x80 || ustr[i + 2] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte of E0, expecting a 3nd byte "
                           "between 80 and BF.";
-                    *faulty_bytes = 3;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 3;
+                    continue;
                 }
             } else {
-                *message
+                retval.usr_message
                     = "After a first byte of E0, expecting two following "
                       "bytes.";
-                *faulty_bytes = 1;
-                return {i, has_ansi};
+                retval.usr_faulty_bytes = 1;
+                continue;
             }
             i += 3;
-        } else if (str[i] >= 0xE1 && str[i] <= 0xEC) /* E1..EC 80..BF 80..BF */
+        } else if (ustr[i] >= 0xE1
+                   && ustr[i] <= 0xEC) /* E1..EC 80..BF 80..BF */
         {
-            if (i + 2 < len) /* Expect a 2nd and 3rd byte */ {
-                if (str[i + 1] < 0x80 || str[i + 1] > 0xBF) {
-                    *message
+            if (i + 2 < in_len) /* Expect a 2nd and 3rd byte */ {
+                if (ustr[i + 1] < 0x80 || ustr[i + 1] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte between E1 and EC, expecting the "
                           "2nd byte between 80 and BF.";
-                    *faulty_bytes = 2;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 2;
+                    continue;
                 }
-                if (str[i + 2] < 0x80 || str[i + 2] > 0xBF) {
-                    *message
+                if (ustr[i + 2] < 0x80 || ustr[i + 2] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte between E1 and EC, expecting the "
                           "3rd byte between 80 and BF.";
-                    *faulty_bytes = 3;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 3;
+                    continue;
                 }
             } else {
-                *message
+                retval.usr_message
                     = "After a first byte between E1 and EC, expecting two "
                       "following bytes.";
-                *faulty_bytes = 1;
-                return {i, has_ansi};
+                retval.usr_faulty_bytes = 1;
+                continue;
             }
             i += 3;
-        } else if (str[i] == 0xED) /* ED 80..9F 80..BF */ {
-            if (i + 2 < len) /* Expect a 2nd and 3rd byte */ {
-                if (str[i + 1] < 0x80 || str[i + 1] > 0x9F) {
-                    *message
+        } else if (ustr[i] == 0xED) /* ED 80..9F 80..BF */ {
+            if (i + 2 < in_len) /* Expect a 2nd and 3rd byte */ {
+                if (ustr[i + 1] < 0x80 || ustr[i + 1] > 0x9F) {
+                    retval.usr_message
                         = "After a first byte of ED, expecting 2nd byte "
                           "between 80 and 9F.";
-                    *faulty_bytes = 2;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 2;
+                    continue;
                 }
-                if (str[i + 2] < 0x80 || str[i + 2] > 0xBF) {
-                    *message
+                if (ustr[i + 2] < 0x80 || ustr[i + 2] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte of ED, expecting 3rd byte "
                           "between 80 and BF.";
-                    *faulty_bytes = 3;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 3;
+                    continue;
                 }
             } else {
-                *message
+                retval.usr_message
                     = "After a first byte of ED, expecting two following "
                       "bytes.";
-                *faulty_bytes = 1;
-                return {i, has_ansi};
+                retval.usr_faulty_bytes = 1;
+                continue;
             }
             i += 3;
-        } else if (str[i] >= 0xEE && str[i] <= 0xEF) /* EE..EF 80..BF 80..BF */
+        } else if (ustr[i] >= 0xEE
+                   && ustr[i] <= 0xEF) /* EE..EF 80..BF 80..BF */
         {
-            if (i + 2 < len) /* Expect a 2nd and 3rd byte */ {
-                if (str[i + 1] < 0x80 || str[i + 1] > 0xBF) {
-                    *message
+            if (i + 2 < in_len) /* Expect a 2nd and 3rd byte */ {
+                if (ustr[i + 1] < 0x80 || ustr[i + 1] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte between EE and EF, expecting 2nd "
                           "byte between 80 and BF.";
-                    *faulty_bytes = 2;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 2;
+                    continue;
                 }
-                if (str[i + 2] < 0x80 || str[i + 2] > 0xBF) {
-                    *message
+                if (ustr[i + 2] < 0x80 || ustr[i + 2] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte between EE and EF, expecting 3rd "
                           "byte between 80 and BF.";
-                    *faulty_bytes = 3;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 3;
+                    continue;
                 }
             } else {
-                *message
+                retval.usr_message
                     = "After a first byte between EE and EF, two following "
                       "bytes.";
-                *faulty_bytes = 1;
-                return {i, has_ansi};
+                retval.usr_faulty_bytes = 1;
+                continue;
             }
             i += 3;
-        } else if (str[i] == 0xF0) /* F0 90..BF 80..BF 80..BF */ {
-            if (i + 3 < len) /* Expect a 2nd, 3rd 3th byte */ {
-                if (str[i + 1] < 0x90 || str[i + 1] > 0xBF) {
-                    *message
+        } else if (ustr[i] == 0xF0) /* F0 90..BF 80..BF 80..BF */ {
+            if (i + 3 < in_len) /* Expect a 2nd, 3rd 3th byte */ {
+                if (ustr[i + 1] < 0x90 || ustr[i + 1] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte of F0, expecting 2nd byte "
                           "between 90 and BF.";
-                    *faulty_bytes = 2;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 2;
+                    continue;
                 }
-                if (str[i + 2] < 0x80 || str[i + 2] > 0xBF) {
-                    *message
+                if (ustr[i + 2] < 0x80 || ustr[i + 2] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte of F0, expecting 3rd byte "
                           "between 80 and BF.";
-                    *faulty_bytes = 3;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 3;
+                    continue;
                 }
-                if (str[i + 3] < 0x80 || str[i + 3] > 0xBF) {
-                    *message
+                if (ustr[i + 3] < 0x80 || ustr[i + 3] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte of F0, expecting 4th byte "
                           "between 80 and BF.";
-                    *faulty_bytes = 4;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 4;
+                    continue;
                 }
             } else {
-                *message
+                retval.usr_message
                     = "After a first byte of F0, expecting three following "
                       "bytes.";
-                *faulty_bytes = 1;
-                return {i, has_ansi};
+                retval.usr_faulty_bytes = 1;
+                continue;
             }
             i += 4;
-        } else if (str[i] >= 0xF1
-                   && str[i] <= 0xF3) /* F1..F3 80..BF 80..BF 80..BF */
+        } else if (ustr[i] >= 0xF1
+                   && ustr[i] <= 0xF3) /* F1..F3 80..BF 80..BF 80..BF */
         {
-            if (i + 3 < len) /* Expect a 2nd, 3rd 3th byte */ {
-                if (str[i + 1] < 0x80 || str[i + 1] > 0xBF) {
-                    *message
+            if (i + 3 < in_len) /* Expect a 2nd, 3rd 3th byte */ {
+                if (ustr[i + 1] < 0x80 || ustr[i + 1] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte of F1, F2, or F3, expecting a "
                           "2nd byte between 80 and BF.";
-                    *faulty_bytes = 2;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 2;
+                    continue;
                 }
-                if (str[i + 2] < 0x80 || str[i + 2] > 0xBF) {
-                    *message
+                if (ustr[i + 2] < 0x80 || ustr[i + 2] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte of F1, F2, or F3, expecting a "
                           "3rd byte between 80 and BF.";
-                    *faulty_bytes = 3;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 3;
+                    continue;
                 }
-                if (str[i + 3] < 0x80 || str[i + 3] > 0xBF) {
-                    *message
+                if (ustr[i + 3] < 0x80 || ustr[i + 3] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte of F1, F2, or F3, expecting a "
                           "4th byte between 80 and BF.";
-                    *faulty_bytes = 4;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 4;
+                    continue;
                 }
             } else {
-                *message
+                retval.usr_message
                     = "After a first byte of F1, F2, or F3, expecting three "
                       "following bytes.";
-                *faulty_bytes = 1;
-                return {i, has_ansi};
+                retval.usr_faulty_bytes = 1;
+                continue;
             }
             i += 4;
-        } else if (str[i] == 0xF4) /* F4 80..8F 80..BF 80..BF */ {
-            if (i + 3 < len) /* Expect a 2nd, 3rd 3th byte */ {
-                if (str[i + 1] < 0x80 || str[i + 1] > 0x8F) {
-                    *message
+        } else if (ustr[i] == 0xF4) /* F4 80..8F 80..BF 80..BF */ {
+            if (i + 3 < in_len) /* Expect a 2nd, 3rd 3th byte */ {
+                if (ustr[i + 1] < 0x80 || ustr[i + 1] > 0x8F) {
+                    retval.usr_message
                         = "After a first byte of F4, expecting 2nd byte "
                           "between 80 and 8F.";
-                    *faulty_bytes = 2;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 2;
+                    continue;
                 }
-                if (str[i + 2] < 0x80 || str[i + 2] > 0xBF) {
-                    *message
+                if (ustr[i + 2] < 0x80 || ustr[i + 2] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte of F4, expecting 3rd byte "
                           "between 80 and BF.";
-                    *faulty_bytes = 3;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 3;
+                    continue;
                 }
-                if (str[i + 3] < 0x80 || str[i + 3] > 0xBF) {
-                    *message
+                if (ustr[i + 3] < 0x80 || ustr[i + 3] > 0xBF) {
+                    retval.usr_message
                         = "After a first byte of F4, expecting 4th byte "
                           "between 80 and BF.";
-                    *faulty_bytes = 4;
-                    return {i, has_ansi};
+                    retval.usr_faulty_bytes = 4;
+                    continue;
                 }
             } else {
-                *message
+                retval.usr_message
                     = "After a first byte of F4, expecting three following "
                       "bytes.";
-                *faulty_bytes = 1;
-                return {i, has_ansi};
+                retval.usr_faulty_bytes = 1;
+                continue;
             }
             i += 4;
         } else {
-            *message
+            retval.usr_message
                 = "Expecting bytes in the following ranges: 00..7F C2..F4.";
-            *faulty_bytes = 1;
-            return {i, has_ansi};
+            retval.usr_faulty_bytes = 1;
+            continue;
         }
     }
-    return {-1, has_ansi};
+    if (retval.usr_message == nullptr) {
+        retval.usr_valid_frag = str.sub_range(0, i);
+    } else {
+        retval.usr_valid_frag = str.sub_range(0, valid_end);
+    }
+    return retval;
 }

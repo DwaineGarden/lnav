@@ -59,7 +59,7 @@ wait_for_children()
 }
 
 size_t
-rebuild_indexes(nonstd::optional<ui_clock::time_point> deadline)
+rebuild_indexes(std::optional<ui_clock::time_point> deadline)
 {
     return 0;
 }
@@ -69,13 +69,18 @@ rebuild_indexes_repeatedly()
 {
 }
 
-readline_context::command_map_t lnav_commands;
+void
+wait_for_pipers(std::optional<ui_clock::time_point>)
+{
+}
+
+lnav::commands::command_map_t lnav_commands;
 
 namespace injector {
 
 template<>
 void
-force_linking(lnav_flags_tag anno)
+force_linking(last_relative_time_tag anno)
 {
 }
 
@@ -90,4 +95,16 @@ void
 force_linking(services::remote_tailer_t anno)
 {
 }
+
+template<>
+void
+force_linking(services::main_t anno)
+{
+}
 }  // namespace injector
+
+bool
+update_active_files(file_collection& new_files)
+{
+    return false;
+}

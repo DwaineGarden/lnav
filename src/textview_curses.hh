@@ -32,24 +32,37 @@
 #ifndef textview_curses_hh
 #define textview_curses_hh
 
+#include <array>
+#include <bitset>
+#include <chrono>
+#include <memory>
+#include <set>
 #include <utility>
 #include <vector>
 
+#include "base/enum_util.hh"
 #include "base/func_util.hh"
+#include "base/lnav.console.hh"
 #include "base/lnav_log.hh"
+#include "base/result.h"
+#include "base/text_format_enum.hh"
 #include "bookmarks.hh"
 #include "breadcrumb.hh"
 #include "grep_proc.hh"
+#include "hasher.hh"
 #include "highlighter.hh"
 #include "listview_curses.hh"
 #include "lnav_config_fwd.hh"
+#include "log_accel.hh"
 #include "logfile_fwd.hh"
 #include "ring_span.hh"
-#include "text_format.hh"
 #include "textview_curses_fwd.hh"
+#include "vis_line.hh"
 
 class textview_curses;
+struct exec_context;
 
+using vis_bookmarks_t = bookmarks<vis_line_t>;
 using vis_bookmarks = bookmarks<vis_line_t>::type;
 
 class logfile_filter_state {
@@ -58,13 +71,17 @@ public:
 
     void clear();
 
+    void clear_for_rebuild();
+
     void clear_filter_state(size_t index);
 
     void clear_deleted_filter_state(uint32_t used_mask);
 
     void resize(size_t newsize);
 
-    nonstd::optional<size_t> content_line_to_vis_line(uint32_t line);
+    void reserve(size_t expected);
+
+    std::optional<size_t> content_line_to_vis_line(uint32_t line);
 
     const static int MAX_FILTERS = 32;
 
@@ -73,8 +90,10 @@ public:
     int tfs_filter_hits[MAX_FILTERS];
     bool tfs_message_matched[MAX_FILTERS];
     size_t tfs_lines_for_message[MAX_FILTERS];
+    size_t tfs_hits_for_message[MAX_FILTERS];
     bool tfs_last_message_matched[MAX_FILTERS];
     size_t tfs_last_lines_for_message[MAX_FILTERS];
+    size_t tfs_last_hits_for_message[MAX_FILTERS];
     std::vector<uint32_t> tfs_mask;
     std::vector<uint32_t> tfs_index;
 };
@@ -88,13 +107,8 @@ enum class filter_lang_t : int {
 class text_filter {
 public:
     typedef enum {
-        MAYBE,
         INCLUDE,
         EXCLUDE,
-
-        LFT__MAX,
-
-        LFT__MASK = (MAYBE | INCLUDE | EXCLUDE)
     } type_t;
 
     text_filter(type_t type, filter_lang_t lang, std::string id, size_t index)
@@ -117,16 +131,19 @@ public:
 
     void revert_to_last(logfile_filter_state& lfs, size_t rollback_size);
 
-    void add_line(logfile_filter_state& lfs,
+    bool add_line(logfile_filter_state& lfs,
                   logfile_const_iterator ll,
-                  shared_buffer_ref& line);
+                  const shared_buffer_ref& line);
 
     void end_of_message(logfile_filter_state& lfs);
 
-    virtual bool matches(const logfile& lf,
-                         logfile_const_iterator ll,
-                         shared_buffer_ref& line)
-        = 0;
+    struct line_source {
+        const logfile& ls_file;
+        logfile_const_iterator ls_line;
+    };
+
+    virtual bool matches(std::optional<line_source> ls,
+                         const shared_buffer_ref& line) = 0;
 
     virtual std::string to_command() const = 0;
 
@@ -144,16 +161,42 @@ protected:
 
 class empty_filter : public text_filter {
 public:
-    empty_filter(type_t type, size_t index)
-        : text_filter(type, filter_lang_t::REGEX, "", index)
+    empty_filter(type_t type, filter_lang_t lang, size_t index)
+        : text_filter(type, lang, "", index)
     {
     }
 
-    bool matches(const logfile& lf,
-                 logfile_const_iterator ll,
-                 shared_buffer_ref& line) override;
+    bool matches(std::optional<line_source> ls,
+                 const shared_buffer_ref& line) override;
 
     std::string to_command() const override;
+};
+
+class pcre_filter : public text_filter {
+public:
+    pcre_filter(type_t type,
+                const std::string& id,
+                size_t index,
+                std::shared_ptr<lnav::pcre2pp::code> code)
+        : text_filter(type, filter_lang_t::REGEX, id, index),
+          pf_pcre(std::move(code))
+    {
+    }
+
+    ~pcre_filter() override = default;
+
+    bool matches(std::optional<line_source> ls,
+                 const shared_buffer_ref& line) override;
+
+    std::string to_command() const override
+    {
+        return (this->lf_type == text_filter::INCLUDE ? "filter-in "
+                                                      : "filter-out ")
+            + this->lf_id;
+    }
+
+protected:
+    std::shared_ptr<lnav::pcre2pp::code> pf_pcre;
 };
 
 class filter_stack {
@@ -173,6 +216,8 @@ public:
 
     const_iterator end() const { return this->fs_filters.end(); }
 
+    iterator find(size_t index);
+
     size_t size() const { return this->fs_filters.size(); }
 
     bool empty() const { return this->fs_filters.empty(); };
@@ -183,7 +228,7 @@ public:
             == logfile_filter_state::MAX_FILTERS;
     }
 
-    nonstd::optional<size_t> next_index();
+    std::optional<size_t> next_index();
 
     void add_filter(const std::shared_ptr<text_filter>& filter);
 
@@ -192,6 +237,7 @@ public:
         while (!this->fs_filters.empty()) {
             this->fs_filters.pop_back();
         }
+        this->fs_generation += 1;
     }
 
     void set_filter_enabled(const std::shared_ptr<text_filter>& filter,
@@ -202,6 +248,7 @@ public:
         } else {
             filter->disable();
         }
+        this->fs_generation += 1;
     }
 
     std::shared_ptr<text_filter> get_filter(const std::string& id);
@@ -212,6 +259,8 @@ public:
 
     void get_enabled_mask(uint32_t& filter_in_mask, uint32_t& filter_out_mask);
 
+    uint32_t fs_generation{0};
+
 private:
     const size_t fs_reserved;
     std::vector<std::shared_ptr<text_filter>> fs_filters;
@@ -219,22 +268,156 @@ private:
 
 class text_time_translator {
 public:
+    struct row_info {
+        row_info() = default;
+
+        row_info(timeval tv, int64_t id) : ri_time(tv), ri_id(id) {}
+
+        bool operator==(const row_info& rhs) const
+        {
+            return this->ri_time == rhs.ri_time && this->ri_id == rhs.ri_id;
+        }
+
+        timeval ri_time{0, 0};
+        int64_t ri_id{-1};
+    };
+
     virtual ~text_time_translator() = default;
 
-    virtual nonstd::optional<vis_line_t> row_for_time(
-        struct timeval time_bucket)
-        = 0;
+    virtual std::optional<vis_line_t> row_for_time(timeval time_bucket) = 0;
 
-    virtual nonstd::optional<struct timeval> time_for_row(vis_line_t row) = 0;
+    virtual std::optional<vis_line_t> row_for(const row_info& ri)
+    {
+        return this->row_for_time(ri.ri_time);
+    }
 
-    void scroll_invoked(textview_curses* tc);
+    virtual std::optional<row_info> time_for_row(vis_line_t row) = 0;
 
     void data_reloaded(textview_curses* tc);
 
+    void ttt_scroll_invoked(textview_curses* tc);
+
+    static constexpr ssize_t ZOOM_COUNT = 12;
+
+    static const std::chrono::microseconds ZOOM_LEVELS[ZOOM_COUNT];
+
+    static const std::array<string_fragment, ZOOM_COUNT> ZOOM_STRINGS;
+
+    std::chrono::microseconds get_zoom_level() const
+    {
+        return this->ttt_zoom_level;
+    }
+
+    void set_zoom_level(std::chrono::microseconds level);
+
+    std::string format_zoom_level() const;
+
+    std::optional<std::chrono::microseconds> get_min_row_time() const
+    {
+        if (this->ttt_min_row_time == min_time_init) {
+            return std::nullopt;
+        }
+
+        return this->ttt_min_row_time;
+    }
+
+    void set_min_row_time(const std::chrono::microseconds& tv)
+    {
+        if (this->ttt_min_row_time != tv) {
+            this->ttt_min_row_time = tv;
+            this->ttt_time_filter_generation += 1;
+        }
+    }
+
+    std::optional<std::chrono::microseconds> get_max_row_time() const
+    {
+        if (this->ttt_max_row_time == max_time_init) {
+            return std::nullopt;
+        }
+
+        return this->ttt_max_row_time;
+    }
+
+    void set_max_row_time(const std::chrono::microseconds& tv)
+    {
+        if (this->ttt_max_row_time != tv) {
+            this->ttt_max_row_time = tv;
+            this->ttt_time_filter_generation += 1;
+        }
+    }
+
+    void clear_min_max_row_times()
+    {
+        if (this->ttt_min_row_time != min_time_init
+            || this->ttt_max_row_time != max_time_init)
+        {
+            this->ttt_min_row_time = min_time_init;
+            this->ttt_max_row_time = max_time_init;
+            this->ttt_time_filter_generation += 1;
+        }
+    }
+
+    static constexpr auto min_time_init = std::chrono::microseconds::zero();
+    static constexpr auto max_time_init
+        = std::chrono::microseconds::max();
+
+    void clear_preview_times()
+    {
+        this->ttt_preview_min_time = std::nullopt;
+        this->ttt_preview_max_time = std::nullopt;
+    }
+
+    void add_time_commands_for_session(
+        const std::function<void(const std::string&)>& receiver);
+
+    std::optional<std::chrono::microseconds> ttt_preview_min_time;
+    std::optional<std::chrono::microseconds> ttt_preview_max_time;
+
 protected:
-    struct timeval ttt_top_time {
-        0, 0
-    };
+    std::chrono::microseconds ttt_min_row_time
+        = std::chrono::microseconds::zero();
+    std::chrono::microseconds ttt_max_row_time
+        = std::chrono::microseconds::max();
+    uint32_t ttt_time_filter_generation{0};
+    std::optional<row_info> ttt_top_row_info;
+    std::chrono::microseconds ttt_zoom_level{ZOOM_LEVELS[3]};
+};
+
+class text_accel_source {
+public:
+    virtual ~text_accel_source() = default;
+
+    virtual log_accel::direction_t get_line_accel_direction(vis_line_t vl);
+
+    void toggle_time_offset()
+    {
+        this->tas_display_time_offset = !this->tas_display_time_offset;
+        this->text_accel_display_changed();
+    }
+
+    void set_time_offset(bool enabled)
+    {
+        if (this->tas_display_time_offset != enabled) {
+            this->tas_display_time_offset = enabled;
+            this->text_accel_display_changed();
+        }
+    }
+
+    bool is_time_offset_enabled() const
+    {
+        return this->tas_display_time_offset;
+    }
+
+    virtual bool is_time_offset_supported() const { return true; }
+
+    virtual logline* text_accel_get_line(vis_line_t vl) = 0;
+
+    std::string get_time_offset_for_line(textview_curses& tc, vis_line_t vl);
+
+protected:
+    virtual void text_accel_display_changed() {}
+
+    bool tas_display_time_offset{false};
 };
 
 class text_anchors {
@@ -243,12 +426,52 @@ public:
 
     static std::string to_anchor_string(const std::string& raw);
 
-    virtual nonstd::optional<vis_line_t> row_for_anchor(const std::string& id)
-        = 0;
+    virtual std::optional<vis_line_t> row_for_anchor(const std::string& id) = 0;
 
-    virtual nonstd::optional<std::string> anchor_for_row(vis_line_t vl) = 0;
+    enum class direction {
+        prev,
+        next,
+    };
+
+    virtual std::optional<vis_line_t> adjacent_anchor(vis_line_t vl,
+                                                      direction dir)
+    {
+        return std::nullopt;
+    }
+
+    virtual std::optional<std::string> anchor_for_row(vis_line_t vl) = 0;
 
     virtual std::unordered_set<std::string> get_anchors() = 0;
+};
+
+/**
+ * A source that knows where its marks of a given type are from its own index,
+ * so that the view does not have to hold a row per mark.
+ *
+ * The queries here are the whole surface that the mark readers use: stepping
+ * to the next or previous one, asking about a single row, and asking whether a
+ * range holds any.  A source that does not answer a given type leaves it to
+ * the view's bookmark vector, which is what keeps the sources that still store
+ * their marks working unchanged.
+ */
+class text_mark_scanner {
+public:
+    virtual ~text_mark_scanner() = default;
+
+    virtual bool text_scans_mark(const bookmark_type_t* bt) const = 0;
+
+    virtual std::optional<vis_line_t> text_adjacent_mark(
+        const bookmark_type_t* bt,
+        vis_line_t from,
+        text_anchors::direction dir) const = 0;
+
+    virtual bool text_mark_at_row(const bookmark_type_t* bt,
+                                  vis_line_t vl) const = 0;
+
+    // Whether any row in the half-open range [start, stop) carries the mark.
+    virtual bool text_any_mark_in_range(const bookmark_type_t* bt,
+                                        vis_line_t start,
+                                        vis_line_t stop) const = 0;
 };
 
 class location_history {
@@ -257,13 +480,11 @@ public:
 
     virtual void loc_history_append(vis_line_t top) = 0;
 
-    virtual nonstd::optional<vis_line_t> loc_history_back(
-        vis_line_t current_top)
+    virtual std::optional<vis_line_t> loc_history_back(vis_line_t current_top)
         = 0;
 
-    virtual nonstd::optional<vis_line_t> loc_history_forward(
-        vis_line_t current_top)
-        = 0;
+    virtual std::optional<vis_line_t> loc_history_forward(
+        vis_line_t current_top) = 0;
 
     const static int MAX_SIZE = 100;
 
@@ -274,9 +495,9 @@ protected:
 /**
  * Source for the text to be shown in a textview_curses view.
  */
-class text_sub_source {
+class text_sub_source : public list_input_delegate {
 public:
-    virtual ~text_sub_source() = default;
+    ~text_sub_source() override = default;
 
     enum {
         RB_RAW,
@@ -296,7 +517,11 @@ public:
     {
     }
 
-    void register_view(textview_curses* tc) { this->tss_view = tc; }
+    virtual void register_view(textview_curses* tc) { this->tss_view = tc; }
+
+    textview_curses* get_view() const { return this->tss_view; }
+
+    virtual bool empty() const = 0;
 
     /**
      * @return The total number of lines available from the source.
@@ -322,16 +547,14 @@ public:
      * @param raw Indicates that the raw contents of the line should be returned
      *   without any post processing.
      */
-    virtual void text_value_for_line(textview_curses& tc,
-                                     int line,
-                                     std::string& value_out,
-                                     line_flags_t flags = 0)
-        = 0;
+    virtual line_info text_value_for_line(textview_curses& tc,
+                                          int line,
+                                          std::string& value_out,
+                                          line_flags_t flags = 0) = 0;
 
     virtual size_t text_size_for_line(textview_curses& tc,
                                       int line,
-                                      line_flags_t raw = 0)
-        = 0;
+                                      line_flags_t raw = 0) = 0;
 
     /**
      * Inform the source that the given line has been marked/unmarked.  This
@@ -373,17 +596,30 @@ public:
     }
 
     /**
+     * Insert column offsets where logical "fields" start in the rows
+     * [start_row, end_row).  Used by horizontal-snap navigation.  The
+     * view (not the source) decides which offset to scroll to relative
+     * to its current position.  `0` is implicitly always a snap target,
+     * so sources do NOT need to insert it.  Default inserts nothing,
+     * which causes navigation to fall through to the listview's default
+     * half-screen step.
+     */
+    virtual void text_horiz_columns(textview_curses& tc,
+                                    vis_line_t start_row,
+                                    vis_line_t end_row,
+                                    std::set<int>& columns_out)
+    {
+    }
+
+    bool list_input_handle_key(listview_curses& lv, const ncinput& ch) override;
+
+    /**
      * Update the bookmarks used by the text view based on the bookmarks
      * maintained by the text source.
      *
      * @param bm The bookmarks data structure used by the text view.
      */
     virtual void text_update_marks(vis_bookmarks& bm) {}
-
-    virtual std::string text_source_name(const textview_curses& tv)
-    {
-        return "";
-    }
 
     filter_stack& get_filters() { return this->tss_filters; }
 
@@ -393,21 +629,27 @@ public:
 
     virtual int get_filtered_count_for(size_t filter_index) const { return 0; }
 
-    virtual text_format_t get_text_format() const
+    virtual size_t get_filtered_before() const { return 0; }
+
+    virtual size_t get_filtered_after() const { return 0; }
+
+    virtual void update_filter_hash_state(hasher& h) const;
+
+    virtual std::optional<text_format_t> get_text_format() const
     {
-        return text_format_t::TF_UNKNOWN;
+        return text_format_t::TF_PLAINTEXT;
     }
 
-    virtual nonstd::optional<
+    virtual std::optional<
         std::pair<grep_proc_source<vis_line_t>*, grep_proc_sink<vis_line_t>*>>
     get_grepper()
     {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
-    virtual nonstd::optional<location_history*> get_location_history()
+    virtual std::optional<location_history*> get_location_history()
     {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     void toggle_apply_filters();
@@ -417,12 +659,46 @@ public:
 
     virtual void quiesce() {}
 
+    virtual void scroll_invoked(textview_curses* tc);
+
+    virtual void clear_preview();
+
+    virtual void add_commands_for_session(
+        const std::function<void(const std::string&)>& receiver);
+
+    virtual std::optional<std::string> text_view_details() const;
+
+    // Re-run whatever operation populated this view.  Default behavior
+    // is to report that the view cannot be reloaded; views like the DB
+    // view and the TIMELINE view override this to re-execute the last
+    // SQL query or rebuild the timeline index, respectively.
+    virtual Result<std::string, lnav::console::user_message> text_reload_data(
+        exec_context& ec);
+
+    [[nodiscard]] log_level_t get_min_log_level() const
+    {
+        return this->tss_min_log_level;
+    }
+
+    void set_min_log_level(log_level_t level)
+    {
+        if (this->tss_min_log_level != level) {
+            this->tss_min_log_level = level;
+            this->text_filters_changed();
+        }
+    }
+
     bool tss_supports_filtering{false};
     bool tss_apply_filters{true};
+    size_t tss_context_before{0};
+    size_t tss_context_after{0};
+    uint64_t tss_level_filtered_count{0};
+    std::optional<log_level_t> tss_preview_min_log_level;
 
 protected:
     textview_curses* tss_view{nullptr};
     filter_stack tss_filters;
+    log_level_t tss_min_log_level{LEVEL_UNKNOWN};
 };
 
 class vis_location_history : public location_history {
@@ -435,10 +711,9 @@ public:
 
     void loc_history_append(vis_line_t top) override;
 
-    nonstd::optional<vis_line_t> loc_history_back(
-        vis_line_t current_top) override;
+    std::optional<vis_line_t> loc_history_back(vis_line_t current_top) override;
 
-    nonstd::optional<vis_line_t> loc_history_forward(
+    std::optional<vis_line_t> loc_history_forward(
         vis_line_t current_top) override;
 
     nonstd::ring_span<vis_line_t> vlh_history;
@@ -460,12 +735,21 @@ class text_delegate {
 public:
     virtual ~text_delegate() = default;
 
-    virtual void text_overlay(textview_curses& tc) {}
-
-    virtual bool text_handle_mouse(textview_curses& tc, mouse_event& me)
+    virtual bool text_handle_mouse(
+        textview_curses& tc,
+        const listview_curses::display_line_content_t&,
+        mouse_event& me)
     {
         return false;
     }
+};
+
+class text_detail_provider {
+public:
+    virtual ~text_detail_provider() = default;
+
+    virtual std::optional<json_string> text_row_details(
+        const textview_curses& tc) = 0;
 };
 
 /**
@@ -481,16 +765,22 @@ class textview_curses
 public:
     using action = std::function<void(textview_curses*)>;
 
+    const static bookmark_type_t BM_ERRORS;
+    const static bookmark_type_t BM_WARNINGS;
     const static bookmark_type_t BM_USER;
     const static bookmark_type_t BM_USER_EXPR;
     const static bookmark_type_t BM_SEARCH;
     const static bookmark_type_t BM_META;
+    const static bookmark_type_t BM_PARTITION;
+    const static bookmark_type_t BM_STICKY;
 
     textview_curses();
 
     ~textview_curses();
 
-    void reload_config(error_reporter& reporter);
+    void deinit() override;
+
+    void reload_config(error_reporter& reporter) override;
 
     void set_paused(bool paused)
     {
@@ -506,15 +796,65 @@ public:
 
     const vis_bookmarks& get_bookmarks() const { return this->tc_bookmarks; }
 
-    void toggle_user_mark(const bookmark_type_t* bm,
-                          vis_line_t start_line,
-                          vis_line_t end_line = vis_line_t(-1));
+    /**
+     * Where the marks of the given type are.
+     *
+     * A source that implements text_mark_scanner answers these from its own
+     * index; for everything else they come from the view's bookmark vector.
+     * Readers have to come through here rather than indexing the bookmarks
+     * directly, since a scanned type has no vector to look in.
+     */
+    std::optional<vis_line_t> adjacent_mark(const bookmark_type_t* bt,
+                                            vis_line_t from,
+                                            text_anchors::direction dir) const;
+
+    bool mark_at_row(const bookmark_type_t* bt, vis_line_t vl) const;
+
+    // Whether any row in the half-open range [start, stop) carries the mark.
+    bool any_mark_in_range(const bookmark_type_t* bt,
+                           vis_line_t start,
+                           vis_line_t stop) const;
+
+    // The source, when it answers this mark type by scanning; null otherwise,
+    // which is the signal to use the bookmark vector.
+    const text_mark_scanner* mark_scanner_for(const bookmark_type_t* bt) const;
+
+    struct mark_toggle_result {
+        int mtr_marked{0};
+        int mtr_unmarked{0};
+    };
+
+    mark_toggle_result toggle_user_mark(const bookmark_type_t* bm,
+                                        vis_line_t start_line,
+                                        vis_line_t end_line = vis_line_t(-1));
 
     void set_user_mark(const bookmark_type_t* bm, vis_line_t vl, bool marked);
 
+    /**
+     * Point the view at a source that is owned by someone else and outlives
+     * it.  Use set_owned_sub_source() to hand over one that the view should
+     * free.
+     */
     textview_curses& set_sub_source(text_sub_source* src);
 
+    /**
+     * Hand the view a sub-source that it owns.  The source being replaced is
+     * released only after the view has been pointed at the new one, which is
+     * what keeps the two from ever sharing an address: set_sub_source() does
+     * nothing at all when the pointer it is given compares equal to the one
+     * already installed, so a caller that freed the old source first could
+     * get its address back for the new one and leave the view holding the
+     * bookmarks and search hits of text that is gone.
+     */
+    textview_curses& set_owned_sub_source(std::unique_ptr<text_sub_source> src);
+
     text_sub_source* get_sub_source() const { return this->tc_sub_source; }
+
+    textview_curses& set_supports_marks(bool m)
+    {
+        this->tc_supports_marks = m;
+        return *this;
+    }
 
     textview_curses& set_delegate(std::shared_ptr<text_delegate> del)
     {
@@ -528,26 +868,26 @@ public:
         return this->tc_delegate;
     }
 
-    nonstd::optional<std::pair<int, int>> horiz_shift(vis_line_t start,
-                                                      vis_line_t end,
-                                                      int off_start);
+    std::optional<std::pair<int, int>> horiz_shift(vis_line_t start,
+                                                   vis_line_t end,
+                                                   int off_start);
 
     void set_search_action(action sa)
     {
         this->tc_search_action = std::move(sa);
     }
 
-    void grep_end_batch(grep_proc<vis_line_t>& gp);
-    void grep_end(grep_proc<vis_line_t>& gp);
+    void grep_end_batch(grep_proc<vis_line_t>& gp) override;
+    void grep_end(grep_proc<vis_line_t>& gp) override;
 
-    size_t listview_rows(const listview_curses& lv)
+    size_t listview_rows(const listview_curses& lv) override
     {
         return this->tc_sub_source == nullptr
             ? 0
             : this->tc_sub_source->text_line_count();
     }
 
-    size_t listview_width(const listview_curses& lv)
+    size_t listview_width(const listview_curses& lv) override
     {
         return this->tc_sub_source == nullptr
             ? 0
@@ -556,42 +896,42 @@ public:
 
     void listview_value_for_rows(const listview_curses& lv,
                                  vis_line_t line,
-                                 std::vector<attr_line_t>& rows_out);
+                                 std::vector<attr_line_t>& rows_out) override;
 
     void textview_value_for_row(vis_line_t line, attr_line_t& value_out);
 
-    bool listview_is_row_selectable(const listview_curses& lv, vis_line_t row);
+    bool listview_is_row_selectable(const listview_curses& lv,
+                                    vis_line_t row) override;
 
-    void listview_selection_changed(const listview_curses& lv);
+    void listview_selection_changed(const listview_curses& lv) override;
 
-    size_t listview_size_for_row(const listview_curses& lv, vis_line_t row)
+    size_t listview_size_for_row(const listview_curses& lv,
+                                 vis_line_t row) override
     {
         return this->tc_sub_source->text_size_for_line(*this, row);
     }
 
-    std::string listview_source_name(const listview_curses& lv)
-    {
-        return this->tc_sub_source == nullptr
-            ? ""
-            : this->tc_sub_source->text_source_name(*this);
-    }
+    std::optional<line_info> grep_value_for_line(
+        vis_line_t line, std::string& value_out) override;
 
-    bool grep_value_for_line(vis_line_t line, std::string& value_out);
-
-    void grep_quiesce()
+    void grep_quiesce() override
     {
         if (this->tc_sub_source != nullptr) {
             this->tc_sub_source->quiesce();
         }
     }
 
+    void grep_reset(grep_proc<vis_line_t>& gp,
+                    vis_line_t start,
+                    vis_line_t stop,
+                    grep_pattern_mask_t patterns) override;
     void grep_begin(grep_proc<vis_line_t>& gp,
                     vis_line_t start,
-                    vis_line_t stop);
+                    vis_line_t stop,
+                    grep_pattern_mask_t patterns) override;
     void grep_match(grep_proc<vis_line_t>& gp,
                     vis_line_t line,
-                    int start,
-                    int end);
+                    grep_pattern_mask_t patterns) override;
 
     bool is_searching() const { return this->tc_searching > 0; }
 
@@ -604,18 +944,203 @@ public:
         tv.tv_usec = (ms_to_deadline % 1000) * 1000;
         gettimeofday(&now, nullptr);
         timeradd(&now, &tv, &this->tc_follow_deadline);
-        this->tc_follow_top = this->get_top();
+        this->tc_follow_selection = this->get_selection().value_or(-1_vl);
         this->tc_follow_func = func;
     }
 
     size_t get_match_count() { return this->tc_bookmarks[&BM_SEARCH].size(); }
 
-    void match_reset()
+    /**
+     * The slot in the search grep_procs that is driven by execute_search().
+     * The remaining slots are handed out by alloc_search_slot().
+     */
+    static constexpr size_t SEARCH_SLOT_INTERACTIVE = 0;
+
+    /**
+     * Reserve a pattern slot for a search that is not the interactive one.
+     * The slot number is shared by both search procs so that a given search
+     * matches message text and metadata under the same identity.
+     */
+    std::optional<size_t> alloc_search_slot();
+
+    /**
+     * Release a slot taken by alloc_search_slot().  Dropping the slot's
+     * matches is left to the caller so that freeing several slots only needs
+     * a single match_reset().
+     */
+    void free_search_slot(size_t slot);
+
+    /** Forget the matches recorded for the given patterns. */
+    void match_reset(grep_pattern_mask_t patterns);
+
+    void match_reset() { this->match_reset(~0U); }
+
+    /** The number of hits for the interactive search alone. */
+    size_t get_interactive_match_count() const
     {
-        this->tc_bookmarks[&BM_SEARCH].clear();
-        if (this->tc_sub_source != nullptr) {
-            this->tc_sub_source->text_clear_marks(&BM_SEARCH);
+        return this->tc_search_matches[SEARCH_SLOT_INTERACTIVE].size();
+    }
+
+    const bookmark_vector<vis_line_t>& get_interactive_matches() const
+    {
+        return this->tc_search_matches[SEARCH_SLOT_INTERACTIVE];
+    }
+
+    /**
+     * A search that has been given a name so that it persists while the
+     * interactive search changes underneath it.  Its hits live in
+     * tc_search_matches[ns_slot]; there is no second copy.
+     */
+    struct named_search {
+        std::string ns_name;
+        std::string ns_pattern;
+        size_t ns_slot;
+        /**
+         * The same code that is installed in the grep procs and the
+         * highlighter, kept here so that callers can re-run the pattern to
+         * find out what a line matched.
+         */
+        std::shared_ptr<lnav::pcre2pp::code> ns_code;
+        /**
+         * A disabled search keeps its slot and its hits, and new data is
+         * still scanned for it, so that it can be turned back on without
+         * another pass over the view.  It is only dropped from the
+         * highlighting, the search marks, and the places that report which
+         * searches matched a message.
+         */
+        bool ns_enabled{true};
+    };
+
+    const std::vector<named_search>& get_named_searches() const
+    {
+        return this->tc_named_searches;
+    }
+
+    /** @return nullptr if there is no search with the given name. */
+    const named_search* find_named_search(const std::string& name) const;
+
+    /**
+     * A name is written into the session as the argument of a
+     * create-named-search command, where it is delimited by whitespace, so
+     * only names that survive that trip are accepted.
+     */
+    static Result<void, lnav::console::user_message> validate_search_name(
+        const std::string& name);
+
+    /** What becomes of the active search when a named one is created. */
+    enum class search_adoption_t {
+        /** It is left alone; the caller supplied a pattern of its own. */
+        keep,
+        /**
+         * The pattern was taken from the active search, so that search is
+         * cleared and the named one takes it over.
+         */
+        promote,
+    };
+
+    /**
+     * Turn a pattern into a named search.  When the pattern matches the active
+     * search and that search has finished, its hits are reused rather than
+     * being found again, whichever way the active search is being treated.
+     */
+    Result<void, lnav::console::user_message> create_named_search(
+        const std::string& name,
+        const std::string& pattern,
+        search_adoption_t adoption = search_adoption_t::keep);
+
+    /** @return false if there is no search with the given name. */
+    bool delete_named_search(const std::string& name);
+
+    /** @return false if there is no search with the given name. */
+    bool set_named_search_enabled(const std::string& name, bool enabled);
+
+    /** Remove all of the named searches in this view. */
+    void clear_named_searches();
+
+    /**
+     * The slot that next_search_hit() and the horizontal shift are narrowed
+     * to, if any.  An empty value means every enabled search is in play, which
+     * is how the view behaves when nothing has been focused.
+     */
+    std::optional<size_t> get_focused_search_slot() const
+    {
+        return this->tc_focused_search_slot;
+    }
+
+    /** @return false if there is no enabled search with the given name. */
+    bool focus_named_search(const std::string& name);
+
+    void clear_search_focus() { this->tc_focused_search_slot = std::nullopt; }
+
+    /**
+     * Move the focus to the next (dir > 0) or previous (dir < 0) search.  The
+     * cycle runs from nothing focused, through the interactive search when
+     * there is one, then the enabled named searches in slot order, and back to
+     * nothing, so there is always a way back to searching all of them.
+     *
+     * @return The slot that is now focused, or an empty value for "all".
+     */
+    std::optional<size_t> cycle_search_focus(int dir);
+
+    /**
+     * The name to show for a focused slot: the named search that holds it, or
+     * an empty value for the interactive search, which has no name.
+     */
+    std::optional<std::string> get_focused_search_name() const;
+
+    /**
+     * Hold off the scan for searches created while this is alive and do a
+     * single pass for all of them at the end.  Creating searches one at a
+     * time, as a session restore does, would otherwise read the log once per
+     * pattern instead of once for all of them.
+     */
+    struct search_defer_guard {
+        explicit search_defer_guard(textview_curses& tc) : sdg_view(tc)
+        {
+            this->sdg_view.tc_defer_searches = true;
         }
+
+        ~search_defer_guard()
+        {
+            this->sdg_view.tc_defer_searches = false;
+            this->sdg_view.flush_deferred_searches();
+        }
+
+        search_defer_guard(const search_defer_guard&) = delete;
+        search_defer_guard& operator=(const search_defer_guard&) = delete;
+
+        textview_curses& sdg_view;
+    };
+
+    /** Scan for the searches that were held back by a search_defer_guard. */
+    void flush_deferred_searches();
+
+    /**
+     * @return The mask of pattern slots whose named search matches a line in
+     * the half-open range.  Callers that need the names walk
+     * get_named_searches() and test grep_pattern_bit(ns_slot), which keeps
+     * this off the allocation path for the common case of a line that nothing
+     * matched.
+     *
+     * This deliberately takes a range rather than a single line: a log message
+     * spanning several lines belongs to a search when *any* of its lines
+     * match, and testing only the first line misses a hit that landed on a
+     * continuation line.
+     */
+    grep_pattern_mask_t named_search_matches(vis_line_t start,
+                                             vis_line_t end) const;
+
+    /**
+     * @return The lines matched by the search in the given slot.  Iterating
+     * this is proportional to the number of matches, unlike testing every line
+     * with named_search_matches().
+     */
+    const bookmark_vector<vis_line_t>& search_matches_for_slot(
+        size_t slot) const
+    {
+        require(slot < GREP_MAX_PATTERNS);
+
+        return this->tc_search_matches[slot];
     }
 
     highlight_map_t& get_highlights() { return this->tc_highlights; }
@@ -625,22 +1150,14 @@ public:
         return this->tc_highlights;
     }
 
-    std::set<highlight_source_t>& get_disabled_highlights()
+    lnav::enums::bitset<highlight_source_t>& get_disabled_highlights()
     {
         return this->tc_disabled_highlights;
     }
 
-    bool handle_mouse(mouse_event& me);
+    bool handle_mouse(mouse_event& me) override;
 
-    void reload_data();
-
-    void do_update()
-    {
-        this->listview_curses::do_update();
-        if (this->tc_delegate != nullptr) {
-            this->tc_delegate->text_overlay(*this);
-        }
-    }
+    void reload_data() override;
 
     bool toggle_hide_fields()
     {
@@ -653,114 +1170,236 @@ public:
 
     bool get_hide_fields() const { return this->tc_hide_fields; }
 
+    void set_hide_fields(bool val)
+    {
+        if (this->tc_hide_fields != val) {
+            this->tc_hide_fields = val;
+            this->set_needs_update();
+        }
+    }
+
     void execute_search(const std::string& regex_orig);
 
     void redo_search();
 
-    void search_range(vis_line_t start, vis_line_t stop = -1_vl)
-    {
-        if (this->tc_search_child) {
-            this->tc_search_child->get_grep_proc()->queue_request(start, stop);
-        }
-        if (this->tc_source_search_child) {
-            this->tc_source_search_child->queue_request(start, stop);
-        }
-    }
+    void search_range(vis_line_t start, vis_line_t stop);
 
-    void search_new_data(vis_line_t start = -1_vl)
-    {
-        this->search_range(start);
-        if (this->tc_search_child) {
-            this->tc_search_child->get_grep_proc()->start();
-        }
-        if (this->tc_source_search_child) {
-            this->tc_source_search_child->start();
-        }
-    }
+    /**
+     * Scan a range again with both the content and the metadata search, and
+     * start the run.
+     *
+     * Both searches record their hits in the same per-pattern set, so this
+     * cannot be narrowed to just the metadata search: queueing a range clears
+     * the results already recorded for it, and only the search that is run
+     * again puts its hits back.
+     */
+    void rescan_range(vis_line_t start, vis_line_t stop);
 
+    /** Scan the lines that have arrived since the last scan was queued. */
+    void search_new_data();
+
+    /**
+     * Scan from the given line on, for a source that has re-indexed from that
+     * point.
+     */
+    void search_new_data(vis_line_t start);
+
+    /** @return The search text as it was typed. */
     std::string get_current_search() const { return this->tc_current_search; }
+
+    /**
+     * @return The pattern the active search is actually matching with.  It
+     * differs from get_current_search() when what was typed would not compile
+     * and was quoted to look for it literally, so this is what a caller that
+     * needs to compile the same thing again should use.
+     */
+    std::string get_current_search_pattern() const
+    {
+        return this->tc_current_search_pattern;
+    }
 
     void save_current_search()
     {
         this->tc_previous_search = this->tc_current_search;
     }
 
-    void revert_search() { this->execute_search(this->tc_previous_search); }
-
-    void invoke_scroll()
+    std::string get_input_suggestion() const
     {
-        if (this->tc_sub_source != nullptr) {
-            auto ttt = dynamic_cast<text_time_translator*>(this->tc_sub_source);
+        std::string retval;
+        if (this->tc_selected_text) {
+            retval = this->tc_selected_text->sti_value;
+        } else {
+            retval = this->tc_current_search;
+        }
 
-            if (ttt != nullptr) {
-                ttt->scroll_invoked(this);
+        if (this->tc_sub_source != nullptr) {
+            if (this->tc_sub_source->get_filters().get_filter(retval)
+                != nullptr)
+            {
+                retval.clear();
             }
         }
 
-        listview_curses::invoke_scroll();
+        return retval;
     }
 
-    std::function<void(textview_curses&)> tc_state_event_handler;
-    std::function<void(textview_curses&)> tc_reload_config_delegate;
+    void revert_search() { this->execute_search(this->tc_previous_search); }
 
-    nonstd::optional<role_t> tc_cursor_role;
+    void invoke_scroll() override;
+
+    textview_curses& set_reload_config_delegate(
+        std::function<void(textview_curses&)> func)
+    {
+        this->tc_reload_config_delegate = std::move(func);
+        if (this->tc_reload_config_delegate) {
+            this->tc_reload_config_delegate(*this);
+        }
+        return *this;
+    }
+
+    std::optional<std::chrono::milliseconds> consume_search_duration()
+    {
+        return std::exchange(this->tc_search_duration, std::nullopt);
+    }
+
+    void apply_highlights(attr_line_t& al,
+                          const line_range& body,
+                          const line_range& orig_line);
+
+    void update_hash_state(hasher& h) const override;
+
+    void clear_preview();
+
+    bool tc_interactive{false};
+    std::function<void(textview_curses&)> tc_state_event_handler;
+
+    std::optional<role_t> tc_cursor_role;
+    std::optional<role_t> tc_disabled_cursor_role;
+
+    struct selected_text_info {
+        int sti_x;
+        int64_t sti_line;
+        line_range sti_range;
+        string_attrs_t sti_attrs;
+        std::string sti_value;
+        std::string sti_href;
+    };
+
+    std::optional<selected_text_info> tc_selected_text;
+    bool tc_text_selection_active{false};
+    display_line_content_t tc_press_line;
+    std::optional<vis_line_t> tc_selection_at_press;
+    int tc_press_left{0};
+    std::function<bool(
+        textview_curses&, const attr_line_t&, int x, const mouse_event&)>
+        tc_on_click;
+    /**
+     * Called when a named search is created or deleted.  The LOG view uses
+     * these to keep a search table in step with the search.  Returning an
+     * error from the create hook cancels the creation.
+     */
+    std::function<Result<void, lnav::console::user_message>(
+        textview_curses&,
+        const std::string&,
+        std::shared_ptr<lnav::pcre2pp::code>)>
+        tc_on_named_search_created;
+    std::function<void(textview_curses&, const std::string&)>
+        tc_on_named_search_deleted;
+    std::optional<string_attr_pair> tc_mark_style{
+        VC_STYLE.value(text_attrs::with_reverse())};
 
 protected:
-    class grep_highlighter {
-    public:
-        grep_highlighter(std::shared_ptr<grep_proc<vis_line_t>>& gp,
-                         highlight_source_t source,
-                         std::string hl_name,
-                         highlight_map_t& hl_map)
-            : gh_grep_proc(std::move(gp)), gh_hl_source(source),
-              gh_hl_name(std::move(hl_name)), gh_hl_map(hl_map)
-        {
-        }
-
-        ~grep_highlighter()
-        {
-            this->gh_hl_map.erase(
-                this->gh_hl_map.find({this->gh_hl_source, this->gh_hl_name}));
-        }
-
-        grep_proc<vis_line_t>* get_grep_proc()
-        {
-            return this->gh_grep_proc.get();
-        }
-
-    private:
-        std::shared_ptr<grep_proc<vis_line_t>> gh_grep_proc;
-        highlight_source_t gh_hl_source;
-        std::string gh_hl_name;
-        highlight_map_t& gh_hl_map;
-    };
-
     text_sub_source* tc_sub_source{nullptr};
+    /**
+     * Set only when the view owns what tc_sub_source points at; most sources
+     * outlive the view and are owned elsewhere.
+     */
+    std::unique_ptr<text_sub_source> tc_owned_sub_source;
     std::shared_ptr<text_delegate> tc_delegate;
 
-    vis_bookmarks tc_bookmarks;
+    vis_bookmarks tc_bookmarks{vis_bookmarks_t::create_array()};
 
     int tc_searching{0};
-    struct timeval tc_follow_deadline {
-        0, 0
-    };
-    vis_line_t tc_follow_top{-1_vl};
+    /**
+     * The line that the queued searches have reached, i.e. where a scan of
+     * newly arrived lines should begin.  Both search procs are handed the same
+     * ranges, so this is kept here rather than in either of them.
+     */
+    vis_line_t tc_searched_through{0_vl};
+    timeval tc_follow_deadline{0, 0};
+    vis_line_t tc_follow_selection{-1_vl};
     std::function<bool()> tc_follow_func;
     action tc_search_action;
 
     highlight_map_t tc_highlights;
-    std::set<highlight_source_t> tc_disabled_highlights;
+    lnav::enums::bitset<highlight_source_t> tc_disabled_highlights;
 
-    vis_line_t tc_selection_start{-1_vl};
-    vis_line_t tc_selection_last{-1_vl};
-    bool tc_selection_cleared{false};
+    std::optional<vis_line_t> tc_selection_start;
+    mouse_event tc_press_event;
     bool tc_hide_fields{true};
     bool tc_paused{false};
+    bool tc_supports_marks{false};
 
+    /** The search text as it was typed. */
     std::string tc_current_search;
+    /** What that text compiled to; see get_current_search_pattern(). */
+    std::string tc_current_search_pattern;
     std::string tc_previous_search;
-    std::shared_ptr<grep_highlighter> tc_search_child;
-    std::shared_ptr<grep_proc<vis_line_t>> tc_source_search_child;
+    std::optional<std::string> tc_search_op_id;
+
+    /**
+     * The search procs outlive any individual pattern -- patterns are swapped
+     * in and out of their slots -- so that one search can be changed without
+     * disturbing the others.  tc_search_proc covers the view's lines and
+     * tc_meta_search_proc covers the sub-source's metadata (comments, tags).
+     * Both use the same slot number for a given search.
+     */
+    std::shared_ptr<grep_proc<vis_line_t>> tc_search_proc;
+    std::shared_ptr<grep_proc<vis_line_t>> tc_meta_search_proc;
+
+    /**
+     * Matches recorded per pattern slot.  BM_SEARCH is the union of these; the
+     * per-slot breakdown is what lets one search be cleared without dropping
+     * lines that another search also matched.
+     */
+    std::array<bookmark_vector<vis_line_t>, GREP_MAX_PATTERNS>
+        tc_search_matches;
+    /** Slots that alloc_search_slot() has handed out. */
+    std::bitset<GREP_MAX_PATTERNS> tc_search_slots_used;
+    /**
+     * The slots of the disabled named searches.  These still collect matches,
+     * they are just left out of the BM_SEARCH union and of the reports of
+     * which searches matched a message.
+     */
+    grep_pattern_mask_t tc_disabled_search_slots{0};
+    /** Set by search_defer_guard while searches are being created in bulk. */
+    bool tc_defer_searches{false};
+    /** The slots of the searches that are waiting for the deferred pass. */
+    grep_pattern_mask_t tc_deferred_search_slots{0};
+    std::vector<named_search> tc_named_searches;
+    /** The slot that n/N and the horizontal shift are narrowed to, if any. */
+    std::optional<size_t> tc_focused_search_slot;
+
+    /** Lazily construct the search procs.  @return tc_search_proc. */
+    grep_proc<vis_line_t>* ensure_search_procs();
+
+    /** Scan the whole view for the given pattern slots. */
+    void queue_search_for(grep_pattern_mask_t patterns);
+
+    /** Give the named search its own background color in the view. */
+    void add_named_search_highlight(
+        const std::string& name,
+        const std::shared_ptr<lnav::pcre2pp::code>& code);
+
+    /**
+     * Recompute the BM_SEARCH union over [start, stop) from tc_search_matches,
+     * updating the sub-source marks to match.  Disabled slots do not
+     * contribute.
+     */
+    void rebuild_search_marks(vis_line_t start, vis_line_t stop);
+    std::optional<std::chrono::steady_clock::time_point> tc_search_start_time;
+    std::optional<std::chrono::milliseconds> tc_search_duration;
+    std::function<void(textview_curses&)> tc_reload_config_delegate;
 };
 
 #endif

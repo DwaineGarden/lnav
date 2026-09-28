@@ -30,16 +30,36 @@
 #include "all_logs_vtab.hh"
 
 #include "base/attr_line.hh"
+#include "base/intern_string.hh"
 #include "config.h"
+#include "data_parser.hh"
+#include "elem_to_json.hh"
+#include "hasher.hh"
+#include "scn/scan.h"
+
+#ifdef HAVE_RUST_DEPS
+#    include "lnav_rs_ext.cxx.hh"
+#endif
 
 static auto intern_lifetime = intern_string::get_table_lifetime();
 
 all_logs_vtab::all_logs_vtab()
     : log_vtab_impl(intern_string::lookup("all_logs")),
-      alv_msg_meta(
-          intern_string::lookup("log_msg_format"), value_kind_t::VALUE_TEXT, 0),
-      alv_schema_meta(
-          intern_string::lookup("log_msg_schema"), value_kind_t::VALUE_TEXT, 1)
+      alv_msg_meta(intern_string::lookup("log_msg_format"),
+                   value_kind_t::VALUE_TEXT,
+                   logline_value_meta::table_column{0}),
+      alv_schema_meta(intern_string::lookup("log_msg_schema"),
+                      value_kind_t::VALUE_TEXT,
+                      logline_value_meta::table_column{1}),
+      alv_values_meta(intern_string::lookup("log_msg_values"),
+                      value_kind_t::VALUE_JSON,
+                      logline_value_meta::table_column{2}),
+      alv_src_meta(intern_string::lookup("log_msg_src"),
+                   value_kind_t::VALUE_JSON,
+                   logline_value_meta::table_column{3}),
+      alv_stacktrace_meta(intern_string::lookup("log_stack_trace"),
+                          value_kind_t::VALUE_TEXT,
+                          logline_value_meta::table_column{4})
 {
     this->alv_msg_meta.lvm_identifier = true;
     this->alv_schema_meta.lvm_identifier = true;
@@ -49,19 +69,35 @@ void
 all_logs_vtab::get_columns(std::vector<vtab_column>& cols) const
 {
     cols.emplace_back(
-        vtab_column(this->alv_msg_meta.lvm_name.get())
+        vtab_column(this->alv_msg_meta.lvm_name)
             .with_comment(
-                "The message format with variables replaced by hash marks"));
-    cols.emplace_back(this->alv_schema_meta.lvm_name.get(),
+                "The message format with variables replaced by hash marks"_frag));
+    cols.emplace_back(this->alv_schema_meta.lvm_name,
                       SQLITE3_TEXT,
-                      "",
+                      intern_string_t{},
                       true,
-                      "The ID for the message schema");
+                      "The ID for the message schema"_frag);
+    cols.emplace_back(this->alv_values_meta.lvm_name,
+                      SQLITE3_TEXT,
+                      intern_string_t{},
+                      false,
+                      "The values extracted from the message"_frag);
+    cols.emplace_back(this->alv_src_meta.lvm_name,
+                      SQLITE3_TEXT,
+                      intern_string_t{},
+                      false,
+                      "The source code that generated this message"_frag);
+    cols.emplace_back(this->alv_stacktrace_meta.lvm_name,
+                      SQLITE3_TEXT,
+                      intern_string_t{},
+                      false,
+                      "If found, the stack trace details"_frag);
 }
 
 void
 all_logs_vtab::extract(logfile* lf,
                        uint64_t line_number,
+                       string_attrs_t& sa,
                        logline_value_vector& values)
 {
     auto& line = values.lvv_sbr;
@@ -69,27 +105,92 @@ all_logs_vtab::extract(logfile* lf,
 
     logline_value_vector sub_values;
 
-    this->vi_attrs.clear();
-    sub_values.lvv_sbr = line;
-    format->annotate(line_number, this->vi_attrs, sub_values, false);
+    sa.clear();
+    sub_values.lvv_sbr = line.clone();
+    format->annotate(lf, line_number, sa, sub_values);
 
-    auto body = find_string_attr_range(this->vi_attrs, &SA_BODY);
-    if (body.lr_start == -1) {
+    auto body = find_string_attr_range(sa, &SA_BODY);
+    if (!body.is_valid()) {
         body.lr_start = 0;
         body.lr_end = line.length();
     }
+    auto body_sf = line.to_string_fragment(body);
+    auto src_file_sf = sub_values.lvv_src_file_value;
+    auto src_line_sf = sub_values.lvv_src_line_value;
+    auto h = hasher();
+    if (src_file_sf && src_line_sf) {
+        h.update(format->get_name().c_str());
+        h.update(src_file_sf.value());
+        h.update(src_line_sf.value());
+    }
+#ifdef HAVE_RUST_DEPS
+    auto file_rust_str = rust::Str();
+    auto lineno = 0UL;
+    if (src_file_sf) {
+        file_rust_str = rust::Str(src_file_sf->data(), src_file_sf->length());
+    }
+    if (src_line_sf) {
+        auto scan_res
+            = scn::scan_int<decltype(lineno)>(src_line_sf->to_string_view());
+        if (scan_res) {
+            lineno = scan_res->value();
+        }
+    }
+    auto body_rust_str = rust::Str(body_sf.data(), body_sf.length());
+    auto find_res = lnav_rs_ext::find_log_statement_json(
+        file_rust_str, lineno, body_rust_str);
+    if (find_res != nullptr) {
+        if (!src_file_sf || !src_line_sf) {
+            h.update(find_res->src.c_str());
+            h.update(find_res->pattern.c_str());
+        }
+        auto line_iter = lf->begin() + line_number;
+        line_iter->merge_bloom_bits(h.to_bloom_bits());
+        line_iter->set_schema_computed(true);
+        values.lvv_values.emplace_back(this->alv_msg_meta,
+                                       (std::string) find_res->pattern);
+        values.lvv_values.emplace_back(this->alv_schema_meta, h.to_string());
+        values.lvv_values.emplace_back(this->alv_values_meta,
+                                       (std::string) find_res->variables);
+        values.lvv_values.emplace_back(this->alv_src_meta,
+                                       (std::string) find_res->src);
+        if (!find_res->stack_trace.empty()) {
+            values.lvv_values.emplace_back(this->alv_stacktrace_meta,
+                                           (std::string) find_res->stack_trace);
+        }
+    } else
+#endif
+    {
+        data_scanner ds(body_sf);
+        data_parser dp(&ds);
+        std::string str;
 
-    data_scanner ds(
-        line.to_string_fragment().sub_range(body.lr_start, body.lr_end));
-    data_parser dp(&ds);
-    std::string str;
+        dp.dp_msg_format = &str;
+        dp.parse();
 
-    dp.dp_msg_format = &str;
-    dp.parse();
+        yajlpp_gen gen;
+        yajl_gen_config(gen, yajl_gen_beautify, false);
 
-    values.lvv_values.emplace_back(this->alv_msg_meta, std::move(str));
-    values.lvv_values.emplace_back(this->alv_schema_meta,
-                                   dp.dp_schema_id.to_string());
+        elements_to_json(gen, dp, &dp.dp_pairs);
+
+        auto schema_id = (src_file_sf && src_line_sf)
+            ? h.to_string()
+            : dp.dp_schema_id.to_string();
+        values.lvv_values.emplace_back(this->alv_msg_meta, std::move(str));
+        values.lvv_values.emplace_back(this->alv_schema_meta, schema_id);
+        values.lvv_values.emplace_back(
+            this->alv_values_meta,
+            json_string(gen).to_string_fragment().to_string());
+    }
+    values.lvv_thread_id_value
+        = to_owned(sub_values.lvv_thread_id_value, values.lvv_allocator);
+    values.lvv_opid_value = std::move(sub_values.lvv_opid_value);
+    values.lvv_opid_provenance = sub_values.lvv_opid_provenance;
+    values.lvv_src_file_value
+        = to_owned(sub_values.lvv_src_file_value, values.lvv_allocator);
+    values.lvv_src_line_value
+        = to_owned(sub_values.lvv_src_line_value, values.lvv_allocator);
+    values.lvv_duration_value = sub_values.lvv_duration_value;
 }
 
 bool

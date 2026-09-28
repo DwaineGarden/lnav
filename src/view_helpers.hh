@@ -32,12 +32,17 @@
 #ifndef lnav_view_helpers_hh
 #define lnav_view_helpers_hh
 
-#include "bookmarks.hh"
-#include "help_text.hh"
-#include "logfile_fwd.hh"
-#include "vis_line.hh"
+#include <array>
+#include <optional>
 
-class textview_curses;
+#include "bookmarks.hh"
+#include "listview_curses.hh"
+#include "logfile_fwd.hh"
+// for text_anchors::direction, which next_cluster() takes
+#include "textview_curses.hh"
+#include "vis_line.hh"
+#include "xterm_mouse.hh"
+
 class hist_source2;
 class logfile_sub_source;
 
@@ -51,6 +56,7 @@ typedef enum {
     LNV_SCHEMA,
     LNV_PRETTY,
     LNV_SPECTRO,
+    LNV_TIMELINE,
 
     LNV__MAX
 } lnav_view_t;
@@ -61,6 +67,7 @@ enum class ln_mode_t : int {
     BREADCRUMBS,
     FILTER,
     FILES,
+    FILE_DETAILS,
     SPECTRO_DETAILS,
     SEARCH_SPECTRO_DETAILS,
     COMMAND,
@@ -74,29 +81,47 @@ enum class ln_mode_t : int {
     BUSY,
 };
 
-extern const char* lnav_view_strings[LNV__MAX + 1];
-extern const char* lnav_view_titles[LNV__MAX];
+extern const std::array<string_fragment, LNV__MAX> lnav_view_strings;
+extern const char* const lnav_view_titles[LNV__MAX];
+extern const char* const
+    lnav_mode_strings[lnav::enums::to_underlying(ln_mode_t::BUSY) + 1];
 
-nonstd::optional<lnav_view_t> view_from_string(const char* name);
+std::optional<lnav_view_t> view_from_string(const char* name);
 
 bool ensure_view(textview_curses* expected_tc);
 bool ensure_view(lnav_view_t expected);
 bool toggle_view(textview_curses* toggle_tc);
-bool handle_winch();
+bool handle_winch(screen_curses* sc);
 void layout_views();
 void update_hits(textview_curses* tc);
+void clear_preview();
+void set_view_mode(ln_mode_t mode);
 
-nonstd::optional<vis_line_t> next_cluster(
-    nonstd::optional<vis_line_t> (bookmark_vector<vis_line_t>::*f)(vis_line_t)
+std::optional<vis_line_t> next_cluster(text_anchors::direction dir,
+                                       const bookmark_type_t* bt,
+                                       vis_line_t top);
+/** As above, for hits that are not kept in a bookmark type of their own. */
+std::optional<vis_line_t> next_cluster(
+    std::optional<vis_line_t> (bookmark_vector<vis_line_t>::*f)(vis_line_t)
         const,
-    const bookmark_type_t* bt,
+    const bookmark_vector<vis_line_t>& bv,
     vis_line_t top);
-bool moveto_cluster(nonstd::optional<vis_line_t> (
-                        bookmark_vector<vis_line_t>::*f)(vis_line_t) const,
-                    const bookmark_type_t* bt,
-                    vis_line_t top);
-void previous_cluster(const bookmark_type_t* bt, textview_curses* tc);
 vis_line_t search_forward_from(textview_curses* tc);
 textview_curses* get_textview_for_mode(ln_mode_t mode);
+
+void setup_initial_view_stack();
+std::vector<view_curses*> all_views();
+
+class lnav_behavior : public mouse_behavior {
+public:
+    void mouse_event(
+        notcurses* nc, int button, bool release, int x, int y) override;
+    void tick(const timeval& now);
+
+    view_curses* lb_last_view{nullptr};
+    struct mouse_event lb_last_real_event;
+    struct mouse_event lb_last_event;
+    struct mouse_event lb_last_release_event;
+};
 
 #endif

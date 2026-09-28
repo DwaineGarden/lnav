@@ -1,4 +1,3 @@
-
 /**
  * Copyright (c) 2007-2012, Timothy Stack
  *
@@ -33,61 +32,89 @@
 #ifndef logfile_hh
 #define logfile_hh
 
-#include <set>
+#include <atomic>
+#include <chrono>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <stdint.h>
 #include <stdio.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
 #include "ArenaAlloc/arenaalloc.h"
+#include "base/auto_fd.hh"
+#include "base/auto_mem.hh"
 #include "base/lnav_log.hh"
+#include "base/map_util.hh"
+#include "base/progress.hh"
 #include "base/result.h"
 #include "bookmarks.hh"
-#include "byte_array.hh"
-#include "ghc/filesystem.hpp"
+#include "file_options.hh"
 #include "line_buffer.hh"
 #include "log_format_fwd.hh"
 #include "logfile_fwd.hh"
+#include "mapbox/variant.hpp"
 #include "safe/safe.h"
 #include "shared_buffer.hh"
-#include "text_format.hh"
 #include "unique_path.hh"
 
 /**
- * Observer interface for logfile indexing progress.
+ * How far rebuild_index() has gotten with a file.
  *
- * @see logfile
+ * Every field is atomic because the UI thread reads them while a worker is
+ * writing them.  That is also why the numbers live here rather than being
+ * derived from lf_index on demand: reading lf_index.size() while a worker is
+ * appending to it races against a vector that may be reallocating.  A tick's
+ * reading of these is handed to the UI as a vector of index_progress_report
+ * (logfile_fwd.hh), which is where the drawing code gets its numbers from.
  */
-class logfile_observer {
-public:
-    virtual ~logfile_observer() = default;
-
-    enum class indexing_result {
-        CONTINUE,
-        BREAK,
-    };
-
-    /**
-     * @param lf The logfile object that is doing the indexing.
-     * @param off The current offset in the file being processed.
-     * @param total The total size of the file.
-     * @return false
-     */
-    virtual indexing_result logfile_indexing(const std::shared_ptr<logfile>& lf,
-                                             file_off_t off,
-                                             file_size_t total)
-        = 0;
+struct index_progress {
+    std::atomic<file_off_t> ip_offset{0};
+    std::atomic<file_ssize_t> ip_total{0};
+    std::atomic<bool> ip_done{false};
+    /** Raised by the UI thread when the user interrupts the pass. */
+    std::atomic<bool> ip_abort{false};
 };
 
+namespace lnav {
+
+/**
+ * @return How many workers to index `file_count` files across, from
+ * /tuning/logfile/indexing-threads.  0 asks the machine for a count and 1
+ * means index them one at a time.
+ *
+ * Also warms the injected singletons the scan path reaches through
+ * function-local statics, while the UI thread is still the only one running.
+ * Call it on the UI thread ahead of every fan-out.
+ */
+size_t logfile_indexing_width(size_t file_count);
+
+}  // namespace lnav
+
 struct logfile_activity {
+    // Stats for the indexing pipeline — wall/cpu time accumulate
+    // across each rebuild_index() call that consumed bytes (empty
+    // polls don't); memory_bytes is refreshed to a current snapshot.
+    // The wall/cpu gap is roughly time spent blocked on the
+    // underlying file (raw read, decompressor, remote fetch, etc.).
+    struct index_stats {
+        std::chrono::microseconds is_wall_us{};
+        std::chrono::microseconds is_cpu_us{};
+        size_t is_memory_bytes{0};
+    };
+
     int64_t la_polls{0};
     int64_t la_reads{0};
-    struct rusage la_initial_index_rusage {};
+    index_stats la_index;
+    // Approximate per-file memory held by the line_buffer (I/O
+    // buffer + per-line offset / utf / ansi / col-width vectors).
+    // Tracked separately from index memory because the line_buffer
+    // is an I/O cache with very different sizing dynamics than the
+    // indexed view.
+    size_t la_line_buffer_memory_bytes{0};
 };
 
 /**
@@ -106,27 +133,62 @@ public:
     };
 
     /**
+     * The relationship between a descriptor passed to open() and the path.
+     */
+    enum class fd_source {
+        /** The descriptor is not associated with the path, like stdin. */
+        detached,
+        /** The descriptor was opened from the path. */
+        of_path,
+    };
+
+    /**
      * Construct a logfile with the given arguments.
      *
      * @param filename The name of the log file.
      * @param fd The file descriptor for accessing the file or -1 if the
      * constructor should open the file specified by 'filename'.  The
      * descriptor needs to be seekable.
+     * @param src Whether 'fd' was opened from 'filename'.
      */
     static Result<std::shared_ptr<logfile>, std::string> open(
-        std::string filename, logfile_open_options& loo);
+        std::filesystem::path filename,
+        const logfile_open_options& loo,
+        auto_fd fd = auto_fd{},
+        fd_source src = fd_source::detached);
+
+    logfile(const logfile&) = delete;
+    logfile& operator=(const logfile&) = delete;
 
     ~logfile() override;
 
     const logfile_activity& get_activity() const { return this->lf_activity; }
 
-    nonstd::optional<ghc::filesystem::path> get_actual_path() const
+    std::optional<std::filesystem::path> get_actual_path() const
     {
         return this->lf_actual_path;
     }
 
     /** @return The filename as given in the constructor. */
-    const std::string& get_filename() const { return this->lf_filename; }
+    const std::filesystem::path& get_filename() const
+    {
+        return this->lf_filename;
+    }
+
+    const std::string get_filename_as_string() const
+    {
+        return this->lf_filename_as_string;
+    }
+
+    std::filesystem::path get_path_for_key() const;
+
+    /**
+     * @return The key to use when looking for this file in
+     *   file_collection::fc_name_to_stubs.  This is the path that the scan
+     *   was working with, which is not necessarily the name the file is
+     *   displayed under.
+     */
+    std::string get_stub_key() const;
 
     /** @return The filename as given in the constructor, excluding the path
      * prefix. */
@@ -137,20 +199,103 @@ public:
     /** @param filename The new filename for this log file. */
     void set_filename(const std::string& filename);
 
+    static uint64_t next_serial()
+    {
+        static std::atomic<uint64_t> counter{0};
+
+        return counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
     const std::string& get_content_id() const { return this->lf_content_id; }
+
+    /**
+     * @return An id for this file, handed out in creation order and never
+     * reused.
+     *
+     * For code that needs to say "the same file" without holding the file
+     * alive.  The address will not do: a new logfile can be allocated where a
+     * freed one used to live, and would then compare equal to it.
+     */
+    uint64_t get_serial() const { return this->lf_serial; }
 
     /** @return The inode for this log file. */
     const struct stat& get_stat() const { return this->lf_stat; }
+
+    time_t get_origin_mtime() const;
 
     size_t get_longest_line_length() const { return this->lf_longest_line; }
 
     bool is_compressed() const { return this->lf_line_buffer.is_compressed(); }
 
+    bool has_line_metadata() const
+    {
+        return this->lf_line_buffer.has_line_metadata();
+    }
+
     bool is_valid_filename() const { return this->lf_valid_filename; }
 
     file_off_t get_index_size() const { return this->lf_index_size; }
 
-    nonstd::optional<const_iterator> line_for_offset(file_off_t off) const;
+    /**
+     * @return The amount of data in the (possibly compressed) file that has
+     * been indexed.
+     */
+    file_off_t get_indexed_file_offset() const
+    {
+        return this->lf_line_buffer.get_read_offset(this->lf_index_size);
+    }
+
+    int get_index_generation() const { return this->lf_index_generation; }
+
+    file_ssize_t get_content_size() const
+    {
+        auto lb_size = this->lf_line_buffer.get_file_size();
+        if (lb_size != -1) {
+            return lb_size;
+        }
+        return this->lf_stat.st_size;
+    }
+
+    /**
+     * @return How far indexing has gotten, as (done, total), or nullopt when
+     * the total cannot be established.
+     *
+     * The numerator is always lf_index_size -- decompressed bytes indexed --
+     * because that is the thing that actually advances smoothly.  Only the
+     * denominator is in question, and it is taken from, in order:
+     *
+     *   - the line buffer, once it knows the real size.  That covers plain
+     *     files, pipes that have hit EOF, and any compressed file that has
+     *     been read to the end.
+     *   - a gzip trailer's ISIZE, which is exact below 4GB and, unlike the
+     *     decompressor's own position, is known before any of the file has
+     *     been read.  Discarded the moment indexing passes it, which is what
+     *     catches a wrapped value or a concatenated file.
+     *   - the on-disk size, for an uncompressed file whose size the line
+     *     buffer has not settled yet.
+     *
+     * Anything left over -- bzip2, or a gzip whose trailer proved wrong --
+     * has no honest denominator and reports nothing.
+     */
+    std::optional<std::pair<file_off_t, file_ssize_t>> get_index_progress()
+        const;
+
+    /**
+     * @return Whether the whole file has been read and indexed.
+     *
+     * Deliberately not a comparison of the two numbers above:
+     * is_data_available() already knows that a compressed file's size is
+     * only settled once decompression reaches EOF.
+     */
+    bool is_fully_indexed() const
+    {
+        return !this->lf_indexing
+            || (this->lf_activity.la_polls > 0
+                && !this->lf_line_buffer.is_data_available(
+                    this->lf_index_size, this->lf_stat.st_size));
+    }
+
+    std::optional<const_iterator> line_for_offset(file_off_t off) const;
 
     /**
      * @return The detected format, rebuild_index() must be called before this
@@ -162,20 +307,24 @@ public:
 
     intern_string_t get_format_name() const;
 
-    text_format_t get_text_format() const { return this->lf_text_format; }
+    std::optional<text_format_t> get_text_format() const
+    {
+        return this->lf_text_format;
+    }
 
-    /**
-     * @return The last modified time of the file when the file was last
-     * indexed.
-     */
-    time_t get_modified_time() const { return this->lf_index_time; }
+    void set_text_format(std::optional<text_format_t> tf)
+    {
+        this->lf_text_format = tf;
+    }
+
+    std::chrono::microseconds get_modified_time() const
+    {
+        return this->lf_index_time;
+    }
 
     int get_time_offset_line() const { return this->lf_time_offset_line; }
 
-    const struct timeval& get_time_offset() const
-    {
-        return this->lf_time_offset;
-    }
+    const timeval& get_time_offset() const { return this->lf_time_offset; }
 
     void adjust_content_time(int line,
                              const struct timeval& tv,
@@ -183,16 +332,26 @@ public:
 
     void clear_time_offset()
     {
-        struct timeval tv = {0, 0};
+        timeval tv = {0, 0};
 
         this->adjust_content_time(-1, tv);
     }
 
-    void mark_as_duplicate(const std::string& name);
+    bool mark_as_duplicate(const std::string& name);
 
     const logfile_open_options& get_open_options() const
     {
         return this->lf_options;
+    }
+
+    void set_include_in_session(bool enabled)
+    {
+        this->lf_options.with_include_in_session(enabled);
+    }
+
+    void set_init_location(file_location_t loc)
+    {
+        this->lf_options.with_init_location(loc);
     }
 
     void reset_state();
@@ -218,14 +377,46 @@ public:
     /** @return The number of lines in the index. */
     size_t size() const { return this->lf_index.size(); }
 
-    nonstd::optional<const_iterator> find_from_time(
-        const struct timeval& tv) const;
+    const_iterator find_from_time(std::chrono::microseconds us) const;
+
+    /**
+     * @return The indexes of the lines in time order, or an empty vector
+     *   when the index is already in time order.
+     */
+    const std::vector<uint32_t>& get_time_order() const
+    {
+        return this->lf_time_order;
+    }
+
+    /**
+     * @return The line with the lowest time from the given line to the end
+     *   of the index.  The line must be less than size().
+     */
+    const logline& earliest_line_from(size_t line) const;
+
+    /**
+     * @return The position in the time order of the first line whose time
+     *   is not less than the given time.
+     */
+    size_t time_order_lower_bound(std::chrono::microseconds us) const;
 
     logline& operator[](int index) { return this->lf_index[index]; }
+
+    std::optional<const_iterator> find_line(int line_number) const
+    {
+        if (line_number < 0 || line_number >= this->lf_index.size()) {
+            return std::nullopt;
+        }
+        return this->lf_index.begin() + line_number;
+    }
+
+    logline& at(int index) { return this->lf_index.at(index); }
 
     logline& front() { return this->lf_index.front(); }
 
     logline& back() { return this->lf_index.back(); }
+
+    bool in_range() const;
 
     /** @return True if this log file still exists. */
     bool exists() const;
@@ -234,11 +425,24 @@ public:
 
     bool is_closed() const { return this->lf_is_closed; }
 
-    struct timeval original_line_time(iterator ll);
+    timeval original_line_time(iterator ll);
 
-    Result<shared_buffer_ref, std::string> read_line(iterator ll);
+    Result<shared_buffer_ref, std::string> read_line(iterator ll,
+                                                     subline_options opts = {});
 
-    Result<std::string, std::string> read_file();
+    enum class read_format_t {
+        plain,
+        with_framing,
+    };
+
+    struct read_file_result {
+        file_range rfr_range;
+        std::string rfr_content;
+    };
+
+    Result<read_file_result, std::string> read_file(read_format_t format);
+
+    Result<shared_buffer_ref, std::string> read_range(const file_range& fr);
 
     iterator line_base(iterator ll)
     {
@@ -264,8 +468,11 @@ public:
         return retval;
     }
 
+    std::pair<iterator, iterator> message_lines(iterator ll);
+
     struct message_length_result {
         file_ssize_t mlr_length;
+        size_t mlr_line_count;
         file_range::metadata mlr_metadata;
     };
 
@@ -283,9 +490,23 @@ public:
         };
     }
 
+    file_range get_msg_range(const_iterator ll)
+    {
+        return this->get_file_range(ll, true);
+    }
+
+    file_off_t get_line_content_offset(const_iterator ll)
+    {
+        return ll->get_offset() + (this->lf_line_buffer.is_piper() ? 22 : 0);
+    }
+
+    size_t get_line_number(const_iterator ll) const;
+
     void read_full_message(const_iterator ll,
                            shared_buffer_ref& msg_out,
-                           int max_lines = 50);
+                           line_buffer::scan_direction dir
+                           = line_buffer::scan_direction::forward,
+                           read_format_t format = read_format_t::plain);
 
     Result<shared_buffer_ref, std::string> read_raw_message(const_iterator ll);
 
@@ -303,14 +524,51 @@ public:
      * indexing.
      * @return True if any new lines were indexed.
      */
-    rebuild_result_t rebuild_index(
-        nonstd::optional<ui_clock::time_point> deadline = nonstd::nullopt);
+    rebuild_result_t rebuild_index(std::optional<ui_clock::time_point> deadline
+                                   = std::nullopt);
 
     void reobserve_from(iterator iter);
 
-    void set_logfile_observer(logfile_observer* lo)
+    /**
+     * Zero the progress and seed the denominator, on the thread that is about
+     * to hand this file to a worker.
+     *
+     * The total is seeded here rather than left to the worker so that the
+     * aggregate the UI shows is complete from the first tick and only moves
+     * forward; filled in as files were picked up, the bar would slide
+     * backwards.  It comes from get_index_progress() so the numerator and
+     * denominator stay in one coordinate space -- get_content_size() reports
+     * a compressed file's on-disk size until the stream hits EOF and its
+     * decompressed size after, which made the total jump mid-pass.
+     */
+    void begin_indexing_progress()
     {
-        this->lf_logfile_observer = lo;
+        auto prog = this->get_index_progress();
+
+        this->lf_index_progress.ip_offset.store(0, std::memory_order_relaxed);
+        this->lf_index_progress.ip_total.store(prog ? prog->second : 0,
+                                               std::memory_order_relaxed);
+        this->lf_index_progress.ip_done.store(false, std::memory_order_relaxed);
+        this->lf_index_progress.ip_abort.store(false,
+                                               std::memory_order_relaxed);
+    }
+
+    /** @see index_progress -- safe to read while a worker is scanning. */
+    const index_progress& indexing_progress() const
+    {
+        return this->lf_index_progress;
+    }
+
+    /** Ask the scan of this file to stop as soon as it notices. */
+    void abort_indexing()
+    {
+        this->lf_index_progress.ip_abort.store(true, std::memory_order_relaxed);
+    }
+
+    /** Called by the scanning thread when it is done with this file. */
+    void finish_indexing_progress()
+    {
+        this->lf_index_progress.ip_done.store(true, std::memory_order_relaxed);
     }
 
     void set_logline_observer(logline_observer* llo);
@@ -329,13 +587,15 @@ public:
         } else if (rhs.lf_index.empty()) {
             retval = false;
         } else {
-            retval = this->lf_index[0].get_time() < rhs.lf_index[0].get_time();
+            retval = this->lf_index[0] < rhs.lf_index[0];
         }
 
         return retval;
     }
 
     bool is_indexing() const { return this->lf_indexing; }
+
+    void set_indexing(bool val) { this->lf_indexing = val; }
 
     /** Check the invariants for this object. */
     bool invariant()
@@ -345,22 +605,80 @@ public:
         return true;
     }
 
-    ghc::filesystem::path get_path() const override;
+    std::filesystem::path get_path() const override;
+
+    /**
+     * The most lines that will be indexed for a single file.  Kept equal to
+     * lnav::logfile::MAX_LINES in logfile.cfg.hh, which the configuration
+     * uses, without this header having to include that one.
+     */
+    static constexpr uint64_t MAX_LINES = 1ULL << 27;
+
+    /**
+     * While fewer lines than this have been indexed, a better matching format
+     * can still replace the current one, which reindexes the file from the
+     * start.
+     */
+    static constexpr size_t RETRY_MATCH_SIZE = 250;
+
+    /**
+     * Formats that describe themselves with a header need to read this many
+     * lines before they can match, so candidates are not skipped based on
+     * their file type until the index has gone past this point.
+     */
+    static constexpr size_t FILE_TYPE_PRUNE_SIZE = 20;
 
     enum class note_type {
         indexing_disabled,
         duplicate,
         not_utf,
+        line_limit,
     };
 
-    using note_map = std::map<note_type, std::string>;
-    using safe_notes = safe::Safe<note_map>;
+    using note_map = lnav::map::small<note_type, lnav::console::user_message>;
+    using safe_notes = safe::Safe<note_map, std::recursive_mutex>;
 
     note_map get_notes() const { return *this->lf_notes.readAccess(); }
 
-    using safe_opid_map = safe::Safe<log_opid_map>;
+    const std::vector<logline_value_stats>& get_value_stats() const
+    {
+        return this->lf_value_stats;
+    }
 
-    safe_opid_map& get_opids() { return this->lf_opids; }
+    const logline_value_stats* stats_for_value(intern_string_t name) const;
+
+    log_format_file_state get_format_file_state() const
+    {
+        return {
+            this->lf_value_stats,
+            this->lf_pattern_locks,
+            this->lf_time_scanner,
+        };
+    }
+
+    /**
+     * @return The scanner that parsed this file's timestamps.  Anything
+     * rendering or re-parsing one of its lines wants this rather than the
+     * format's, which only holds the configuration it was seeded from.
+     */
+    date_time_scanner& get_time_scanner() const
+    {
+        return this->lf_time_scanner;
+    }
+
+    using safe_opid_state = safe::Safe<log_opid_state, std::recursive_mutex>;
+
+    safe_opid_state& get_opids() { return this->lf_opids; }
+
+    using safe_thread_id_state = safe::Safe<log_thread_id_state>;
+
+    safe_thread_id_state& get_thread_ids() { return this->lf_thread_ids; }
+
+    void set_logline_opid(uint32_t line_number, string_fragment opid);
+
+    void set_opid_description(string_fragment opid, string_fragment desc);
+
+    void clear_logline_opid(uint32_t line_number);
 
     void quiesce() { this->lf_line_buffer.quiesce(); }
 
@@ -384,6 +702,85 @@ public:
         return this->lf_embedded_metadata;
     }
 
+    std::optional<std::pair<std::string, lnav::file_options>> get_file_options()
+        const
+    {
+        return this->lf_file_options;
+    }
+
+    const robin_hood::unordered_set<intern_string_t, intern_hasher>&
+    get_mismatched_formats() const
+    {
+        return this->lf_mismatched_formats;
+    }
+
+    const std::vector<lnav::console::user_message>& get_format_match_messages()
+        const
+    {
+        return this->lf_format_match_messages;
+    }
+
+    struct invalid_line_info {
+        static constexpr size_t MAX_INVALID_LINES = 5;
+
+        std::vector<size_t> ili_lines;
+        size_t ili_total{0};
+    };
+
+    const invalid_line_info& get_invalid_line_info() const
+    {
+        return this->lf_invalid_lines;
+    }
+
+    size_t estimated_remaining_lines() const;
+
+    /**
+     * Forget the index entries before the given index for a file opened with
+     * loo_streaming.  The last message and enough entries for format
+     * detection are always kept, so fewer entries than asked for may be
+     * dropped.  Line-number keyed state (opids, thread IDs, pattern locks) is
+     * cleared as well.
+     *
+     * @return The number of entries that were dropped.
+     */
+    size_t discard_index_before(size_t index);
+
+    /**
+     * @return The number of index entries dropped by discard_index_before().
+     */
+    size_t get_index_base() const { return this->lf_index_base; }
+
+    /**
+     * @return The offset of the first line past the end of the time range in
+     * the open options, once indexing has reached it.
+     */
+    std::optional<file_size_t> get_upper_bound_offset() const
+    {
+        return this->lf_upper_bound_size;
+    }
+
+    /**
+     * @return The corrections the last rebuild_index() made to the times of
+     * the lines before a date rollover, in the order they were made.  Lines
+     * that were already dropped with discard_index_before() did not get them.
+     */
+    const std::vector<time_rollover>& get_time_rollovers() const
+    {
+        return this->lf_time_rollovers;
+    }
+
+    const std::string& get_decompress_error() const
+    {
+        return this->lf_line_buffer.get_decompress_error();
+    }
+
+    time_range get_content_time_range() const;
+
+    const log_level_stats& get_level_stats() const
+    {
+        return this->lf_level_stats;
+    }
+
 protected:
     /**
      * Process a line from the file.
@@ -396,65 +793,186 @@ protected:
                         const line_info& li,
                         scan_batch_context& sbc);
 
-    void set_format_base_time(log_format* lf);
+    /**
+     * @return Whether anything in the indexing scan still needs this line's
+     * bytes.
+     *
+     * False once no format is going to be found for this file:
+     * process_prefix() builds the logline out of the line_info alone on that
+     * path, and every block in the scan that does read the line is gated on
+     * having a format, on the line being invalid UTF-8, or on a filter being
+     * configured.
+     *
+     * @param observer_wants_text What the logline observer said when the
+     * scan started.  Passed in rather than asked for here because the answer
+     * holds for the whole pass and this runs on every line.
+     */
+    bool needs_line_text(const line_info& li, bool observer_wants_text) const
+    {
+        // Both of these can change part-way through a pass -- a format may
+        // still be found, and detection may give up -- so they are read per
+        // line rather than hoisted with the observer's answer.
+        if (this->lf_format != nullptr || this->lf_options.loo_detect_format) {
+            return true;
+        }
+        if (!li.li_utf8_scan_result.is_valid()) {
+            // The not-utf note and the TRACE-level warning both hexdump the
+            // offending line.
+            return true;
+        }
+
+        return observer_wants_text;
+    }
+
+    void set_base_time_for(scan_batch_context& sbc, const line_info& li);
 
 private:
-    logfile(std::string filename, logfile_open_options& loo);
+    logfile(std::filesystem::path filename, const logfile_open_options& loo);
 
-    std::string lf_filename;
+    bool file_options_have_changed();
+
+    void reset_internal_state_for_reindex();
+
+    void reset_time_order();
+
+    void truncate_time_order(size_t line_count);
+
+    void update_time_order(bool recheck);
+
+    std::filesystem::path lf_filename;
+    std::string lf_filename_as_string;
     logfile_open_options lf_options;
     logfile_activity lf_activity;
     bool lf_named_file{true};
     bool lf_valid_filename{true};
-    nonstd::optional<ghc::filesystem::path> lf_actual_path;
+    std::optional<std::filesystem::path> lf_actual_path;
     std::string lf_basename;
     std::string lf_content_id;
-    struct stat lf_stat {};
+    const uint64_t lf_serial{next_serial()};
+    struct stat lf_stat{};
     std::shared_ptr<log_format> lf_format;
+    log_format_scan_match lf_format_match;
     std::vector<logline> lf_index;
-    time_t lf_index_time{0};
+    std::vector<uint32_t> lf_time_order;
+    size_t lf_time_order_size{0};
+    size_t lf_index_base{0};
+    std::chrono::microseconds lf_index_time{0};
     file_off_t lf_index_size{0};
+    size_t lf_input_lines{0};
+    int lf_index_generation{0};
     bool lf_sort_needed{false};
     line_buffer lf_line_buffer;
     int lf_time_offset_line{0};
-    struct timeval lf_time_offset {
-        0, 0
-    };
+    timeval lf_time_offset{0, 0};
     bool lf_is_closed{false};
     bool lf_indexing{true};
-    bool lf_partial_line{false};
+    line_info lf_last_line_info;
+    bool lf_zoned_to_local_state{true};
+    robin_hood::unordered_set<string_fragment,
+                              frag_hasher,
+                              std::equal_to<string_fragment>>
+        lf_invalidated_opids;
     logline_observer* lf_logline_observer{nullptr};
-    logfile_observer* lf_logfile_observer{nullptr};
+    index_progress lf_index_progress;
     size_t lf_longest_line{0};
-    text_format_t lf_text_format{text_format_t::TF_UNKNOWN};
+    std::optional<text_format_t> lf_text_format;
     uint32_t lf_out_of_time_order_count{0};
     safe_notes lf_notes;
-    safe_opid_map lf_opids;
+    std::vector<logline_value_stats> lf_value_stats;
+    log_level_stats lf_level_stats;
+    pattern_locks lf_pattern_locks;
+    /**
+     * This file's own timestamp scanner.  The format holds the configuration
+     * it is seeded from; the format lock and conversion caches it builds up
+     * belong to this file alone.  Mutable because the display side keeps
+     * using it as a cache -- reformatting a timestamp locks onto a format and
+     * memoizes the local-time offset -- long after indexing is done.
+     */
+    mutable date_time_scanner lf_time_scanner;
+    safe_opid_state lf_opids;
+    safe_thread_id_state lf_thread_ids;
     size_t lf_watch_count{0};
     ArenaAlloc::Alloc<char> lf_allocator{64 * 1024};
-    nonstd::optional<time_t> lf_cached_base_time;
-    nonstd::optional<tm> lf_cached_base_tm;
+    std::optional<time_t> lf_cached_base_time;
+    std::optional<tm> lf_cached_base_tm;
 
-    nonstd::optional<std::pair<file_off_t, size_t>> lf_next_line_cache;
-    std::set<intern_string_t> lf_mismatched_formats;
+    std::optional<std::pair<file_off_t, size_t>> lf_next_line_cache;
+    robin_hood::unordered_set<intern_string_t, intern_hasher>
+        lf_mismatched_formats;
+    /**
+     * The set of file types that a format has matched in this file.  Once a
+     * format has matched, formats whose file type is not in this set are
+     * skipped.
+     */
+    uint8_t lf_viable_file_types{0};
+    bool lf_pruned_formats_logged{false};
     robin_hood::unordered_map<uint32_t, bookmark_metadata> lf_bookmark_metadata;
 
     std::vector<std::shared_ptr<format_tag_def>> lf_applicable_taggers;
+    std::vector<std::shared_ptr<format_partition_def>>
+        lf_applicable_partitioners;
     std::map<std::string, metadata> lf_embedded_metadata;
+    size_t lf_file_options_generation{0};
+    std::optional<std::pair<std::string, lnav::file_options>> lf_file_options;
+    std::vector<lnav::console::user_message> lf_format_match_messages;
+    invalid_line_info lf_invalid_lines;
+    auto_buffer lf_plain_msg_buffer = auto_buffer::alloc(256);
+    shared_buffer lf_plain_msg_shared;
+
+    time_range lf_content_time_range;
+
+    struct content_map_entry {
+        file_range cme_range;
+        std::chrono::microseconds cme_time;
+    };
+    file_size_t lf_file_size_at_map_time{0};
+    std::vector<content_map_entry> lf_content_map;
+    std::optional<content_map_entry> lf_lower_bound_entry;
+    std::optional<content_map_entry> lf_upper_bound_entry;
+    std::optional<file_size_t> lf_upper_bound_size;
+    std::vector<time_rollover> lf_time_rollovers;
+
+    struct map_read_upper_bound {};
+    struct map_read_lower_bound {
+        std::chrono::microseconds mrlb_time;
+    };
+    using map_read_requirement
+        = mapbox::util::variant<map_read_upper_bound, map_read_lower_bound>;
+
+    struct map_entry_not_found {};
+    struct map_entry_found {
+        content_map_entry mef_entry;
+    };
+    using map_entry_result
+        = mapbox::util::variant<map_entry_not_found, map_entry_found>;
+
+    map_entry_result find_content_map_entry(file_off_t offset,
+                                            map_read_requirement req);
+
+    rebuild_result_t build_content_map();
 };
 
 class logline_observer {
 public:
     virtual ~logline_observer() = default;
 
+    virtual void logline_clear(const logfile& lf) = 0;
+
     virtual void logline_restart(const logfile& lf, file_size_t rollback_size)
         = 0;
 
-    virtual void logline_new_lines(const logfile& lf,
+    virtual bool logline_new_lines(const logfile& lf,
                                    logfile::const_iterator ll_begin,
                                    logfile::const_iterator ll_end,
-                                   shared_buffer_ref& sbr)
-        = 0;
+                                   const shared_buffer_ref& sbr) = 0;
+
+    /**
+     * @return Whether logline_new_lines() will look at the line text.  Saying
+     * no lets the indexer skip reading the bytes and hand over an empty
+     * buffer; the observer is still called, since it may have per-line
+     * bookkeeping of its own.
+     */
+    virtual bool logline_wants_text() const { return true; }
 
     virtual void logline_eof(const logfile& lf) = 0;
 };

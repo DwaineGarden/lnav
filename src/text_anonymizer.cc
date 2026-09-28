@@ -27,6 +27,8 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <filesystem>
+
 #include "text_anonymizer.hh"
 
 #include <arpa/inet.h>
@@ -37,8 +39,7 @@
 #include "config.h"
 #include "data_scanner.hh"
 #include "diseases-json.h"
-#include "ghc/filesystem.hpp"
-#include "lnav_util.hh"
+#include "hasher.hh"
 #include "pcrepp/pcre2pp.hh"
 #include "words-json.h"
 #include "yajlpp/yajlpp_def.hh"
@@ -61,18 +62,26 @@ struct random_list {
     }
 };
 
-static const typed_json_path_container<random_list> random_list_handlers = {
-    yajlpp::property_handler("data#").for_field(&random_list::rl_data),
-};
+static const typed_json_path_container<random_list>&
+get_random_list_handlers()
+{
+    static const typed_json_path_container<random_list> retval = {
+        yajlpp::property_handler("data#").for_field(&random_list::rl_data),
+    };
+
+    return retval;
+}
 
 static random_list
 load_word_list()
 {
     static const intern_string_t name
         = intern_string::lookup(words_json.get_name());
-    auto parse_res
-        = random_list_handlers.parser_for(name).with_ignore_unused(false).of(
-            words_json.to_string_fragment());
+    auto sfp = words_json.to_string_fragment_producer();
+    auto parse_res = get_random_list_handlers()
+                         .parser_for(name)
+                         .with_ignore_unused(false)
+                         .of(*sfp);
 
     return parse_res.unwrap();
 }
@@ -90,9 +99,11 @@ load_animal_list()
 {
     static const intern_string_t name
         = intern_string::lookup(animals_json.get_name());
-    auto parse_res
-        = random_list_handlers.parser_for(name).with_ignore_unused(false).of(
-            animals_json.to_string_fragment());
+    auto sfp = animals_json.to_string_fragment_producer();
+    auto parse_res = get_random_list_handlers()
+                         .parser_for(name)
+                         .with_ignore_unused(false)
+                         .of(*sfp);
 
     return parse_res.unwrap();
 }
@@ -110,9 +121,11 @@ load_disease_list()
 {
     static const intern_string_t name
         = intern_string::lookup(diseases_json.get_name());
-    auto parse_res
-        = random_list_handlers.parser_for(name).with_ignore_unused(false).of(
-            diseases_json.to_string_fragment());
+    auto sfp = diseases_json.to_string_fragment_producer();
+    auto parse_res = get_random_list_handlers()
+                         .parser_for(name)
+                         .with_ignore_unused(false)
+                         .of(*sfp);
 
     return parse_res.unwrap();
 }
@@ -205,8 +218,8 @@ text_anonymizer::next(string_fragment line)
                             cu, CURLUPART_PATH, url_part.out(), CURLU_URLDECODE)
                         == CURLUE_OK)
                     {
-                        ghc::filesystem::path url_path(url_part.in());
-                        ghc::filesystem::path anon_path;
+                        std::filesystem::path url_path(url_part.in());
+                        std::filesystem::path anon_path;
 
                         for (const auto& comp : url_path) {
                             if (comp == comp.root_path()) {
@@ -290,8 +303,8 @@ text_anonymizer::next(string_fragment line)
                 break;
             }
             case DT_PATH: {
-                ghc::filesystem::path inp_path(tok_res->to_string());
-                ghc::filesystem::path anon_path;
+                std::filesystem::path inp_path(tok_res->to_string());
+                std::filesystem::path anon_path;
 
                 for (const auto& comp : inp_path) {
                     auto comp_str = comp.string();
@@ -342,15 +355,14 @@ text_anonymizer::next(string_fragment line)
                             (unsigned char) ((base_mac >> 0) & 0xff),
                         });
 
-                        return anon_mac.to_string(
-                            nonstd::make_optional(inp[2]));
+                        return anon_mac.to_string(std::make_optional(inp[2]));
                     });
                 break;
             }
             case DT_HEX_DUMP: {
                 auto hex_str = tok_res->to_string();
                 auto hash_str = hasher().update(hex_str).to_array().to_string(
-                    nonstd::make_optional(hex_str[2]));
+                    std::make_optional(hex_str[2]));
                 std::string anon_hex;
 
                 while (anon_hex.size() < hex_str.size()) {
@@ -468,7 +480,7 @@ text_anonymizer::next(string_fragment line)
                 } else {
                     static const auto ATTR_RE
                         = lnav::pcre2pp::code::from_const(R"([\w\-]+=)");
-                    static thread_local auto md
+                    thread_local auto md
                         = lnav::pcre2pp::match_data::unitialized();
 
                     auto remaining = string_fragment::from_str_range(
@@ -508,6 +520,10 @@ text_anonymizer::next(string_fragment line)
                 break;
             }
             default: {
+                log_debug("tok_re %d %d:%d",
+                          tok_res->tr_token,
+                          tok_res->tr_capture.c_begin,
+                          tok_res->tr_capture.c_end);
                 retval += tok_res->to_string();
                 break;
             }

@@ -28,6 +28,7 @@
  */
 
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,10 +47,8 @@ class my_source : public grep_proc_source<vis_line_t> {
 public:
     my_source(auto_fd& fd) { this->ms_buffer.set_fd(fd); };
 
-    bool grep_value_for_line(vis_line_t line_number, string& value_out)
+    std::optional<line_info> grep_value_for_line(vis_line_t line_number, string& value_out) override
     {
-        bool retval = false;
-
         try {
             auto load_result = this->ms_buffer.load_next_line(this->ms_range);
 
@@ -64,7 +63,9 @@ public:
                                   value_out = to_string(sbr);
                               });
 
-                    retval = read_result.isOk();
+                    if (read_result.isOk()) {
+                        return line_info{};
+                    }
                 }
             }
         } catch (const line_buffer::error& e) {
@@ -74,7 +75,7 @@ public:
                     strerror(e.e_err));
         }
 
-        return retval;
+        return std::nullopt;
     };
 
 private:
@@ -84,28 +85,28 @@ private:
 
 class my_sink : public grep_proc_sink<vis_line_t> {
 public:
-    my_sink() : ms_finished(false) {}
+    my_sink(size_t pattern_count) : ms_pattern_count(pattern_count) {}
 
     void grep_match(grep_proc<vis_line_t>& gp,
                     vis_line_t line,
-                    int start,
-                    int end)
+                    grep_pattern_mask_t patterns) override
     {
-        printf("%d:%d:%d\n", (int) line, start, end);
+        if (this->ms_pattern_count > 1) {
+            // Only report which patterns hit when there is more than one, so
+            // that the single-pattern output stays pipeable into slicer(1).
+            printf("%d/%x\n", (int) line, patterns);
+        } else {
+            printf("%d\n", (int) line);
+        }
     }
 
-    void grep_capture(grep_proc<vis_line_t>& gp,
-                      vis_line_t line,
-                      int start,
-                      int end,
-                      char* capture)
+    void grep_end(grep_proc<vis_line_t>& gp) override
     {
-        fprintf(stderr, "%d(%d:%d)%s\n", (int) line, start, end, capture);
+        this->ms_finished = true;
     }
 
-    void grep_end(grep_proc<vis_line_t>& gp) { this->ms_finished = true; }
-
-    bool ms_finished;
+    size_t ms_pattern_count;
+    bool ms_finished{false};
 };
 
 int
@@ -114,41 +115,56 @@ main(int argc, char* argv[])
     int retval = EXIT_SUCCESS;
     auto_fd fd;
 
+    // The last argument is the file, everything before it is a pattern.  Each
+    // pattern gets its own slot in the grep_proc so that a single pass over
+    // the file services all of them.
+    auto pattern_count = argc - 2;
+
     if (argc < 3) {
         fprintf(stderr, "error: expecting pattern and file arguments\n");
         retval = EXIT_FAILURE;
-    } else if ((fd = open(argv[2], O_RDONLY)) == -1) {
+    } else if ((fd = open(argv[argc - 1], O_RDONLY)) == -1) {
         perror("open");
         retval = EXIT_FAILURE;
     } else {
-        auto compile_res = lnav::pcre2pp::code::from(
-            string_fragment::from_c_str(argv[1]), PCRE2_CASELESS);
+        vector<shared_ptr<lnav::pcre2pp::code>> codes;
 
-        if (compile_res.isErr()) {
-            auto ce = compile_res.unwrapErr();
-            fprintf(stderr,
-                    "error: invalid pattern -- %s\n",
-                    ce.get_message().c_str());
-        } else {
-            auto co = compile_res.unwrap().to_shared();
-            auto psuperv = std::make_shared<pollable_supervisor>();
-            my_source ms(fd);
-            my_sink msink;
+        for (int lpc = 1; lpc < argc - 1; lpc++) {
+            auto compile_res = lnav::pcre2pp::code::from(
+                string_fragment::from_c_str(argv[lpc]), PCRE2_CASELESS);
 
-            grep_proc<vis_line_t> gp(co, ms, psuperv);
-
-            gp.set_sink(&msink);
-            gp.queue_request();
-            gp.start();
-
-            while (!msink.ms_finished) {
-                vector<struct pollfd> pollfds;
-
-                psuperv->update_poll_set(pollfds);
-                poll(&pollfds[0], pollfds.size(), -1);
-
-                psuperv->check_poll_set(pollfds);
+            if (compile_res.isErr()) {
+                auto ce = compile_res.unwrapErr();
+                fprintf(stderr,
+                        "error: invalid pattern -- %s\n",
+                        ce.get_message().c_str());
+                return EXIT_FAILURE;
             }
+            codes.emplace_back(compile_res.unwrap().to_shared());
+        }
+
+        auto psuperv = std::make_shared<pollable_supervisor>();
+        my_source ms(fd);
+        my_sink msink(pattern_count);
+
+        grep_proc<vis_line_t> gp(codes[0], ms, psuperv);
+        for (size_t lpc = 1; lpc < codes.size(); lpc++) {
+            gp.set_pattern(lpc, codes[lpc]);
+        }
+
+        gp.set_sink(&msink);
+        // The source runs out of lines before this, which is what ends the
+        // scan -- the driver has no line count to give.
+        gp.queue_request(0_vl, vis_line_t(INT32_MAX));
+        gp.start();
+
+        while (!msink.ms_finished) {
+            vector<struct pollfd> pollfds;
+
+            psuperv->update_poll_set(pollfds);
+            poll(&pollfds[0], pollfds.size(), -1);
+
+            psuperv->check_poll_set(pollfds);
         }
     }
 

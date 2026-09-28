@@ -4,9 +4,13 @@ add_library(
         ansi_scrubber.cc
         attr_line.cc
         attr_line.builder.cc
+        auto_fd.cc
         auto_pid.cc
+        cell_container.cc
+        color_spaces.cc
         date_time_scanner.cc
         fs_util.cc
+        fts_fuzzy_match.cc
         humanize.cc
         humanize.network.cc
         humanize.time.cc
@@ -14,10 +18,18 @@ add_library(
         is_utf8.cc
         isc.cc
         lnav.console.cc
+        lnav.console.win.cc
         lnav.gzip.cc
+        lnav.tz.cc
         lnav_log.cc
         network.tcp.cc
+        parallel_for.cc
         paths.cc
+        piper.file.cc
+        progress.cc
+        relative_time.cc
+        separated_string.cc
+        small_string_map.cc
         snippet_highlighters.cc
         string_attr_type.cc
         string_util.cc
@@ -25,17 +37,25 @@ add_library(
         time_util.cc
 
         ansi_scrubber.hh
+        ansi_vars.hh
         attr_line.hh
         attr_line.builder.hh
         auto_fd.hh
         auto_mem.hh
         auto_pid.hh
         bus.hh
+        cell_container.hh
+        color_spaces.hh
+        date_time_scanner.cfg.hh
         date_time_scanner.hh
+        distributed_slice.hh
         enum_util.hh
+        from_trait.hh
         fs_util.hh
+        fts_fuzzy_match.hh
         func_util.hh
         future_util.hh
+        guard_util.hh
         humanize.hh
         humanize.network.hh
         humanize.time.hh
@@ -45,37 +65,86 @@ add_library(
         is_utf8.hh
         isc.hh
         itertools.hh
+        itertools.enumerate.hh
+        keycodes.hh
+        line_range.hh
         lnav.console.hh
         lnav.console.into.hh
+        lnav.resolver.hh
+        lnav.ryml.hh
+        lnav.tz.hh
         log_level_enum.hh
         lrucache.hpp
+        lazy_vector.hh
+        map_util.hh
         math_util.hh
         network.tcp.hh
+        parallel_for.hh
         paths.hh
+        piper.file.hh
+        progress.hh
+        relative_time.hh
         result.h
+        separated_string.hh
+        short_alloc.h
+        small_string_map.hh
+        sparse_cursor_container.hh
         snippet_highlighters.hh
         string_attr_type.hh
         strnatcmp.h
+        text_format_enum.hh
         time_util.hh
+        types.hh
 
         ../third-party/xxHash/xxhash.h
         ../third-party/xxHash/xxhash.c
+
+        ../third-party/parallel_hashmap/meminfo.h
+        ../third-party/parallel_hashmap/phmap.h
+        ../third-party/parallel_hashmap/phmap_base.h
+        ../third-party/parallel_hashmap/phmap_bits.h
+        ../third-party/parallel_hashmap/phmap_config.h
+        ../third-party/parallel_hashmap/phmap_dump.h
+        ../third-party/parallel_hashmap/phmap_fwd_decl.h
+        ../third-party/parallel_hashmap/phmap_utils.h
 )
 
 target_include_directories(base PUBLIC . .. ../third-party
-        ${CMAKE_CURRENT_BINARY_DIR}/..)
-target_link_libraries(base cppfmt cppscnlib pcrepp ncurses::libcurses pthread)
+        ../third-party/date/include
+        ../third-party/parallel_hashmap
+        ${CMAKE_CURRENT_BINARY_DIR}/..
+)
+target_link_libraries(base
+        cppfmt
+        cppscnlib
+        pcrepp
+        pthread
+        lnavdt
+        lnavnotcurses
+        datepp
+)
 
 add_executable(
         test_base
         attr_line.tests.cc
+        cell_container.tests.cc
+        color_spaces.tests.cc
         fs_util.tests.cc
+        future_util.tests.cc
+        gallop.tests.cc
         humanize.file_size.tests.cc
         humanize.network.tests.cc
         humanize.time.tests.cc
         intern_string.tests.cc
+        is_utf8.tests.cc
+        lnav.console.tests.cc
         lnav.gzip.tests.cc
+        math_util.tests.cc
+        separated_string.tests.cc
+        small_string_map.tests.cc
+        sparse_cursor_container.tests.cc
         string_util.tests.cc
+        parallel_for.tests.cc
         network.tcp.tests.cc
         test_base.cc)
 target_include_directories(test_base PUBLIC ../third-party/doctest-root)

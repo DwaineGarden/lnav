@@ -31,17 +31,15 @@
 #define pretty_printer_hh
 
 #include <deque>
-#include <map>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <stack>
-#include <utility>
+#include <string>
 #include <vector>
-
-#include <sys/types.h>
 
 #include "base/attr_line.hh"
 #include "base/file_range.hh"
-#include "base/opt_util.hh"
 #include "data_scanner.hh"
 #include "document.sections.hh"
 
@@ -97,23 +95,25 @@ public:
         return std::move(this->pp_hier_stage);
     }
 
-private:
-    void descend();
+    std::set<size_t> take_indents() { return std::move(this->pp_indents); }
 
-    void ascend();
+private:
+    void descend(data_token_t dt);
+
+    void ascend(data_token_t dt);
 
     void start_new_line();
 
     bool flush_values(bool start_on_depth = false);
 
-    void append_indent();
+    int append_indent();
 
     void write_element(const element& el);
 
     void append_child_node();
 
     struct interval_state {
-        nonstd::optional<file_off_t> is_start;
+        std::optional<file_off_t> is_start;
         std::string is_name;
     };
 
@@ -121,6 +121,7 @@ private:
     int pp_depth{0};
     int pp_line_length{0};
     int pp_soft_indent{0};
+    std::vector<data_token_t> pp_container_tokens{};
     std::stack<int> pp_body_lines{};
     data_scanner* pp_scanner;
     string_attrs_t pp_attrs;
@@ -132,6 +133,7 @@ private:
     std::vector<lnav::document::section_interval_t> pp_intervals;
     std::vector<std::unique_ptr<lnav::document::hier_node>> pp_hier_nodes;
     std::unique_ptr<lnav::document::hier_node> pp_hier_stage;
+    std::set<size_t> pp_indents;
 };
 
 #endif

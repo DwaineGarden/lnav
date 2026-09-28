@@ -34,16 +34,38 @@ Options
    exit.  This option can be helpful for validating that a log format is
    well-formed.
 
+.. option:: -S <relative-time/absolute-local-time>
+
+    Only index log content since the given time.  The time can be relative
+    (e.g. "2pm yesterday", "30 min ago") or an absolute time
+    (e.g. "2020-01-02T03:04:05").  If the log content lies completely outside
+    of this time cutoff, the file will be closed out to reduce resource
+    usage.
+
+.. option:: -U <relative-time/absolute-local-time>
+
+    Only index log content until the given time.  The time can be relative
+    (e.g. "2pm yesterday", "30 min ago") or an absolute time
+    (e.g. "2020-01-02T03:04:05").  If the log content lies completely outside
+    of this time cutoff, the file will be closed out to reduce resource
+    usage.
+
 .. option:: -c <command>
 
    Execute the given lnav command, SQL query, or lnav script.  The
    argument must be prefixed with the character used to enter the prompt
-   to distinguish between the different types (i.e. ':', ';', '|').
-   This option can be given multiple times.
+   to distinguish between the different types (i.e. :code:`:`, :code:`;`,
+   :code:`|`, :code:`/`).  This option can be given multiple times.
 
 .. option:: -f <path>
 
    Execute the given command file.  This option can be given multiple times.
+
+.. option:: -e <command-line>
+
+   Execute the given shell command-line and display its output.  This is
+   equivalent to executing the :code:`:sh` command and passing the
+   :option:`-N` flag. This option can be given multiple times.
 
 .. option:: -I <path>
 
@@ -51,10 +73,11 @@ Options
 
 .. option:: -i
 
-   Install the format files in the :file:`.lnav/formats/` directory.
-   Individual files will be installed in the :file:`installed`
-   directory and git repositories will be cloned with a directory
-   name based on their repository URI.
+   Install the given files in the lnav configuration directories.
+   Format files, SQL, and lnav scripts will be installed in the
+   :file:`formats/installed`.  Configuration files will be installed
+   in the :file:`configs/installed` directory.  Git repository URIs
+   will be cloned with a directory name based on their repository URI.
 
 .. option:: -u
 
@@ -78,20 +101,23 @@ Options
 
 .. option:: -t
 
-   Prepend timestamps to the lines of data being read in on the standard input.
-
-.. option:: -w <path>
-
-   Write the contents of the standard input to this file.
+   For data that was piped into lnav, show the timestamp for each line.
 
 .. option:: -V
 
    Print the version of lnav.
 
+.. option:: -v
+
+   Print extra information during operations.
+
 .. option:: -q
 
-   Do not print the log messages after executing all of the commands.
+   Do not print informational messages and behave in a manner compatible
+   with being used as a PAGER.
 
+
+.. _management_cli:
 
 Management Mode (v0.11.0+)
 --------------------------
@@ -107,12 +133,49 @@ Options
    Switch to management mode.  This must be the first option passed on the
    command-line.
 
+.. option:: -I <path>
+
+   Add a configuration directory.
+
 Subcommands
 ^^^^^^^^^^^
 
-.. option:: regex101 import <regex101-url> <format-name> [<regex-name>]
+.. option:: apps create <name>
 
-   Convert a regex101.com entry into a skeleton log format file.
+    Create a new app with the given name.  This command will create the
+    configuration directory, an :file:`app.json` configuration file,
+    and an :file:`app-files` directory with a basic :file:`index.md`.
+    The publisher value will be taken from the :envvar:`USER` environment
+    variable or the current user name.
+
+.. option:: config get
+
+   Print out the current configuration as JSON on the standard output.
+
+.. option:: config blame
+
+   Print out the configuration options as JSON-Pointers and the
+   file/line-number where the configuration is sourced from.
+
+.. option:: config file-options <path>
+
+   Print out the options that will be applied to the given file.  The
+   options are stored in the :file:`file-options.json` file in the
+   **lnav** configuration directory.  The only option available at
+   the moment is the timezone to be used for log message timestamps
+   that do not include a zone.  The timezone for a file can be set
+   using the :ref:`:set-file-timezone<set_file_timezone>` command
+   and cleared with the :ref:`:clear-file-timezone<clear_file_timezone>`
+   command.
+
+.. option:: format <format-name> get
+
+   Print information about the given log format.
+
+.. option:: format <format-name> source
+
+   Print the name of the first file that contained this log format
+   definition.
 
 .. option:: format <format-name> regex <regex-name> push
 
@@ -121,6 +184,28 @@ Subcommands
 .. option:: format <format-name> regex <regex-name> pull
 
    Pull changes to a regex that was previously pushed to regex101.com .
+
+.. _format_test_cli:
+.. option:: format <format-name> test <path>
+
+   Test this format against the given file.
+
+.. option:: piper clean
+
+   Remove all of the files that stored data that was piped into **lnav**
+   through stdin or a FIFO.
+
+.. option:: piper list
+
+   List all of the data that was piped into **lnav** from oldest to newest.
+   The listing will show the creation time, the URL you can use to reopen
+   the data, and a description of the data.  Passing the :option:`-v`
+   option will print out additional metadata that was captured, such as
+   the current working directory of **lnav** and the environment variables.
+
+.. option:: regex101 import <regex101-url> <format-name> [<regex-name>]
+
+   Convert a regex101.com entry into a skeleton log format file.
 
 Environment Variables
 ---------------------
@@ -142,27 +227,27 @@ Environment Variables
 
 .. envvar:: TZ
 
-   The timezone setting is used in some log formats to convert UTC timestamps
-   to the local timezone.
+   The timezone setting is used in some log formats to convert timestamps
+   with a timezone to the local timezone.
 
 
 Examples
 --------
 
-  To load and follow the system syslog file:
+To load and follow the system syslog file:
 
-  .. prompt:: bash
+.. code-block:: bash
 
-    lnav
+   lnav
 
-  To load all of the files in :file:`/var/log`:
+To load all of the files in :file:`/var/log`:
 
-  .. prompt:: bash
+.. code-block:: bash
 
-    lnav /var/log
+   lnav /var/log
 
-  To watch the output of make with timestamps prepended:
+To watch the output of make:
 
-  .. prompt:: bash
+.. code-block:: bash
 
-    make 2>&1 | lnav -t
+   lnav -e 'make -j4'

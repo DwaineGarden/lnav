@@ -33,18 +33,28 @@
 #define lnav_file_collection_hh
 
 #include <forward_list>
+#include <functional>
+#include <future>
 #include <list>
 #include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
-#include <utility>
+#include <vector>
+
+#include <sys/resource.h>
+#include <time.h>
 
 #include "archive_manager.hh"
+#include "base/auto_pid.hh"
 #include "base/future_util.hh"
+#include "base/lnav.console.hh"
+#include "base/string_util.hh"
 #include "file_format.hh"
 #include "logfile_fwd.hh"
 #include "safe/safe.h"
-#include "tailer/tailer.looper.hh"
+#include "tlx/container/btree_map.hpp"
 
 struct tailer_progress {
     std::string tp_message;
@@ -53,6 +63,11 @@ struct tailer_progress {
 struct scan_progress {
     std::list<archive_manager::extract_progress> sp_extractions;
     std::map<std::string, tailer_progress> sp_tailers;
+
+    bool empty() const
+    {
+        return this->sp_extractions.empty() && this->sp_tailers.empty();
+    }
 };
 
 using safe_scan_progress = safe::Safe<scan_progress>;
@@ -60,6 +75,7 @@ using safe_scan_progress = safe::Safe<scan_progress>;
 struct other_file_descriptor {
     file_format_t ofd_format;
     std::string ofd_description;
+    std::vector<lnav::console::user_message> ofd_details;
 
     other_file_descriptor(file_format_t format = file_format_t::UNKNOWN,
                           std::string description = "")
@@ -68,14 +84,43 @@ struct other_file_descriptor {
     }
 };
 
-struct file_error_info {
-    const time_t fei_mtime;
-    const std::string fei_description;
+struct file_stub_info {
+    const std::string fsi_display_name;
+    /**
+     * The timestamps of the file when the stub was recorded, if it could be
+     * stat()'d at all.  An unset value means "unknown", which is treated as
+     * stale so that the file is retried.
+     */
+    const std::optional<time_t> fsi_mtime;
+    const std::optional<time_t> fsi_ctime;
+    const lnav::console::user_message fsi_description;
 };
+
+/**
+ * @return True if the file has changed since the stub was recorded, meaning
+ *   it is worth trying to open it again.  A permission change moves ctime
+ *   and not mtime, so both are checked.
+ */
+inline bool
+is_stub_stale(const file_stub_info& fsi, const struct stat& st)
+{
+    if (!fsi.fsi_mtime && !fsi.fsi_ctime) {
+        return true;
+    }
+    if (fsi.fsi_mtime && fsi.fsi_mtime.value() != st.st_mtime) {
+        return true;
+    }
+    if (fsi.fsi_ctime && fsi.fsi_ctime.value() != st.st_ctime) {
+        return true;
+    }
+    return false;
+}
+
+using safe_name_to_stubs = safe::Safe<std::map<std::string, file_stub_info>>;
 
 struct file_collection;
 
-enum class child_poll_result_t {
+enum class child_poll_result_t : uint8_t {
     ALIVE,
     FINISHED,
 };
@@ -83,16 +128,19 @@ enum class child_poll_result_t {
 class child_poller {
 public:
     explicit child_poller(
+        std::string description,
+        std::optional<std::string> filename,
         auto_pid<process_state::running> child,
         std::function<void(file_collection&,
                            auto_pid<process_state::finished>&)> finalizer)
-        : cp_child(std::move(child)), cp_finalizer(std::move(finalizer))
+        : cp_description(std::move(description)), cp_filename(filename),
+          cp_child(std::move(child)), cp_finalizer(std::move(finalizer))
     {
         ensure(this->cp_finalizer);
     }
 
     child_poller(child_poller&& other) noexcept
-        : cp_child(std::move(other.cp_child)),
+        : cp_filename(other.cp_filename), cp_child(std::move(other.cp_child)),
           cp_finalizer(std::move(other.cp_finalizer))
     {
         ensure(this->cp_finalizer);
@@ -102,6 +150,7 @@ public:
     {
         require(other.cp_finalizer);
 
+        this->cp_filename = other.cp_filename;
         this->cp_child = std::move(other.cp_child);
         this->cp_finalizer = std::move(other.cp_finalizer);
 
@@ -114,12 +163,28 @@ public:
 
     child_poller& operator=(const child_poller&) = delete;
 
+    const std::string& get_description() const { return this->cp_description; }
+
+    const std::optional<std::string>& get_filename() const
+    {
+        return this->cp_filename;
+    }
+
+    void send_sigint();
+
     child_poll_result_t poll(file_collection& fc);
 
+    bool is_alive() const { return this->cp_child.has_value(); }
+
+    std::optional<int> get_exit_status() const { return this->cp_exit_status; }
+
 private:
-    nonstd::optional<auto_pid<process_state::running>> cp_child;
+    std::string cp_description;
+    std::optional<std::string> cp_filename;
+    std::optional<auto_pid<process_state::running>> cp_child;
     std::function<void(file_collection&, auto_pid<process_state::finished>&)>
         cp_finalizer;
+    std::optional<int> cp_exit_status;
 };
 
 struct file_collection {
@@ -128,34 +193,69 @@ struct file_collection {
     bool fc_recursive{false};
     bool fc_rotated{false};
 
-    std::map<std::string, file_error_info> fc_name_to_errors;
-    std::map<std::string, logfile_open_options> fc_file_names;
+    std::shared_ptr<safe_name_to_stubs> fc_name_to_stubs{
+        std::make_shared<safe_name_to_stubs>()};
+    tlx::btree_map<std::string, logfile_open_options, strnatless> fc_file_names;
     std::vector<std::shared_ptr<logfile>> fc_files;
     int fc_files_generation{0};
+    std::optional<size_t> fc_files_high_mark;
     std::vector<std::pair<std::shared_ptr<logfile>, std::string>>
         fc_renamed_files;
     std::set<std::string> fc_closed_files;
     std::map<std::string, other_file_descriptor> fc_other_files;
     std::set<std::string> fc_synced_files;
-    std::shared_ptr<safe_scan_progress> fc_progress;
+    std::shared_ptr<safe_scan_progress> fc_progress{
+        std::make_shared<safe_scan_progress>()};
     std::vector<struct stat> fc_new_stats;
-    std::list<child_poller> fc_child_pollers;
+    std::list<std::shared_ptr<child_poller>> fc_child_pollers;
     size_t fc_largest_path_length{0};
 
-    file_collection()
-        : fc_progress(std::make_shared<safe::Safe<scan_progress>>())
+    struct limits_t {
+        limits_t();
+
+        rlim_t l_fds;
+        rlim_t l_high_fd;
+        rlim_t l_open_files;
+    };
+
+    static const limits_t& get_limits();
+
+    file_collection() = default;
+    file_collection(const file_collection&) = delete;
+    file_collection& operator=(const file_collection&) = delete;
+    file_collection(file_collection&&) = default;
+
+    file_collection copy();
+
+    /**
+     * @return Whether the rescan that returned this collection turned
+     *         anything up -- a name to expand, or a file it opened.
+     *
+     * This is the drain signal for a caller looping over rescan_files().
+     * Having opened files is not proof that there is nothing left, because
+     * that stops after 100 new ones and a name it had no room for leaves no
+     * trace: fc_file_names only carries names the pass discovered, which a
+     * file named directly never does.  watch_logfile() skips a file that is
+     * already open, so a pass that turns up nothing had nothing left to find.
+     */
+    bool found_anything() const
     {
+        return !this->fc_file_names.empty() || !this->fc_files.empty();
     }
 
-    void clear()
+    bool empty() const
     {
-        this->fc_name_to_errors.clear();
-        this->fc_file_names.clear();
-        this->fc_files.clear();
-        this->fc_closed_files.clear();
-        this->fc_other_files.clear();
-        this->fc_new_stats.clear();
+        return this->fc_name_to_stubs->readAccess()->empty()
+            && this->fc_file_names.empty() && this->fc_files.empty()
+            && this->fc_progress->readAccess()->empty()
+            && this->fc_other_files.empty();
     }
+
+    void clear();
+
+    bool is_below_open_file_limit() const;
+
+    size_t other_file_format_count(file_format_t ff) const;
 
     file_collection rescan_files(bool required = false);
 
@@ -164,9 +264,12 @@ struct file_collection {
                          logfile_open_options& loo,
                          bool required);
 
-    std::future<file_collection> watch_logfile(const std::string& filename,
-                                               logfile_open_options& loo,
-                                               bool required);
+    std::optional<std::future<file_collection>> watch_logfile(
+        lnav::futures::future_queue<file_collection>& fq,
+        const std::string& user_req,
+        const std::string& filename,
+        logfile_open_options& loo,
+        bool required);
 
     void merge(file_collection& other);
 
@@ -175,6 +278,12 @@ struct file_collection {
     void close_files(const std::vector<std::shared_ptr<logfile>>& files);
 
     void regenerate_unique_file_names();
+
+    size_t initial_indexing_pipers() const;
+
+    size_t active_pipers() const;
+
+    size_t finished_pipers();
 };
 
 #endif

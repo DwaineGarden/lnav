@@ -30,10 +30,12 @@
 #ifndef lnav_all_logs_vtab_hh
 #define lnav_all_logs_vtab_hh
 
-#include <array>
+#include <cstdint>
+#include <vector>
 
-#include "data_parser.hh"
+#include "log_format.hh"
 #include "log_vtab_impl.hh"
+#include "logfile.hh"
 
 /**
  * A virtual table that provides access to all log messages from all formats.
@@ -48,6 +50,7 @@ public:
 
     void extract(logfile* lf,
                  uint64_t line_number,
+                 string_attrs_t& sa,
                  logline_value_vector& values) override;
 
     bool next(log_cursor& lc, logfile_sub_source& lss) override;
@@ -55,6 +58,9 @@ public:
 private:
     logline_value_meta alv_msg_meta;
     logline_value_meta alv_schema_meta;
+    logline_value_meta alv_values_meta;
+    logline_value_meta alv_src_meta;
+    logline_value_meta alv_stacktrace_meta;
 };
 
 #endif  // LNAV_ALL_LOGS_VTAB_HH

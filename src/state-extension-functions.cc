@@ -40,54 +40,80 @@
 #include "sqlite3.h"
 #include "vtab_module.hh"
 
-static nonstd::optional<int64_t>
+static std::optional<int64_t>
 sql_log_top_line()
 {
     const auto& tc = lnav_data.ld_views[LNV_LOG];
+    auto sel = tc.get_selection();
 
-    if (tc.get_inner_height() == 0_vl) {
-        return nonstd::nullopt;
+    if (!sel || tc.get_inner_height() == 0_vl) {
+        return std::nullopt;
     }
-    return (int64_t) tc.get_top();
+    return (int64_t) sel.value();
 }
 
-static nonstd::optional<std::string>
+static std::optional<int64_t>
+sql_log_msg_line()
+{
+    const auto& tc = lnav_data.ld_views[LNV_LOG];
+    auto top_line_opt = tc.get_selection();
+
+    if (!top_line_opt || tc.get_inner_height() == 0_vl) {
+        return std::nullopt;
+    }
+
+    auto top_line = top_line_opt.value();
+    auto line_pair_opt = lnav_data.ld_log_source.find_line_with_file(top_line);
+    if (!line_pair_opt) {
+        return std::nullopt;
+    }
+
+    auto ll = line_pair_opt.value().second;
+    while (ll->is_continued()) {
+        --ll;
+        top_line -= 1_vl;
+    }
+
+    return (int64_t) top_line;
+}
+
+static std::optional<std::string>
 sql_log_top_datetime()
 {
     const auto& tc = lnav_data.ld_views[LNV_LOG];
+    auto top_line_opt = tc.get_selection();
 
-    if (tc.get_inner_height() == 0_vl) {
-        return nonstd::nullopt;
+    if (!top_line_opt || tc.get_inner_height() == 0_vl) {
+        return std::nullopt;
     }
 
-    auto top_time = lnav_data.ld_log_source.time_for_row(
-        lnav_data.ld_views[LNV_LOG].get_top());
-    if (!top_time) {
-        return nonstd::nullopt;
+    auto top_ri = lnav_data.ld_log_source.time_for_row(top_line_opt.value());
+    if (!top_ri) {
+        return std::nullopt;
     }
 
     char buffer[64];
 
-    sql_strftime(buffer, sizeof(buffer), top_time.value());
+    sql_strftime(buffer, sizeof(buffer), top_ri->ri_time);
     return buffer;
 }
 
-static nonstd::optional<std::string>
+static std::optional<std::string>
 sql_lnav_top_file()
 {
     auto top_view_opt = lnav_data.ld_view_stack.top();
 
     if (!top_view_opt) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     auto* top_view = top_view_opt.value();
     return top_view->map_top_row([](const auto& al) {
-        return get_string_attr(al.get_attrs(), logline::L_FILE) |
+        return get_string_attr(al.get_attrs(), L_FILE) |
             [](const auto wrapper) {
                 auto lf = wrapper.get();
 
-                return nonstd::make_optional(lf->get_filename());
+                return std::make_optional(lf->get_filename());
             };
     });
 }
@@ -99,13 +125,23 @@ sql_lnav_version()
 }
 
 static int64_t
-sql_error(const char* str)
+sql_error(const char* str,
+          std::optional<string_fragment> reason,
+          std::optional<string_fragment> help)
 {
-    throw sqlite_func_error("{}", str);
+    auto um = lnav::console::user_message::error(str);
+
+    if (reason) {
+        um.with_reason(reason->to_string());
+    }
+    if (help) {
+        um.with_help(help->to_string());
+    }
+    throw um;
 }
 
-static nonstd::optional<std::string>
-sql_echoln(nonstd::optional<std::string> arg)
+static std::optional<std::string>
+sql_echoln(std::optional<std::string> arg)
 {
     if (arg) {
         auto& ec = lnav_data.ld_exec_context;
@@ -129,33 +165,56 @@ state_extension_functions(struct FuncDef** basic_funcs,
     static struct FuncDef state_funcs[] = {
         sqlite_func_adapter<decltype(&sql_log_top_line), sql_log_top_line>::
             builder(
-                help_text("log_top_line",
-                          "Return the line number at the top of the log view.")
-                    .sql_function()),
+                help_text(
+                    "log_top_line",
+                    "Return the number of the focused line of the log view.")
+                    .sql_function()
+                    .with_prql_path({"lnav", "view", "top_line"})),
+
+        sqlite_func_adapter<decltype(&sql_log_msg_line), sql_log_msg_line>::
+            builder(help_text("log_msg_line",
+                              "Return the starting line number of the focused "
+                              "log message.")
+                        .sql_function()
+                        .with_prql_path({"lnav", "view", "msg_line"})),
 
         sqlite_func_adapter<decltype(&sql_log_top_datetime),
                             sql_log_top_datetime>::
             builder(help_text("log_top_datetime",
                               "Return the timestamp of the line at the top of "
                               "the log view.")
-                        .sql_function()),
+                        .sql_function()
+                        .with_prql_path({"lnav", "view", "top_datetime"})),
 
         sqlite_func_adapter<decltype(&sql_lnav_top_file), sql_lnav_top_file>::
             builder(help_text("lnav_top_file",
                               "Return the name of the file that the top line "
                               "in the current view came from.")
-                        .sql_function()),
+                        .sql_function()
+                        .with_prql_path({"lnav", "view", "top_file"})),
 
         sqlite_func_adapter<decltype(&sql_lnav_version), sql_lnav_version>::
             builder(
                 help_text("lnav_version", "Return the current version of lnav")
-                    .sql_function()),
+                    .sql_function()
+                    .with_prql_path({"lnav", "version"})),
 
         sqlite_func_adapter<decltype(&sql_error), sql_error>::builder(
             help_text("raise_error",
                       "Raises an error with the given message when executed")
                 .sql_function()
-                .with_parameter({"msg", "The error message"}))
+                .with_parameter({"msg", "The error message"})
+                .with_parameter(
+                    help_text("reason", "The reason the error occurred")
+                        .optional())
+                .with_parameter(
+                    help_text("help", "A possible resolution to the error")
+                        .optional())
+                .with_example({
+                    "To raise an error if a variable is not set",
+                    "SELECT ifnull($val, raise_error('please set $val', "
+                    "'because'))",
+                }))
             .with_flags(SQLITE_UTF8),
 
         sqlite_func_adapter<decltype(&sql_echoln), sql_echoln>::builder(

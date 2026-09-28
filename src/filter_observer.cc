@@ -27,47 +27,69 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <algorithm>
+#include <iterator>
+
 #include "filter_observer.hh"
 
+#include "base/lnav_log.hh"
 #include "config.h"
 #include "log_format.hh"
+#include "shared_buffer.hh"
 
 void
+line_filter_observer::logline_clear(const logfile& lf)
+{
+    this->lfo_filter_state.clear_for_rebuild();
+}
+
+bool
 line_filter_observer::logline_new_lines(const logfile& lf,
                                         logfile::const_iterator ll_begin,
                                         logfile::const_iterator ll_end,
-                                        shared_buffer_ref& sbr)
+                                        const shared_buffer_ref& sbr)
 {
-    size_t offset = std::distance(lf.begin(), ll_begin);
+    const auto offset = std::distance(lf.begin(), ll_begin);
 
     require(&lf == this->lfo_filter_state.tfs_logfile.get());
 
+    auto retval = false;
+
     this->lfo_filter_state.resize(lf.size());
     if (this->lfo_filter_stack.empty()) {
-        return;
+        return retval;
     }
 
     for (; ll_begin != ll_end; ++ll_begin) {
-        if (lf.get_format() != nullptr) {
-            lf.get_format()->get_subline(*ll_begin, sbr);
+        auto sbr_copy = sbr.clone();
+        auto* format = lf.get_format_ptr();
+        if (format != nullptr) {
+            format->get_subline(
+                lf.get_format_file_state(), *ll_begin, sbr_copy);
         }
-        for (auto& filter : this->lfo_filter_stack) {
+        sbr_copy.erase_ansi();
+        for (const auto& filter : this->lfo_filter_stack) {
             if (filter->lf_deleted) {
                 continue;
             }
-            if (offset
-                >= this->lfo_filter_state.tfs_filter_count[filter->get_index()])
+            if (offset >= (ssize_t) this->lfo_filter_state
+                              .tfs_filter_count[filter->get_index()])
             {
-                filter->add_line(this->lfo_filter_state, ll_begin, sbr);
+                retval = filter->add_line(
+                             this->lfo_filter_state, ll_begin, sbr_copy)
+                    || retval;
             }
         }
     }
+
+    return retval;
 }
 
 void
 line_filter_observer::logline_eof(const logfile& lf)
 {
-    for (auto& iter : this->lfo_filter_stack) {
+    this->lfo_filter_state.reserve(lf.size() + lf.estimated_remaining_lines());
+    for (const auto& iter : this->lfo_filter_stack) {
         if (iter->lf_deleted) {
             continue;
         }
@@ -80,7 +102,7 @@ line_filter_observer::get_min_count(size_t max) const
 {
     size_t retval = max;
 
-    for (auto& filter : this->lfo_filter_stack) {
+    for (const auto& filter : this->lfo_filter_stack) {
         if (filter->lf_deleted) {
             continue;
         }
@@ -99,7 +121,7 @@ line_filter_observer::clear_deleted_filter_state()
 
     for (auto& filter : this->lfo_filter_stack) {
         if (filter->lf_deleted) {
-            log_debug("skipping deleted %p %d %d",
+            log_debug("skipping deleted %p %zu %d",
                       filter.get(),
                       filter->get_index(),
                       filter->get_lang());

@@ -44,16 +44,26 @@ public:
     void spectro_row(spectrogram_request& sr,
                      spectrogram_row& row_out) override;
 
+    bool spectro_is_marked(spectrogram_request& sr) override;
+
     void spectro_mark(textview_curses& tc,
-                      time_t begin_time,
-                      time_t end_time,
+                      std::chrono::microseconds begin_time,
+                      std::chrono::microseconds end_time,
                       double range_min,
-                      double range_max) override;
+                      double range_max,
+                      mark_op_t op) override;
+
+    std::string spectro_value_suffix() const override;
 
     intern_string_t lsvs_colname;
+    // Cached copy of the column's metadata for fast access to
+    // humanization hints (`lvm_unit_suffix` / `lvm_unit_divisor`).
+    // Resolved once at construction from the first log file whose
+    // format declares this column.
+    std::optional<logline_value_meta> lsvs_meta;
     logline_value_stats lsvs_stats;
-    time_t lsvs_begin_time{0};
-    time_t lsvs_end_time{0};
+    std::chrono::microseconds lsvs_begin_time{0};
+    std::chrono::microseconds lsvs_end_time{0};
     bool lsvs_found{false};
 };
 
@@ -69,19 +79,22 @@ public:
                      spectrogram_row& row_out) override;
 
     void spectro_mark(textview_curses& tc,
-                      time_t begin_time,
-                      time_t end_time,
+                      std::chrono::microseconds begin_time,
+                      std::chrono::microseconds end_time,
                       double range_min,
-                      double range_max) override
+                      double range_max,
+                      mark_op_t op) override
     {
     }
 
+    std::string spectro_value_suffix() const override;
+
     std::string dsvs_colname;
     logline_value_stats dsvs_stats;
-    time_t dsvs_begin_time{0};
-    time_t dsvs_end_time{0};
-    nonstd::optional<size_t> dsvs_column_index;
-    nonstd::optional<lnav::console::user_message> dsvs_error_msg;
+    std::chrono::microseconds dsvs_begin_time{0};
+    std::chrono::microseconds dsvs_end_time{0};
+    std::optional<size_t> dsvs_column_index;
+    std::optional<lnav::console::user_message> dsvs_error_msg;
 };
 
 #endif

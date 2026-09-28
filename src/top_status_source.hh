@@ -30,15 +30,8 @@
 #ifndef lnav_top_status_source_hh
 #define lnav_top_status_source_hh
 
-#include <string>
-
-#include <sqlite3.h>
-
-#include "base/injector.hh"
-#include "bound_tags.hh"
-#include "listview_curses.hh"
-#include "sql_util.hh"
 #include "sqlitepp.client.hh"
+#include "sqlitepp.hh"
 #include "statusview_curses.hh"
 #include "top_status_source.cfg.hh"
 
@@ -46,6 +39,7 @@ class top_status_source : public status_data_source {
 public:
     enum field_t {
         TSF_TIME,
+        TSF_EXT_ACCESS,
         TSF_USER_MSG,
 
         TSF__MAX
@@ -64,11 +58,11 @@ public:
         return this->tss_fields[field];
     }
 
-    void update_time(const struct timeval& current_time);
+    bool update_time(const struct timeval& current_time);
 
     void update_time();
 
-    void update_user_msg();
+    bool update_user_msg();
 
 private:
     const top_status_source_cfg& tss_config;

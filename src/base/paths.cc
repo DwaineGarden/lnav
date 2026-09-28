@@ -27,26 +27,28 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "config.h"
+#include <filesystem>
 
 #ifdef __CYGWIN__
-#    include <iostream>
-#    include <sstream>
+#include <algorithm>
 #endif
 
+#include <unistd.h>
+
+#include "config.h"
 #include "fmt/format.h"
+#include "lnav_log.hh"
+#include "opt_util.hh"
 #include "paths.hh"
 
-namespace lnav {
-namespace paths {
+namespace lnav::paths {
 
 #ifdef __CYGWIN__
-char*
-windows_to_unix_file_path(char* input)
+std::string
+windows_to_unix_file_path(const std::string& input)
 {
-    if (input == nullptr) {
-        return nullptr;
-    }
+    static const auto CYGDRIVE = std::filesystem::path("/cygdrive");
+
     std::string file_path;
     file_path.assign(input);
 
@@ -68,45 +70,48 @@ windows_to_unix_file_path(char* input)
     const auto remaining_path = file_path.substr(2, file_path.size() - 2);
     file_path = drive_letter + remaining_path;
 
-    std::stringstream stringstream;
-    stringstream << "/cygdrive/";
-    stringstream << file_path;
-
-    return const_cast<char*>(stringstream.str().c_str());
+    return (CYGDRIVE / file_path).string();
 }
 #endif
 
-ghc::filesystem::path
+std::filesystem::path
 dotlnav()
 {
+    auto home_env = std::string(getenv_opt("HOME").value_or(""));
+    const auto* xdg_config_home = getenv("XDG_CONFIG_HOME");
+
 #ifdef __CYGWIN__
-    auto home_env = windows_to_unix_file_path(getenv("APPDATA"));
-#else
-    auto home_env = getenv("HOME");
+    const auto* app_data = getenv("APPDATA");
+    if (app_data != nullptr) {
+        auto app_data_path = std::filesystem::path(windows_to_unix_file_path(app_data));
+
+        if (std::filesystem::is_directory(app_data_path)) {
+            return app_data_path / "lnav";
+        }
+    }
 #endif
-    auto xdg_config_home = getenv("XDG_CONFIG_HOME");
 
-    if (home_env != nullptr) {
-        auto home_path = ghc::filesystem::path(home_env);
+    if (!home_env.empty()) {
+        auto home_path = std::filesystem::path(home_env);
 
-        if (ghc::filesystem::is_directory(home_path)) {
+        if (std::filesystem::is_directory(home_path)) {
             auto home_lnav = home_path / ".lnav";
 
-            if (ghc::filesystem::is_directory(home_lnav)) {
+            if (std::filesystem::is_directory(home_lnav)) {
                 return home_lnav;
             }
 
             if (xdg_config_home != nullptr) {
-                auto xdg_path = ghc::filesystem::path(xdg_config_home);
+                auto xdg_path = std::filesystem::path(xdg_config_home);
 
-                if (ghc::filesystem::is_directory(xdg_path)) {
+                if (std::filesystem::is_directory(xdg_path)) {
                     return xdg_path / "lnav";
                 }
             }
 
             auto home_config = home_path / ".config";
 
-            if (ghc::filesystem::is_directory(home_config)) {
+            if (std::filesystem::is_directory(home_config)) {
                 return home_config / "lnav";
             }
 
@@ -114,17 +119,45 @@ dotlnav()
         }
     }
 
-    return ghc::filesystem::current_path();
+    std::error_code ec;
+    auto retval = std::filesystem::current_path(ec);
+    if (ec) {
+        retval = std::filesystem::temp_directory_path();
+    }
+
+    return retval;
 }
 
-ghc::filesystem::path
+std::filesystem::path
 workdir()
 {
-    auto subdir_name = fmt::format(FMT_STRING("lnav-user-{}-work"), getuid());
-    auto tmp_path = ghc::filesystem::temp_directory_path();
+    // Honored so a caller can put the piper captures, archives and
+    // conversions somewhere of its own choosing.  lnav exports this for the
+    // processes it spawns, and scripts like piper-url-handler.lnav read it,
+    // so a child works out of the same directory as its parent.
+    if (auto workdir_env = getenv_opt("LNAV_WORK_DIR")) {
+        if (workdir_env.value()[0] != '\0') {
+            return std::filesystem::path(workdir_env.value());
+        }
+    }
 
-    return tmp_path / ghc::filesystem::path(subdir_name);
+    auto subdir_name = fmt::format(FMT_STRING("lnav-user-{}-work"), getuid());
+    auto tmp_path = std::filesystem::temp_directory_path();
+
+    return tmp_path / std::filesystem::path(subdir_name);
 }
 
-}  // namespace paths
-}  // namespace lnav
+std::filesystem::path userhome()
+{
+    if (auto home_env = getenv_opt("HOME")) {
+        auto home_path = std::filesystem::path(home_env.value());
+
+        if (std::filesystem::is_directory(home_path)) {
+            return home_path;
+        }
+    }
+
+    return std::filesystem::path("/");
+}
+
+}  // namespace lnav::paths

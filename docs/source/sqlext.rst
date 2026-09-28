@@ -1,4 +1,3 @@
-
 .. _sql-ext:
 
 SQLite Interface
@@ -48,6 +47,14 @@ and maximum number of bytes returned by the server, grouped by IP address:
 
     ;SELECT c_ip, avg(sc_bytes), max(sc_bytes) FROM access_log GROUP BY c_ip
 
+.. note::
+
+   For reference, the PRQL query would look like this:
+
+   .. code-block:: elm
+
+       from access_log | stats.by c_ip {average sc_bytes, max sc_bytes}
+
 After pressing :kbd:`Enter`, SQLite will execute the query using **lnav**'s
 virtual table implementation to extract the data directly from the log files.
 Once the query has finished, the main window will switch to the DB view to
@@ -61,16 +68,73 @@ switch between the DB view and the log
 
    Screenshot of the SQL results view.
 
+DB View
+-------
+
 The DB view has the following display features:
 
 * Column headers stick to the top of the view when scrolling.
-* A stacked bar chart of the numeric column values is displayed underneath the
-  rows.  Pressing :kbd:`TAB` will cycle through displaying no columns, each
-  individual column, or all columns.
-* JSON columns in the top row can be pretty-printed by pressing :kbd:`p`.
-  The display will show the value and JSON-Pointer path that can be passed to
-  the `jget`_ function.
+* Numeric columns contain a bar chart of the values.
+* Pressing :kbd:`p` opens an overlay with the columns and the values from the
+  focused row in a vertical orientation for easier reading.  Columns with
+  JSON objects/arrays are pretty-printed with bar-charts for numeric values
+  as well. The display will show the value and JSON-Pointer path that can be
+  passed to the `jget`_ function.
+* With the overlay open, pressing :kbd:`CTRL-]` will focus into it.  Then,
+  you can select a column and copy its contents by pressing :kbd:`c` or
+  hide/show it by pressing the space bar.  You can also hide/show a column
+  by clicking on the diamond on the left side.
+* Table cells can be styled by adding a :code:`__lnav_style__` column to the
+  query. This column must be a JSON object with the key `columns` that contains
+  the the column names to be styled and the :ref:`style
+  configuration<theme_style>`. For example, to apply semantic coloring to the
+  :code:`cs_uri_stem` column you would use the following JSON:
 
+  .. code-block:: json
+
+      {
+          "columns": {
+              "cs_uri_stem": {
+                 "color": "semantic()"
+              }
+          }
+      }
+
+  .. jsonschema:: ../schemas/config-v1.schema.json#/definitions/style
+
+
+PRQL Support (v0.12.1+)
+-----------------------
+
+`PRQL <https://prql-lang.org>`_ is an alternative database query language
+that compiles to SQLite.  You can enter PRQL in the database query prompt
+and lnav will switch accordingly.  A major advantage of using PRQL is that
+lnav can show previews of the results of the pipeline stages and provide
+better tab completion options.
+
+A PRQL query starts with the :code:`from` keyword that specifies the table
+to use as a data source.  The next stage of a pipeline is started by
+entering a pipe symbol (:code:`|`) followed by a
+`PRQL transform <https://prql-lang.org/book/reference/stdlib/transforms/index.html>`_.
+As you build the query in the prompt, lnav will display any relevant
+help and preview for the current and previous stages of the pipeline.
+
+The following is a screenshot of lnav viewing a web access log with a
+query in progress:
+
+.. figure:: ../assets/images/lnav-prql-preview.png
+   :align: center
+
+   Screenshot of a PRQL query in progress
+
+The top half of the window is the usual log message view.  Below that is
+the online help panel showing the documentation for the :code:`stats.count_by`
+PRQL function.  lnav will show the help for what is currently under the
+cursor.  The next panel shows the preview data for the pipeline stage
+that precedes the stage where the cursor is.  In this case, the
+results of :code:`from access_log`, which is the contents of the access
+log table.  The second preview window shows the result of the
+pipeline stage where the cursor is located.
 
 Log Tables
 ----------
@@ -89,28 +153,40 @@ The columns in the log tables are made up of several builtins along with
 the values captured by the log format specification.  Use the :code:`.schema`
 command in the SQL prompt to examine a dump of the current database schema.
 
+.. note:: Unless explicitly stated, builtin columns are read-only and cannot
+   be changed by an :code:`UPDATE`.
+
 The following columns are builtin and included in a :code:`SELECT *`:
 
   :log_line: The line number for the message in the log view.
-  :log_part: The partition the message is in.  This column can be changed by
-    an :code:`UPDATE` or the :ref:`:parition-name<partition_name>` command.
   :log_time: The adjusted timestamp for the log message.  This time can differ
     from the log message's time stamp if it arrived out-of-order and the log
     format expects log files to be time-ordered.
+  :log_level: The log message level.
+  :log_part: The partition the message is in.  This column can be changed by
+    an :code:`UPDATE` or the :ref:`:parition-name<partition_name>` command.
   :log_actual_time: The log messages original timestamp in the file.
   :log_idle_msecs: The difference in time between this messages and the
     previous.  The unit of time is milliseconds.
-  :log_level: The log message level.
-  :log_mark: True if the log message was marked by the user.
+  :log_mark: True if the log message was marked by the user.  This column can
+    be changed by an :code:`UPDATE`.
   :log_comment: The comment for the message.  This column can be changed by
     an :code:`UPDATE` or the :ref:`:comment<comment>` command.
   :log_tags: A JSON list of tags for the message.  This column can be changed
     by an :code:`UPDATE` or the :ref:`:tag<tag>` command.
+  :log_annotations: A JSON object of annotations for this message.
+    This column is populated by the :ref:`:annotate<annotate>` command.
   :log_filters: A JSON list of filter IDs that matched this message
 
 The following columns are builtin and are hidden, so they will *not* be
 included in a :code:`SELECT *`:
 
+  :log_opid: The OP ID as captured from the log message or as set by an
+    :code:`UPDATE`.  Setting the OP ID allows operations to be visualized
+    in the :ref:`timeline<timeline>` view.
+  :log_user_opid: The OP ID as set by the user.
+  :log_format: The name of the format that parsed this log message.
+  :log_format_regex: The name of the format's regex that matched this message.
   :log_time_msecs: The adjusted timestamp for the log message as the number of
     milliseconds from the epoch.  This column can be more efficient to use for
     time-related operations, like :ref:`timeslice()<timeslice>`.
@@ -120,6 +196,10 @@ included in a :code:`SELECT *`:
   :log_raw_text: The raw text of this message from the log file.  In this case
     of JSON and CSV logs, this will be the exact line of JSON-Line and CSV
     text from the file.
+  :log_line_hash: A hash of the first line of the log message.
+  :log_line_link: The permalink for the log message.
+  :log_named_searches: A JSON list of the names of the
+    :ref:`named searches<named_searches>` that matched this message.
 
 Extensions
 ----------
@@ -140,19 +220,31 @@ Commands
 
 A SQL command is an internal macro implemented by lnav.
 
-* .schema - Open the schema view.  This view contains a dump of the schema
-  for the internal tables and any tables in attached databases.
-* .msgformats - Executes a canned query that groups and counts log messages by
-  the format of their message bodies.  This command can be useful for quickly
-  finding out the types of messages that are most common in a log file.
+* :code:`.schema` - Open the schema view.  This view contains a dump of the
+  schema for the internal tables and any tables in attached databases.
+* :code:`.read` - Execute the SQL statements in the given file.
+* :code:`.dump` - Write a file containing SQL statements that can be used to
+  recreate a table.
+* :code:`.save` - Write the contents of the main DB to a SQLite database file.
+  This command is useful if you have created some tables during your analysis
+  and would like to preserve them.  The command is implemented using the
+  SQLite Backup API, so it can be run in the background.
+* :code:`.msgformats` - Executes a canned query that groups and counts log
+  messages by the format of their message bodies.  This command can be useful
+  for quickly finding out the types of messages that are most common in a log
+  file.
 
 Variables
 ---------
 
 The following variables are available in SQL statements:
 
-* $LINES - The number of lines in the terminal window.
-* $COLS - The number of columns in the terminal window.
+* :code:`$LINES` - The number of lines in the terminal window.
+* :code:`$COLS` - The number of columns in the terminal window.
+* :code:`$zoom_level` - The current zoom level of the DB view as a
+  duration string (e.g. :code:`5m`, :code:`1h`).  Passing this
+  value to the `timeslice`_ function can be useful for easily
+  adjusting the time slice duration based on the zoom level.
 
 Environment
 -----------
@@ -175,6 +267,13 @@ Collators
   values.  For example, "foo10" would be considered greater than "foo2".
 * **naturalnocase** - The same as naturalcase, but case-insensitive.
 * **ipaddress** - Compare IPv4/IPv6 addresses.
+* **loglevel** - Compare log levels.
+* **measure_with_units** - Compare numbers with unit suffixes.  The
+  currently supported suffixes are:
+
+  - Sizes with an E/P/T/G/M/K prefix.
+  - Seconds with an f/p/n/u/m prefix.
+  - Durations of the form :code:`HH:MM:SS` or :code:`HH:MM:SS`
 
 Reference
 ---------

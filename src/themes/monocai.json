@@ -4,7 +4,7 @@
         "theme-defs": {
             "monocai": {
                 "vars": {
-                    "black": "#2d2a2e",
+                    "black": "Grey15",
                     "red": "#f92772",
                     "green": "#a7e22e",
                     "yellow": "#fe9720",
@@ -12,6 +12,7 @@
                     "magenta": "#ae81ff",
                     "cyan": "#66d9ee",
                     "white": "#808080",
+                    "orange": "#fc9867",
                     "semantic_highlight_color": "semantic()"
                 },
                 "styles": {
@@ -19,13 +20,19 @@
                         "color": "semantic()"
                     },
                     "text": {
-                        "color": "#f6f6f6",
+                        "color": "Grey89",
                         "background-color": "$black"
                     },
-                    "alt-text": {
-                        "color": "#f6f6f6",
-                        "background-color": "$black",
+                    "selected-text": {
+                        "background-color": "$cyan"
+                    },
+                    "fuzzy-match": {
+                        "color": "$orange",
+                        "underline": true,
                         "bold": true
+                    },
+                    "alt-text": {
+                        "background-color": "Grey11"
                     },
                     "ok": {
                         "color": "$green",
@@ -49,9 +56,12 @@
                     },
                     "cursor-line": {
                         "color": "$cyan",
-                        "background-color": "$red",
-                        "bold": true,
-                        "underline": true
+                        "background-color": "#7f005f",
+                        "bold": true
+                    },
+                    "disabled-cursor-line": {
+                        "color": "$cyan",
+                        "background-color": "#5f005f"
                     },
                     "adjusted-time": {
                         "color": "$magenta"
@@ -61,6 +71,15 @@
                     },
                     "offset-time": {
                         "color": "$cyan"
+                    },
+                    "time-ago": {
+                        "bold": true
+                    },
+                    "time-column": {
+                        "background-color": "Grey27"
+                    },
+                    "file-offset": {
+                        "color": "#888"
                     },
                     "invalid-msg": {
                         "color": "$yellow"
@@ -74,12 +93,22 @@
                         "background-color": "#333"
                     },
                     "popup": {
-                        "color": "$white",
-                        "background-color": "$cyan"
+                        "color": "#ccc",
+                        "background-color": "#333"
+                    },
+                    "popup-border": {
+                        "color": "#ff5fd7",
+                        "background-color": "#333"
                     },
                     "scrollbar": {
                         "color": "$black",
                         "background-color": "#888"
+                    },
+                    "timeline-bar": {
+                        "background-color": "#6a4e9e"
+                    },
+                    "context-line": {
+                        "background-color": "Grey11"
                     },
                     "h1": {
                         "color": "$magenta",
@@ -96,10 +125,10 @@
                         "underline": true
                     },
                     "h5": {
-                        "underline": true
+                        "italic": true
                     },
                     "h6": {
-                        "underline": true
+                        "italic": true
                     },
                     "hr": {
                         "color": "#444"
@@ -111,7 +140,8 @@
                         "color": "$yellow"
                     },
                     "breadcrumb": {
-                        "color": "#99a"
+                        "color": "$orange",
+                        "bold": true
                     },
                     "table-border": {
                         "color": "#444"
@@ -136,9 +166,16 @@
                     },
                     "snippet-border": {
                         "color": "$cyan"
+                    },
+                    "indent-guide": {
+                        "color": "#444"
                     }
                 },
                 "syntax-styles": {
+                    "inline-code": {
+                        "color": "$red",
+                        "background-color": "#121212"
+                    },
                     "quoted-code": {
                         "color": "#eee",
                         "background-color": "#121212"
@@ -146,6 +183,9 @@
                     "code-border": {
                         "color": "#444",
                         "background-color": "#121212"
+                    },
+                    "object-key": {
+                        "color": "semantic()"
                     },
                     "keyword": {
                         "color": "#ff6188",
@@ -183,19 +223,43 @@
                         "color": "#656e76"
                     },
                     "spectrogram-low": {
-                        "background-color": "$green"
+                        "color": "$black",
+                        "background-color": "$green",
+                        "bold": true
                     },
                     "spectrogram-medium": {
-                        "background-color": "$yellow"
+                        "color": "$black",
+                        "background-color": "$yellow",
+                        "bold": true
                     },
                     "spectrogram-high": {
-                        "background-color": "$red"
+                        "color": "$black",
+                        "background-color": "$red",
+                        "bold": true
                     },
                     "file": {
                         "color": "$blue"
                     },
+                    "null": {
+                        "color": "#888"
+                    },
+                    "ascii-control": {
+                        "color": "$green"
+                    },
+                    "non-ascii": {
+                        "color": "$yellow"
+                    },
                     "number": {
                         "bold": true
+                    },
+                    "function": {
+                        "color": "$cyan"
+                    },
+                    "separators-references-accessors": {
+                        "color": "$red"
+                    },
+                    "type": {
+                        "color": "$blue"
                     }
                 },
                 "status-styles": {
@@ -206,6 +270,11 @@
                     },
                     "title": {
                         "color": "#f6f6f6",
+                        "background-color": "#5394ec",
+                        "bold": true
+                    },
+                    "alert-title": {
+                        "color": "$red",
                         "background-color": "#5394ec",
                         "bold": true
                     },
@@ -247,9 +316,16 @@
                         "color": "#555",
                         "background-color": "#2f2f2f"
                     },
+                    "inactive-warn": {
+                        "color": "$yellow",
+                        "background-color": "#2f2f2f"
+                    },
                     "inactive-alert": {
                         "color": "$red",
                         "background-color": "#2f2f2f"
+                    },
+                    "suggestion": {
+                        "color": "#888"
                     }
                 },
                 "log-level-styles": {

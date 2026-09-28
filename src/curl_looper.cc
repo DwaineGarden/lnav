@@ -30,6 +30,7 @@
  */
 
 #include <algorithm>
+#include <mutex>
 
 #include "config.h"
 
@@ -108,8 +109,10 @@ curl_url_strerror(CURLUcode error)
 }
 #    endif
 
+namespace {
+
 struct curl_request_eq {
-    explicit curl_request_eq(const std::string& name) : cre_name(name){};
+    explicit curl_request_eq(const std::string& name) : cre_name(name) {};
 
     bool operator()(const std::shared_ptr<curl_request>& cr) const
     {
@@ -124,6 +127,8 @@ struct curl_request_eq {
 
     const std::string& cre_name;
 };
+
+}  // namespace
 
 int
 curl_request::debug_cb(
@@ -153,7 +158,7 @@ curl_request::debug_cb(
         while (size > 0 && isspace(data[size - 1])) {
             size -= 1;
         }
-        log_debug("%s:%.*s", cr->get_name().c_str(), size, data);
+        log_debug("%s:%.*s", cr->get_name().c_str(), (int) size, data);
     }
 
     return 0;
@@ -168,6 +173,90 @@ curl_request::string_cb(void* data, size_t size, size_t nmemb, void* userp)
     vec.append((char*) data, ((char*) data) + realsize);
 
     return realsize;
+}
+
+curl_request::curl_request(std::string name)
+    : cr_name(std::move(name)), cr_handle(curl_easy_cleanup)
+{
+    ensure_curl_global_init();
+    this->cr_handle.reset(curl_easy_init());
+    curl_easy_setopt(this->cr_handle, CURLOPT_NOSIGNAL, 1);
+    curl_easy_setopt(
+        this->cr_handle, CURLOPT_ERRORBUFFER, this->cr_error_buffer);
+    curl_easy_setopt(this->cr_handle, CURLOPT_DEBUGFUNCTION, debug_cb);
+    curl_easy_setopt(this->cr_handle, CURLOPT_DEBUGDATA, this);
+    curl_easy_setopt(this->cr_handle, CURLOPT_VERBOSE, 1);
+    if (getenv("SSH_AUTH_SOCK") != nullptr) {
+        curl_easy_setopt(this->cr_handle,
+                         CURLOPT_SSH_AUTH_TYPES,
+#    ifdef CURLSSH_AUTH_AGENT
+                         CURLSSH_AUTH_AGENT |
+#    endif
+                             CURLSSH_AUTH_PASSWORD);
+    }
+}
+
+long
+curl_request::complete(CURLcode result)
+{
+    double total_time = 0;
+    curl_off_t download_size = 0, download_speed = 0;
+
+    this->cr_completions += 1;
+    curl_easy_getinfo(this->cr_handle, CURLINFO_TOTAL_TIME, &total_time);
+    log_debug("%s: total_time=%f", this->cr_name.c_str(), total_time);
+    curl_easy_getinfo(
+        this->cr_handle, CURLINFO_SIZE_DOWNLOAD_T, &download_size);
+    log_debug("%s: download_size=%" CURL_FORMAT_CURL_OFF_T,
+              this->cr_name.c_str(),
+              download_size);
+    curl_easy_getinfo(
+        this->cr_handle, CURLINFO_SPEED_DOWNLOAD_T, &download_speed);
+    log_debug("%s: download_speed=%" CURL_FORMAT_CURL_OFF_T,
+              this->cr_name.c_str(),
+              download_speed);
+
+    return -1;
+}
+
+Result<std::string, CURLcode>
+curl_request::perform() const
+{
+    std::string response;
+
+    curl_easy_setopt(this->get_handle(), CURLOPT_WRITEFUNCTION, string_cb);
+    curl_easy_setopt(this->get_handle(), CURLOPT_WRITEDATA, &response);
+
+    auto rc = curl_easy_perform(this->get_handle());
+    if (rc == CURLE_OK) {
+        return Ok(response);
+    }
+
+    return Err(rc);
+}
+
+void
+ensure_curl_global_init()
+{
+    static std::once_flag flag;
+
+    std::call_once(flag, []() {
+        log_info("initializing libcurl");
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+    });
+}
+
+curl_looper::curl_looper() : cl_curl_multi(curl_multi_cleanup) {}
+
+CURLM*
+curl_looper::get_multi()
+{
+    if (this->cl_curl_multi == nullptr) {
+        ensure_curl_global_init();
+        this->cl_curl_multi.reset(curl_multi_init());
+    }
+
+    return this->cl_curl_multi;
 }
 
 void
@@ -195,10 +284,10 @@ curl_looper::perform_io()
     auto timeout = this->compute_timeout(current_time);
     int running_handles;
 
-    if (timeout < 1ms) {
+    if (!timeout || *timeout < 1ms) {
         timeout = 5ms;
     }
-    curl_multi_wait(this->cl_curl_multi, nullptr, 0, timeout.count(), nullptr);
+    curl_multi_wait(this->cl_curl_multi, nullptr, 0, timeout->count(), nullptr);
     curl_multi_perform(this->cl_curl_multi, &running_handles);
 }
 
@@ -214,7 +303,7 @@ curl_looper::requeue_requests(mstime_t up_to_time)
                   cr->get_name().c_str(),
                   cr.get());
         this->cl_handle_to_request[cr->get_handle()] = cr;
-        curl_multi_add_handle(this->cl_curl_multi, cr->get_handle());
+        curl_multi_add_handle(this->get_multi(), cr->get_handle());
         this->cl_poll_queue.erase(this->cl_poll_queue.begin());
     }
 }
@@ -227,7 +316,7 @@ curl_looper::check_for_new_requests()
 
         log_info("%s:new curl request %p", cr->get_name().c_str(), cr.get());
         this->cl_handle_to_request[cr->get_handle()] = cr;
-        curl_multi_add_handle(this->cl_curl_multi, cr->get_handle());
+        curl_multi_add_handle(this->get_multi(), cr->get_handle());
         this->cl_new_requests.pop_back();
     }
     while (!this->cl_close_requests.empty()) {
@@ -270,6 +359,10 @@ curl_looper::check_for_finished_requests()
     CURLMsg* msg;
     int msgs_left;
 
+    if (this->cl_curl_multi == nullptr) {
+        return;
+    }
+
     while ((msg = curl_multi_info_read(this->cl_curl_multi, &msgs_left))
            != nullptr)
     {
@@ -296,7 +389,7 @@ curl_looper::check_for_finished_requests()
                     this->cl_all_requests.erase(all_iter);
                 }
             } else {
-                log_debug("%s:curl_request %p is polling, requeueing in %d",
+                log_debug("%s:curl_request %p is polling, requeueing in %ld",
                           cr->get_name().c_str(),
                           cr.get(),
                           delay_ms);
@@ -307,7 +400,7 @@ curl_looper::check_for_finished_requests()
     }
 }
 
-std::chrono::milliseconds
+std::optional<std::chrono::milliseconds>
 curl_looper::compute_timeout(mstime_t current_time) const
 {
     std::chrono::milliseconds retval = 1s;

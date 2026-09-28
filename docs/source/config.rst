@@ -1,23 +1,42 @@
-
 .. _Configuration:
 
 Configuration
 =============
 
-The configuration for **lnav** is stored in the following JSON files in
-:file:`~/.lnav`:
+The configuration for **lnav** is stored in JSON files that are read on
+startup.  Files are consumed from multiple locations and update the
+internal configuration state as they are processed.  File names must
+end with :file:`.json` if they are in a :file:`configs` directory or,
+if they are in a :file:`formats` directory [#]_, start with :file:`config.`
+and end with :file:`.json`.  The following enumerates the order in
+which files are processed (where :file:`<lnav-home>` refers to the
+location in the :envvar:`HOME` directory where files are stored,
+either: :file:`~/.lnav` or :file:`~/.config/lnav`):
 
-* :file:`config.json` -- Contains local customizations that were done using the
-  :code:`:config` command.
-* :file:`configs/default/*.json` -- The default configuration files that are
-  built into lnav are written to this directory with :file:`.sample` appended.
-  Removing the :file:`.sample` extension and editing the file will allow you to
-  do basic customizations.
-* :file:`configs/installed/*.json` -- Contains configuration files installed
-  using the :option:`-i` flag (e.g. :code:`$ lnav -i /path/to/config.json`).
-* :file:`configs/*/*.json` -- Other directories that contain :file:`*.json`
-  files will be loaded on startup.  This structure is convenient for installing
-  **lnav** configurations, like from a git repository.
+#. Builtin -- The default configuration is shipped inside the **lnav** binary.
+
+#. :file:`/etc/lnav/configs/*/*.json`,
+   :file:`/etc/lnav/formats/*/config.*.json` -- System-wide configuration files
+   can be installed in these locations to make it available to all users.
+
+#. :file:`<lnav-home>/configs/default/*.json` -- The default configuration
+   files that are built into lnav are written to this directory with :file:`.sample`
+   appended. Removing the :file:`.sample` extension and editing the file will
+   allow you to do basic customizations.
+
+#. :file:`<lnav-home>/configs/*/*.json`,
+   :file:`<lnav-home>/formats/*/config.*.json` -- Other directories under
+   home will be scanned for JSON files. This structure is convenient for installing
+   **lnav** configurations, like from a git repository.  The :file:`configs/installed`
+   directory is reserved for files that are installed using the :option:`-i`
+   flag (e.g. :code:`$ lnav -i /path/to/config.json`).
+
+#. :file:`-I <path>/configs/*/*.json`,
+   :file:`-I <path>/formats/*/*.json` -- Include directories passed on the
+   command-line can have a :file:`configs` directory that will also be searched.
+
+#. :file:`<lnav-home>/config.json` -- Contains local customizations that were
+   done using the :code:`:config` command.
 
 A valid **lnav** configuration file must contain an object with the
 :code:`$schema` property, like so:
@@ -34,6 +53,18 @@ A valid **lnav** configuration file must contain an object with the
   directly.  See the :ref:`Log Formats<log_formats>` chapter for more
   information.
 
+.. note::
+
+  Configuration files are read in the above directory order and sorted
+  by path name.  The internal configuration is updated as files are
+  parsed, so one file can overwrite the settings from another.  You can
+  use the :ref:`Management CLI<management_cli>` to get the final
+  configuration and where the value came from for a particular
+  configuration option.
+
+.. [#] Putting log format files and configuration files in the same directory
+  can be convenient for organizations that wish to have a single git repository
+  that contains all of the files needed for folks to do their work.
 
 Options
 -------
@@ -51,6 +82,17 @@ your liking.  The options can be changed using the :code:`:config` command.
 
 .. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/default-colors
 
+.. _config_log_time_column:
+
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/views/properties/log/properties/time-column
+
+.. _config_external_editor:
+
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/tuning/properties/external-editor
+
+.. _config_external_opener:
+
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/tuning/properties/external-opener
 
 .. _themes:
 
@@ -101,6 +143,9 @@ the values from the :code:`styles/text` definition.
   picked based on the `CIEDE2000 <https://en.wikipedia.org/wiki/Color_difference#CIEDE2000>`_
   color difference algorithm.
 
+The special value :code:`semantic()` can also be used in place of a color.
+The displayed color is derived from a hash of the text to create a stable,
+distinguishable color.
 
 
 Example
@@ -115,39 +160,39 @@ You can copy the code block, save it to a file in
 definition, see one of the definitions built into **lnav**, like
 `monocai <https://github.com/tstack/lnav/blob/master/src/themes/monocai.json>`_.
 
-  .. code-block:: json
+.. code-block:: json
 
-    {
-        "$schema": "https://lnav.org/schemas/config-v1.schema.json",
-        "ui": {
-            "theme-defs": {
-                "example1": {
-                    "vars": {
-                        "black": "#2d2a2e"
-                    },
-                    "styles": {
-                        "text": {
-                            "color": "#f6f6f6",
-                            "background-color": "$black"
-                        }
-                    }
-                }
-            }
-        }
-    }
+  {
+      "$schema": "https://lnav.org/schemas/config-v1.schema.json",
+      "ui": {
+          "theme-defs": {
+              "example1": {
+                  "vars": {
+                      "black": "#2d2a2e"
+                  },
+                  "styles": {
+                      "text": {
+                          "color": "#f6f6f6",
+                          "background-color": "$black"
+                      }
+                  }
+              }
+          }
+      }
+  }
 
 Reference
 ^^^^^^^^^
 
-.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/theme-defs/patternProperties/([\w\-]+)/properties/vars
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/theme-defs/patternProperties/^([\w\-]+)$/properties/vars
 
-.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/theme-defs/patternProperties/([\w\-]+)/properties/styles
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/theme-defs/patternProperties/^([\w\-]+)$/properties/styles
 
-.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/theme-defs/patternProperties/([\w\-]+)/properties/syntax-styles
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/theme-defs/patternProperties/^([\w\-]+)$/properties/syntax-styles
 
-.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/theme-defs/patternProperties/([\w\-]+)/properties/status-styles
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/theme-defs/patternProperties/^([\w\-]+)$/properties/status-styles
 
-.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/theme-defs/patternProperties/([\w\-]+)/properties/log-level-styles
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/theme-defs/patternProperties/^([\w\-]+)$/properties/log-level-styles
 
 .. _theme_style:
 
@@ -165,7 +210,10 @@ keymap.  The :code:`command` value associated with the entry in the keymap is
 then executed.  Note that the "command" can be an **lnav**
 :ref:`command<commands>`, a :ref:`SQL statement/query<sql-ext>`, or an
 **lnav** script.  If an :code:`alt-msg` value is included in the entry, the
-bottom-right section of the UI will be updated with the help text.
+bottom-right section of the UI will be updated with the help text.  See the
+`default keymap <https://github.com/tstack/lnav/blob/master/src/keymaps/default-keymap.json>`_
+for an example of how many of the :ref:`default hotkeys<hotkeys>` are
+implemented.
 
 .. note::
 
@@ -175,10 +223,11 @@ bottom-right section of the UI will be updated with the help text.
 Key Sequence Encoding
 ^^^^^^^^^^^^^^^^^^^^^
 
-Key presses are converted into a hex-encoded string that is used to lookup an
-entry in the keymap.  Each byte of the keypress value is formatted as an
+Key presses are converted into a string that is used to lookup an
+entry in the keymap.  Function keys are encoded as an :code:`f` followed by
+the key number.  Other keys are encoded as UTF-8 bytes and formatted as an
 :code:`x` followed by the hex-encoding in lowercase.  For example, the encoding
-for the £ key would be :code:`xc2xa3`.  To make it easier to discover the
+for the :code:`£` key would be :code:`xc2xa3`.  To make it easier to discover the
 encoding for unassigned keys, **lnav** will print in the command prompt the
 :code:`:config` command and
 `JSON-Pointer <https://tools.ietf.org/html/rfc6901>`_ for assigning a command
@@ -198,7 +247,7 @@ to the key.
 Reference
 ^^^^^^^^^
 
-.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/keymap-defs/patternProperties/([\w\-]+)
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/ui/properties/keymap-defs/patternProperties/^([\w\-]+)$
 
 
 Log Handling
@@ -207,6 +256,18 @@ Log Handling
 The handling of logs is largely determined by the
 :ref:`log file formats<log_formats>`, this section covers options that are not
 specific to a particular format.
+
+Timezone Conversion (v0.12.0+)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Log messages that have a numeric timezone, like :code:`-03:00` or :code:`Z`
+for UTC, will be converted to the local timezone as given by the :envvar:`TZ`
+environment variable. For example, a timestamp ending in `-03:00` will be treated
+as three hours behind UTC and then adjusted to the local timezone.
+
+This behavior can be disabled by setting the
+:code:`/log/date-time/convert-zoned-to-local` configuration property to
+:code:`false`.
 
 Watch Expressions (v0.11.0+)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -243,10 +304,166 @@ From there, you can create a SQLite trigger on the :code:`lnav_events` table
 that will examine the event contents and perform an action.  See the
 :ref:`Events` section for more information on handling events.
 
-Reference
-^^^^^^^^^
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/log/properties/watch-expressions/patternProperties/^([\w\.\-]+)$
 
-.. jsonschema:: ../schemas/config-v1.schema.json#/properties/log/properties/watch-expressions/patternProperties/([\w\-]+)
+Annotations (v0.12.0+)
+^^^^^^^^^^^^^^^^^^^^^^
+
+Annotations are content generated by a script for a given log message and
+displayed along with the message, like comments and tags.  Since the script
+is run asynchronously, it can do complex analysis without delaying loading
+or interrupting the viewing experience.  An annotation is defined by a
+condition and a handler in the **lnav** configuration. The condition is
+tested against a log message to determine if the annotation is applicable.
+If it is, the handler script will be executed for that log message when
+the user runs the :ref:`:annotate<annotate>` command.
+
+Conditions are SQLite expressions like the ones passed to
+:ref:`:filter-expr<filter_expr>` where the expression is appended to
+:code:`SELECT 1 WHERE`.  The expression can use bound variables that
+correspond to the columns that would be in the format table and are
+prefixed by a colon (:code:`:`).  For example, the standard
+:code:`log_opid` table column can be accessed by using :code:`:log_opid`.
+
+.. note:: The expression is executed with bound variables because it
+  can be applied to log messages from multiple formats.  Writing an
+  expression that could handle different formats would be more
+  challenging.  In this approach, variables for log message fields
+  that are not part of a format will evaluate to :code:`NULL`.
+
+Handlers are executable script files that should be co-located with
+the configuration file that defined the annotation.  The handler will
+be executed and a JSON object with log message data fed in on the
+standard input.  The handler should then generate the annotation
+content on the standard output.  The output is treated as Markdown,
+so the content can be styled as desired.
+
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/log/properties/annotations/patternProperties/^([\w\.\-]+)$
+
+Demultiplexing (v0.12.3+)
+-------------------------
+
+Files that contain a mix of content from different sources, like
+the output of :code:`docker compose logs`, can be automatically
+demultiplexed so that *lnav* can process them correctly.
+
+Each line of the input file must include a unique identifier that can
+be used to determine which service the line belongs to.
+A demultiplexer is a regular expression that
+extracts the identifier, the log message, and an optional
+timestamp.  Once extracted, lines are distributed to separate files
+based on the identifier.
+
+Demultiplexing can be done on plain text files using a regular expression
+or JSON-lines files where the JSON contains certain properties.
+
+Demultiplexers that are based on regular expressions are defined in
+the main configuration under the :code:`/log/demux` path. The pattern
+for the demuxer has the following known capture names:
+
+:mux_id: (required) Captures the unique identifier.
+
+:body: (required) Captures the body of the log message
+  that should be written to the file.
+
+:timestamp: (optional) Captures the timestamp for the log message.
+  If this is available and the log message does not have
+  it's own timestamp, this will be used instead.
+
+If there are additional captures, they will be included
+in the file metadata that can be accessed by the
+:code:`lnav_file_demux_metadata` view of the
+:code:`lnav_file_metadata` table.
+
+Example
+^^^^^^^
+
+.. code-block:: json
+
+  {
+      "$schema": "https://lnav.org/schemas/config-v1.schema.json",
+      "log": {
+          "demux": {
+               "recv-with-pod": {
+                   "control-pattern": "^===== (?:START|END) =====$",
+                   "pattern": "^(?<timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}(?:Z|[+\\-]\\d{2}:\\d{2})) source=[a-zA-Z0-9][a-zA-Z0-9_\\.\\-]* (?<body>.*) kubernetes_host=(?<k8s_host>[a-zA-Z0-9][a-zA-Z0-9_\\.\\-]*) kubernetes_pod_name=(?<mux_id>[a-zA-Z0-9][a-zA-Z0-9_\\.\\-]*)"
+               }
+          }
+      }
+  }
+
+Sample Input Document:
+++++++++++++++++++++++
+
+.. code-block:: text
+
+  ===== START =====
+  2024-12-12T08:00:00.123Z source=service-a This is a log message kubernetes_host=host-a kubernetes_pod_name=pod-1
+  2024-12-12T08:01:00.456Z source=service-b Another log message kubernetes_host=host-b kubernetes_pod_name=pod-2
+  ===== END =====
+
+Demuxed Output Files:
++++++++++++++++++++++
+
+File: `pod-1`
+
+.. code-block:: text
+
+  2024-12-12T08:00:00.123Z This is a log message
+
+File: `pod-2`
+
+.. code-block:: text
+
+  2024-12-12T08:01:00.456Z Another log message
+
+
+JSON-Lines Demultiplexing (v0.13.0+)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Demultiplexers for JSON-lines files are defined in the main
+configuration under the :code:`/log/demux-json` path.  The
+configuration needs to specify the following three properties:
+
+:timestamp: (optional) The timestamp for the log message.
+  If this is available and the log message does not have
+  it's own timestamp, this will be used instead.
+
+:mux_id: (required) Captures the unique identifier for the
+  source of the log message.
+
+:body: (required) Captures the body of the log message
+  that should be written to the file.
+
+
+Behavior Details
+^^^^^^^^^^^^^^^^
+
+Control Lines:
+
+* Control lines match the control-pattern and are used to separate
+  sections of the file. These lines are ignored for matching log
+  patterns but are placed into an _out_of_frame_ sub-file.
+* If the log file contains control lines at the beginning, only
+  demultiplexers with a matching control-pattern will attempt to
+  process the subsequent lines.
+
+Demuxing Process:
+
+* For each non-control line, lnav checks against all defined demultiplexers.
+* The first demultiplexer whose pattern matches the line is applied.
+* If a match occurs, the captured `mux_id` and `body` fields are required.
+  If either is missing, the match is discarded.
+* Matched lines are written to sub-files corresponding to their `mux_id` values.
+* Sub-files created by demultiplexing are treated as standalone files for
+  further processing. They will not undergo additional demuxing.
+
+JSON Schema Reference
+^^^^^^^^^^^^^^^^^^^^^
+
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/log/properties/demux/patternProperties/^([\w\-\.]+)$
+
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/log/properties/demux-json/patternProperties/^([\w\-\.]+)$
 
 .. _tuning:
 
@@ -261,6 +478,10 @@ command.
 
 .. jsonschema:: ../schemas/config-v1.schema.json#/properties/tuning/properties/clipboard
 
+.. _pipercfg:
+
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/tuning/properties/piper
+
 .. jsonschema:: ../schemas/config-v1.schema.json#/definitions/clip-commands
 
 .. jsonschema:: ../schemas/config-v1.schema.json#/properties/tuning/properties/file-vtab
@@ -268,3 +489,7 @@ command.
 .. jsonschema:: ../schemas/config-v1.schema.json#/properties/tuning/properties/logfile
 
 .. jsonschema:: ../schemas/config-v1.schema.json#/properties/tuning/properties/remote/properties/ssh
+
+.. _url_scheme:
+
+.. jsonschema:: ../schemas/config-v1.schema.json#/properties/tuning/properties/url-scheme

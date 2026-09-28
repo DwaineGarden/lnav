@@ -1,4 +1,4 @@
-/**
+ /**
  * Copyright (c) 2020, Timothy Stack
  *
  * All rights reserved.
@@ -27,15 +27,24 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <algorithm>
+#include <optional>
+#include <vector>
+
 #include "log_search_table.hh"
 
 #include "base/ansi_scrubber.hh"
 #include "column_namer.hh"
 #include "config.h"
+#include "logfile_sub_source.hh"
+#include "textview_curses.hh"
 #include "sql_util.hh"
 
-const static std::string MATCH_INDEX = "match_index";
+static constexpr const char MATCH_INDEX[] = "match_index";
 static auto match_index_name = intern_string::lookup("match_index");
+
+static constexpr const char MATCH_ROWID[] = "match_rowid";
+static auto match_rowid_name = intern_string::lookup("match_rowid");
 
 log_search_table::log_search_table(std::shared_ptr<lnav::pcre2pp::code> code,
                                    intern_string_t table_name)
@@ -44,9 +53,21 @@ log_search_table::log_search_table(std::shared_ptr<lnav::pcre2pp::code> code,
 {
 }
 
+std::optional<std::string>
+log_search_table::get_command() const
+{
+    return fmt::format(FMT_STRING(":create-search-table {} {}"),
+                       this->vi_name.to_string_fragment(),
+                       this->lst_regex->get_pattern());
+}
+
 void
 log_search_table::get_columns_int(std::vector<vtab_column>& cols) const
 {
+    if (!this->lst_cols.empty()) {
+        return;
+    }
+
     column_namer cn{column_namer::language::SQL};
 
     if (this->lst_format != nullptr) {
@@ -54,23 +75,40 @@ log_search_table::get_columns_int(std::vector<vtab_column>& cols) const
         this->lst_format_column_count = this->lst_column_metas.size();
         cols.resize(this->lst_column_metas.size());
         for (const auto& meta : this->lst_column_metas) {
-            if (meta.lvm_column == -1) {
+            if (!meta.lvm_column.is<logline_value_meta::table_column>()) {
+                cols.pop_back();
                 continue;
             }
-            auto type_pair
-                = log_vtab_impl::logline_value_to_sqlite_type(meta.lvm_kind);
-            cols[meta.lvm_column].vc_name = meta.lvm_name.to_string();
-            cols[meta.lvm_column].vc_type = type_pair.first;
-            cols[meta.lvm_column].vc_subtype = type_pair.second;
+            auto col
+                = meta.lvm_column.get<logline_value_meta::table_column>().value;
+            auto type_pair = logline_value_to_sqlite_type(meta.lvm_kind);
+            cols[col].vc_name = meta.lvm_name;
+            cols[col].vc_type = type_pair.first;
+            cols[col].vc_subtype = type_pair.second;
+
+            ensure(!cols[col].vc_name.empty());
         }
     }
 
     this->lst_column_metas.emplace_back(
-        match_index_name, value_kind_t::VALUE_INTEGER, cols.size());
-    cols.emplace_back(MATCH_INDEX, SQLITE_INTEGER);
-    cn.add_column(string_fragment::from_const("__all__"));
+        match_rowid_name,
+        value_kind_t::VALUE_INTEGER,
+        logline_value_meta::table_column{cols.size()});
+    cols.emplace_back(intern_string::lookup(MATCH_ROWID), SQLITE_INTEGER);
+    cols.back().vc_comment
+        = "A sequence number for the matching log messages in this result, "
+          "starting at zero.  It follows the order the rows are produced in, "
+          "so it is not stable across queries."_frag;
+    this->lst_column_metas.emplace_back(
+        match_index_name,
+        value_kind_t::VALUE_INTEGER,
+        logline_value_meta::table_column{cols.size()});
+    cols.emplace_back(intern_string::lookup(MATCH_INDEX), SQLITE_INTEGER);
+    cols.back().vc_comment
+        = "The index of the match within a log message"_frag;
+    cn.add_column("__all__"_frag);
     auto captures = this->lst_regex->get_captures();
-    for (int lpc = 0; lpc < this->lst_regex->get_capture_count(); lpc++) {
+    for (size_t lpc = 0; lpc < this->lst_regex->get_capture_count(); lpc++) {
         std::string collator;
         int sqlite_type = SQLITE3_TEXT;
 
@@ -78,47 +116,43 @@ log_search_table::get_columns_int(std::vector<vtab_column>& cols) const
             = cn.add_column(string_fragment::from_c_str(
                                 this->lst_regex->get_name_for_capture(lpc + 1)))
                   .to_string();
-        if (captures.size() == (size_t) this->lst_regex->get_capture_count()) {
-            auto cap_re = captures[lpc].to_string();
-            sqlite_type = guess_type_from_pcre(cap_re, collator);
-            switch (sqlite_type) {
-                case SQLITE_FLOAT:
-                    this->lst_column_metas.emplace_back(
-                        intern_string::lookup(colname),
-                        value_kind_t::VALUE_FLOAT,
-                        cols.size());
-                    break;
-                case SQLITE_INTEGER:
-                    this->lst_column_metas.emplace_back(
-                        intern_string::lookup(colname),
-                        value_kind_t::VALUE_INTEGER,
-                        cols.size());
-                    break;
-                default:
-                    this->lst_column_metas.emplace_back(
-                        intern_string::lookup(colname),
-                        value_kind_t::VALUE_TEXT,
-                        cols.size());
-                    break;
-            }
+        auto kind = value_kind_t::VALUE_TEXT;
+        auto cap_re = captures[lpc].to_string();
+        sqlite_type = guess_type_from_pcre(cap_re, collator);
+        switch (sqlite_type) {
+            case SQLITE_FLOAT:
+                kind = value_kind_t::VALUE_FLOAT;
+                break;
+            case SQLITE_INTEGER:
+                kind = value_kind_t::VALUE_INTEGER;
+                break;
+            default:
+                break;
         }
-        cols.emplace_back(colname, sqlite_type, collator);
+        this->lst_column_metas.emplace_back(
+            intern_string::lookup(colname),
+            kind,
+            logline_value_meta::table_column{cols.size()});
+        cols.emplace_back(intern_string::lookup(colname),
+                          sqlite_type,
+                          intern_string::lookup(collator));
     }
 }
 
 void
-log_search_table::get_foreign_keys(std::vector<std::string>& keys_inout) const
+log_search_table::get_foreign_keys(
+    std::unordered_set<std::string>& keys_inout) const
 {
     log_vtab_impl::get_foreign_keys(keys_inout);
-    keys_inout.emplace_back(MATCH_INDEX);
+    keys_inout.emplace(MATCH_ROWID);
+    keys_inout.emplace(MATCH_INDEX);
 }
 
 bool
 log_search_table::next(log_cursor& lc, logfile_sub_source& lss)
 {
-    this->vi_attrs.clear();
-    this->lst_line_values_cache.lvv_values.clear();
-
+    // Later matches in a message are rows for the same message, so they keep
+    // the attributes and values that were annotated for the first match.
     if (this->lst_match_index >= 0) {
         auto match_res = this->lst_regex->capture_from(this->lst_content)
                              .at(this->lst_remaining)
@@ -127,21 +161,20 @@ log_search_table::next(log_cursor& lc, logfile_sub_source& lss)
                              .ignore_error();
 
         if (match_res) {
-#if 0
-            log_debug("matched within line: %d",
-                      this->lst_match_context.get_count());
-#endif
             this->lst_remaining = match_res->f_remaining;
             this->lst_match_index += 1;
             return true;
         }
 
-        // log_debug("done matching message");
+        this->lst_attrs_cache.clear();
+        this->lst_line_values_cache.lvv_values.clear();
         this->lst_remaining.clear();
         this->lst_match_index = -1;
         return false;
     }
 
+    this->lst_attrs_cache.clear();
+    this->lst_line_values_cache.lvv_values.clear();
     this->lst_match_index = -1;
 
     if (lc.is_eof()) {
@@ -162,18 +195,24 @@ log_search_table::next(log_cursor& lc, logfile_sub_source& lss)
     }
 
     if (this->lst_mismatch_bitmap.is_bit_set(lc.lc_curr_line)) {
-        // log_debug("%d: mismatch, aborting", (int) lc.lc_curr_line);
         return false;
     }
 
-    // log_debug("%d: doing message", (int) lc.lc_curr_line);
     auto& sbr = this->lst_line_values_cache.lvv_sbr;
     lf->read_full_message(lf_iter, sbr);
     sbr.erase_ansi();
-    lf->get_format()->annotate(
-        cl, this->vi_attrs, this->lst_line_values_cache, false);
-    this->lst_content
-        = this->lst_line_values_cache.lvv_sbr.to_string_fragment();
+
+    // Annotating a structured message replaces the buffer with its rendered
+    // form, and that is the text the regex has to match.  A plain text
+    // message is left as-is, so the cost of annotating it is only paid for
+    // the messages that match.
+    auto* format = lf->get_format_ptr();
+    const auto annotate_first = format->lf_file_type != log_format::file_type_t::TEXT;
+    if (annotate_first) {
+        format->annotate(
+            lf, cl, this->lst_attrs_cache, this->lst_line_values_cache);
+    }
+    this->lst_content = sbr.to_string_fragment();
 
     auto match_res = this->lst_regex->capture_from(this->lst_content)
                          .into(this->lst_match_data)
@@ -185,6 +224,12 @@ log_search_table::next(log_cursor& lc, logfile_sub_source& lss)
         return false;
     }
 
+    if (!annotate_first) {
+        format->annotate(
+            lf, cl, this->lst_attrs_cache, this->lst_line_values_cache);
+    }
+
+    this->lst_rowid += 1;
     this->lst_remaining = match_res->f_remaining;
     this->lst_match_index = 0;
 
@@ -194,28 +239,41 @@ log_search_table::next(log_cursor& lc, logfile_sub_source& lss)
 void
 log_search_table::extract(logfile* lf,
                           uint64_t line_number,
+                          string_attrs_t& sa,
                           logline_value_vector& values)
 {
     auto& line = values.lvv_sbr;
     if (this->lst_format != nullptr) {
         values = this->lst_line_values_cache;
     }
-    values.lvv_values.emplace_back(
-        this->lst_column_metas[this->lst_format_column_count],
-        this->lst_match_index);
-    for (int lpc = 0; lpc < this->lst_regex->get_capture_count(); lpc++) {
+    auto curr_col = this->lst_format_column_count;
+    values.lvv_values.emplace_back(this->lst_column_metas[curr_col],
+                                   this->lst_rowid);
+    curr_col += 1;
+    values.lvv_values.emplace_back(this->lst_column_metas[curr_col],
+                                   this->lst_match_index);
+    curr_col += 1;
+    for (size_t lpc = 0; lpc < this->lst_regex->get_capture_count();
+         lpc++, curr_col++)
+    {
         const auto cap = this->lst_match_data[lpc + 1];
         if (cap) {
-            values.lvv_values.emplace_back(
-                this->lst_column_metas[this->lst_format_column_count + 1 + lpc],
-                line,
-                to_line_range(cap.value()));
+            values.lvv_values.emplace_back(this->lst_column_metas[curr_col],
+                                           line,
+                                           to_line_range(cap.value()));
         } else {
-            values.lvv_values.emplace_back(
-                this->lst_column_metas[this->lst_format_column_count + 1
-                                       + lpc]);
+            values.lvv_values.emplace_back(this->lst_column_metas[curr_col]);
         }
     }
+    sa = this->lst_attrs_cache;
+}
+
+bool
+log_search_table::matches(logline_value_vector& values)
+{
+    return this->lst_regex->find_in(values.lvv_sbr.to_string_fragment())
+        .ignore_error()
+        .has_value();
 }
 
 void
@@ -241,6 +299,7 @@ log_search_table::filter(log_cursor& lc, logfile_sub_source& lss)
             this->lst_log_level.value(),
         };
     }
+    this->lst_rowid = -1;
     this->lst_match_index = -1;
 
     if (lss.lss_index_generation != this->lst_index_generation) {
@@ -256,15 +315,113 @@ log_search_table::filter(log_cursor& lc, logfile_sub_source& lss)
     if (this->lst_mismatch_bitmap.bitmap_size() < lss.text_line_count()) {
         this->lst_mismatch_bitmap.expand_bitmap_to(lss.text_line_count());
         this->lst_mismatch_bitmap.resize_bitmap(lss.text_line_count());
-#if 1
-        log_debug("%s:bitmap resize %d:%d",
-                  this->vi_name.c_str(),
-                  this->lst_mismatch_bitmap.size(),
-                  this->lst_mismatch_bitmap.capacity());
-#endif
     }
-    if (!lc.lc_indexed_lines.empty()) {
+    this->drive_from_named_search(lc, lss);
+
+    if (!lc.lc_indexed_lines.empty()
+        && lc.lc_indexed_lines_range.contains(lc.lc_curr_line))
+    {
         lc.lc_curr_line = lc.lc_indexed_lines.back();
         lc.lc_indexed_lines.pop_back();
     }
+}
+
+void
+log_search_table::drive_from_named_search(log_cursor& lc,
+                                          logfile_sub_source& lss)
+{
+    if (this->vi_provenance != provenance_t::named_search) {
+        return;
+    }
+
+    if (!lc.lc_indexed_lines.empty()) {
+        // A query with an indexed column has its own set of lines to look
+        // at, and that one is the more selective of the two.
+        log_debug("%s: not using named search hits, indexed lines present",
+                  this->vi_name.c_str());
+        return;
+    }
+
+    if (lc.lc_direction <= 0) {
+        log_debug("%s: not using named search hits, scan is in reverse",
+                  this->vi_name.c_str());
+        return;
+    }
+
+    auto* tc = lss.get_view();
+    if (tc == nullptr) {
+        log_debug("%s: not using named search hits, no view",
+                  this->vi_name.c_str());
+        return;
+    }
+
+    if (tc->is_searching()) {
+        // The hits are still being collected, so falling back to the scan is
+        // the only way to get a complete answer.
+        log_debug("%s: not using named search hits, search in progress",
+                  this->vi_name.c_str());
+        return;
+    }
+
+    const auto* ns = tc->find_named_search(this->vi_name.to_string());
+    if (ns == nullptr) {
+        log_debug("%s: not using named search hits, no search with that name",
+                  this->vi_name.c_str());
+        return;
+    }
+
+    // The hits are kept in a tree, so seek to the first one in the range
+    // rather than walking past the ones before it.
+    const auto& matches = tc->search_matches_for_slot(ns->ns_slot);
+    const auto hit_range = matches.equal_range(lc.lc_curr_line, lc.lc_end_line);
+
+    std::vector<vis_line_t> msg_lines;
+    std::optional<vis_line_t> prev_hit;
+    for (auto iter = hit_range.first; iter != hit_range.second; ++iter) {
+        const auto vl = *iter;
+
+        // The hit can be on a continuation line, so walk back to the start
+        // of the message that owns it.  next() only does its work on the
+        // first line of a message.  The hits are in ascending order, so
+        // reaching the previous hit means this one is in the same message
+        // and the walk for that hit already found where it starts.
+        auto msg_line = vl;
+        while (msg_line > 0_vl) {
+            if (prev_hit && msg_line == prev_hit.value()) {
+                msg_line = msg_lines.back();
+                break;
+            }
+
+            auto cl = lss.at(msg_line);
+            auto* lf = lss.find_file_ptr(cl);
+
+            if (lf == nullptr || !(lf->begin() + cl)->is_continued()) {
+                break;
+            }
+            msg_line -= 1_vl;
+        }
+        if (msg_lines.empty() || msg_lines.back() != msg_line) {
+            msg_lines.push_back(msg_line);
+        }
+        prev_hit = vl;
+    }
+
+    // The set is popped from the back, so the first line to visit has to be
+    // last.  The end of the scan goes in as a sentinel: once it is popped the
+    // set is empty and the cursor is at the end, which is how is_eof() knows
+    // to stop instead of walking the rest of the file.
+    msg_lines.push_back(lc.lc_end_line);
+    std::reverse(msg_lines.begin(), msg_lines.end());
+
+    auto range = msg_range::empty();
+    range.expand_to(lc.lc_curr_line);
+    range.expand_to(lc.lc_end_line);
+
+    log_debug("%s: using %zu named search hits in [%d:%d)",
+              this->vi_name.c_str(),
+              msg_lines.size() - 1,
+              (int) lc.lc_curr_line,
+              (int) lc.lc_end_line);
+    lc.lc_indexed_lines = std::move(msg_lines);
+    lc.lc_indexed_lines_range = range;
 }

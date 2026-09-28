@@ -30,16 +30,27 @@
 #ifndef files_sub_source_hh
 #define files_sub_source_hh
 
+#include <chrono>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "base/attr_line.hh"
+#include "base/lnav.console.hh"
 #include "file_collection.hh"
+#include "mapbox/variant.hpp"
+#include "plain_text_source.hh"
 #include "textview_curses.hh"
 
 class files_sub_source
     : public text_sub_source
-    , public list_input_delegate {
+    , public text_delegate {
 public:
-    files_sub_source();
+    bool empty() const override { return false; }
 
-    bool list_input_handle_key(listview_curses& lv, int ch) override;
+    bool list_input_handle_key(listview_curses& lv, const ncinput& ch) override;
 
     void list_input_handle_scroll_out(listview_curses& lv) override;
 
@@ -47,10 +58,10 @@ public:
 
     size_t text_line_width(textview_curses& curses) override;
 
-    void text_value_for_line(textview_curses& tc,
-                             int line,
-                             std::string& value_out,
-                             line_flags_t flags) override;
+    line_info text_value_for_line(textview_curses& tc,
+                                  int line,
+                                  std::string& value_out,
+                                  line_flags_t flags) override;
 
     void text_attrs_for_line(textview_curses& tc,
                              int line,
@@ -60,21 +71,61 @@ public:
                               int line,
                               line_flags_t raw) override;
 
+    bool text_handle_mouse(textview_curses& tc,
+                           const listview_curses::display_line_content_t&,
+                           mouse_event& me) override;
+
+    void text_update_marks(vis_bookmarks& bm) override;
+
+    void text_selection_changed(textview_curses& tc) override;
+
+    /**
+     * @return The last tick's reading for the file with this
+     *         logfile::get_serial(), or null if it is not in a pass.
+     */
+    const index_progress_report* find_index_progress(uint64_t file_id) const
+    {
+        for (const auto& ipr : this->fss_index_progress) {
+            if (ipr.ipr_file_id == file_id) {
+                return &ipr;
+            }
+        }
+
+        return nullptr;
+    }
+
+    bool is_index_pass_in_flight() const
+    {
+        return !this->fss_index_progress.empty();
+    }
+
     size_t fss_last_line_len{0};
+    attr_line_t fss_curr_line;
+    std::chrono::microseconds fss_details_mtime;
+    plain_text_source* fss_details_source{nullptr};
+    /**
+     * What the last tick of a parallel indexing pass saw for the files that
+     * had not finished yet.  A non-empty vector means a pass is in flight,
+     * and these entries are the only safe source for those files' progress:
+     * the workers own the logfiles for the length of the pass.  The closing
+     * tick clears it.
+     */
+    std::vector<index_progress_report> fss_index_progress;
+    /** Set when a selection change was skipped because a pass was running. */
+    bool fss_details_stale{false};
 };
 
-struct files_overlay_source : public list_overlay_source {
-    bool list_value_for_overlay(const listview_curses& lv,
-                                int y,
-                                int bottom,
-                                vis_line_t line,
-                                attr_line_t& value_out) override;
+struct files_overlay_source : list_overlay_source {
+    bool list_static_overlay(const listview_curses& lv,
+                             media_t media,
+                             int y,
+                             int bottom,
+                             attr_line_t& value_out) override;
 };
 
 namespace files_model {
 
-struct no_selection {
-};
+struct no_selection {};
 
 template<typename C, typename T>
 struct selection_base {
@@ -91,26 +142,32 @@ struct selection_base {
     }
 };
 
-struct error_selection
-    : public selection_base<error_selection,
-                            std::map<std::string, file_error_info>::iterator> {
+/**
+ * A snapshot of a file_collection::fc_name_to_stubs entry.  The key is kept
+ * separate from the display name because the two are not always the same:
+ * the key is the path that was scanned, which is not necessarily the name
+ * the file is shown under.
+ */
+struct stub_details {
+    std::string sd_key;
+    std::string sd_display_name;
+    lnav::console::user_message sd_description;
 };
+
+struct stub_selection : selection_base<stub_selection, stub_details> {};
 
 struct other_selection
-    : public selection_base<
-          other_selection,
-          std::map<std::string, other_file_descriptor>::iterator> {
-};
+    : selection_base<other_selection,
+                     std::map<std::string, other_file_descriptor>::iterator> {};
 
 struct file_selection
-    : public selection_base<file_selection,
-                            std::vector<std::shared_ptr<logfile>>::iterator> {
-};
+    : selection_base<file_selection,
+                     std::vector<std::shared_ptr<logfile>>::iterator> {};
 
 using files_list_selection = mapbox::util::
-    variant<no_selection, error_selection, other_selection, file_selection>;
+    variant<no_selection, stub_selection, other_selection, file_selection>;
 
-files_list_selection from_selection(vis_line_t sel_vis);
+files_list_selection from_selection(std::optional<vis_line_t> sel_vis);
 
 }  // namespace files_model
 

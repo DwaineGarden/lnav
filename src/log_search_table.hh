@@ -32,19 +32,34 @@
 #ifndef lnav_log_search_table_hh
 #define lnav_log_search_table_hh
 
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "base/auto_mem.hh"
+#include "base/intern_string.hh"
 #include "log_vtab_impl.hh"
 #include "pcrepp/pcre2pp.hh"
-#include "shared_buffer.hh"
+
+class logfile;
 
 class log_search_table : public log_vtab_impl {
 public:
     log_search_table(std::shared_ptr<lnav::pcre2pp::code> code,
                      intern_string_t table_name);
 
+    std::optional<std::string> get_command() const override;
+
     void get_primary_keys(std::vector<std::string>& keys_out) const override;
+
+    /**
+     * Point the cursor at the messages that the named search behind this
+     * table already found, so that the scan does not have to look at
+     * anything else.  Does nothing for tables that did not come from a
+     * named search.
+     */
+    void drive_from_named_search(log_cursor& lc, logfile_sub_source& lss);
 
     void get_columns_int(std::vector<vtab_column>& cols) const;
 
@@ -56,13 +71,17 @@ public:
 
     void filter(log_cursor& lc, logfile_sub_source& lss) override;
 
-    void get_foreign_keys(std::vector<std::string>& keys_inout) const override;
+    void get_foreign_keys(
+        std::unordered_set<std::string>& keys_inout) const override;
 
     bool next(log_cursor& lc, logfile_sub_source& lss) override;
 
     void extract(logfile* lf,
                  uint64_t line_number,
+                 string_attrs_t& sa,
                  logline_value_vector& values) override;
+
+    bool matches(logline_value_vector& values) override;
 
     std::shared_ptr<lnav::pcre2pp::code> lst_regex;
     lnav::pcre2pp::match_data lst_match_data;
@@ -71,13 +90,15 @@ public:
     log_format* lst_format{nullptr};
     mutable size_t lst_format_column_count{0};
     std::string lst_log_path_glob;
-    nonstd::optional<log_level_t> lst_log_level;
+    std::optional<log_level_t> lst_log_level;
     mutable std::vector<logline_value_meta> lst_column_metas;
     int64_t lst_match_index{-1};
     mutable std::vector<vtab_column> lst_cols;
+    string_attrs_t lst_attrs_cache;
     logline_value_vector lst_line_values_cache;
     auto_buffer lst_mismatch_bitmap{auto_buffer::alloc_bitmap(0)};
-    int32_t lst_index_generation{0};
+    uint32_t lst_index_generation{0};
+    int64_t lst_rowid{-1};
 };
 
 #endif

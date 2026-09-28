@@ -36,12 +36,31 @@
 #include "base/attr_line.hh"
 #include "base/file_range.hh"
 
-namespace lnav {
-namespace console {
+namespace lnav::console {
+
+bool only_process_attached_to_win32_console();
+
+void get_command_line_args(int* argc, char*** argv);
 
 void println(FILE* file, const attr_line_t& al);
 
+namespace detail {
+
+/**
+ * Resolve an attribute range to byte offsets into str.  Rendering to a
+ * terminal works in bytes, so a range that was measured in code points has to
+ * be converted first.  An open-ended (-1) end is passed through.
+ */
+line_range to_byte_range(const std::string& str, const line_range& lr);
+
+}  // namespace detail
+
 struct snippet {
+    static snippet from_content_with_offset(intern_string_t src,
+                                            const attr_line_t& content,
+                                            size_t offset,
+                                            const std::string& errmsg);
+
     static snippet from(intern_string_t src, const attr_line_t& content)
     {
         snippet retval;
@@ -77,9 +96,12 @@ struct user_message {
         info,
         warning,
         error,
+        fatal,
     };
 
     static user_message raw(const attr_line_t& al);
+
+    static user_message fatal(const attr_line_t& al);
 
     static user_message error(const attr_line_t& al);
 
@@ -88,6 +110,13 @@ struct user_message {
     static user_message info(const attr_line_t& al);
 
     static user_message ok(const attr_line_t& al);
+
+    user_message() = default;
+    user_message(user_message&&) = default;
+    user_message(const user_message&) = default;
+
+    user_message& operator=(user_message&&) = default;
+    user_message& operator=(const user_message&) = default;
 
     user_message& with_reason(const attr_line_t& al)
     {
@@ -98,12 +127,12 @@ struct user_message {
 
     user_message& with_reason(const user_message& um)
     {
-        return this->with_reason(um.to_attr_line({}));
+        return this->with_reason(um.to_attr_line(render_flags::none));
     }
 
     user_message& with_errno_reason()
     {
-        this->um_reason = strerror(errno);
+        this->um_reason = lnav::from_errno().message();
         return *this;
     }
 
@@ -114,21 +143,22 @@ struct user_message {
     }
 
     template<typename C>
+    user_message& with_context_snippets(C snippets)
+    {
+        this->um_snippets.insert(this->um_snippets.begin(),
+                                 std::make_move_iterator(std::begin(snippets)),
+                                 std::make_move_iterator(std::end(snippets)));
+        return *this;
+    }
+
+    user_message& remove_internal_snippets();
+
+    template<typename C>
     user_message& with_snippets(C snippets)
     {
         this->um_snippets.insert(this->um_snippets.end(),
                                  std::make_move_iterator(std::begin(snippets)),
                                  std::make_move_iterator(std::end(snippets)));
-        if (this->um_snippets.size() > 1) {
-            for (auto iter = this->um_snippets.begin();
-                 iter != this->um_snippets.end();) {
-                if (iter->s_content.empty()) {
-                    iter = this->um_snippets.erase(iter);
-                } else {
-                    ++iter;
-                }
-            }
-        }
         return *this;
     }
 
@@ -154,11 +184,14 @@ struct user_message {
     }
 
     enum class render_flags {
+        none,
         prefix,
     };
 
-    attr_line_t to_attr_line(std::set<render_flags> flags
-                             = {render_flags::prefix}) const;
+    attr_line_t to_attr_line(render_flags flags = render_flags::prefix) const;
+
+    user_message move() & { return std::move(*this); }
+    user_message move() && { return std::move(*this); }
 
     level um_level{level::ok};
     attr_line_t um_message;
@@ -170,7 +203,6 @@ struct user_message {
 
 void print(FILE* file, const user_message& um);
 
-}  // namespace console
-}  // namespace lnav
+}  // namespace lnav::console
 
 #endif

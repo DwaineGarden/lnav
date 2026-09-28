@@ -31,28 +31,25 @@
 #define lnav_breadcrumb_curses_hh
 
 #include <functional>
-#include <utility>
+#include <optional>
 #include <vector>
 
+#include "breadcrumb.hh"
 #include "plain_text_source.hh"
 #include "textview_curses.hh"
 #include "view_curses.hh"
 
 class breadcrumb_curses : public view_curses {
 public:
+    using action = std::function<void(breadcrumb_curses&)>;
+
     breadcrumb_curses();
 
-    void set_y(int y)
-    {
-        this->bc_y = y;
-        this->bc_match_view.set_y(y + 1);
-    }
+    using injectable = breadcrumb_curses();
 
-    int get_y() const { return this->bc_y; }
-
-    void set_window(WINDOW* win)
+    void set_window(ncplane* win) override
     {
-        this->bc_window = win;
+        view_curses::set_window(win);
         this->bc_match_view.set_window(win);
     }
 
@@ -61,23 +58,38 @@ public:
         this->bc_line_source = std::move(ls);
     }
 
+    bool handle_mouse(mouse_event& me) override;
+
     void focus();
+    void focus_next();
     void blur();
 
-    bool handle_key(int ch);
+    bool handle_key(const ncinput& ch);
 
-    void do_update() override;
+    bool do_update() override;
 
     void reload_data();
+
+    bool is_focused() const { return !this->bc_focused_crumbs.empty(); }
+
+    static void no_op_action(breadcrumb_curses&);
+
+    action on_focus{no_op_action};
+    action on_blur{no_op_action};
+
+    std::function<void(breadcrumb_curses&,
+                       breadcrumb::crumb::perform,
+                       const breadcrumb::crumb::key_t& key)>
+        bc_perform_handler;
 
 private:
     class search_overlay_source : public list_overlay_source {
     public:
-        bool list_value_for_overlay(const listview_curses& lv,
-                                    int y,
-                                    int bottom,
-                                    vis_line_t line,
-                                    attr_line_t& value_out) override;
+        bool list_static_overlay(const listview_curses& lv,
+                                 media_t media,
+                                 int y,
+                                 int bottom,
+                                 attr_line_t& value_out) override;
 
         breadcrumb_curses* sos_parent{nullptr};
     };
@@ -87,21 +99,38 @@ private:
         if_different,
     };
 
-    void perform_selection(perform_behavior_t behavior);
+    bool perform_selection(perform_behavior_t behavior);
 
-    WINDOW* bc_window{nullptr};
     std::function<std::vector<breadcrumb::crumb>()> bc_line_source;
-    int bc_y{0};
     std::vector<breadcrumb::crumb> bc_focused_crumbs;
-    nonstd::optional<size_t> bc_selected_crumb;
-    nonstd::optional<size_t> bc_last_selected_crumb;
+    std::optional<size_t> bc_selected_crumb;
+    std::optional<size_t> bc_last_selected_crumb;
     std::vector<breadcrumb::possibility> bc_possible_values;
     std::vector<breadcrumb::possibility> bc_similar_values;
     std::string bc_current_search;
+    /**
+     * The widest match seen since the search was last empty.  The provider
+     * narrows the list as the search grows, and sizing the popup to that
+     * alone would make it shrink on every keystroke.
+     */
+    size_t bc_match_width{0};
 
     plain_text_source bc_match_source;
     search_overlay_source bc_match_search_overlay;
     textview_curses bc_match_view;
+
+    struct displayed_crumb {
+        displayed_crumb(line_range range, size_t index)
+            : dc_range(range), dc_index(index)
+        {
+        }
+
+        line_range dc_range;
+        size_t dc_index{0};
+    };
+
+    std::vector<displayed_crumb> bc_displayed_crumbs;
+    bool bc_initial_mouse_event{true};
 };
 
 #endif

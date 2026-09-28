@@ -37,6 +37,8 @@
 
 #include <sys/types.h>
 
+#include "date/tz.h"
+#include "intern_string.hh"
 #include "time_util.hh"
 
 /**
@@ -49,24 +51,39 @@
 struct date_time_scanner {
     date_time_scanner() { this->clear(); }
 
-    void clear()
-    {
-        this->dts_base_time = 0;
-        this->dts_base_tm = exttm{};
-        this->dts_fmt_lock = -1;
-        this->dts_fmt_len = -1;
-        this->dts_last_tv = timeval{};
-        this->dts_last_tm = exttm{};
-    }
+    void clear();
+
+    struct lock_state {
+        int ls_fmt_index{-1};
+        int ls_fmt_len{-1};
+    };
 
     /**
      * Unlock this scanner so that the format is rediscovered.
      */
-    void unlock()
+    lock_state unlock()
     {
+        auto retval = lock_state{this->dts_fmt_lock, this->dts_fmt_len};
+
         this->dts_fmt_lock = -1;
         this->dts_fmt_len = -1;
+        return retval;
     }
+
+    void relock(const lock_state& ls)
+    {
+        this->dts_fmt_lock = ls.ls_fmt_index;
+        this->dts_fmt_len = ls.ls_fmt_len;
+    }
+
+    /**
+     * @return A copy that keeps this scanner's configuration -- base time,
+     * zone, and the local-time flags -- but starts with no format lock and no
+     * conversion caches, so that it does its own discovery.  Used to hand a
+     * file its own scanner without inheriting whatever the format object was
+     * last looking at.
+     */
+    date_time_scanner unlocked_copy() const;
 
     void set_base_time(time_t base_time, const tm& local_tm);
 
@@ -81,17 +98,27 @@ struct date_time_scanner {
 
     bool dts_keep_base_tz{false};
     bool dts_local_time{false};
+    bool dts_zoned_to_local{true};
     time_t dts_base_time{0};
     struct exttm dts_base_tm;
     int dts_fmt_lock{-1};
     int dts_fmt_len{-1};
-    struct exttm dts_last_tm {};
-    struct timeval dts_last_tv {};
+    tm dts_last_tm{};
+    long dts_last_gmtoff{0};
+    struct timeval dts_last_tv{};
     time_t dts_local_offset_cache{0};
     time_t dts_local_offset_valid{0};
     time_t dts_local_offset_expiry{0};
+    time_t dts_localtime_cached_gmt{0};
+    tm dts_localtime_cached_tm{};
+    const date::time_zone* dts_default_zone{nullptr};
 
     static const int EXPIRE_TIME = 15 * 60;
+    /**
+     * Times before this (1979-07-05) are not converted to local time.  Any
+     * timestamp this early is taken to be relative, not a real date.
+     */
+    static constexpr time_t MIN_LOCAL_TIME = 300000000;
 
     const char* scan(const char* time_src,
                      size_t time_len,
@@ -99,6 +126,23 @@ struct date_time_scanner {
                      struct exttm* tm_out,
                      struct timeval& tv_out,
                      bool convert_local = true);
+
+    /**
+     * Scan a timestamp whose format may differ from the last one scanned.
+     * The format lock is kept as a fast path, but it is dropped and the
+     * format rediscovered when the locked format does not match.  If no
+     * other format matches either, the lock is restored.  When the format
+     * does not change, this costs the same as scan().
+     *
+     * Like scan(), a match can stop short of the end of the input.  Whether
+     * that is acceptable is up to the caller.
+     */
+    const char* scan_relocking(const char* time_src,
+                               size_t time_len,
+                               const char* const time_fmt[],
+                               struct exttm* tm_out,
+                               struct timeval& tv_out,
+                               bool convert_local = true);
 
     size_t ftime(char* dst,
                  size_t len,
@@ -110,7 +154,7 @@ struct date_time_scanner {
                             const char* const time_fmt[],
                             struct timeval& tv_out)
     {
-        struct exttm tm;
+        exttm tm;
 
         if (time_len == -1) {
             time_len = strlen(time_src);
@@ -121,11 +165,12 @@ struct date_time_scanner {
         return false;
     }
 
-    bool convert_to_timeval(const std::string& time_src, struct timeval& tv_out)
+    bool convert_to_timeval(const string_fragment& time_src,
+                            struct timeval& tv_out)
     {
-        struct exttm tm;
+        exttm tm;
 
-        if (this->scan(time_src.c_str(), time_src.size(), nullptr, &tm, tv_out)
+        if (this->scan(time_src.data(), time_src.length(), nullptr, &tm, tv_out)
             != nullptr)
         {
             return true;

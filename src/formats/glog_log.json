@@ -13,6 +13,9 @@
             }
         },
         "level-field": "level",
+        "src-file-field": "src_file",
+        "src-line-field": "src_line",
+        "thread-id-field": "thread",
         "level": {
             "error": "E",
             "warning": "W",
@@ -20,12 +23,14 @@
             "critical": "C",
             "fatal": "F"
         },
-        "opid-field": "thread",
         "value": {
             "thread": {
                 "kind": "integer",
                 "identifier": true,
                 "foreign-key": true
+            },
+            "level": {
+                "kind": "string"
             },
             "src_file": {
                 "kind": "string",

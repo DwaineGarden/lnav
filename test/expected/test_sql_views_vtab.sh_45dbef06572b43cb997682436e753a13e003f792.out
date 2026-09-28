@@ -1,0 +1,50 @@
+[2020-12-10 06:56:41,092] DEBUG [connect.client:69] Full request text:
+[4m▌ Line 2 parser details.[0m
+ Received Time: [1m2020-12-10T06:56:41.092000+0000[0m — [1min the future[0m  Format: [1m%Y-%m-%d %H:%M:%S,%L[0m  Default Zone: [32mnone[0m
+ [1mPermalink:[0m    #msg0005b616ad91a3a0-v1:e8f1e889e0dbff23577d3881ce1e011f
+ [1mFile:[0m         ]8;;file://{test_dir}/logfile_xml_msg.0#L3\[1m{test_dir}/logfile_xml_msg.0[0m]8;;\]8;;file://{test_dir}/logfile_xml_msg.0#L3\:]8;;\]8;;file://{test_dir}/logfile_xml_msg.0#L3\[1m3[0m]8;;\
+ [1mPattern:[0m      /xml_msg_log/regex/std = [1m[36m^[0m\[[1m[32m([0m[1m[32m?[0m[1m[36m<[0mtimestamp[1m[36m>[0m[1m\d[0m[1m[32m{[0m4[1m[32m}[0m-[1m\d[0m[1m[32m{[0m2[1m[32m}[0m-[1m\d[0m[1m[32m{[0m2[1m[32m}[0m [1m\d[0m[1m[32m{[0m2[1m[32m}[0m:[1m\d[0m[1m[32m{[0m2[1m[32m}[0m:[1m\d[0m[1m[32m{[0m2[1m[32m}[0m,[1m\d[0m[1m[32m{[0m3[1m[32m}[0m[1m[32m)[0m\][1m\s[0m[1m[36m+[0m[1m[32m([0m[1m[32m?[0m[1m[36m<[0mlevel[1m[36m>[0m[1m\w[0m[1m[36m+[0m[1m[32m)[0m[1m\s[0m[1m[36m+[0m\[[1m[32m([0m[1m[32m?[0m[1m[36m<[0mmodule[1m[36m>[0m[1m[32m[[0m[1m[36m^[0m:[1m[32m][0m[1m[36m*[0m[1m[32m)[0m:[1m[32m([0m[1m[32m?[0m[1m[36m<[0mline[1m[36m>[0m[1m\d[0m[1m[36m+[0m[1m[32m)[0m\][1m\s[0m[1m[36m*[0m[1m[32m([0m[1m[32m?[0m[1m[36m<[0mbody[1m[36m>[0m[1m[32m[[0m[1m[36m^[0m\n[1m[32m][0m[1m[36m*[0m[1m[32m)[0m\n[1m[36m?[0m[1m[32m([0m[1m[32m?[0m[1m[36m<[0mmsg_data[1m[36m>[0m[1m[36m.[0m[1m[36m*[0m[1m[32m)[0m
+ Known message fields for table [1mxml_msg_log[0m:
+ | [1m[32m◆[0m 📊 module   = connect.client[32m  ~2 distinct of 4[0m
+ | [1m[32m◆[0m 📊 line     = 69[32m  69..108 of 4[0m
+ | [1m[32m◆[0m    msg_data = <?xml version='1.0' encoding='iso-8859-2'?>␊<a-request>␊  <head>␊    x␊  </head>␊  <source>␊    x␊  </source>␊  <request id="1">␊    <name>␊      x␊    </name>␊  </request>␊</a-request>␊
+ XML fields:
+   [1mxpath[0m([35m'/a-request/head/text()'[0m, xml_msg_log.msg_data) = [1mx[0m
+   [1mxpath[0m([35m'/a-request/request/@id'[0m, xml_msg_log.msg_data) = [1m1[0m
+   [1mxpath[0m([35m'/a-request/request/name/text()'[0m, xml_msg_log.msg_data) = [1mx[0m
+   [1mxpath[0m([35m'/a-request/source/text()'[0m, xml_msg_log.msg_data) = [1mx[0m
+ [32mNo discovered message fields[0m
+ └ #xml-req
+<?xml version='1.0' encoding='iso-8859-2'?>
+<a-request>
+  <head>
+    x
+  </head>
+  <source>
+    x
+  </source>
+  [32m<request id="1">[0m
+    <name>
+      x
+    </name>
+  </request>
+</a-request>
+ 
+[2020-12-10 06:56:41,099] DEBUG [[35mm[0m:85] Full reply text:
+<?xml version='1.0' encoding='iso-8859-2'?>
+<a-reply>
+  <head>
+    x
+  </head>
+  <reply id="2">
+    <status>
+      <result>OK</result>
+    </status>
+    <name>
+      x
+    </name>
+  </reply>
+  <technical-track>
+    x
+  </technical-track>
+</a-reply>

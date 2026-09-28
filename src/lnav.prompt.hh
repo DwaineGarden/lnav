@@ -1,0 +1,206 @@
+/**
+ * Copyright (c) 2025, Timothy Stack
+ *
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * * Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ * * Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ * * Neither the name of Timothy Stack nor the names of its contributors
+ * may be used to endorse or promote products derived from this software
+ * without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ''AS IS'' AND ANY
+ * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#ifndef lnav_prompt_hh
+#define lnav_prompt_hh
+
+#include <map>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "base/attr_line.hh"
+#include "base/string_attr_type.hh"
+#include "format.scripts.hh"
+#include "help_text.hh"
+#include "mapbox/variant.hpp"
+#include "textinput.history.hh"
+#include "textinput_curses.hh"
+#include "yajlpp/yajlpp.hh"
+
+namespace lnav {
+
+struct prompt {
+    static const string_attr_type<std::string> SUBST_TEXT;
+
+    static prompt& get();
+
+    struct sql_keyword_t {};
+    struct sql_db_t {};
+    struct sql_table_t {};
+    struct sql_table_valued_function_t {};
+    struct sql_function_t {
+        size_t sf_param_count{0};
+    };
+    struct prql_function_t {};
+    struct sql_column_t {};
+    struct sql_number_t {};
+    struct sql_string_t {};
+    struct sql_collation_t {};
+    struct sql_var_t {};
+    struct sql_field_var_t {};
+    struct sql_format_column_t {};
+
+    using sql_item_t = mapbox::util::variant<sql_keyword_t,
+                                             sql_collation_t,
+                                             sql_db_t,
+                                             sql_table_t,
+                                             sql_table_valued_function_t,
+                                             sql_function_t,
+                                             prql_function_t,
+                                             sql_column_t,
+                                             sql_number_t,
+                                             sql_string_t,
+                                             sql_var_t,
+                                             sql_field_var_t,
+                                             sql_format_column_t>;
+
+    struct sql_item_meta {
+        const char* sim_type_hint;
+        const char* sim_display_suffix;
+        const char* sim_replace_suffix;
+        role_t sim_role;
+    };
+
+    enum class context_t {
+        none,
+        sql,
+        cmd,
+        search,
+        script,
+        regex_filter,
+        sql_filter,
+    };
+
+    lnav::textinput::history p_sql_history;
+    lnav::textinput::history p_cmd_history;
+    lnav::textinput::history p_search_history;
+    lnav::textinput::history p_script_history;
+    lnav::textinput::history p_regexp_filter_history;
+    lnav::textinput::history p_sql_filter_history;
+
+    lnav::textinput::history& get_history_for()
+    {
+        switch (this->p_current_context) {
+            case context_t::cmd:
+                return this->p_cmd_history;
+            case context_t::sql:
+                return this->p_sql_history;
+            case context_t::search:
+                return this->p_search_history;
+            case context_t::script:
+                return this->p_script_history;
+            case context_t::regex_filter:
+                return this->p_regexp_filter_history;
+            case context_t::sql_filter:
+                return this->p_sql_filter_history;
+            default:
+                ensure(false);
+        }
+    }
+
+    lnav::textinput::history& get_history_for(char ch)
+    {
+        switch (ch) {
+            case ';':
+                return this->p_sql_history;
+            case ':':
+                return this->p_cmd_history;
+            case '/':
+                return this->p_search_history;
+            case '|':
+                return this->p_script_history;
+            default:
+                ensure(false);
+        }
+    }
+
+    context_t p_current_context{context_t::none};
+    std::map<std::string, std::string> p_env_vars;
+    std::multimap<std::string, sql_item_t, strnatcaseless> p_sql_completions;
+    std::set<std::string, strnatless> p_sql_completion_terms;
+    std::map<std::string, sql_item_t, strnatcaseless> p_prql_completions;
+    std::map<std::string, const json_path_handler_base*> p_config_paths;
+    std::map<std::string, std::vector<std::string>> p_config_values;
+    std::set<std::string> p_remote_paths;
+    available_scripts p_scripts;
+    textinput_curses p_editor;
+    bool p_alt_mode{false};
+    std::string p_pre_history_content;
+    bool p_replace_from_history{false};
+    bool p_in_completion{false};
+    int32_t p_history_changes{0};
+
+    void focus_for(textview_curses& tc,
+                   textinput_curses& editor,
+                   context_t context,
+                   char sigil,
+                   const std::vector<std::string>& args);
+
+    void refresh_sql_completions(textview_curses& tc);
+    void refresh_sql_expr_completions(textview_curses& tc);
+    void insert_sql_completion(const std::string& name, const sql_item_t& item);
+    const sql_item_meta& sql_item_hint(const sql_item_t& item) const;
+    attr_line_t get_db_completion_text(const std::string& pattern,
+                                       const std::string& str,
+                                       int width) const;
+    attr_line_t get_sql_completion_text(
+        const std::string& pattern,
+        const std::pair<std::string, sql_item_t>& p) const;
+    std::string get_regex_suggestion(textview_curses& tc,
+                                     const std::string& pattern) const;
+
+    void refresh_config_completions();
+    std::vector<attr_line_t> get_cmd_parameter_completion(
+        textview_curses& tc,
+        const help_text* cmd_ht,
+        const help_text* ht,
+        const std::string& str);
+    std::vector<attr_line_t> get_env_completion(const std::string& str);
+    std::vector<attr_line_t> get_config_value_completion(
+        const std::string& path, const std::string& str) const;
+
+    void highlight_match_chars(const std::string& str,
+                               std::vector<attr_line_t>& poss);
+
+    void rl_help(textinput_curses& tc);
+    void rl_reformat(textinput_curses& tc);
+    void rl_history(textinput_curses& tc);
+    void rl_history_list(textinput_curses& tc);
+    void rl_history_search(textinput_curses& tc);
+    void rl_completion(textinput_curses& tc);
+    void rl_popup_change(textinput_curses& tc);
+    void rl_popup_cancel(textinput_curses& tc);
+    void rl_external_edit(textinput_curses& tc);
+};
+
+}  // namespace lnav
+
+#endif

@@ -37,6 +37,7 @@
 #include <assert.h>
 
 #include "base/ansi_scrubber.hh"
+#include "base/attr_line.builder.hh"
 #include "config.h"
 #include "view_curses.hh"
 
@@ -45,6 +46,176 @@ using namespace std;
 int
 main(int argc, char* argv[])
 {
+    printf("BEGIN test\n");
+
+    {
+        auto input = std::string("\x1b[33mHello\x1b[0m");
+        string_attrs_t sa;
+
+        auto lr = line_range{0, (int) input.size()};
+        sa.emplace_back(lr, SA_ORIGINAL_LINE.value());
+
+        scrub_ansi_string(input, &sa);
+        assert(sa[0].sa_range.lr_end == input.size());
+        assert("Hello" == input);
+    }
+
+    {
+        auto input = std::string("\0Hello", 6);
+        string_attrs_t sa;
+
+        scrub_ansi_string(input, &sa);
+        assert(" Hello" == input);
+    }
+
+    {
+        auto input = std::string("\0Hello", 6);
+        string_attrs_t sa;
+
+        erase_ansi_escapes(input);
+        assert(" Hello" == input);
+    }
+
+    {
+        auto input = std::string("AB\x1b[33m\0CD", 10);
+        string_attrs_t sa;
+
+        scrub_ansi_string(input, &sa);
+        assert(input == "AB CD");
+    }
+
+    {
+        auto input = std::string("\x1b[33m\0Hello", 11);
+        string_attrs_t sa;
+
+        scrub_ansi_string(input, &sa);
+        assert(input == " Hello");
+    }
+
+    {
+        char input[] = "AB\x1b[33m\0CD";
+        auto sf = string_fragment{input, 0, 10};
+
+        auto new_len = erase_ansi_escapes(sf);
+        auto result = std::string(input, new_len);
+        assert(result == "AB CD");
+    }
+
+    {
+        char input[] = "\x1b[33m\0Hello";
+        auto sf = string_fragment{input, 0, 11};
+
+        auto new_len = erase_ansi_escapes(sf);
+        auto result = std::string(input, new_len);
+        assert(result == " Hello");
+    }
+
+    {
+        auto input = std::string("\x1b[0;1;38:2:1:2:3mHello");
+        string_attrs_t sa;
+
+        scrub_ansi_string(input, &sa);
+        assert(input == "Hello");
+        assert(sa.size() == 1);
+        assert(sa[0].sa_type == &VC_STYLE);
+        auto ta = sa[0].sa_value.get<text_attrs>();
+        auto rgb = std::get_if<rgb_color>(&ta.ta_fg_color.cu_value);
+        assert(rgb->rc_r == 1);
+        assert(rgb->rc_g == 2);
+        assert(rgb->rc_b == 3);
+    }
+
+    {
+        auto input = std::string("\x1b[0;48:2:10:20:30mHello");
+        string_attrs_t sa;
+
+        scrub_ansi_string(input, &sa);
+        assert(input == "Hello");
+        assert(sa.size() == 1);
+        assert(sa[0].sa_type == &VC_STYLE);
+        auto ta = sa[0].sa_value.get<text_attrs>();
+        auto rgb = std::get_if<rgb_color>(&ta.ta_bg_color.cu_value);
+        assert(rgb != nullptr);
+        assert(sa[0].sa_range.lr_start == 0);
+        assert(sa[0].sa_range.lr_end == -1);
+        assert(rgb->rc_r == 10);
+        assert(rgb->rc_g == 20);
+        assert(rgb->rc_b == 30);
+    }
+
+    {
+        auto input = std::string("\x1b[0;1;38:5:245mHello");
+        string_attrs_t sa;
+
+        scrub_ansi_string(input, &sa);
+        assert(input == "Hello");
+        assert(sa.size() == 1);
+        assert(sa[0].sa_type == &VC_STYLE);
+        auto ta = sa[0].sa_value.get<text_attrs>();
+        assert(*std::get_if<palette_color>(&ta.ta_fg_color.cu_value)
+               == palette_color{245});
+    }
+
+    {
+        auto input = std::string("\x1b[0;1;38;5;245mHello");
+        string_attrs_t sa;
+
+        scrub_ansi_string(input, &sa);
+        assert(input == "Hello");
+    }
+
+    {
+        auto input = std::string("\x1b[66O\x1b[66O");
+        string_attrs_t sa;
+        scrub_ansi_string(input, &sa);
+
+        assert(input.empty());
+        assert(sa.size() == 1);
+        assert(sa[0].sa_type == &SA_INVALID);
+    }
+
+    {
+        std::string zero_width = "\x16 1 \x16 2 \x16";
+        string_attrs_t sa;
+
+        scrub_ansi_string(zero_width, &sa);
+        printf("zero width: '%s'\n",
+               fmt::format(FMT_STRING("{:?}"), zero_width).c_str());
+        assert(zero_width == " 1  2 ");
+        for (const auto& attr : sa) {
+            printf("attr %d:%d %s\n",
+                   attr.sa_range.lr_start,
+                   attr.sa_range.lr_end,
+                   attr.sa_type->sat_name);
+            if (attr.sa_type == &VC_HYPERLINK) {
+                printf("  value: %s\n",
+                       attr.sa_value.get<std::string>().c_str());
+            }
+            if (attr.sa_type == &SA_ORIGIN_OFFSET) {
+                printf("  value: %lld\n", attr.sa_value.get<int64_t>());
+            }
+        }
+    }
+
+    {
+        std::string bad_bold = "That is not\b\b\ball\n";
+        string_attrs_t sa;
+
+        scrub_ansi_string(bad_bold, &sa);
+        printf("bad bold1: '%s'\n",
+               fmt::format(FMT_STRING("{:?}"), bad_bold).c_str());
+        assert(bad_bold == "That is not\b\b\ball\n");
+    }
+    {
+        std::string bad_bold = "test r\bra\bc not\b\b\ball \x16";
+        string_attrs_t sa;
+
+        scrub_ansi_string(bad_bold, &sa);
+        printf("bad bold2: '%s'\n",
+               fmt::format(FMT_STRING("{:?}"), bad_bold).c_str());
+        assert(bad_bold == "test ra\bc not\b\b\ball ");
+    }
+
     {
         char input[] = "Hello, \x1b[33;mWorld\x1b[0;m!";
 
@@ -53,6 +224,13 @@ main(int argc, char* argv[])
         printf("result '%s'\n", input);
 
         assert(new_len == 13);
+    }
+
+    {
+        std::string bad_bold = "^_\x8b\b ";
+        string_attrs_t sa;
+
+        scrub_ansi_string(bad_bold, &sa);
     }
 
     {
@@ -82,17 +260,61 @@ main(int argc, char* argv[])
             }
         }
     }
+    {
+        string_attrs_t sa;
+        string str_cp;
 
-    string_attrs_t sa;
-    string str_cp;
+        str_cp = "Hello, World!";
+        scrub_ansi_string(str_cp, &sa);
 
-    str_cp = "Hello, World!";
-    scrub_ansi_string(str_cp, &sa);
+        assert(str_cp == "Hello, World!");
+        assert(sa.empty());
 
-    assert(str_cp == "Hello, World!");
-    assert(sa.empty());
+        str_cp = "Hello\x1b[44;m, \x1b[33;mWorld\x1b[0;m!";
+        scrub_ansi_string(str_cp, &sa);
+        assert(str_cp == "Hello, World!");
+        printf("%s\n", str_cp.c_str());
+        for (const auto& attr : sa) {
+            printf("  attr %d:%d %s %s\n",
+                   attr.sa_range.lr_start,
+                   attr.sa_range.lr_end,
+                   attr.sa_type->sat_name,
+                   string_fragment::from_str_range(
+                       str_cp, attr.sa_range.lr_start, attr.sa_range.lr_end)
+                       .to_string()
+                       .c_str());
+        }
+    }
 
-    str_cp = "Hello\x1b[44;m, \x1b[33;mWorld\x1b[0;m!";
-    scrub_ansi_string(str_cp, &sa);
-    assert(str_cp == "Hello, World!");
+    {
+        // "•]8;;http://example.com•\This_is_a_link•]8;;•\_"
+        auto hlink = std::string(
+            "\033]8;;http://example.com\033\\This is a "
+            "link\033]8;;\033\\\n");
+
+        auto al = attr_line_t();
+        attr_line_builder alb(al);
+
+        alb.append_as_hexdump(hlink);
+        printf("%s\n", al.get_string().c_str());
+
+        string_attrs_t sa;
+        scrub_ansi_string(hlink, &sa);
+
+        printf("hlink %d %d %s", hlink.size(), sa.size(), hlink.c_str());
+        assert(sa.size() == 3);
+        for (const auto& attr : sa) {
+            printf("attr %d:%d %s\n",
+                   attr.sa_range.lr_start,
+                   attr.sa_range.lr_end,
+                   attr.sa_type->sat_name);
+            if (attr.sa_type == &VC_HYPERLINK) {
+                printf("  value: %s\n",
+                       attr.sa_value.get<std::string>().c_str());
+            }
+            if (attr.sa_type == &SA_ORIGIN_OFFSET) {
+                printf("  value: %lld\n", attr.sa_value.get<int64_t>());
+            }
+        }
+    }
 }

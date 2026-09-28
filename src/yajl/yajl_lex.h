@@ -77,12 +77,14 @@ void yajl_lex_free(yajl_lexer lexer);
  */
 yajl_tok yajl_lex_lex(yajl_lexer lexer, const unsigned char * jsonText,
                       size_t jsonTextLen, size_t * offset,
-                      const unsigned char ** outBuf, size_t * outLen);
+                      const unsigned char ** outBuf, size_t * outLen,
+                      yajl_string_props_t* props);
 
 /** have a peek at the next token, but don't move the lexer forward */
 yajl_tok yajl_lex_peek(yajl_lexer lexer, const unsigned char * jsonText,
                        size_t jsonTextLen, size_t offset);
 
+void yajl_need_key(yajl_lexer lexer, unsigned int val);
 
 typedef enum {
     yajl_lex_e_ok = 0,

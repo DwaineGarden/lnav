@@ -34,41 +34,39 @@
 
 #include <memory>
 
-#include <assert.h>
 #include <sys/types.h>
-#include <zlib.h>
 
 #include "base/intern_string.hh"
 
 struct bin_src_file {
-    bin_src_file(const char* name,
-                 const unsigned char* data,
-                 size_t compressed_size,
-                 size_t size)
-        : bsf_name(name), bsf_data(new unsigned char[size + 1]), bsf_size(size)
-    {
-        uLongf zsize = size;
-        auto rc
-            = uncompress(this->bsf_data.get(), &zsize, data, compressed_size);
-        assert(rc == Z_OK);
-        assert(zsize == size);
-        this->bsf_data[size] = '\0';
-    };
+    template<typename T, std::size_t N>
+    constexpr bin_src_file(const T (&name)[N],
+                           const unsigned char* data,
+                           size_t compressed_size,
+                           size_t size);
 
-    string_fragment to_string_fragment() const
-    {
-        return string_fragment{this->bsf_data.get(), 0, (int) this->bsf_size};
-    }
+    std::unique_ptr<string_fragment_producer> to_string_fragment_producer()
+        const;
 
-    const char* get_name() const
-    {
-        return this->bsf_name;
-    }
+    string_fragment get_name() const { return this->bsf_name; }
+
+    size_t get_uncompressed_size() const { return this->bsf_uncompressed_size; }
 
 private:
-    const char* bsf_name;
-    std::unique_ptr<unsigned char[]> bsf_data;
-    ssize_t bsf_size;
+    string_fragment bsf_name;
+    const unsigned char* bsf_compressed_data;
+    size_t bsf_compressed_size;
+    size_t bsf_uncompressed_size;
 };
+
+template<typename T, std::size_t N>
+constexpr bin_src_file::bin_src_file(const T (&name)[N],
+                                     const unsigned char* data,
+                                     size_t compressed_size,
+                                     size_t size)
+    : bsf_name(name), bsf_compressed_data(data),
+      bsf_compressed_size(compressed_size), bsf_uncompressed_size(size)
+{
+}
 
 #endif

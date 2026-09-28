@@ -29,12 +29,24 @@
 
 #include "pretty_printer.hh"
 
+#include <sys/types.h>
+
+#include "base/auto_mem.hh"
+#include "base/intern_string.hh"
 #include "base/string_util.hh"
 #include "config.h"
+
+constexpr auto MIN_QUOTED_PRETTY_SIZE = 8;
 
 void
 pretty_printer::append_to(attr_line_t& al)
 {
+    static auto op = lnav_operation{"pretty_print"};
+
+    auto op_guard = lnav_opid_guard::internal(op);
+
+    log_debug("BEGIN pretty-print (length=%d)",
+              this->pp_scanner->get_input().length());
     if (this->pp_scanner->get_init_offset() > 0) {
         data_scanner::capture_t leading_cap = {
             0,
@@ -73,14 +85,14 @@ pretty_printer::append_to(attr_line_t& al)
                         = this->pp_stream.tellp();
                     this->pp_interval_state.back().is_name
                         = tok_res->to_string();
-                    this->descend();
+                    this->descend(DT_XML_CLOSE_TAG);
                 } else {
                     this->pp_values.emplace_back(el);
                 }
                 continue;
             case DT_XML_CLOSE_TAG:
                 this->flush_values();
-                this->ascend();
+                this->ascend(el.e_token);
                 this->append_child_node();
                 this->write_element(el);
                 this->start_new_line();
@@ -90,7 +102,7 @@ pretty_printer::append_to(attr_line_t& al)
             case DT_LPAREN:
                 this->flush_values(true);
                 this->pp_values.emplace_back(el);
-                this->descend();
+                this->descend(to_closer(el.e_token));
                 this->pp_interval_state.back().is_start
                     = this->pp_stream.tellp();
                 continue;
@@ -101,7 +113,7 @@ pretty_printer::append_to(attr_line_t& al)
                 if (this->pp_body_lines.top()) {
                     this->start_new_line();
                 }
-                this->ascend();
+                this->ascend(el.e_token);
                 this->write_element(el);
                 continue;
             case DT_COMMA:
@@ -122,16 +134,27 @@ pretty_printer::append_to(attr_line_t& al)
                     && this->pp_line_length == 0)
                 {
                     this->pp_leading_indent = el.e_capture.length();
+                    auto shift_cover
+                        = line_range::empty_at(this->pp_stream.tellp());
+                    shift_string_attrs(
+                        this->pp_attrs, shift_cover, -el.e_capture.length());
                     continue;
                 }
                 break;
             default:
+                if (this->pp_depth > 0 && !this->pp_values.empty()
+                    && this->pp_values.back().e_token == DT_LINE)
+                {
+                    while (!this->pp_container_tokens.empty()) {
+                        this->ascend(this->pp_container_tokens.back());
+                    }
+                }
                 break;
         }
         this->pp_values.emplace_back(el);
     }
     while (this->pp_depth > 0) {
-        this->ascend();
+        this->ascend(this->pp_container_tokens.back());
     }
     this->flush_values();
 
@@ -158,19 +181,30 @@ pretty_printer::append_to(attr_line_t& al)
             = std::move(this->pp_hier_stage->hn_children.front());
         this->pp_hier_stage->hn_parent = nullptr;
     }
+
+    log_debug("END pretty-print");
 }
 
 void
-pretty_printer::write_element(const pretty_printer::element& el)
+pretty_printer::write_element(const element& el)
 {
+    ssize_t start_size = this->pp_stream.tellp();
     if (this->pp_leading_indent == 0 && this->pp_line_length == 0
         && el.e_token == DT_WHITE)
     {
         if (this->pp_depth == 0) {
             this->pp_soft_indent += el.e_capture.length();
+        } else {
+            auto shift_cover = line_range{
+                (int) start_size,
+                (int) start_size + el.e_capture.length(),
+            };
+            shift_string_attrs(
+                this->pp_attrs, shift_cover, -el.e_capture.length());
         }
         return;
     }
+    auto start_soft_indent = this->pp_soft_indent;
     if (((this->pp_leading_indent == 0)
          || (this->pp_line_length <= this->pp_leading_indent))
         && el.e_token == DT_LINE)
@@ -180,15 +214,20 @@ pretty_printer::write_element(const pretty_printer::element& el)
             this->pp_line_length = 0;
             this->pp_stream << std::endl;
             this->pp_body_lines.top() += 1;
+        } else {
+            auto shift_cover = line_range::empty_at(start_size);
+            shift_string_attrs(this->pp_attrs, shift_cover, -1);
         }
         return;
     }
+    int indent_size = 0;
     if (this->pp_line_length == 0) {
-        this->append_indent();
+        indent_size = this->append_indent();
     }
-    ssize_t start_size = this->pp_stream.tellp();
-    if (el.e_token == DT_QUOTED_STRING) {
-        auto_mem<char> unquoted_str((char*) malloc(el.e_capture.length() + 1));
+    if (el.e_token == DT_QUOTED_STRING
+        && el.e_capture.length() > MIN_QUOTED_PRETTY_SIZE)
+    {
+        auto unquoted_str = auto_mem<char>::malloc(el.e_capture.length() + 1);
         const char* start
             = this->pp_scanner->to_string_fragment(el.e_capture).data();
         auto unq_len = unquote(unquoted_str.in(), start, el.e_capture.length());
@@ -200,6 +239,7 @@ pretty_printer::write_element(const pretty_printer::element& el)
         attr_line_t result;
         str_pp.append_to(result);
         if (result.get_string().find('\n') != std::string::npos) {
+            auto pre_string_size = this->pp_stream.tellp();
             switch (start[0]) {
                 case 'r':
                 case 'u':
@@ -216,17 +256,27 @@ pretty_printer::write_element(const pretty_printer::element& el)
             }
             this->pp_stream << start[el.e_capture.length() - 1]
                             << start[el.e_capture.length() - 1];
+            auto post_string_size = this->pp_stream.tellp();
+            auto shift_cover = line_range{
+                (int) pre_string_size,
+                (int) post_string_size,
+            };
+            auto pretty_string_size = post_string_size - pre_string_size;
+            auto shift_amount = pretty_string_size - el.e_capture.length();
+            shift_string_attrs(this->pp_attrs, shift_cover, shift_amount);
         } else {
             this->pp_stream
                 << this->pp_scanner->to_string_fragment(el.e_capture);
         }
     } else {
-        this->pp_stream << this->pp_scanner->to_string_fragment(el.e_capture);
-        int shift_amount
-            = start_size - el.e_capture.c_begin - this->pp_shift_accum;
-        shift_string_attrs(this->pp_attrs, el.e_capture.c_begin, shift_amount);
-        this->pp_shift_accum = start_size - el.e_capture.c_begin;
+        auto sf = this->pp_scanner->to_string_fragment(el.e_capture);
+        this->pp_stream << sf;
     }
+    auto shift_cover = line_range::empty_at(start_size);
+    if (indent_size >= start_soft_indent) {
+        indent_size -= start_soft_indent;
+    }
+    shift_string_attrs(this->pp_attrs, shift_cover, indent_size);
     this->pp_line_length += el.e_capture.length();
     if (el.e_token == DT_LINE) {
         this->pp_line_length = 0;
@@ -234,24 +284,29 @@ pretty_printer::write_element(const pretty_printer::element& el)
     }
 }
 
-void
+int
 pretty_printer::append_indent()
 {
-    this->pp_stream << std::string(
-        this->pp_leading_indent + this->pp_soft_indent, ' ');
+    auto start_size = this->pp_stream.tellp();
+    auto prefix_size = this->pp_leading_indent + this->pp_soft_indent;
+    this->pp_stream << std::string(prefix_size, ' ');
     this->pp_soft_indent = 0;
-    if (this->pp_stream.tellp() == this->pp_leading_indent) {
-        return;
+    if (this->pp_stream.tellp() != this->pp_leading_indent) {
+        for (int lpc = 0; lpc < this->pp_depth; lpc++) {
+            this->pp_stream << "    ";
+        }
+        if (this->pp_depth > 0) {
+            this->pp_indents.insert(this->pp_leading_indent
+                                    + 4 * this->pp_depth);
+        }
     }
-    for (int lpc = 0; lpc < this->pp_depth; lpc++) {
-        this->pp_stream << "    ";
-    }
+    return (this->pp_stream.tellp() - start_size);
 }
 
 bool
 pretty_printer::flush_values(bool start_on_depth)
 {
-    nonstd::optional<data_scanner::capture_t> last_key;
+    std::optional<data_scanner::capture_t> last_key;
     bool retval = false;
 
     while (!this->pp_values.empty()) {
@@ -276,7 +331,7 @@ pretty_printer::flush_values(bool start_on_depth)
                             this->pp_interval_state.back().is_start
                                 = static_cast<ssize_t>(this->pp_stream.tellp());
                         }
-                        last_key = nonstd::nullopt;
+                        last_key = std::nullopt;
                     }
                     break;
                 default:
@@ -286,7 +341,11 @@ pretty_printer::flush_values(bool start_on_depth)
                 && (el.e_token == DT_LSQUARE || el.e_token == DT_LCURLY))
             {
                 if (this->pp_line_length > 0) {
+                    ssize_t start_size = this->pp_stream.tellp();
                     this->pp_stream << std::endl;
+
+                    auto shift_cover = line_range::empty_at(start_size);
+                    shift_string_attrs(this->pp_attrs, shift_cover, 1);
                 }
                 this->pp_line_length = 0;
             }
@@ -300,45 +359,66 @@ pretty_printer::flush_values(bool start_on_depth)
 void
 pretty_printer::start_new_line()
 {
-    bool has_output;
-
+    ssize_t start_size = this->pp_stream.tellp();
     if (this->pp_line_length > 0) {
         this->pp_stream << std::endl;
+        auto shift_cover = line_range::empty_at(start_size);
+        shift_string_attrs(this->pp_attrs, shift_cover, 1);
         this->pp_line_length = 0;
     }
-    has_output = this->flush_values();
+    auto has_output = this->flush_values();
     if (has_output && this->pp_line_length > 0) {
+        start_size = this->pp_stream.tellp();
         this->pp_stream << std::endl;
+        auto shift_cover = line_range::empty_at(start_size);
+        shift_string_attrs(this->pp_attrs, shift_cover, 1);
     }
     this->pp_line_length = 0;
     this->pp_body_lines.top() += 1;
 }
 
 void
-pretty_printer::ascend()
+pretty_printer::ascend(data_token_t dt)
 {
     if (this->pp_depth > 0) {
-        int lines = this->pp_body_lines.top();
-        this->pp_depth -= 1;
-        this->pp_body_lines.pop();
-        this->pp_body_lines.top() += lines;
-
-        if (!this->pp_is_xml) {
-            this->append_child_node();
+        if (this->pp_container_tokens.back() != dt
+            && std::find(this->pp_container_tokens.begin(),
+                         this->pp_container_tokens.end(),
+                         dt)
+                == this->pp_container_tokens.end())
+        {
+            return;
         }
-        this->pp_interval_state.pop_back();
-        this->pp_hier_stage = std::move(this->pp_hier_nodes.back());
-        this->pp_hier_nodes.pop_back();
+
+        auto found = false;
+        do {
+            if (this->pp_container_tokens.back() == dt) {
+                found = true;
+            }
+            int lines = this->pp_body_lines.top();
+            this->pp_depth -= 1;
+            this->pp_body_lines.pop();
+            this->pp_body_lines.top() += lines;
+
+            if (!this->pp_is_xml) {
+                this->append_child_node();
+            }
+            this->pp_interval_state.pop_back();
+            this->pp_hier_stage = std::move(this->pp_hier_nodes.back());
+            this->pp_hier_nodes.pop_back();
+            this->pp_container_tokens.pop_back();
+        } while (!found);
     } else {
         this->pp_body_lines.top() = 0;
     }
 }
 
 void
-pretty_printer::descend()
+pretty_printer::descend(data_token_t dt)
 {
     this->pp_depth += 1;
     this->pp_body_lines.push(0);
+    this->pp_container_tokens.push_back(dt);
     this->pp_interval_state.resize(this->pp_depth + 1);
     this->pp_hier_nodes.push_back(
         std::make_unique<lnav::document::hier_node>());
@@ -373,6 +453,6 @@ pretty_printer::append_child_node()
         });
     }
     top_node->hn_children.emplace_back(std::move(new_node));
-    ivstate.is_start = nonstd::nullopt;
+    ivstate.is_start = std::nullopt;
     ivstate.is_name.clear();
 }

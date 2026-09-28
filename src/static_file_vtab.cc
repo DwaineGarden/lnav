@@ -27,49 +27,43 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <filesystem>
 #include <map>
+#include <optional>
+#include <vector>
 
 #include "static_file_vtab.hh"
 
-#include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
+#include "apps.cfg.hh"
+#include "apps.hh"
 #include "base/auto_mem.hh"
 #include "base/fs_util.hh"
 #include "base/lnav_log.hh"
-#include "base/paths.hh"
 #include "config.h"
-#include "ghc/filesystem.hpp"
 #include "lnav.hh"
 #include "vtab_module.hh"
 
-const char* const STATIC_FILE_CREATE_STMT = R"(
--- Access static files in the lnav configuration directories
-CREATE TABLE lnav_static_files (
-    name TEXT PRIMARY KEY,
-    filepath TEXT,
-    content BLOB HIDDEN
-);
-)";
+namespace {
 
-struct static_file_vtab {
+struct app_file_vtab {
     sqlite3_vtab base;
     sqlite3* db;
 };
 
-struct static_file_info {
-    ghc::filesystem::path sfi_path;
-};
-
 struct sf_vtab_cursor {
     sqlite3_vtab_cursor base;
-    std::map<std::string, static_file_info>::iterator vc_files_iter;
-    std::map<std::string, static_file_info> vc_files;
+    sqlite_int64 vc_rowid{0};
+    std::vector<lnav::apps::app_files> vc_files;
+    std::optional<size_t> vc_apps_index;
+    std::optional<size_t> vc_files_index;
 };
 
-static int sfvt_destructor(sqlite3_vtab* p_svt);
+int sfvt_destructor(sqlite3_vtab* p_svt);
 
-static int
+int
 sfvt_create(sqlite3* db,
             void* pAux,
             int argc,
@@ -77,10 +71,10 @@ sfvt_create(sqlite3* db,
             sqlite3_vtab** pp_vt,
             char** pzErr)
 {
-    static_file_vtab* p_vt;
+    app_file_vtab* p_vt;
 
     /* Allocate the sqlite3_vtab/vtab structure itself */
-    p_vt = (static_file_vtab*) sqlite3_malloc(sizeof(*p_vt));
+    p_vt = (app_file_vtab*) sqlite3_malloc(sizeof(*p_vt));
 
     if (p_vt == nullptr) {
         return SQLITE_NOMEM;
@@ -96,10 +90,10 @@ sfvt_create(sqlite3* db,
     return rc;
 }
 
-static int
+int
 sfvt_destructor(sqlite3_vtab* p_svt)
 {
-    static_file_vtab* p_vt = (static_file_vtab*) p_svt;
+    app_file_vtab* p_vt = (app_file_vtab*) p_svt;
 
     /* Free the SQLite structure */
     sqlite3_free(p_vt);
@@ -107,7 +101,7 @@ sfvt_destructor(sqlite3_vtab* p_svt)
     return SQLITE_OK;
 }
 
-static int
+int
 sfvt_connect(sqlite3* db,
              void* p_aux,
              int argc,
@@ -118,55 +112,28 @@ sfvt_connect(sqlite3* db,
     return sfvt_create(db, p_aux, argc, argv, pp_vt, pzErr);
 }
 
-static int
+int
 sfvt_disconnect(sqlite3_vtab* pVtab)
 {
     return sfvt_destructor(pVtab);
 }
 
-static int
+int
 sfvt_destroy(sqlite3_vtab* p_vt)
 {
     return sfvt_destructor(p_vt);
 }
 
-static int sfvt_next(sqlite3_vtab_cursor* cur);
+int sfvt_next(sqlite3_vtab_cursor* cur);
 
-static void
-find_static_files(sf_vtab_cursor* p_cur, const ghc::filesystem::path& dir)
-{
-    auto& file_map = p_cur->vc_files;
-    std::error_code ec;
-
-    for (const auto& format_dir_entry :
-         ghc::filesystem::directory_iterator(dir, ec))
-    {
-        if (!format_dir_entry.is_directory()) {
-            continue;
-        }
-        auto format_static_files_dir = format_dir_entry.path() / "static-files";
-        log_debug("format static files: %s", format_static_files_dir.c_str());
-        for (const auto& static_file_entry :
-             ghc::filesystem::recursive_directory_iterator(
-                 format_static_files_dir, ec))
-        {
-            auto rel_path = ghc::filesystem::relative(static_file_entry.path(),
-                                                      format_static_files_dir);
-
-            file_map[rel_path.string()] = {static_file_entry.path()};
-        }
-    }
-}
-
-static int
+int
 sfvt_open(sqlite3_vtab* p_svt, sqlite3_vtab_cursor** pp_cursor)
 {
-    static_file_vtab* p_vt = (static_file_vtab*) p_svt;
+    auto p_vt = (app_file_vtab*) p_svt;
 
-    p_vt->base.zErrMsg = NULL;
+    p_vt->base.zErrMsg = nullptr;
 
-    sf_vtab_cursor* p_cur = (sf_vtab_cursor*) new sf_vtab_cursor();
-
+    auto p_cur = new (std::nothrow) sf_vtab_cursor();
     if (p_cur == nullptr) {
         return SQLITE_NOMEM;
     }
@@ -174,74 +141,82 @@ sfvt_open(sqlite3_vtab* p_svt, sqlite3_vtab_cursor** pp_cursor)
     *pp_cursor = (sqlite3_vtab_cursor*) p_cur;
 
     p_cur->base.pVtab = p_svt;
-
-    for (const auto& config_path : lnav_data.ld_config_paths) {
-        auto formats_root = config_path / "formats";
-        log_debug("format root: %s", formats_root.c_str());
-        find_static_files(p_cur, formats_root);
-        auto configs_root = config_path / "configs";
-        log_debug("configs root: %s", configs_root.c_str());
-        find_static_files(p_cur, configs_root);
-    }
+    p_cur->vc_files = lnav::apps::find_app_files();
+    log_info("opened app file vtab with %zu files", p_cur->vc_files.size());
 
     return SQLITE_OK;
 }
 
-static int
+int
 sfvt_close(sqlite3_vtab_cursor* cur)
 {
-    sf_vtab_cursor* p_cur = (sf_vtab_cursor*) cur;
+    auto* p_cur = (sf_vtab_cursor*) cur;
 
-    p_cur->vc_files_iter = p_cur->vc_files.end();
     /* Free cursor struct. */
     delete p_cur;
 
     return SQLITE_OK;
 }
 
-static int
+int
 sfvt_eof(sqlite3_vtab_cursor* cur)
 {
-    sf_vtab_cursor* vc = (sf_vtab_cursor*) cur;
+    auto* vc = (sf_vtab_cursor*) cur;
 
-    return vc->vc_files_iter == vc->vc_files.end();
+    return vc->vc_apps_index.value_or(0) == vc->vc_files.size();
 }
 
-static int
+int
 sfvt_next(sqlite3_vtab_cursor* cur)
 {
-    sf_vtab_cursor* vc = (sf_vtab_cursor*) cur;
+    auto* vc = (sf_vtab_cursor*) cur;
 
-    if (vc->vc_files_iter != vc->vc_files.end()) {
-        ++vc->vc_files_iter;
+    if (!vc->vc_apps_index) {
+        vc->vc_apps_index = 0;
+    } else {
+        if (!vc->vc_files_index) {
+            vc->vc_files_index = 0;
+        } else if (vc->vc_files_index.value() + 1
+                   < vc->vc_files[vc->vc_apps_index.value()].af_files.size())
+        {
+            vc->vc_files_index = vc->vc_files_index.value() + 1;
+        } else {
+            vc->vc_files_index = std::nullopt;
+            vc->vc_apps_index = vc->vc_apps_index.value() + 1;
+            if (vc->vc_apps_index.value() < vc->vc_files.size()) {
+                vc->vc_files_index = 0;
+            }
+        }
+        vc->vc_rowid += 1;
     }
 
     return SQLITE_OK;
 }
 
-static int
+int
 sfvt_column(sqlite3_vtab_cursor* cur, sqlite3_context* ctx, int col)
 {
-    sf_vtab_cursor* vc = (sf_vtab_cursor*) cur;
+    auto* vc = (sf_vtab_cursor*) cur;
+    const auto& af = vc->vc_files[vc->vc_apps_index.value()];
+    const auto& fi = af.af_files[vc->vc_files_index.value()];
 
     switch (col) {
         case 0:
-            to_sqlite(ctx, vc->vc_files_iter->first);
+            to_sqlite(ctx, fi.fi_app_path);
             break;
-        case 1: {
-            sqlite3_result_text(ctx,
-                                vc->vc_files_iter->second.sfi_path.c_str(),
-                                -1,
-                                SQLITE_TRANSIENT);
+        case 1:
+            to_sqlite(ctx, af.af_name);
             break;
-        }
-        case 2: {
-            auto read_res = lnav::filesystem::read_file(
-                vc->vc_files_iter->second.sfi_path);
+        case 2:
+            to_sqlite(ctx, fi.fi_full_path);
+            break;
+        case 3: {
+            auto read_res = lnav::filesystem::read_file(fi.fi_full_path);
             if (read_res.isErr()) {
                 auto um = lnav::console::user_message::error(
                               "unable to read static file")
-                              .with_reason(read_res.unwrapErr());
+                              .with_reason(read_res.unwrapErr())
+                              .move();
 
                 to_sqlite(ctx, um);
             } else {
@@ -257,36 +232,37 @@ sfvt_column(sqlite3_vtab_cursor* cur, sqlite3_context* ctx, int col)
     return SQLITE_OK;
 }
 
-static int
+int
 sfvt_rowid(sqlite3_vtab_cursor* cur, sqlite_int64* p_rowid)
 {
-    sf_vtab_cursor* p_cur = (sf_vtab_cursor*) cur;
+    auto* p_cur = (sf_vtab_cursor*) cur;
 
-    *p_rowid = std::distance(p_cur->vc_files.begin(), p_cur->vc_files_iter);
+    *p_rowid = p_cur->vc_rowid;
 
     return SQLITE_OK;
 }
 
-static int
+int
 sfvt_best_index(sqlite3_vtab* tab, sqlite3_index_info* p_info)
 {
     return SQLITE_OK;
 }
 
-static int
+int
 sfvt_filter(sqlite3_vtab_cursor* cur,
             int idxNum,
             const char* idxStr,
             int argc,
             sqlite3_value** argv)
 {
-    sf_vtab_cursor* p_cur = (sf_vtab_cursor*) cur;
+    auto* p_cur = (sf_vtab_cursor*) cur;
 
-    p_cur->vc_files_iter = p_cur->vc_files.begin();
+    p_cur->vc_apps_index = 0;
+    p_cur->vc_files_index = 0;
     return SQLITE_OK;
 }
 
-static sqlite3_module static_file_vtab_module = {
+const sqlite3_module static_file_vtab_module = {
     0, /* iVersion */
     sfvt_create, /* xCreate       - create a vtable */
     sfvt_connect, /* xConnect      - associate a vtable with a connection */
@@ -309,25 +285,120 @@ static sqlite3_module static_file_vtab_module = {
     nullptr, /* xFindFunction - function overloading */
 };
 
+}  // namespace
+
+const char* const STATIC_FILE_CREATE_STMT = R"(
+-- Access app files in the lnav configuration directories
+CREATE TABLE lnav_db.lnav_app_files (
+    name TEXT PRIMARY KEY,
+    app TEXT,
+    filepath TEXT,
+    content BLOB HIDDEN
+);
+)";
+
+struct lnav_apps_vtab {
+    static constexpr const char* NAME = "lnav_apps";
+    static constexpr const char* CREATE_STMT = R"(
+CREATE TABLE lnav_db.lnav_apps (
+    name TEXT PRIMARY KEY,
+    description TEXT,
+    root TEXT
+);
+)";
+
+    struct cursor {
+        struct app_info {
+            std::string ai_name;
+            lnav::apps::app_def ai_def;
+        };
+
+        sqlite3_vtab_cursor base;
+        std::vector<app_info> c_apps;
+        size_t c_index{0};
+
+        explicit cursor(sqlite3_vtab* vt) : base({vt})
+        {
+            const auto& cfg = injector::get<lnav::apps::config&>();
+
+            for (const auto& pd : cfg.c_publishers) {
+                for (const auto& ad : pd.second.pd_apps) {
+                    auto name
+                        = fmt::format(FMT_STRING("{}/{}"), pd.first, ad.first);
+                    this->c_apps.emplace_back(app_info{name, ad.second});
+                }
+            }
+        }
+
+        int next()
+        {
+            if (this->c_index < this->c_apps.size()) {
+                this->c_index += 1;
+            }
+
+            return SQLITE_OK;
+        }
+
+        int reset()
+        {
+            this->c_index = 0;
+            return SQLITE_OK;
+        }
+
+        int eof() { return this->c_index == this->c_apps.size(); }
+
+        int get_rowid(sqlite3_int64& rowid_out)
+        {
+            rowid_out = this->c_index;
+
+            return SQLITE_OK;
+        }
+    };
+
+    int get_column(cursor& vc, sqlite3_context* ctx, int col)
+    {
+        const auto& ai = vc.c_apps[vc.c_index];
+        switch (col) {
+            case 0: {
+                to_sqlite(ctx, ai.ai_name);
+                break;
+            }
+            case 1: {
+                to_sqlite(ctx, ai.ai_def.ad_description);
+                break;
+            }
+            case 2: {
+                const auto root = ai.ai_def.get_root_path();
+                to_sqlite(ctx, root);
+                break;
+            }
+        }
+
+        return SQLITE_OK;
+    }
+};
+
 int
 register_static_file_vtab(sqlite3* db)
 {
     auto_mem<char, sqlite3_free> errmsg;
-    int rc;
-    rc = sqlite3_create_module(
-        db, "lnav_static_file_vtab_impl", &static_file_vtab_module, nullptr);
+    int rc = sqlite3_create_module(
+        db, "lnav_app_file_vtab_impl", &static_file_vtab_module, nullptr);
     ensure(rc == SQLITE_OK);
     if ((rc = sqlite3_exec(db,
-                           "CREATE VIRTUAL TABLE lnav_static_files USING "
-                           "lnav_static_file_vtab_impl()",
+                           "CREATE VIRTUAL TABLE lnav_db.lnav_app_files USING "
+                           "lnav_app_file_vtab_impl()",
                            nullptr,
                            nullptr,
                            errmsg.out()))
         != SQLITE_OK)
     {
-        fprintf(stderr,
-                "unable to create lnav_static_file table %s\n",
-                errmsg.in());
+        fprintf(
+            stderr, "unable to create lnav_app_file table %s\n", errmsg.in());
     }
+
+    static vtab_module<tvt_no_update<lnav_apps_vtab>> LNAV_APPS_MODULE;
+    auto arc = LNAV_APPS_MODULE.create(db, "lnav_apps");
+    ensure(arc == SQLITE_OK);
     return rc;
 }

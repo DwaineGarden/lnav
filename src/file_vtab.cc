@@ -27,9 +27,14 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <memory>
+#include <utility>
+#include <vector>
+
 #include <string.h>
 #include <unistd.h>
 
+#include "base/distributed_slice.hh"
 #include "base/injector.bind.hh"
 #include "base/lnav.gzip.hh"
 #include "base/lnav_log.hh"
@@ -39,15 +44,44 @@
 #include "log_format.hh"
 #include "logfile.hh"
 #include "session_data.hh"
+#include "text_format.hh"
 #include "vtab_module.hh"
+#include "vtab_module_json.hh"
+#include "yajlpp/yajlpp_def.hh"
 
-struct lnav_file : public tvt_iterator_cursor<lnav_file> {
+namespace {
+
+// Schema for the lnav_file.stats column.  Field names mirror the
+// logfile_activity members (minus the `la_` prefix); the container's
+// to_json_string() handles encoding + JSON_SUBTYPE tagging via
+// vtab_module_json.hh's to_sqlite overload.
+const typed_json_path_container<logfile_activity::index_stats>
+    index_stats_handlers = {
+        yajlpp::property_handler("wall-us")
+            .for_field(&logfile_activity::index_stats::is_wall_us),
+        yajlpp::property_handler("cpu-us")
+            .for_field(&logfile_activity::index_stats::is_cpu_us),
+        yajlpp::property_handler("memory-bytes")
+            .for_field(&logfile_activity::index_stats::is_memory_bytes),
+};
+
+const typed_json_path_container<logfile_activity> activity_handlers = {
+    yajlpp::property_handler("polls").for_field(&logfile_activity::la_polls),
+    yajlpp::property_handler("reads").for_field(&logfile_activity::la_reads),
+    yajlpp::property_handler("index")
+        .for_child(&logfile_activity::la_index)
+        .with_children(index_stats_handlers),
+    yajlpp::property_handler("line-buffer-memory-bytes")
+        .for_field(&logfile_activity::la_line_buffer_memory_bytes),
+};
+
+struct lnav_file : tvt_iterator_cursor<lnav_file> {
     using iterator = std::vector<std::shared_ptr<logfile>>::iterator;
 
     static constexpr const char* NAME = "lnav_file";
     static constexpr const char* CREATE_STMT = R"(
 -- Access lnav's open file list through this table.
-CREATE TABLE lnav_file (
+CREATE TABLE lnav_db.lnav_file (
     device integer,       -- The device the file is stored on.
     inode integer,        -- The inode for the file on the device.
     filepath text,        -- The path to the file.
@@ -56,6 +90,9 @@ CREATE TABLE lnav_file (
     format text,          -- The log file format for the file.
     lines integer,        -- The number of lines in the file.
     time_offset integer,  -- The millisecond offset for timestamps.
+    options_path TEXT,    -- The matched path for the file options.
+    options TEXT,         -- The effective options for the file.
+    stats TEXT,           -- JSON-encoded indexing statistics for the file.
 
     content BLOB HIDDEN   -- The contents of the file.
 );
@@ -87,7 +124,9 @@ CREATE TABLE lnav_file (
                 to_sqlite(ctx, name);
                 break;
             case 3:
-                to_sqlite(ctx, fmt::to_string(lf->get_text_format()));
+                to_sqlite(ctx,
+                          fmt::to_string(lf->get_text_format().value_or(
+                              text_format_t::TF_BINARY)));
                 break;
             case 4:
                 to_sqlite(
@@ -108,6 +147,40 @@ CREATE TABLE lnav_file (
                 break;
             }
             case 8: {
+                if (sqlite3_vtab_nochange(ctx)) {
+                    return SQLITE_OK;
+                }
+
+                auto opts = lf->get_file_options();
+                if (opts) {
+                    to_sqlite(ctx, opts.value().first);
+                } else {
+                    sqlite3_result_null(ctx);
+                }
+                break;
+            }
+            case 9: {
+                if (sqlite3_vtab_nochange(ctx)) {
+                    return SQLITE_OK;
+                }
+
+                auto opts = lf->get_file_options();
+                if (opts) {
+                    to_sqlite(ctx, opts.value().second.to_json_string());
+                } else {
+                    sqlite3_result_null(ctx);
+                }
+                break;
+            }
+            case 10:
+                to_sqlite(ctx,
+                          activity_handlers.to_json_string(lf->get_activity()));
+                break;
+            case 11: {
+                if (sqlite3_vtab_nochange(ctx)) {
+                    return SQLITE_OK;
+                }
+
                 auto& cfg = injector::get<const file_vtab::config&>();
                 auto lf_stat = lf->get_stat();
 
@@ -115,8 +188,7 @@ CREATE TABLE lnav_file (
                     sqlite3_result_error(ctx, "file is too large", -1);
                 } else {
                     auto fd = lf->get_fd();
-                    auto_mem<char> buf;
-                    buf = (char*) malloc(lf_stat.st_size);
+                    auto buf = auto_mem<char>::malloc(lf_stat.st_size);
                     auto rc = pread(fd, buf, lf_stat.st_size, 0);
 
                     if (rc == -1) {
@@ -183,15 +255,30 @@ CREATE TABLE lnav_file (
                    const char* format,
                    int64_t lines,
                    int64_t time_offset,
+                   const char* options_path,
+                   const char* options,
+                   const char* stats,
                    const char* content)
     {
         auto lf = this->lf_collection.fc_files[rowid];
+        // Round toward negative infinity so the microseconds stay positive,
+        // which is how a timeval is kept.
+        auto offset_secs = time_offset / 1000LL;
+        auto offset_msecs = time_offset % 1000LL;
+        if (offset_msecs < 0) {
+            offset_secs -= 1;
+            offset_msecs += 1000LL;
+        }
         struct timeval tv = {
-            (int) (time_offset / 1000LL),
-            (int) (time_offset / (1000LL * 1000LL)),
+            (time_t) offset_secs,
+            (suseconds_t) (offset_msecs * 1000LL),
         };
 
-        lf->adjust_content_time(0, tv, true);
+        // Every update passes all of the columns, so only re-time the file
+        // when the offset was actually changed.
+        if (tv != lf->get_time_offset()) {
+            lf->adjust_content_time(0, tv, true);
+        }
 
         if (path != lf->get_filename()) {
             if (lf->is_valid_filename()) {
@@ -203,18 +290,21 @@ CREATE TABLE lnav_file (
                 = this->lf_collection.fc_file_names.find(lf->get_filename());
 
             if (iter != this->lf_collection.fc_file_names.end()) {
-                auto loo = std::move(iter->second);
+                auto loo = iter->second;
 
                 this->lf_collection.fc_file_names.erase(iter);
 
                 loo.loo_include_in_session = true;
-                this->lf_collection.fc_file_names[path] = std::move(loo);
-                lf->set_filename(path);
-                this->lf_collection.regenerate_unique_file_names();
-
-                init_session();
-                load_session();
+                this->lf_collection.fc_file_names[path] = loo;
             }
+
+            lf->set_filename(path);
+            lf->set_include_in_session(true);
+            this->lf_collection.regenerate_unique_file_names();
+
+            init_session();
+            load_session();
+            load_time_bookmarks();
         }
 
         return SQLITE_OK;
@@ -227,7 +317,7 @@ struct lnav_file_metadata {
     static constexpr const char* NAME = "lnav_file_metadata";
     static constexpr const char* CREATE_STMT = R"(
 -- Access the metadata embedded in open files
-CREATE TABLE lnav_file_metadata (
+CREATE TABLE lnav_db.lnav_file_metadata (
     filepath text,    -- The path to the file.
     descriptor text,  -- The descriptor that identifies the source of the metadata.
     mimetype text,    -- The MIME type of the metadata.
@@ -252,7 +342,9 @@ CREATE TABLE lnav_file_metadata (
 
         cursor(sqlite3_vtab* vt)
             : base({vt}),
-              c_meta(((vtab_module<lnav_file_metadata>::vtab*) vt)->v_impl)
+              c_meta(
+                  ((vtab_module<tvt_no_update<lnav_file_metadata>>::vtab*) vt)
+                      ->v_impl)
         {
             for (auto& lf : this->c_meta.lfm_collection.fc_files) {
                 auto& lf_meta = lf->get_embedded_metadata();
@@ -262,8 +354,6 @@ CREATE TABLE lnav_file_metadata (
                 }
             }
         }
-
-        ~cursor() { this->c_iter = this->c_rows.end(); }
 
         int next()
         {
@@ -294,6 +384,11 @@ CREATE TABLE lnav_file_metadata (
     int get_column(const cursor& vc, sqlite3_context* ctx, int col)
     {
         auto& mr = *vc.c_iter;
+        // The descriptors were collected when the cursor was opened, so the
+        // metadata might not have one anymore.  Look it up without adding it.
+        const auto& lf_meta
+            = std::as_const(*mr.mr_logfile).get_embedded_metadata();
+        const auto meta_iter = lf_meta.find(mr.mr_descriptor);
 
         switch (col) {
             case 0:
@@ -303,18 +398,18 @@ CREATE TABLE lnav_file_metadata (
                 to_sqlite(ctx, mr.mr_descriptor);
                 break;
             case 2:
-                to_sqlite(
-                    ctx,
-                    fmt::to_string(
-                        mr.mr_logfile->get_embedded_metadata()[mr.mr_descriptor]
-                            .m_format));
+                if (meta_iter == lf_meta.end()) {
+                    sqlite3_result_null(ctx);
+                } else {
+                    to_sqlite(ctx, fmt::to_string(meta_iter->second.m_format));
+                }
                 break;
             case 3:
-                to_sqlite(
-                    ctx,
-                    fmt::to_string(
-                        mr.mr_logfile->get_embedded_metadata()[mr.mr_descriptor]
-                            .m_value));
+                if (meta_iter == lf_meta.end()) {
+                    sqlite3_result_null(ctx);
+                } else {
+                    to_sqlite(ctx, fmt::to_string(meta_iter->second.m_value));
+                }
                 break;
             default:
                 ensure(0);
@@ -328,18 +423,20 @@ CREATE TABLE lnav_file_metadata (
 };
 
 struct injectable_lnav_file : vtab_module<lnav_file> {
-    using vtab_module<lnav_file>::vtab_module;
+    using vtab_module::vtab_module;
     using injectable = injectable_lnav_file(file_collection&);
 };
 
 struct injectable_lnav_file_metadata
     : vtab_module<tvt_no_update<lnav_file_metadata>> {
-    using vtab_module<tvt_no_update<lnav_file_metadata>>::vtab_module;
+    using vtab_module::vtab_module;
     using injectable = injectable_lnav_file_metadata(file_collection&);
 };
 
-static auto file_binder
+auto file_binder
     = injector::bind_multiple<vtab_module_base>().add<injectable_lnav_file>();
 
-static auto file_meta_binder = injector::bind_multiple<vtab_module_base>()
-                                   .add<injectable_lnav_file_metadata>();
+auto file_meta_binder = injector::bind_multiple<vtab_module_base>()
+                            .add<injectable_lnav_file_metadata>();
+
+}  // namespace

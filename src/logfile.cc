@@ -29,95 +29,149 @@
  * @file logfile.cc
  */
 
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <memory>
+#include <numeric>
+#include <optional>
 #include <utility>
+#include <vector>
 
 #include "logfile.hh"
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdio.h>
 #include <string.h>
 #include <sys/param.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 
 #include "base/ansi_scrubber.hh"
+#include "base/attr_line.builder.hh"
+#include "base/auto_fd.hh"
+#include "base/date_time_scanner.cfg.hh"
 #include "base/fs_util.hh"
 #include "base/injector.hh"
+#include "base/intern_string.hh"
+#include "base/is_utf8.hh"
+#include "base/parallel_for.hh"
+#include "base/result.h"
+#include "base/snippet_highlighters.hh"
 #include "base/string_util.hh"
+#include "base/time_util.hh"
 #include "config.h"
+#include "file_options.hh"
+#include "hasher.hh"
 #include "lnav_util.hh"
 #include "log.watch.hh"
 #include "log_format.hh"
 #include "logfile.cfg.hh"
+#include "piper.header.hh"
+#include "shared_buffer.hh"
+#include "text_format.hh"
 #include "yajlpp/yajlpp_def.hh"
+
+using namespace lnav::roles::literals;
+using namespace std::chrono_literals;
 
 static auto intern_lifetime = intern_string::get_table_lifetime();
 
-static const size_t INDEX_RESERVE_INCREMENT = 1024;
+static constexpr size_t INDEX_RESERVE_INCREMENT = 1024;
 
-static const typed_json_path_container<line_buffer::header_data>
-    file_header_handlers = {
-        yajlpp::property_handler("name").for_field(
-            &line_buffer::header_data::hd_name),
+static const typed_json_path_container<lnav::gzip::header>&
+get_file_header_handlers()
+{
+    static const typed_json_path_container<lnav::gzip::header> retval = {
+        yajlpp::property_handler("name").for_field(&lnav::gzip::header::h_name),
         yajlpp::property_handler("mtime").for_field(
-            &line_buffer::header_data::hd_mtime),
+            &lnav::gzip::header::h_mtime),
         yajlpp::property_handler("comment").for_field(
-            &line_buffer::header_data::hd_comment),
-};
+            &lnav::gzip::header::h_comment),
+    };
+
+    return retval;
+}
 
 Result<std::shared_ptr<logfile>, std::string>
-logfile::open(std::string filename, logfile_open_options& loo)
+logfile::open(std::filesystem::path filename,
+              const logfile_open_options& loo,
+              auto_fd fd,
+              fd_source src)
 {
     require(!filename.empty());
 
     auto lf = std::shared_ptr<logfile>(new logfile(std::move(filename), loo));
 
     memset(&lf->lf_stat, 0, sizeof(lf->lf_stat));
-    if (lf->lf_options.loo_fd == -1) {
-        char resolved_path[PATH_MAX];
+    std::filesystem::path resolved_path;
 
-        errno = 0;
-        if (realpath(lf->lf_filename.c_str(), resolved_path) == nullptr) {
+    if (!fd.has_value()) {
+        auto rp_res = lnav::filesystem::realpath(lf->lf_filename);
+        if (rp_res.isErr()) {
             return Err(fmt::format(FMT_STRING("realpath({}) failed with: {}"),
                                    lf->lf_filename,
-                                   strerror(errno)));
+                                   rp_res.unwrapErr()));
         }
 
-        if (stat(resolved_path, &lf->lf_stat) == -1) {
+        resolved_path = rp_res.unwrap();
+        if (lnav::filesystem::statp(resolved_path, &lf->lf_stat) == -1) {
             return Err(fmt::format(FMT_STRING("stat({}) failed with: {}"),
                                    lf->lf_filename,
-                                   strerror(errno)));
+                                   lnav::from_errno()));
         }
 
         if (!S_ISREG(lf->lf_stat.st_mode)) {
             return Err(fmt::format(FMT_STRING("{} is not a regular file"),
-                                   lf->lf_filename,
-                                   strerror(errno)));
+                                   lf->lf_filename));
         }
+    }
 
-        if ((lf->lf_options.loo_fd = ::open(resolved_path, O_RDONLY)) == -1) {
-            return Err(fmt::format(FMT_STRING("open({}) failed with: {}"),
+    auto_fd lf_fd;
+    if (fd.has_value() && src == fd_source::of_path) {
+        lf_fd = std::move(fd);
+        if (fstat(lf_fd.get(), &lf->lf_stat) == -1) {
+            return Err(fmt::format(FMT_STRING("stat({}) failed with: {}"),
                                    lf->lf_filename,
-                                   strerror(errno)));
+                                   lnav::from_errno()));
         }
-
-        lf->lf_options.loo_fd.close_on_exec();
-
-        log_info("Creating logfile: fd=%d; size=%" PRId64 "; mtime=%" PRId64
-                 "; filename=%s",
-                 (int) lf->lf_options.loo_fd,
-                 (long long) lf->lf_stat.st_size,
-                 (long long) lf->lf_stat.st_mtime,
-                 lf->lf_filename.c_str());
-
+        if (!S_ISREG(lf->lf_stat.st_mode)) {
+            return Err(fmt::format(FMT_STRING("{} is not a regular file"),
+                                   lf->lf_filename));
+        }
+        if (lseek(lf_fd.get(), 0, SEEK_SET) == -1) {
+            return Err(fmt::format(FMT_STRING("lseek({}) failed with: {}"),
+                                   lf->lf_filename,
+                                   lnav::from_errno()));
+        }
         lf->lf_actual_path = lf->lf_filename;
         lf->lf_valid_filename = true;
+    } else if (fd.has_value()) {
+        lf_fd = std::move(fd);
+        fstat(lf_fd.get(), &lf->lf_stat);
+    } else if ((lf_fd
+                = lnav::filesystem::openp(resolved_path, O_RDONLY | O_CLOEXEC))
+               == -1)
+    {
+        return Err(fmt::format(FMT_STRING("open({}) failed with: {}"),
+                               lf->lf_filename,
+                               lnav::from_errno()));
     } else {
-        log_perror(fstat(lf->lf_options.loo_fd, &lf->lf_stat));
-        lf->lf_named_file = false;
-        lf->lf_valid_filename = false;
+        lf->lf_actual_path = lf->lf_filename;
+        lf->lf_valid_filename = true;
+    }
+
+    lf_fd.close_on_exec();
+
+    log_info("Creating logfile(%p): fd=%d; size=%" PRId64 "; mtime=%" PRId64
+             "; filename=%s",
+             lf.get(),
+             (int) lf_fd,
+             (long long) lf->lf_stat.st_size,
+             (long long) lf->lf_stat.st_mtime,
+             lf->lf_filename_as_string.c_str());
+    if (lf->lf_actual_path) {
+        log_info("  actual_path=%s", lf->lf_actual_path->c_str());
     }
 
     if (!lf->lf_options.loo_filename.empty()) {
@@ -125,30 +179,695 @@ logfile::open(std::string filename, logfile_open_options& loo)
         lf->lf_valid_filename = false;
     }
 
-    lf->lf_content_id = hasher().update(lf->lf_filename).to_string();
-    lf->lf_line_buffer.set_fd(lf->lf_options.loo_fd);
+    lf->lf_line_buffer.set_fd(lf_fd);
     lf->lf_index.reserve(INDEX_RESERVE_INCREMENT);
 
     lf->lf_indexing = lf->lf_options.loo_is_visible;
+    lf->lf_text_format = lf->lf_options.loo_text_format;
+    lf->lf_format_match_messages = loo.loo_match_details;
 
     const auto& hdr = lf->lf_line_buffer.get_header_data();
-    if (!hdr.empty()) {
-        lf->lf_embedded_metadata["net.zlib.gzip.header"]
-            = {text_format_t::TF_JSON, file_header_handlers.to_string(hdr)};
+    if (hdr.valid()) {
+        log_info("%s: has header %d",
+                 lf->lf_filename_as_string.c_str(),
+                 hdr.valid());
+        hdr.match(
+            [&lf](const lnav::gzip::header& gzhdr) {
+                if (!gzhdr.empty()) {
+                    lf->lf_embedded_metadata["net.zlib.gzip.header"] = {
+                        text_format_t::TF_JSON,
+                        get_file_header_handlers()
+                            .formatter_for(gzhdr)
+                            .with_config(yajl_gen_beautify, 1)
+                            .to_string(),
+                    };
+                }
+            },
+            [&lf](const lnav::piper::header& phdr) {
+                static auto& safe_options_hier
+                    = injector::get<lnav::safe_file_options_hier&>();
+
+                lf->lf_embedded_metadata["org.lnav.piper.header"] = {
+                    text_format_t::TF_JSON,
+                    lnav::piper::header_handlers.formatter_for(phdr)
+                        .with_config(yajl_gen_beautify, 1)
+                        .to_string(),
+                };
+                log_info("setting file name from piper header: %s",
+                         phdr.h_name.c_str());
+                lf->set_filename(phdr.h_name);
+                lf->lf_valid_filename = false;
+                if (phdr.h_demux_output
+                    == lnav::piper::demux_output_t::signal) {
+                    lf->lf_text_format = text_format_t::TF_LOG;
+                }
+
+                lnav::file_options fo;
+                if (!phdr.h_timezone.empty()) {
+                    log_info("setting default time zone from piper header: %s",
+                             phdr.h_timezone.c_str());
+                    try {
+                        fo.fo_default_zone.pp_value
+                            = date::locate_zone(phdr.h_timezone);
+                    } catch (const std::runtime_error& e) {
+                        log_error("unable to get tz from piper header %s -- %s",
+                                  phdr.h_timezone.c_str(),
+                                  e.what());
+                    }
+                }
+                if (!fo.empty()) {
+                    safe::WriteAccess<lnav::safe_file_options_hier>
+                        options_hier(safe_options_hier);
+
+                    auto& coll = options_hier->foh_path_to_collection["/"];
+                    auto iter
+                        = coll.foc_pattern_to_options.find(lf->get_filename());
+                    if (iter == coll.foc_pattern_to_options.end()
+                        || !(iter->second == fo))
+                    {
+                        coll.foc_pattern_to_options[lf->get_filename()] = fo;
+                        options_hier->foh_generation += 1;
+                    }
+                }
+            });
     }
+
+    lf->file_options_have_changed();
+    lf->lf_content_id = hasher().update(lf->lf_filename_as_string).to_string();
+
+    lf->lf_line_buffer.set_do_preloading(true);
+    lf->lf_line_buffer.send_initial_load();
 
     ensure(lf->invariant());
 
     return Ok(lf);
 }
 
-logfile::logfile(std::string filename, logfile_open_options& loo)
-    : lf_filename(std::move(filename)), lf_options(std::move(loo))
+logfile::logfile(std::filesystem::path filename,
+                 const logfile_open_options& loo)
+    : lf_filename(std::move(filename)),
+      lf_filename_as_string(lf_filename.string()), lf_options(loo),
+      lf_basename(lf_filename.filename())
 {
-    this->lf_opids.writeAccess()->reserve(64);
+    this->lf_content_time_range.invalidate();
+    this->lf_line_buffer.set_decompress_extra(true);
+    this->lf_opids.writeAccess()->los_opid_ranges.reserve(64);
+    this->lf_thread_ids.writeAccess()->ltis_tid_ranges.reserve(64);
 }
 
-logfile::~logfile() {}
+logfile::~logfile()
+{
+    log_info("destructing logfile(%p): %s",
+             this,
+             this->lf_filename_as_string.c_str());
+}
+
+bool
+logfile::file_options_have_changed()
+{
+    static auto& safe_options_hier
+        = injector::get<lnav::safe_file_options_hier&>();
+
+    bool tz_changed = false;
+
+    {
+        safe::ReadAccess<lnav::safe_file_options_hier> options_hier(
+            safe_options_hier);
+
+        if (this->lf_file_options_generation == options_hier->foh_generation) {
+            return false;
+        }
+        log_info("%s: checking new generation of file options: %zu -> %zu",
+                 this->lf_filename_as_string.c_str(),
+                 this->lf_file_options_generation,
+                 options_hier->foh_generation);
+        auto new_options = options_hier->match(this->get_filename());
+        if (this->lf_file_options == new_options) {
+            this->lf_file_options_generation = options_hier->foh_generation;
+            return false;
+        }
+
+        this->lf_file_options = new_options;
+        log_info("%s: file options have changed",
+                 this->lf_filename_as_string.c_str());
+        if (this->lf_file_options) {
+            log_info(
+                "  tz=%s",
+                this->lf_file_options->second.fo_default_zone.pp_value->name()
+                    .c_str());
+            if (this->lf_file_options->second.fo_default_zone.pp_value
+                    != nullptr
+                && this->lf_format != nullptr
+                && !(this->lf_format->lf_timestamp_flags & ETF_ZONE_SET))
+            {
+                log_info("  tz change affects this file");
+                tz_changed = true;
+            }
+        } else if (this->lf_format != nullptr
+                   && !(this->lf_format->lf_timestamp_flags & ETF_ZONE_SET)
+                   && this->lf_time_scanner.dts_default_zone != nullptr)
+        {
+            tz_changed = true;
+        }
+        this->lf_file_options_generation = options_hier->foh_generation;
+    }
+
+    return tz_changed;
+}
+
+static_assert(logfile::MAX_LINES == lnav::logfile::MAX_LINES);
+
+void
+logfile::reset_internal_state_for_reindex()
+{
+    log_debug("resetting internal state for reindex");
+    this->lf_index.clear();
+    this->reset_time_order();
+    this->lf_index_base = 0;
+    this->lf_input_lines = 0;
+    this->lf_index_size = 0;
+    this->lf_level_stats = {};
+    this->lf_last_line_info = {};
+    this->lf_longest_line = 0;
+    this->lf_sort_needed = true;
+    this->lf_out_of_time_order_count = 0;
+    this->lf_pattern_locks.pl_lines.clear();
+    this->lf_value_stats.clear();
+    this->lf_opids.writeAccess()->clear();
+    this->lf_thread_ids.writeAccess()->clear();
+    this->lf_allocator.reset();
+    this->lf_content_time_range.invalidate();
+    if (this->lf_logline_observer) {
+        this->lf_logline_observer->logline_clear(*this);
+    }
+}
+
+size_t
+logfile::discard_index_before(size_t index)
+{
+    require(this->lf_options.loo_streaming);
+
+    if (this->lf_index.size() <= RETRY_MATCH_SIZE) {
+        return 0;
+    }
+
+    // The next rebuild_index() rolls back the last message and re-reads the
+    // line before it, so neither can go.
+    auto last_msg = this->lf_index.size() - 1;
+    while (last_msg > 0
+           && (this->lf_index[last_msg].is_continued()
+               || this->lf_index[last_msg].get_sub_offset() != 0))
+    {
+        last_msg -= 1;
+    }
+    if (last_msg > 0) {
+        last_msg -= 1;
+    }
+
+    const auto count
+        = std::min({index, last_msg, this->lf_index.size() - RETRY_MATCH_SIZE});
+    if (count == 0) {
+        return 0;
+    }
+
+    this->lf_index.erase(this->lf_index.begin(),
+                         this->lf_index.begin() + count);
+    this->reset_time_order();
+    this->lf_index_base += count;
+
+    // Everything below refers to lines by their position in the index or
+    // points into the arena, so it is reset the same way a reindex does.
+    this->lf_opids.writeAccess()->clear();
+    this->lf_thread_ids.writeAccess()->clear();
+    this->lf_invalidated_opids.clear();
+    this->lf_allocator.reset();
+    this->lf_invalid_lines = {};
+    if (!this->lf_pattern_locks.pl_lines.empty()) {
+        auto last_lock = this->lf_pattern_locks.pl_lines.back();
+        last_lock.pfl_line = 0;
+        this->lf_pattern_locks.pl_lines.clear();
+        this->lf_pattern_locks.pl_lines.emplace_back(last_lock);
+    }
+
+    return count;
+}
+
+logfile::map_entry_result
+logfile::find_content_map_entry(file_off_t offset, map_read_requirement req)
+{
+    static constexpr auto LOOKBACK_SIZE = 32 * 1024;
+    static constexpr auto MAX_LOOKBACK_SIZE = 4 * 1024 * 1024;
+
+    auto lookback_size = this->lf_line_buffer.is_compressed()
+        ? LOOKBACK_SIZE * 4
+        : LOOKBACK_SIZE;
+
+    if (offset < lookback_size) {
+        return map_entry_not_found{};
+    }
+    auto end_range = file_range{
+        offset - lookback_size,
+        lookback_size,
+    };
+
+    auto full_size = this->get_content_size();
+    file_size_t lower_offset = 0;
+    file_size_t upper_offset = full_size;
+    auto looping = true;
+    std::optional<content_map_entry> best_lower_bound;
+    do {
+        std::optional<content_map_entry> lower_retval;
+        std::optional<content_map_entry> time_found;
+        log_debug(
+            "    peeking range (off=%lld; size=%lld;  lower=%lld; upper=%lld)",
+            end_range.fr_offset,
+            end_range.fr_size,
+            lower_offset,
+            upper_offset);
+        auto peek_res = this->lf_line_buffer.peek_range(end_range);
+        if (!peek_res.isOk()) {
+            log_error("    peek failed -- %s", peek_res.unwrapErr().c_str());
+            return map_entry_not_found{};
+        }
+        auto peek_buf = peek_res.unwrap();
+        auto peek_sf = to_string_fragment(peek_buf);
+
+        if (req.is<map_read_upper_bound>()) {
+            if (!peek_sf.endswith("\n")) {
+                log_warning("    peek returned partial line");
+                this->lf_file_size_at_map_time = full_size;
+                return map_entry_not_found{};
+            }
+            peek_sf.pop_back();
+        } else if (end_range.next_offset() < full_size) {
+            // The peek can stop in the middle of a line and what is left of it
+            // can still scan as a message with a cut-off timestamp, so only
+            // whole lines are looked at.
+            const auto last_nl = peek_sf.rfind('\n');
+            if (last_nl) {
+                peek_sf.sf_end = last_nl.value();
+            } else {
+                peek_sf = string_fragment{};
+            }
+        }
+        auto found_line = false;
+        while (!peek_sf.empty()) {
+            auto rsplit_res = peek_sf.rsplit_pair(string_fragment::tag1{'\n'});
+            if (!rsplit_res) {
+                log_trace("    did not peek enough to find last line (off=%d)",
+                          peek_sf.sf_end);
+                if (!found_line && req.is<map_read_upper_bound>()) {
+                    if (end_range.fr_offset < lookback_size) {
+                        return map_entry_not_found{};
+                    }
+                    end_range.fr_offset -= lookback_size;
+                    end_range.fr_size += lookback_size;
+                    if (end_range.next_offset() > full_size) {
+                        end_range.fr_offset = 0;
+                        end_range.fr_size = full_size;
+                    } else if (end_range.fr_size > MAX_LOOKBACK_SIZE) {
+                        return map_entry_not_found{};
+                    }
+                }
+                break;
+            }
+
+            found_line = true;
+            auto [leading, last_line] = rsplit_res.value();
+            // log_debug("leading %d", leading.length());
+            // log_debug("last %.*s", last_line.length(), last_line.data());
+            pattern_locks line_locks;
+            date_time_scanner line_time_scanner;
+            scan_batch_context sbc_tmp{
+                this->lf_allocator,
+                line_locks,
+                line_time_scanner,
+            };
+            // The scratch scanner starts blank, so hand it the file's base
+            // time.  Formats whose timestamps leave out the date need it to
+            // land in the right year, and the line time computed here is what
+            // the bound search below compares against.
+            this->set_base_time_for(sbc_tmp, line_info{});
+            shared_buffer tmp_sb;
+            shared_buffer_ref tmp_sbr;
+            tmp_sbr.share(tmp_sb, last_line.data(), last_line.length());
+            auto end_lines_fr = file_range{
+                end_range.fr_offset + last_line.sf_begin,
+                last_line.length(),
+            };
+            auto utf8_res = is_utf8(last_line, '\n');
+            end_lines_fr.fr_metadata.m_has_ansi = utf8_res.usr_has_ansi;
+            end_lines_fr.fr_metadata.m_valid_utf = utf8_res.is_valid();
+            auto end_li = line_info{
+                end_lines_fr,
+            };
+            end_li.li_utf8_scan_result = utf8_res;
+            std::vector<logline> tmp_index;
+            tmp_index.emplace_back(
+                end_li.li_file_range.fr_offset, 0us, LEVEL_UNKNOWN);
+            auto scan_res = this->lf_format->scan(
+                *this, tmp_index, end_li, tmp_sbr, sbc_tmp);
+            if (scan_res.is<log_format::scan_match>() && !tmp_index.empty()) {
+                auto line_time = tmp_index.back().get_time<>();
+
+                if (req.is<map_read_lower_bound>()) {
+                    auto lb = req.get<map_read_lower_bound>();
+                    if (line_time >= lb.mrlb_time) {
+                        log_debug("  got lower retval! %s",
+                                  lnav::to_rfc3339_string(line_time).c_str());
+                        lower_retval = content_map_entry{
+                            end_lines_fr,
+                            line_time,
+                        };
+                        if (!best_lower_bound
+                            || line_time < best_lower_bound->cme_time)
+                        {
+                            best_lower_bound = lower_retval;
+                        }
+                    } else if (lower_retval) {
+                        return map_entry_found{lower_retval.value()};
+                    } else {
+                        // need to move forward
+                        time_found = content_map_entry{
+                            end_lines_fr,
+                            line_time,
+                        };
+                        peek_sf = string_fragment{};
+                        continue;
+                    }
+                } else {
+                    return map_entry_found{content_map_entry{
+                        end_lines_fr,
+                        line_time,
+                    }};
+                }
+            }
+            // log_trace("%s: no match for line, going back",
+            // this->lf_filename_as_string.c_str());
+            peek_sf = leading;
+        }
+
+        log_trace("    no messages found in peek, going back further");
+        if (time_found && best_lower_bound
+            && end_range.next_offset() >= upper_offset)
+        {
+            log_info("    lower bound lies in upper half");
+            return map_entry_found{best_lower_bound.value()};
+        }
+        req.match(
+            [&](map_read_upper_bound& m) {
+                if (end_range.fr_offset < end_range.fr_size
+                    || (full_size - end_range.fr_offset) >= MAX_LOOKBACK_SIZE)
+                {
+                    looping = false;
+                } else {
+                    // look further back
+                    end_range.fr_offset = end_range.fr_offset + peek_sf.sf_end
+                        + 1 - end_range.fr_size;
+                }
+            },
+            [&](map_read_lower_bound& m) {
+                if (lower_retval) {
+                    upper_offset = lower_retval.value().cme_range.fr_offset;
+                    log_debug("    first half %lld %s",
+                              (upper_offset - lower_offset) / 2,
+                              lnav::to_rfc3339_string(lower_retval->cme_time)
+                                  .c_str());
+                    auto amount = (upper_offset - lower_offset) / 2;
+                    end_range.fr_offset = lower_offset + amount;
+                    if (end_range.next_offset() > upper_offset) {
+                        log_debug("    adjusting end offset");
+                        if (end_range.fr_size < upper_offset) {
+                            end_range.fr_offset
+                                = upper_offset - end_range.fr_size;
+                        } else {
+                            end_range.fr_offset = 0;
+                            end_range.fr_size = upper_offset;
+                        }
+                    }
+                } else if (time_found) {
+                    log_debug(
+                        "    second half (%lld %lld) %s",
+                        end_range.fr_offset,
+                        upper_offset,
+                        lnav::to_rfc3339_string(time_found.value().cme_time)
+                            .c_str());
+                    lower_offset = time_found->cme_range.next_offset();
+                    end_range.fr_offset
+                        = lower_offset + (upper_offset - lower_offset) / 2;
+                } else if (end_range.next_offset() <= full_size) {
+                    log_debug("    no time found (%lld %lld)",
+                              end_range.fr_offset,
+                              upper_offset);
+                    if (end_range.next_offset() == upper_offset) {
+                        upper_offset = end_range.fr_offset;
+                    }
+                    end_range.fr_offset = upper_offset - end_range.fr_size;
+                } else {
+                    looping = false;
+                }
+                if (end_range.next_offset() > full_size) {
+                    end_range.fr_offset = full_size - end_range.fr_size;
+                }
+            });
+    } while (looping);
+
+    return map_entry_not_found{};
+}
+
+logfile::rebuild_result_t
+logfile::build_content_map()
+{
+    static auto op = lnav_operation{"build_content_map"};
+
+    auto op_guard = lnav_opid_guard::internal(op);
+
+    log_info("%s: trying to build content map",
+             this->lf_filename_as_string.c_str());
+    if (this->lf_line_buffer.is_compressed()) {
+        auto skip_size = file_off_t{512 * 1024};
+        auto read_size = file_ssize_t{64 * 1024};
+        pattern_locks line_locks;
+        date_time_scanner line_time_scanner;
+        scan_batch_context sbc_tmp{
+            this->lf_allocator,
+            line_locks,
+            line_time_scanner,
+        };
+        // @see find_content_map_entry() -- the scratch scanner needs the
+        // file's base time for the date-less formats.
+        this->set_base_time_for(sbc_tmp, line_info{});
+
+        auto peek_range = file_range{
+            0,
+            read_size,
+        };
+        log_info("  file is compressed, doing scan");
+        while (true) {
+            auto last_peek = peek_range;
+            peek_range.fr_offset += skip_size;
+            log_debug("    content map peek %lld:%lld",
+                      peek_range.fr_offset,
+                      peek_range.fr_size);
+            auto peek_res = this->lf_line_buffer.peek_range(
+                peek_range,
+                {
+                    line_buffer::peek_options::allow_short_read,
+                });
+            if (peek_res.isErr()) {
+                log_error("    content map peek failed -- %s",
+                          peek_res.unwrapErr().c_str());
+                break;
+            }
+
+            auto buf = peek_res.unwrap();
+            if (buf.empty()) {
+                if (this->lf_line_buffer.get_file_size() == -1) {
+                    log_info("    skipped past end, reversing");
+                    skip_size = peek_range.fr_size;
+                    peek_range = last_peek;
+                    continue;
+                }
+                log_info("    reached end of file %lld",
+                         this->lf_line_buffer.get_file_size());
+                break;
+            }
+            auto buf_sf = to_string_fragment(buf);
+            auto split_res = buf_sf.split_pair(string_fragment::tag1{'\n'});
+            if (!split_res) {
+                log_warning("  cannot find start of line at %lld",
+                            peek_range.fr_offset);
+                continue;
+            }
+
+            auto [_junk, line_start_sf] = split_res.value();
+            while (!line_start_sf.empty()) {
+                auto utf8_res = is_utf8(line_start_sf, '\n');
+                if (!utf8_res.usr_remaining) {
+                    log_warning("    cannot find end of line at %lld",
+                                peek_range.fr_offset + line_start_sf.sf_begin);
+                    break;
+                }
+                auto line_len = utf8_res.remaining_ptr() - line_start_sf.data();
+                shared_buffer tmp_sb;
+                shared_buffer_ref tmp_sbr;
+
+                tmp_sbr.share(tmp_sb, line_start_sf.data(), line_len);
+
+                auto map_line_fr = file_range{
+                    peek_range.fr_offset + line_start_sf.sf_begin,
+                    line_len,
+                };
+                map_line_fr.fr_metadata.m_has_ansi = utf8_res.usr_has_ansi;
+                map_line_fr.fr_metadata.m_valid_utf = utf8_res.is_valid();
+                auto map_li = line_info{map_line_fr};
+                map_li.li_utf8_scan_result = utf8_res;
+                std::vector<logline> tmp_index;
+                tmp_index.emplace_back(
+                    map_li.li_file_range.fr_offset, 0us, LEVEL_UNKNOWN);
+                auto scan_res = this->lf_format->scan(
+                    *this, tmp_index, map_li, tmp_sbr, sbc_tmp);
+                if (scan_res.is<log_format::scan_match>()) {
+                    auto line_time = tmp_index.front().get_time<>();
+                    this->lf_content_map.emplace_back(content_map_entry{
+                        map_line_fr,
+                        line_time,
+                    });
+                    log_info("  adding content map entry %lld - %s",
+                             map_line_fr.fr_offset,
+                             lnav::to_rfc3339_string(line_time).c_str());
+                    if (skip_size < 1024 * 1024 * 1024) {
+                        skip_size *= 2;
+                    }
+                    break;
+                }
+                line_start_sf = utf8_res.usr_remaining.value();
+            }
+        }
+    }
+
+    auto retval = rebuild_result_t::NO_NEW_LINES;
+    auto full_size = this->get_content_size();
+
+    this->lf_lower_bound_entry = std::nullopt;
+    this->lf_upper_bound_entry = std::nullopt;
+
+    log_info("  finding content layout (full_size=%lld)", full_size);
+    if (this->lf_options.loo_time_range.has_lower_bound()
+        && this->lf_options.loo_time_range.tr_begin
+            > this->lf_index.front().get_time<>()
+        && this->lf_options.loo_time_range.tr_begin
+            <= this->lf_index.back().get_time<>())
+    {
+        auto ll
+            = this->find_from_time(this->lf_options.loo_time_range.tr_begin);
+        auto first_line_offset = ll->get_offset();
+        this->lf_lower_bound_entry = content_map_entry{
+            file_range{first_line_offset, full_size - first_line_offset},
+            ll->get_time<>(),
+        };
+        log_info("  lower bound is within current index, erasing %ld lines",
+                 std::distance(this->lf_index.cbegin(), ll));
+        this->lf_index_size = first_line_offset;
+        this->lf_index.clear();
+        retval = rebuild_result_t::NEW_ORDER;
+    }
+
+    if (this->lf_index_size == full_size) {
+        log_trace("  file has already been scanned, no need to peek");
+        const auto& last_line = this->lf_index.back();
+        auto last_line_offset = last_line.get_offset();
+        this->lf_upper_bound_entry = content_map_entry{
+            file_range{last_line_offset, full_size - last_line_offset},
+            last_line.get_time<>(),
+        };
+        if (this->lf_options.loo_time_range.has_lower_bound()
+            && this->lf_options.loo_time_range.tr_begin
+                > this->lf_index.back().get_time<>())
+        {
+            log_info("  lower bound is past content");
+            this->lf_index.clear();
+            retval = rebuild_result_t::NEW_ORDER;
+        }
+        this->lf_file_size_at_map_time = full_size;
+        return retval;
+    }
+
+    auto end_entry_opt
+        = this->find_content_map_entry(full_size, map_read_upper_bound{});
+    if (!end_entry_opt.is<map_entry_found>()) {
+        log_warning(
+            "  skipping content map since the last message could not be "
+            "found");
+        return retval;
+    }
+
+    auto end_entry = end_entry_opt.get<map_entry_found>().mef_entry;
+    log_info("  found content end: %llu %s",
+             end_entry.cme_range.fr_offset,
+             lnav::to_rfc3339_string(to_timeval(end_entry.cme_time)).c_str());
+    this->lf_upper_bound_entry = end_entry;
+    this->lf_file_size_at_map_time = full_size;
+
+    if (this->lf_options.loo_time_range.has_lower_bound()) {
+        if (this->lf_options.loo_time_range.tr_begin > end_entry.cme_time) {
+            retval = rebuild_result_t::NEW_ORDER;
+        } else if (this->lf_index.empty()
+                   || this->lf_options.loo_time_range.tr_begin
+                       > this->lf_index.back().get_time<>())
+        {
+            auto offset = full_size / 2;
+            log_debug("  searching for lower bound %lld",
+                      this->lf_options.loo_time_range.tr_begin.count());
+            auto low_entry_opt = this->find_content_map_entry(
+                offset,
+                map_read_lower_bound{
+                    this->lf_options.loo_time_range.tr_begin,
+                });
+            if (low_entry_opt.is<map_entry_found>()) {
+                auto low_entry = low_entry_opt.get<map_entry_found>().mef_entry;
+                log_info("  found content start: %llu %s",
+                         low_entry.cme_range.fr_offset,
+                         lnav::to_rfc3339_string(to_timeval(low_entry.cme_time))
+                             .c_str());
+                this->lf_lower_bound_entry = low_entry;
+                this->lf_index_size = low_entry.cme_range.fr_offset;
+
+                retval = rebuild_result_t::NEW_ORDER;
+            }
+        }
+    }
+
+    if (retval == rebuild_result_t::NEW_ORDER) {
+        {
+            auto los = this->lf_opids.writeAccess();
+
+            los->los_opid_ranges.clear();
+            los->los_sub_in_use.clear();
+        }
+        {
+            auto tids = this->lf_thread_ids.writeAccess();
+            tids->ltis_tid_ranges.clear();
+        }
+        this->lf_pattern_locks.pl_lines.clear();
+        this->lf_value_stats.clear();
+        this->lf_index.clear();
+        this->reset_time_order();
+        this->lf_upper_bound_size = std::nullopt;
+    }
+
+    return retval;
+}
+
+bool
+logfile::in_range() const
+{
+    if (this->lf_format == nullptr) {
+        return true;
+    }
+
+    return !this->lf_index.empty() || this->lf_lower_bound_entry.has_value();
+}
 
 bool
 logfile::exists() const
@@ -171,21 +890,162 @@ logfile::exists() const
 
     auto st = stat_res.unwrap();
     return this->lf_stat.st_dev == st.st_dev
-        && this->lf_stat.st_ino == st.st_ino
-        && this->lf_stat.st_size <= st.st_size;
+        && this->lf_stat.st_ino == st.st_ino;
 }
 
 void
-logfile::reset_state()
+logfile::reset_time_order()
+{
+    this->lf_time_order.clear();
+    this->lf_time_order_size = 0;
+}
+
+void
+logfile::truncate_time_order(size_t line_count)
+{
+    if (line_count >= this->lf_time_order_size) {
+        return;
+    }
+
+    this->lf_time_order.erase(
+        std::remove_if(this->lf_time_order.begin(),
+                       this->lf_time_order.end(),
+                       [line_count](auto index) { return index >= line_count; }),
+        this->lf_time_order.end());
+    this->lf_time_order_size = line_count;
+}
+
+void
+logfile::update_time_order(bool recheck)
+{
+    if (this->lf_format == nullptr) {
+        return;
+    }
+
+    if (recheck) {
+        // Lines that were already covered may have new times.
+        this->reset_time_order();
+    }
+
+    const auto line_count = this->lf_index.size();
+    this->truncate_time_order(line_count);
+
+    if (!recheck && this->lf_format->lf_time_ordered
+        && this->lf_time_order.empty())
+    {
+        // process_prefix() rewrites an out-of-order time to the time of the
+        // line before it, so new lines cannot break the order.
+        this->lf_time_order_size = line_count;
+        return;
+    }
+
+    const auto old_size = this->lf_time_order_size;
+    if (old_size == line_count) {
+        return;
+    }
+    this->lf_time_order_size = line_count;
+
+    if (this->lf_time_order.empty()) {
+        auto in_order = true;
+        for (auto index = std::max(old_size, size_t{1}); index < line_count;
+             index++)
+        {
+            if (this->lf_index[index] < this->lf_index[index - 1]) {
+                in_order = false;
+                break;
+            }
+        }
+        if (in_order) {
+            return;
+        }
+        this->lf_time_order.resize(old_size);
+        std::iota(this->lf_time_order.begin(), this->lf_time_order.end(), 0);
+    }
+
+    const auto cmp = [this](uint32_t lhs, uint32_t rhs) {
+        return this->lf_index[lhs] < this->lf_index[rhs];
+    };
+    const auto mid_off = this->lf_time_order.size();
+    this->lf_time_order.resize(line_count);
+    auto mid = this->lf_time_order.begin() + mid_off;
+    std::iota(mid, this->lf_time_order.end(), old_size);
+    std::sort(mid, this->lf_time_order.end(), cmp);
+    if (mid != this->lf_time_order.begin() && cmp(*mid, *std::prev(mid))) {
+        std::inplace_merge(
+            this->lf_time_order.begin(), mid, this->lf_time_order.end(), cmp);
+    }
+}
+
+const logline&
+logfile::earliest_line_from(size_t line) const
+{
+    if (this->lf_time_order.empty()) {
+        return this->lf_index[line];
+    }
+
+    return *std::min_element(this->lf_index.begin() + line,
+                             this->lf_index.end());
+}
+
+size_t
+logfile::time_order_lower_bound(std::chrono::microseconds us) const
+{
+    if (this->lf_time_order.empty()) {
+        return std::distance(this->lf_index.begin(), this->find_from_time(us));
+    }
+
+    const auto iter = std::lower_bound(
+        this->lf_time_order.begin(),
+        this->lf_time_order.end(),
+        us,
+        [this](uint32_t index, std::chrono::microseconds rhs) {
+            return this->lf_index[index] < rhs;
+        });
+    return std::distance(this->lf_time_order.begin(), iter);
+}
+
+auto
+logfile::reset_state() -> void
 {
     this->clear_time_offset();
     this->lf_indexing = this->lf_options.loo_is_visible;
 }
 
-void
-logfile::set_format_base_time(log_format* lf)
+size_t
+lnav::logfile_indexing_width(size_t file_count)
 {
-    time_t file_time = this->lf_line_buffer.get_file_time();
+    static const auto PREWARMED = []() {
+        // The scan path reaches these through function-local statics.  The
+        // magic-static guard makes the initialization itself safe, but
+        // building an injected singleton for the first time from several
+        // workers at once is not something to rely on, so build them here,
+        // where the UI thread is still the only one running.
+        injector::get<const date_time_scanner_ns::config&>();
+        injector::get<lnav::safe_file_options_hier&>();
+        injector::get<const lnav::logfile::config&>();
+        return true;
+    }();
+    (void) PREWARMED;
+
+    const auto configured
+        = injector::get<const lnav::logfile::config&>().lc_indexing_threads;
+
+    if (configured == 1 || file_count <= 1) {
+        return 1;
+    }
+    if (configured == 0) {
+        return lnav::default_worker_count(file_count);
+    }
+
+    return std::min(static_cast<size_t>(configured), file_count);
+}
+
+void
+logfile::set_base_time_for(scan_batch_context& sbc, const line_info& li)
+{
+    time_t file_time = li.li_timestamp.tv_sec != 0
+        ? li.li_timestamp.tv_sec
+        : this->lf_line_buffer.get_file_time();
 
     if (file_time == 0) {
         file_time = this->lf_stat.st_mtime;
@@ -194,13 +1054,31 @@ logfile::set_format_base_time(log_format* lf)
     if (!this->lf_cached_base_time
         || this->lf_cached_base_time.value() != file_time)
     {
-        struct tm new_base_tm;
+        tm new_base_tm;
         this->lf_cached_base_time = file_time;
         localtime_r(&file_time, &new_base_tm);
         this->lf_cached_base_tm = new_base_tm;
     }
-    lf->lf_date_time.set_base_time(this->lf_cached_base_time.value(),
-                                   this->lf_cached_base_tm.value());
+    // Stash it for seed_for(), which re-applies it after copying
+    // a format's settings, and set it on the scanner directly for the case
+    // where the format is already settled and so is not reseeded.
+    sbc.sbc_base_time = this->lf_cached_base_time.value();
+    sbc.sbc_base_tm = this->lf_cached_base_tm.value();
+    sbc.sbc_time_scanner.set_base_time(this->lf_cached_base_time.value(),
+                                       this->lf_cached_base_tm.value());
+}
+
+time_range
+logfile::get_content_time_range() const
+{
+    if (this->lf_format == nullptr) {
+        return {
+            std::chrono::seconds{this->lf_stat.st_ctime},
+            std::chrono::seconds{this->lf_stat.st_mtime},
+        };
+    }
+
+    return this->lf_content_time_range;
 }
 
 bool
@@ -212,195 +1090,644 @@ logfile::process_prefix(shared_buffer_ref& sbr,
         = injector::get<const lnav::logfile::config&>()
               .lc_max_unrecognized_lines;
 
-    log_format::scan_result_t found = log_format::SCAN_NO_MATCH;
+    log_format::scan_result_t found = log_format::scan_no_match{};
     size_t prescan_size = this->lf_index.size();
-    time_t prescan_time = 0;
+    auto prescan_time = std::chrono::microseconds{0};
     bool retval = false;
 
-    if (this->lf_format.get() != nullptr) {
-        if (!this->lf_index.empty()) {
-            prescan_time = this->lf_index[prescan_size - 1].get_time();
-        }
-        /* We've locked onto a format, just use that scanner. */
-        found = this->lf_format->scan(*this, this->lf_index, li, sbr, sbc);
-    } else if (this->lf_options.loo_detect_format) {
-        const auto& root_formats = log_format::get_root_formats();
+    {
+        log_level_t last_level = LEVEL_UNKNOWN;
+        auto last_time = this->lf_index_time;
 
-        /*
-         * Try each scanner until we get a match.  Fortunately, the formats
-         * tend to be sufficiently different that there are few ambiguities...
-         */
-        for (auto iter = root_formats.begin();
-             iter != root_formats.end() && (found != log_format::SCAN_MATCH);
-             ++iter)
-        {
-            if (this->lf_index.size()
-                >= (*iter)->lf_max_unrecognized_lines.value_or(
-                    max_unrecognized_lines))
+        if (this->lf_format == nullptr && li.li_timestamp.tv_sec != 0) {
+            last_time = to_us(li.li_timestamp);
+            last_level = li.li_level;
+        } else {
+            for (auto riter = this->lf_index.rbegin();
+                 riter != this->lf_index.rend();
+                 ++riter)
             {
-                continue;
-            }
-
-            if (this->lf_mismatched_formats.count((*iter)->get_name()) > 0) {
-                continue;
-            }
-
-            if (!(*iter)->match_name(this->lf_filename)) {
-                if (li.li_file_range.fr_offset == 0) {
-                    log_debug("(%s) does not match file name: %s",
-                              (*iter)->get_name().get(),
-                              this->lf_filename.c_str());
+                if (riter->is_ignored()
+                    || riter->get_msg_level() == LEVEL_INVALID)
+                {
+                    continue;
                 }
-                this->lf_mismatched_formats.insert((*iter)->get_name());
-                continue;
-            }
-            if (!(*iter)->match_mime_type(this->lf_options.loo_file_format)) {
-                if (li.li_file_range.fr_offset == 0) {
-                    log_debug("(%s) does not match file format: %s",
-                              (*iter)->get_name().get(),
-                              fmt::to_string(this->lf_options.loo_file_format)
-                                  .c_str());
-                }
-                continue;
-            }
-
-            (*iter)->clear();
-            this->set_format_base_time(iter->get());
-            found = (*iter)->scan(*this, this->lf_index, li, sbr, sbc);
-            if (found == log_format::SCAN_MATCH) {
-#if 0
-                require(this->lf_index.size() == 1 ||
-                       (this->lf_index[this->lf_index.size() - 2] <
-                        this->lf_index[this->lf_index.size() - 1]));
-#endif
-                log_info("%s:%d:log format found -- %s",
-                         this->lf_filename.c_str(),
-                         this->lf_index.size(),
-                         (*iter)->get_name().get());
-
-                this->lf_text_format = text_format_t::TF_LOG;
-                this->lf_format = (*iter)->specialized();
-                this->set_format_base_time(this->lf_format.get());
-                this->lf_content_id
-                    = hasher().update(sbr.get_data(), sbr.length()).to_string();
-
-                for (auto& td_pair : this->lf_format->lf_tag_defs) {
-                    bool matches = td_pair.second->ftd_paths.empty();
-                    for (const auto& pr : td_pair.second->ftd_paths) {
-                        if (pr.matches(this->lf_filename.c_str())) {
-                            matches = true;
-                            break;
-                        }
-                    }
-                    if (!matches) {
-                        continue;
-                    }
-
-                    log_info("%s: found applicable tag definition /%s/tags/%s",
-                             this->lf_filename.c_str(),
-                             this->lf_format->get_name().get(),
-                             td_pair.second->ftd_name.c_str());
-                    this->lf_applicable_taggers.emplace_back(td_pair.second);
-                }
-
-                /*
-                 * We'll go ahead and assume that any previous lines were
-                 * written out at the same time as the last one, so we need to
-                 * go back and update everything.
-                 */
-                auto& last_line = this->lf_index[this->lf_index.size() - 1];
-
-                for (size_t lpc = 0; lpc < this->lf_index.size() - 1; lpc++) {
-                    if (this->lf_format->lf_multiline) {
-                        this->lf_index[lpc].set_time(last_line.get_time());
-                        this->lf_index[lpc].set_millis(last_line.get_millis());
-                    } else {
-                        this->lf_index[lpc].set_ignore(true);
-                    }
-                }
-                break;
-            }
-        }
-    }
-
-    switch (found) {
-        case log_format::SCAN_MATCH: {
-            if (!this->lf_index.empty()) {
-                this->lf_index.back().set_valid_utf(li.li_valid_utf);
-                this->lf_index.back().set_has_ansi(li.li_has_ansi);
-            }
-            if (prescan_size > 0 && this->lf_index.size() >= prescan_size
-                && prescan_time != this->lf_index[prescan_size - 1].get_time())
-            {
-                retval = true;
-            }
-            if (prescan_size > 0 && prescan_size < this->lf_index.size()) {
-                auto& second_to_last = this->lf_index[prescan_size - 1];
-                auto& latest = this->lf_index[prescan_size];
-
-                if (!second_to_last.is_ignored() && latest < second_to_last) {
-                    if (this->lf_format->lf_time_ordered) {
-                        this->lf_out_of_time_order_count += 1;
-                        for (size_t lpc = prescan_size;
-                             lpc < this->lf_index.size();
-                             lpc++)
-                        {
-                            auto& line_to_update = this->lf_index[lpc];
-
-                            line_to_update.set_time_skew(true);
-                            line_to_update.set_time(second_to_last.get_time());
-                            line_to_update.set_millis(
-                                second_to_last.get_millis());
-                        }
-                    } else {
-                        retval = true;
-                    }
-                }
-            }
-            break;
-        }
-        case log_format::SCAN_NO_MATCH: {
-            log_level_t last_level = LEVEL_UNKNOWN;
-            time_t last_time = this->lf_index_time;
-            short last_millis = 0;
-            uint8_t last_mod = 0, last_opid = 0;
-
-            if (!this->lf_index.empty()) {
-                logline& ll = this->lf_index.back();
 
                 /*
                  * Assume this line is part of the previous one(s) and copy the
                  * metadata over.
                  */
-                last_time = ll.get_time();
-                last_millis = ll.get_millis();
-                if (this->lf_format.get() != nullptr) {
-                    last_level = (log_level_t) (ll.get_level_and_flags()
-                                                | LEVEL_CONTINUED);
-                }
-                last_mod = ll.get_module_id();
-                last_opid = ll.get_opid();
+                last_time = riter->get_time();
+                last_level = riter->get_msg_level();
+                break;
             }
-            this->lf_index.emplace_back(li.li_file_range.fr_offset,
-                                        last_time,
-                                        last_millis,
-                                        last_level,
-                                        last_mod,
-                                        last_opid);
-            this->lf_index.back().set_valid_utf(li.li_valid_utf);
-            this->lf_index.back().set_has_ansi(li.li_has_ansi);
-            break;
         }
-        case log_format::SCAN_INCOMPLETE:
-            break;
+        this->lf_index.emplace_back(
+            li.li_file_range.fr_offset, last_time, last_level);
+        auto& new_line = this->lf_index.back();
+        new_line.set_valid_utf(li.li_utf8_scan_result.is_valid());
+        new_line.set_has_ansi(li.li_utf8_scan_result.usr_has_ansi);
+    }
+    auto base_ll = this->lf_index.back().clone();
+
+    if (this->lf_options.loo_detect_format
+        && (this->lf_format == nullptr
+            || this->lf_index_base + this->lf_index.size() < RETRY_MATCH_SIZE))
+    {
+        const auto& root_formats = log_format::get_root_formats();
+        std::optional<std::pair<log_format*, log_format::scan_match>>
+            best_match;
+        // What the best candidate so far discovered about the file.  Held
+        // here rather than left in sbc_tmp because the loop keeps going and
+        // later candidates would scribble over it.
+        std::unique_ptr<format_scan_state> best_format_state;
+        std::optional<uint32_t> best_timestamp_flags;
+        size_t scan_count = 0;
+        size_t pruned_count = 0;
+
+        if (prescan_size > 0) {
+            prescan_time = this->lf_index[prescan_size - 1].get_time();
+        }
+        if (this->lf_format != nullptr) {
+            best_match
+                = std::make_pair(this->lf_format.get(), this->lf_format_match);
+        }
+
+        /*
+         * Try each scanner until we get a match.  Fortunately, the formats
+         * tend to be sufficiently different that there are few ambiguities...
+         */
+        log_trace("logfile[%s]: scanning line %zu (offset: %lld; size: %lld)",
+                  this->lf_filename_as_string.c_str(),
+                  this->lf_index.size(),
+                  li.li_file_range.fr_offset,
+                  li.li_file_range.fr_size);
+        auto starting_index_size = this->lf_index.size();
+        size_t prev_index_size = this->lf_index.size();
+        pattern_locks line_locks;
+        date_time_scanner line_time_scanner;
+        scan_batch_context sbc_tmp{
+            this->lf_allocator,
+            line_locks,
+            line_time_scanner,
+        };
+        sbc_tmp.sbc_value_stats.reserve(64);
+        for (const auto& curr : root_formats) {
+            if (this->lf_input_lines
+                    >= curr->lf_max_unrecognized_lines.value_or(
+                        max_unrecognized_lines)
+                && (this->lf_format == nullptr
+                    || this->lf_format->lf_root_format != curr.get()))
+            {
+                continue;
+            }
+
+            if (this->lf_mismatched_formats.count(curr->get_name()) > 0) {
+                continue;
+            }
+
+            // A format that works on a different shape of file than the one
+            // that matched cannot be the right one.  The index has to be past
+            // the point where a format that describes itself with a header
+            // would have found it, since the lines before that can be matched
+            // by a text format.
+            if (this->lf_format != nullptr
+                && this->lf_index.size() > FILE_TYPE_PRUNE_SIZE
+                && !(this->lf_viable_file_types
+                     & log_format::file_type_bit(curr->lf_file_type)))
+            {
+                pruned_count += 1;
+                continue;
+            }
+
+            auto match_res = curr->match_name(this->lf_filename_as_string);
+            if (match_res.is<log_format::name_mismatched>()) {
+                auto nm = match_res.get<log_format::name_mismatched>();
+                if (li.li_file_range.fr_offset == 0) {
+                    log_debug("(%s) does not match file name: %s",
+                              curr->get_name().get(),
+                              this->lf_filename_as_string.c_str());
+                }
+                auto regex_al = attr_line_t(nm.nm_pattern);
+                lnav::snippets::regex_highlighter(
+                    regex_al, -1, line_range{0, (int) regex_al.length()});
+                auto note = attr_line_t("pattern: ")
+                                .append(regex_al)
+                                .append("\n  ")
+                                .append(lnav::roles::quoted_code(
+                                    fmt::to_string(this->get_filename())))
+                                .append("\n")
+                                .append(nm.nm_partial + 2, ' ')
+                                .append("^ matched up to here"_snippet_border);
+                auto match_um = lnav::console::user_message::info(
+                                    attr_line_t()
+                                        .append(lnav::roles::identifier(
+                                            curr->get_name().to_string()))
+                                        .append(" file name pattern required "
+                                                "by format does not match"))
+                                    .with_note(note)
+                                    .move();
+                this->lf_format_match_messages.emplace_back(match_um);
+                this->lf_mismatched_formats.insert(curr->get_name());
+                continue;
+            }
+            if (this->lf_options.loo_format_name
+                && !(curr->get_name()
+                     == this->lf_options.loo_format_name.value()))
+            {
+                if (li.li_file_range.fr_offset == 0) {
+                    log_debug("(%s) does not match file format: %s",
+                              curr->get_name().get(),
+                              this->lf_options.loo_format_name->c_str());
+                }
+                continue;
+            }
+
+            std::vector<logline> prev_subs;
+            scan_count += 1;
+            curr->clear();
+            this->set_base_time_for(sbc_tmp, li);
+            log_format::scan_result_t scan_res{mapbox::util::no_init{}};
+            while (this->lf_index.back().get_sub_offset() != 0) {
+                prev_subs.emplace_back(this->lf_index.back().clone());
+                this->lf_index.pop_back();
+            }
+            auto prev_ll = this->lf_index.back().clone();
+            this->lf_index.back().replace(base_ll);
+            // Which context this candidate scanned with decides whether the
+            // batch state below is worth copying back -- the file's own
+            // format works directly on sbc, so sbc_tmp still holds whatever
+            // the previous candidate left there.
+            auto* scanned_with = &sbc;
+            if (this->lf_format != nullptr
+                && this->lf_format->lf_root_format == curr.get())
+            {
+                scan_res = this->lf_format->scan(
+                    *this, this->lf_index, li, sbr, sbc);
+            } else {
+                scanned_with = &sbc_tmp;
+                sbc_tmp.sbc_pattern_locks.pl_lines.clear();
+                sbc_tmp.sbc_value_stats.clear();
+                sbc_tmp.sbc_opids.los_opid_ranges.clear();
+                sbc_tmp.sbc_opids.los_sub_in_use.clear();
+                sbc_tmp.sbc_tids.clear();
+                sbc_tmp.sbc_level_cache = {};
+                scan_res = curr->scan(*this, this->lf_index, li, sbr, sbc_tmp);
+            }
+            // A match is the only evidence that this shape of file is worth
+            // scanning for.  Formats that work out their columns from a
+            // header are covered by FILE_TYPE_PRUNE_SIZE, since they give up
+            // before the index reaches it.
+            if (scan_res.is<log_format::scan_match>()) {
+                this->lf_viable_file_types
+                    |= log_format::file_type_bit(curr->lf_file_type);
+            }
+            if (!scan_res.is<log_format::scan_match>()) {
+                while (this->lf_index.back().get_sub_offset() != 0) {
+                    this->lf_index.pop_back();
+                }
+                this->lf_index.back().replace(prev_ll);
+                while (!prev_subs.empty()) {
+                    this->lf_index.emplace_back(prev_subs.back().clone());
+                    prev_subs.pop_back();
+                }
+            }
+            scan_res.match(
+                [&](const log_format::scan_match& sm) {
+                    if (best_match && this->lf_format != nullptr
+                        && this->lf_format->lf_root_format == curr.get()
+                        && best_match->first == this->lf_format.get())
+                    {
+                        log_info(
+                            "  scan with format (%s) matched with quality of "
+                            "%d.%d and %d strikes",
+                            curr->get_name().c_str(),
+                            sm.sm_quality,
+                            sm.sm_precision,
+                            sm.sm_strikes);
+                        this->lf_format_match.merge_best(sm);
+                        prev_index_size = this->lf_index.size();
+                        found = best_match->second;
+                        base_ll.set_time(this->lf_index.back().get_time());
+                    } else if (!best_match
+                               || sm.is_better_than(best_match->second))
+                    {
+                        log_info(
+                            "  scan with format (%s) matched with quality of "
+                            "%d.%d and %d strikes",
+                            curr->get_name().c_str(),
+                            sm.sm_quality,
+                            sm.sm_precision,
+                            sm.sm_strikes);
+                        if (best_match) {
+                            log_info(
+                                "    replacing previous match with %s "
+                                "(quality=%d.%d; strikes=%d)",
+                                best_match->first->get_name().c_str(),
+                                best_match->second.sm_quality,
+                                best_match->second.sm_precision,
+                                best_match->second.sm_strikes);
+                        }
+
+                        if (scanned_with == &sbc_tmp) {
+                            sbc.sbc_opids = sbc_tmp.sbc_opids;
+                            sbc.sbc_tids = sbc_tmp.sbc_tids;
+                            sbc.sbc_value_stats = sbc_tmp.sbc_value_stats;
+                            sbc.sbc_pattern_locks = sbc_tmp.sbc_pattern_locks;
+                            // Carry over what this candidate worked out about
+                            // the timestamp, so the file keeps the format lock
+                            // instead of rediscovering it on the next line.
+                            sbc.sbc_time_scanner = sbc_tmp.sbc_time_scanner;
+                            sbc.sbc_format_owner = sbc_tmp.sbc_format_owner;
+                            // Take the scratch away from sbc_tmp so the next
+                            // candidate is handed a fresh one by seed_for().
+                            best_format_state
+                                = std::move(sbc_tmp.sbc_format_state);
+                            // Only meaningful if this candidate actually
+                            // seeded the batch; a format that parses no
+                            // timestamps (piper) never does, and sets its
+                            // own flags in specialized().
+                            best_timestamp_flags
+                                = sbc_tmp.sbc_format_owner == curr.get()
+                                ? std::make_optional(
+                                      sbc_tmp.sbc_timestamp_flags)
+                                : std::nullopt;
+                            sbc_tmp.sbc_format_owner = nullptr;
+                        }
+                        auto match_um
+                            = lnav::console::user_message::info(
+                                  attr_line_t()
+                                      .append(lnav::roles::identifier(
+                                          curr->get_name().to_string()))
+                                      .append(" matched line ")
+                                      .append(lnav::roles::number(
+                                          fmt::to_string(starting_index_size))))
+                                  .with_note(
+                                      attr_line_t("match quality is ")
+                                          .append(lnav::roles::number(
+                                              fmt::format(FMT_STRING("{}.{}"),
+                                                          sm.sm_quality,
+                                                          sm.sm_precision)))
+                                          .append(" with ")
+                                          .append(lnav::roles::number(
+                                              fmt::to_string(sm.sm_strikes)))
+                                          .append(" strikes"))
+                                  .move();
+                        this->lf_format_match_messages.emplace_back(match_um);
+                        best_match = std::make_pair(curr.get(), sm);
+                        prev_index_size = this->lf_index.size();
+                        base_ll.set_time(this->lf_index.back().get_time());
+                    } else {
+                        log_trace(
+                            "  scan with format (%s) matched, but "
+                            "is lower quality (%d.%d < %d.%d) or more strikes "
+                            "(%d vs. %d)",
+                            curr->get_name().c_str(),
+                            sm.sm_quality,
+                            sm.sm_precision,
+                            best_match->second.sm_quality,
+                            best_match->second.sm_precision,
+                            sm.sm_strikes,
+                            best_match->second.sm_strikes);
+                        while (this->lf_index.back().get_sub_offset() != 0) {
+                            this->lf_index.pop_back();
+                        }
+                        this->lf_index.back().replace(prev_ll);
+                        while (!prev_subs.empty()) {
+                            this->lf_index.emplace_back(
+                                prev_subs.back().clone());
+                            prev_subs.pop_back();
+                        }
+                    }
+                },
+                [curr](const log_format::scan_incomplete& si) {
+                    log_trace(
+                        "  scan with format (%s) is incomplete, "
+                        "more data required",
+                        curr->get_name().c_str());
+                },
+                [this, curr](const log_format::scan_error& se) {
+                    if (this->lf_format == nullptr) {
+                        return;
+                    }
+                    this->lf_invalid_lines.ili_total += 1;
+                    if (this->lf_invalid_lines.ili_lines.size()
+                        >= invalid_line_info::MAX_INVALID_LINES)
+                    {
+                        return;
+                    }
+                    log_error("  scan with format (%s) failed: %s",
+                              curr->get_name().c_str(),
+                              se.se_message.c_str());
+                    this->lf_invalid_lines.ili_lines.emplace_back(
+                        this->lf_index.size());
+                    this->lf_format_match_messages.emplace_back(
+                        lnav::console::user_message::error(
+                            attr_line_t()
+                                .append(lnav::roles::identifier(
+                                    curr->get_name().to_string()))
+                                .append(" failed to scan line ")
+                                .append(lnav::roles::number(
+                                    fmt::to_string(this->lf_index.size())))
+                                .append(": ")
+                                .append(se.se_message)));
+                },
+                [this, curr, prescan_size](
+                    const log_format::scan_no_match& snm) {
+                    if (this->lf_format == nullptr && prescan_size < 5) {
+                        log_trace(
+                            "  scan with format (%s) does not match -- %s",
+                            curr->get_name().c_str(),
+                            snm.snm_reason);
+                    }
+                });
+        }
+
+        if (pruned_count > 0 && !this->lf_pruned_formats_logged) {
+            this->lf_pruned_formats_logged = true;
+            log_debug(
+                "%s: skipping %zu format(s) with a file type that is "
+                "not viable for this file (types: 0x%x)",
+                this->lf_filename_as_string.c_str(),
+                pruned_count,
+                this->lf_viable_file_types);
+        }
+
+        if (!scan_count) {
+            log_info("%s: no formats available to scan, no longer detecting",
+                     this->lf_filename_as_string.c_str());
+            this->lf_options.loo_detect_format = false;
+        }
+
+        if (best_match
+            && (this->lf_format == nullptr
+                || ((this->lf_format->lf_root_format
+                     != best_match->first->lf_root_format)
+                    && best_match->second.is_better_than(
+                        this->lf_format_match))))
+        {
+            auto winner = best_match.value();
+            auto* curr = winner.first;
+            auto format_changed = this->lf_format.get() != nullptr;
+            log_info("%s:%zu:log format found -- %s",
+                     this->lf_filename_as_string.c_str(),
+                     this->lf_index.size(),
+                     curr->get_name().get());
+
+            auto match_um = lnav::console::user_message::ok(
+                attr_line_t()
+                    .append(lnav::roles::identifier(
+                        winner.first->get_name().to_string()))
+                    .append(" is the best match for line ")
+                    .append(lnav::roles::number(
+                        fmt::to_string(starting_index_size))));
+            this->lf_format_match_messages.emplace_back(match_um);
+            this->lf_text_format = text_format_t::TF_LOG;
+            this->lf_format = curr->specialized(sbc);
+            if (best_format_state != nullptr) {
+                this->lf_format->adopt_scan_state(*best_format_state);
+            }
+            if (best_timestamp_flags) {
+                // specialized() copied the root's pristine flags; what the
+                // candidate worked out about this file's timestamps is in
+                // the batch.
+                this->lf_format->lf_timestamp_flags
+                    = best_timestamp_flags.value();
+            }
+            this->lf_level_stats = {};
+            for (const auto& ll : this->lf_index) {
+                if (!ll.is_message()) {
+                    continue;
+                }
+                this->lf_level_stats.update_msg_count(ll.get_msg_level());
+            }
+            this->lf_format_match = winner.second;
+            this->set_base_time_for(sbc, li);
+            if (this->lf_time_scanner.dts_fmt_lock != -1) {
+                this->lf_content_id
+                    = hasher().update(sbr.get_data(), sbr.length()).to_string();
+            }
+
+            this->lf_applicable_taggers.clear();
+            for (auto& td_pair : this->lf_format->lf_tag_defs) {
+                bool matches = td_pair.second->ftd_paths.empty();
+                for (const auto& pr : td_pair.second->ftd_paths) {
+                    if (pr.matches(this->lf_filename_as_string.c_str())) {
+                        matches = true;
+                        break;
+                    }
+                }
+                if (!matches) {
+                    continue;
+                }
+
+                log_info("%s: found applicable tag definition /%s/tags/%s",
+                         this->lf_filename_as_string.c_str(),
+                         this->lf_format->get_name().get(),
+                         td_pair.second->ftd_name.c_str());
+                this->lf_applicable_taggers.emplace_back(td_pair.second);
+            }
+
+            this->lf_applicable_partitioners.clear();
+            for (auto& pd_pair : this->lf_format->lf_partition_defs) {
+                bool matches = pd_pair.second->fpd_paths.empty();
+                for (const auto& pr : pd_pair.second->fpd_paths) {
+                    if (pr.matches(this->lf_filename_as_string.c_str())) {
+                        matches = true;
+                        break;
+                    }
+                }
+                if (!matches) {
+                    continue;
+                }
+
+                log_info(
+                    "%s: found applicable partition definition "
+                    "/%s/partitions/%s",
+                    this->lf_filename_as_string.c_str(),
+                    this->lf_format->get_name().get(),
+                    pd_pair.second->fpd_name.c_str());
+                this->lf_applicable_partitioners.emplace_back(pd_pair.second);
+            }
+
+            if (format_changed) {
+                this->reset_internal_state_for_reindex();
+                sbc.sbc_pattern_locks.pl_lines.clear();
+                sbc.sbc_opids.clear();
+                sbc.sbc_tids.clear();
+                sbc.sbc_value_stats.clear();
+                retval = true;
+            } else {
+                /*
+                 * We'll go ahead and assume that any previous lines were
+                 * written out at the same time as the last one, so we need to
+                 * go back and update everything.
+                 */
+                const auto& last_line = this->lf_index.back();
+
+                for (size_t lpc = 0; lpc < starting_index_size - 1; lpc++) {
+                    if (this->lf_format->lf_multiline) {
+                        this->lf_index[lpc].set_time(last_line.get_time());
+                        if (this->lf_format->lf_structured) {
+                            this->lf_index[lpc].set_ignore(true);
+                        }
+                    } else {
+                        this->lf_index[lpc].set_time(last_line.get_time());
+                        this->lf_index[lpc].set_level(LEVEL_INVALID);
+                    }
+                    retval = true;
+                }
+            }
+
+            found = best_match->second;
+        }
+
+        // The scanner holds what the winning candidate worked out, but a
+        // candidate that lost may have left its own format on the context.
+        // Point it at the format that will actually be scanning from here on
+        // so the next line does not reseed the scanner and throw away the
+        // format lock and the default zone.
+        sbc.sbc_format_owner = this->lf_format.get();
+    } else if (this->lf_format.get() != nullptr) {
+        if (prescan_size > 0) {
+            prescan_time = this->lf_index[prescan_size - 1].get_time<>();
+        }
+        /* We've locked onto a format, just use that scanner. */
+        found = this->lf_format->scan(*this, this->lf_index, li, sbr, sbc);
+    }
+
+    if (found.is<log_format::scan_match>()) {
+        if (!this->lf_index.empty()) {
+            auto& last_line = this->lf_index.back();
+
+            this->lf_level_stats.update_msg_count(last_line.get_msg_level());
+            last_line.set_valid_utf(last_line.is_valid_utf()
+                                    && li.li_utf8_scan_result.is_valid());
+            last_line.set_has_ansi(last_line.has_ansi()
+                                   || li.li_utf8_scan_result.usr_has_ansi);
+            if (last_line.get_msg_level() == LEVEL_INVALID) {
+                if (this->lf_invalid_lines.ili_lines.size()
+                    < invalid_line_info::MAX_INVALID_LINES)
+                {
+                    log_debug("%s:%zu:invalid line for format %s: %.*s",
+                              this->lf_filename_as_string.c_str(),
+                              this->lf_index.size() - 1,
+                              this->lf_format->get_name().c_str(),
+                              (int) sbr.length(),
+                              sbr.get_data());
+                    this->lf_invalid_lines.ili_lines.push_back(
+                        this->lf_index.size() - 1);
+                }
+                this->lf_invalid_lines.ili_total += 1;
+            }
+        }
+        if (prescan_size > 0 && this->lf_index.size() >= prescan_size
+            && prescan_time != this->lf_index[prescan_size - 1].get_time<>())
+        {
+            retval = true;
+        }
+        if (prescan_size > 0 && prescan_size < this->lf_index.size()) {
+            auto& second_to_last = this->lf_index[prescan_size - 1];
+            auto& latest = this->lf_index[prescan_size];
+
+            if (!second_to_last.is_ignored() && latest < second_to_last) {
+                if (this->lf_format->lf_time_ordered) {
+                    this->lf_out_of_time_order_count += 1;
+                    for (size_t lpc = prescan_size; lpc < this->lf_index.size();
+                         lpc++)
+                    {
+                        auto& line_to_update = this->lf_index[lpc];
+
+                        line_to_update.set_time_skew(true);
+                        line_to_update.set_time(second_to_last.get_time<>());
+                    }
+                }
+            }
+        }
+    } else if (found.is<log_format::scan_no_match>()) {
+        if (this->lf_format.get() != nullptr) {
+            auto& ll = this->lf_index.back();
+            if (this->lf_format->lf_multiline) {
+                if (this->lf_index.size() > 1) {
+                    auto& prev_ll = this->lf_index[this->lf_index.size() - 2];
+                    if (prev_ll.is_continued() || !prev_ll.is_ignored()) {
+                        ll.set_continued(true);
+                    }
+                }
+            } else {
+                ll.set_level(LEVEL_INVALID);
+            }
+        }
+    }
+
+    if (this->lf_format != nullptr && !this->lf_index.empty()
+        && !this->lf_index.back().is_ignored())
+    {
+        this->lf_content_time_range.extend_to(this->lf_index.back().get_time());
+    }
+
+    if (this->lf_format != nullptr && !this->lf_index.empty()
+        && this->lf_index.back().get_time<>()
+            > this->lf_options.loo_time_range.tr_end)
+    {
+        if (!this->lf_upper_bound_size) {
+            this->lf_upper_bound_size = this->lf_index.back().get_offset();
+            log_debug("%s:%zu: upper found in file found %llu",
+                      this->lf_filename_as_string.c_str(),
+                      this->lf_index.size(),
+                      this->lf_upper_bound_size.value());
+        }
+        this->lf_index.pop_back();
     }
 
     return retval;
 }
 
 logfile::rebuild_result_t
-logfile::rebuild_index(nonstd::optional<ui_clock::time_point> deadline)
+logfile::rebuild_index(std::optional<ui_clock::time_point> deadline)
 {
+    static const auto& dts_cfg
+        = injector::get<const date_time_scanner_ns::config&>();
+
+    static auto op = lnav_operation{"rebuild_file_index"};
+    auto op_guard = lnav_opid_guard::internal(op);
+
+    this->lf_time_rollovers.clear();
+
+    if (!this->lf_invalidated_opids.empty()) {
+        auto writeOpids = this->lf_opids.writeAccess();
+
+        for (auto bm_pair : this->lf_bookmark_metadata) {
+            if (bm_pair.second.bm_opid.empty()) {
+                continue;
+            }
+
+            auto inv_iter
+                = this->lf_invalidated_opids.find(bm_pair.second.bm_opid);
+            if (inv_iter == this->lf_invalidated_opids.end()) {
+                continue;
+            }
+
+            if (bm_pair.first >= this->lf_index.size()) {
+                log_warning("stale bookmark: %d", bm_pair.first);
+                continue;
+            }
+
+            auto opid_iter
+                = writeOpids->los_opid_ranges.find(bm_pair.second.bm_opid);
+            if (opid_iter == writeOpids->los_opid_ranges.end()) {
+                writeOpids->los_opid_ranges.emplace(*inv_iter,
+                                                    opid_time_range{});
+            }
+
+            auto& ll = this->lf_index[bm_pair.first];
+            opid_iter->second.otr_range.extend_to(ll.get_time<>());
+            opid_iter->second.otr_level_stats.update_msg_count(
+                ll.get_msg_level());
+        }
+        this->lf_invalidated_opids.clear();
+    }
+
     if (!this->lf_indexing) {
         if (this->lf_sort_needed) {
             this->lf_sort_needed = false;
@@ -408,6 +1735,17 @@ logfile::rebuild_index(nonstd::optional<ui_clock::time_point> deadline)
         }
         return rebuild_result_t::NO_NEW_LINES;
     }
+
+    if (this->file_options_have_changed()
+        || (this->lf_format != nullptr
+            && (this->lf_zoned_to_local_state != dts_cfg.c_zoned_to_local
+                || this->lf_format->format_changed())))
+    {
+        log_info("%s: format has changed, rebuilding",
+                 this->lf_filename_as_string.c_str());
+        this->reset_internal_state_for_reindex();
+    }
+    this->lf_zoned_to_local_state = dts_cfg.c_zoned_to_local;
 
     auto retval = rebuild_result_t::NO_NEW_LINES;
     struct stat st;
@@ -431,15 +1769,54 @@ logfile::rebuild_index(nonstd::optional<ui_clock::time_point> deadline)
     // Check the previous stat against the last to see if things are wonky.
     if (this->lf_named_file && (is_truncated || is_user_provided_and_rewritten))
     {
-        log_info("overwritten file detected, closing -- %s  new: %" PRId64
-                 "/%" PRId64 "  old: %" PRId64 "/%" PRId64,
-                 this->lf_filename.c_str(),
-                 st.st_size,
-                 st.st_mtime,
-                 this->lf_stat.st_size,
-                 this->lf_stat.st_mtime);
-        this->close();
-        return rebuild_result_t::NO_NEW_LINES;
+        auto is_overwritten = true;
+        if (this->lf_format != nullptr) {
+            const auto first_line = this->lf_index.begin();
+            const auto first_line_range
+                = this->get_file_range(first_line, false);
+            auto read_res = this->read_range(first_line_range);
+            if (read_res.isOk()) {
+                auto sbr = read_res.unwrap();
+                if (first_line->has_ansi()) {
+                    sbr.erase_ansi();
+                }
+                auto curr_content_id
+                    = hasher().update(sbr.get_data(), sbr.length()).to_string();
+
+                log_info(
+                    "%s: overwrite content_id double check: old:%s; now:%s",
+                    this->lf_filename_as_string.c_str(),
+                    this->lf_content_id.c_str(),
+                    curr_content_id.c_str());
+                if (this->lf_content_id == curr_content_id) {
+                    is_overwritten = false;
+                }
+            } else {
+                auto errmsg = read_res.unwrapErr();
+                log_error("unable to read first line for overwrite check: %s",
+                          errmsg.c_str());
+            }
+        }
+
+        if (is_truncated || is_overwritten) {
+            log_info("overwritten file detected, closing -- %s  new: %" PRId64
+                     "/%" PRId64 "  old: %" PRId64 "/%" PRId64,
+                     this->lf_filename_as_string.c_str(),
+                     st.st_size,
+                     st.st_mtime,
+                     this->lf_stat.st_size,
+                     this->lf_stat.st_mtime);
+            this->close();
+            return rebuild_result_t::NO_NEW_LINES;
+        }
+    }
+
+    if (this->lf_text_format == text_format_t::TF_BINARY) {
+        this->lf_index_size = st.st_size;
+        this->lf_stat = st;
+    } else if (this->lf_upper_bound_size) {
+        this->lf_index_size = this->get_content_size();
+        this->lf_stat = st;
     } else if (this->lf_line_buffer.is_data_available(this->lf_index_size,
                                                       st.st_size))
     {
@@ -448,19 +1825,23 @@ logfile::rebuild_index(nonstd::optional<ui_clock::time_point> deadline)
         // We haven't reached the end of the file.  Note that we use the
         // line buffer's notion of the file size since it may be compressed.
         bool has_format = this->lf_format.get() != nullptr;
-        struct rusage begin_rusage;
         file_off_t off;
         size_t begin_size = this->lf_index.size();
-        bool record_rusage = this->lf_index.size() == 1;
         off_t begin_index_size = this->lf_index_size;
-        size_t rollback_size = 0;
+        size_t rollback_size = 0, rollback_index_start = 0;
 
-        if (record_rusage) {
-            getrusage(RUSAGE_SELF, &begin_rusage);
-        }
+        // Bracket the read+scan loop with a wall and a thread-CPU
+        // clock; the post-loop block at end-of-this-branch folds
+        // their deltas into la_index_{wall,cpu}_us if any new index
+        // entries actually landed.
+        const auto wall_begin = std::chrono::steady_clock::now();
+        struct timespec cpu_begin{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_begin);
 
         if (begin_size == 0 && !has_format) {
-            log_debug("scanning file... %s", this->lf_filename.c_str());
+            log_debug("scanning file... fd(%d) %s",
+                      this->lf_line_buffer.get_fd(),
+                      this->lf_filename_as_string.c_str());
         }
 
         if (!this->lf_index.empty()) {
@@ -475,25 +1856,52 @@ logfile::rebuild_index(nonstd::optional<ui_clock::time_point> deadline)
                 rollback_size += 1;
             }
             this->lf_index.pop_back();
+            rollback_index_start = this->lf_index.size();
             rollback_size += 1;
+            this->truncate_time_order(rollback_index_start);
 
             if (!this->lf_index.empty()) {
-                auto last_line = this->lf_index.end();
-                --last_line;
-                auto check_line_off = last_line->get_offset();
+                auto last_line = std::prev(this->lf_index.end());
+                if (last_line != this->lf_index.begin()) {
+                    auto prev_line = std::prev(last_line);
+                    this->lf_line_buffer.flush_at(prev_line->get_offset());
+                    auto prev_len_res
+                        = this->message_byte_length(prev_line, false);
+
+                    auto read_result = this->lf_line_buffer.read_range({
+                        prev_line->get_offset(),
+                        prev_len_res.mlr_length + 1,
+                    });
+                    if (read_result.isErr()) {
+                        log_info(
+                            "overwritten file detected, closing -- %s (%s)",
+                            this->lf_filename_as_string.c_str(),
+                            read_result.unwrapErr().c_str());
+                        this->close();
+                        return rebuild_result_t::INVALID;
+                    }
+
+                    auto sbr = read_result.unwrap();
+                    if (!sbr.to_string_fragment().endswith("\n")) {
+                        log_info("overwritten file detected, closing -- %s",
+                                 this->lf_filename_as_string.c_str());
+                        this->close();
+                        return rebuild_result_t::INVALID;
+                    }
+                } else {
+                    this->lf_line_buffer.flush_at(last_line->get_offset());
+                }
                 auto last_length_res
                     = this->message_byte_length(last_line, false);
-                log_debug("flushing at %d", check_line_off);
-                this->lf_line_buffer.flush_at(check_line_off);
 
                 auto read_result = this->lf_line_buffer.read_range({
-                    check_line_off,
+                    last_line->get_offset(),
                     last_length_res.mlr_length,
                 });
 
                 if (read_result.isErr()) {
                     log_info("overwritten file detected, closing -- %s (%s)",
-                             this->lf_filename.c_str(),
+                             this->lf_filename_as_string.c_str(),
                              read_result.unwrapErr().c_str());
                     this->close();
                     return rebuild_result_t::INVALID;
@@ -503,144 +1911,338 @@ logfile::rebuild_index(nonstd::optional<ui_clock::time_point> deadline)
             }
         } else {
             this->lf_line_buffer.flush_at(0);
-            off = 0;
+            off = this->lf_index_size;
         }
         if (this->lf_logline_observer != nullptr) {
             this->lf_logline_observer->logline_restart(*this, rollback_size);
         }
 
-        bool sort_needed = this->lf_sort_needed;
-        this->lf_sort_needed = false;
+        bool sort_needed = std::exchange(this->lf_sort_needed, false);
         size_t limit = SIZE_MAX;
+        const auto max_lines = std::min(
+            MAX_LINES,
+            injector::get<const lnav::logfile::config&>().lc_max_lines);
 
         if (deadline) {
             if (ui_clock::now() > deadline.value()) {
                 if (has_format) {
                     log_warning("with format ran past deadline! -- %s",
-                                this->lf_filename.c_str());
+                                this->lf_filename_as_string.c_str());
                     limit = 1000;
                 } else {
                     limit = 100;
                 }
-            } else if (!has_format) {
+            } else if (this->lf_options.loo_detect_format
+                       && (!has_format
+                           || (this->lf_options.loo_time_range.has_bounds()
+                               && this->lf_file_size_at_map_time == 0)))
+            {
                 limit = 1000;
             } else {
                 limit = 1000 * 1000;
             }
         }
-        if (!has_format) {
-            log_debug(
-                "loading file... %s:%d", this->lf_filename.c_str(), begin_size);
+        if (this->lf_options.loo_streaming) {
+            limit = std::min(limit, this->lf_options.loo_stream_batch_lines);
         }
-        scan_batch_context sbc{this->lf_allocator};
-        sbc.sbc_opids.reserve(32);
+        if (!has_format) {
+            log_debug("loading file... %s:%zu",
+                      this->lf_filename_as_string.c_str(),
+                      begin_size);
+        }
+        scan_batch_context sbc{
+            this->lf_allocator,
+            this->lf_pattern_locks,
+            this->lf_time_scanner,
+        };
+        if (this->lf_format != nullptr) {
+            // The scanner outlives this context -- it belongs to the file --
+            // and already holds what earlier batches worked out.  Say which
+            // format it is set up for so that it is not seeded over again and
+            // handed back its format lock and base time.
+            sbc.sbc_format_owner = this->lf_format.get();
+        }
+        if (this->lf_cached_base_time) {
+            sbc.sbc_base_time = this->lf_cached_base_time;
+            sbc.sbc_base_tm = this->lf_cached_base_tm.value();
+        }
+        sbc.sbc_opids.los_opid_ranges.reserve(32);
+        sbc.sbc_tids.ltis_tid_ranges.reserve(8);
+        // Asked once for the pass rather than once per line: it is a virtual
+        // call that answers for the filter stack, which belongs to the UI
+        // thread and cannot change while this scan is running.  A filter
+        // added in the meantime re-reads the file through reobserve_from()
+        // anyway, so a stale answer here costs nothing.
+        const auto observer_wants_text = this->lf_logline_observer != nullptr
+            && this->lf_logline_observer->logline_wants_text();
         auto prev_range = file_range{off};
         while (limit > 0) {
             auto load_result = this->lf_line_buffer.load_next_line(prev_range);
-
             if (load_result.isErr()) {
                 log_error("%s: load next line failure -- %s",
-                          this->lf_filename.c_str(),
+                          this->lf_filename_as_string.c_str(),
                           load_result.unwrapErr().c_str());
                 this->close();
                 return rebuild_result_t::INVALID;
             }
 
             auto li = load_result.unwrap();
-
             if (li.li_file_range.empty()) {
                 break;
             }
             prev_range = li.li_file_range;
 
-            if (!this->lf_options.loo_non_utf_is_visible && !li.li_valid_utf) {
-                log_info("file is not utf, hiding: %s",
-                         this->lf_filename.c_str());
-                this->lf_indexing = false;
-                this->lf_options.loo_is_visible = false;
-                this->lf_notes.writeAccess()->emplace(note_type::not_utf,
-                                                      "hiding non-UTF-8 file");
-                if (this->lf_logfile_observer != nullptr) {
-                    this->lf_logfile_observer->logfile_indexing(
-                        this->shared_from_this(), 0, 0);
+            this->lf_input_lines += 1;
+
+            // Nothing downstream looks at the bytes of a line in a file that
+            // has no format and is no longer being scanned for one, and
+            // getting a reference to them is not free: registering one walks
+            // the owning buffer's ref list, as does letting it go, and
+            // erase_ansi() below would copy the line to rewrite it.  Empty
+            // from here down in that case -- see needs_line_text() for who
+            // would have read it.
+            shared_buffer_ref sbr;
+            if (this->needs_line_text(li, observer_wants_text)) {
+                auto read_result
+                    = this->lf_line_buffer.read_range(li.li_file_range);
+                if (read_result.isErr()) {
+                    log_error("%s:read failure -- %s",
+                              this->lf_filename_as_string.c_str(),
+                              read_result.unwrapErr().c_str());
+                    this->close();
+                    return rebuild_result_t::INVALID;
                 }
-                break;
+                sbr = read_result.unwrap();
             }
 
+            if (this->lf_format == nullptr
+                && !this->lf_options.loo_non_utf_is_visible
+                && !li.li_utf8_scan_result.is_valid())
+            {
+                log_info("file is not utf, hiding: %s",
+                         this->lf_filename_as_string.c_str());
+                this->lf_indexing = false;
+                this->lf_options.loo_is_visible = false;
+                attr_line_t hex;
+                attr_line_builder alb(hex);
+                alb.append_as_hexdump(sbr.to_string_fragment());
+                auto snip = lnav::console::snippet::from(
+                    source_location{
+                        intern_string::lookup(this->lf_filename),
+                        (int) this->lf_index.size() + 1,
+                    },
+                    hex);
+                auto note_um
+                    = lnav::console::user_message::warning(
+                          attr_line_t("skipping indexing for ")
+                              .append_quoted(this->lf_filename))
+                          .with_reason("File contains invalid UTF-8")
+                          .with_note(
+                              attr_line_t(li.li_utf8_scan_result.usr_message)
+                                  .append(" at line ")
+                                  .append(lnav::roles::number(fmt::to_string(
+                                      this->lf_index.size() + 1)))
+                                  .append(" column ")
+                                  .append(lnav::roles::number(fmt::to_string(
+                                      li.li_utf8_scan_result.usr_valid_frag
+                                          .sf_end))))
+                          .with_snippet(snip)
+                          .move();
+                this->lf_notes.writeAccess()->insert(note_type::not_utf,
+                                                     note_um);
+                // Equal values are what the UI treats as "nothing to
+                // report", which clears the loading bar.
+                this->lf_index_progress.ip_offset.store(
+                    0, std::memory_order_relaxed);
+                this->lf_index_progress.ip_total.store(
+                    0, std::memory_order_relaxed);
+                break;
+            }
             size_t old_size = this->lf_index.size();
 
-            if (old_size == 0
-                && this->lf_text_format == text_format_t::TF_UNKNOWN)
-            {
-                file_range fr = this->lf_line_buffer.get_available();
+            if (old_size == 0 && !this->lf_text_format) {
+                auto fr = this->lf_line_buffer.get_available();
                 auto avail_data = this->lf_line_buffer.read_range(fr);
 
                 this->lf_text_format
                     = avail_data
-                          .map([path = this->get_path()](
-                                   const shared_buffer_ref& avail_sbr)
-                                   -> text_format_t {
-                              return detect_text_format(
-                                  avail_sbr.to_string_fragment(), path);
+                          .map([path = this->get_path(),
+                                this](const shared_buffer_ref& avail_sbr)
+                                   -> std::optional<text_format_t> {
+                              constexpr auto DETECT_LIMIT = 16 * 1024;
+                              auto sbr_str = to_string(avail_sbr);
+                              if (sbr_str.size() > DETECT_LIMIT) {
+                                  sbr_str.resize(DETECT_LIMIT);
+                              }
+
+                              if (this->lf_line_buffer.is_piper()) {
+                                  auto lines
+                                      = string_fragment::from_str(sbr_str)
+                                            .split_lines();
+                                  for (auto line_iter = lines.rbegin();
+                                       // XXX rejigger read_range() for
+                                       // multi-line reads
+                                       std::next(line_iter) != lines.rend();
+                                       ++line_iter)
+                                  {
+                                      sbr_str.erase(line_iter->sf_begin, 22);
+                                  }
+                              }
+                              auto utf8_res = is_utf8(sbr_str);
+                              if (utf8_res.is_valid()
+                                  && utf8_res.usr_has_ansi) {
+                                  auto new_size = erase_ansi_escapes(sbr_str);
+                                  sbr_str.resize(new_size);
+                              }
+                              return detect_text_format(sbr_str, path);
                           })
-                          .unwrapOr(text_format_t::TF_UNKNOWN);
-                log_debug("setting text format to %d", this->lf_text_format);
-            }
-            if (!li.li_valid_utf
-                && this->lf_text_format != text_format_t::TF_MARKDOWN
-                && this->lf_text_format != text_format_t::TF_LOG)
-            {
-                this->lf_text_format = text_format_t::TF_BINARY;
+                          .unwrapOr(std::nullopt);
+                if (this->lf_text_format) {
+                    log_debug(
+                        "setting text format to %s",
+                        fmt::to_string(this->lf_text_format.value()).c_str());
+                    switch (this->lf_text_format.value()) {
+                        case text_format_t::TF_DIFF:
+                        case text_format_t::TF_MAN:
+                        case text_format_t::TF_MARKDOWN:
+                            log_debug(
+                                "  file is text, disabling log format "
+                                "detection");
+                            this->lf_options.loo_detect_format = false;
+                            break;
+                        default:
+                            break;
+                    }
+                }
             }
 
-            auto read_result
-                = this->lf_line_buffer.read_range(li.li_file_range);
-            if (read_result.isErr()) {
-                log_error("%s:read failure -- %s",
-                          this->lf_filename.c_str(),
-                          read_result.unwrapErr().c_str());
-                this->close();
-                return rebuild_result_t::INVALID;
+            if (!li.li_utf8_scan_result.is_valid()) {
+                log_warning(
+                    "%s: invalid UTF-8 detected at L%zu:C%d/%lld (O:%lld) -- "
+                    "%s",
+                    this->lf_filename_as_string.c_str(),
+                    this->lf_index.size() + 1,
+                    li.li_utf8_scan_result.usr_valid_frag.sf_end,
+                    li.li_file_range.fr_size,
+                    li.li_file_range.fr_offset,
+                    li.li_utf8_scan_result.usr_message);
+                if (lnav_log_level <= lnav_log_level_t::TRACE) {
+                    attr_line_t al;
+                    attr_line_builder alb(al);
+                    alb.append_as_hexdump(
+                        sbr.to_string_fragment().sub_range(0, 256));
+                    log_warning("  dump: %s", al.al_string.c_str());
+                }
             }
 
-            auto sbr = read_result.unwrap();
             sbr.rtrim(is_line_ending);
 
-            if (li.li_valid_utf && li.li_has_ansi) {
-                auto tmp_line = sbr.to_string_fragment().to_string();
-
-                scrub_ansi_string(tmp_line, nullptr);
-                memcpy(sbr.get_writable_data(tmp_line.length()),
-                       tmp_line.c_str(),
-                       tmp_line.length());
-                sbr.narrow(0, tmp_line.length());
+            if (li.li_utf8_scan_result.is_valid()
+                && li.li_utf8_scan_result.usr_has_ansi)
+            {
+                sbr.erase_ansi();
             }
 
             this->lf_longest_line
-                = std::max(this->lf_longest_line, sbr.length());
-            this->lf_partial_line = li.li_partial;
+                = std::max(this->lf_longest_line,
+                           li.li_utf8_scan_result.usr_column_width_guess);
+            this->lf_last_line_info = li;
             sort_needed = this->process_prefix(sbr, li, sbc) || sort_needed;
+            if (sort_needed && this->lf_index.empty()) {
+                if (limit < 1000) {
+                    limit = 1000;
+                }
+                prev_range = file_range{0};
+                continue;
+            }
 
-            if (old_size > this->lf_index.size()) {
-                old_size = 0;
+            // The limit comes from how the log view numbers lines, and a
+            // file being streamed never goes into the log view.
+            if (!this->lf_options.loo_streaming
+                && this->lf_index.size() > max_lines)
+            {
+                log_warning(
+                    "%s: reached the maximum of %llu lines, "
+                    "stopping indexing",
+                    this->lf_filename_as_string.c_str(),
+                    (unsigned long long) max_lines);
+                // A single line can add several entries, so drop all of
+                // them rather than keep part of the message.
+                while (this->lf_index.size() > old_size) {
+                    this->lf_index.pop_back();
+                }
+                prev_range = file_range{li.li_file_range.fr_offset};
+                this->lf_indexing = false;
+                auto note_um
+                    = lnav::console::user_message::warning(
+                          attr_line_t("stopped indexing ")
+                              .append_quoted(this->lf_filename))
+                          .with_reason(
+                              attr_line_t("file has more than ")
+                                  .append(lnav::roles::number(
+                                      fmt::to_string(max_lines)))
+                                  .append(" lines, the maximum that can be "
+                                          "indexed for a single file"))
+                          .with_help("split the file into smaller pieces")
+                          .move();
+                this->lf_notes.writeAccess()->insert(note_type::line_limit,
+                                                     note_um);
+                this->lf_index_progress.ip_offset.store(
+                    0, std::memory_order_relaxed);
+                this->lf_index_progress.ip_total.store(
+                    0, std::memory_order_relaxed);
+                break;
             }
 
             // Update this early so that line_length() works
             this->lf_index_size = li.li_file_range.next_offset();
-
-            if (this->lf_logline_observer != nullptr) {
-                this->lf_logline_observer->logline_new_lines(
-                    *this, this->begin() + old_size, this->end(), sbr);
+            if (old_size > this->lf_index.size()) {
+                old_size = 0;
             }
 
-            if (this->lf_logfile_observer != nullptr) {
-                auto indexing_res = this->lf_logfile_observer->logfile_indexing(
-                    this->shared_from_this(),
-                    this->lf_line_buffer.get_read_offset(
-                        li.li_file_range.next_offset()),
-                    st.st_size);
+            if (this->lf_logline_observer != nullptr) {
+                auto nl_rc = this->lf_logline_observer->logline_new_lines(
+                    *this, this->begin() + old_size, this->end(), sbr);
+                if (rollback_size > 0 && old_size == rollback_index_start
+                    && nl_rc)
+                {
+                    log_debug(
+                        "%s: rollbacked line %zu matched filter, forcing "
+                        "full sort",
+                        this->lf_filename_as_string.c_str(),
+                        rollback_index_start);
+                    sort_needed = true;
+                }
+            }
 
-                if (indexing_res == logfile_observer::indexing_result::BREAK) {
+            {
+                // A single coordinate space; the old pairing put a compressed
+                // offset against get_content_size(), which reports the
+                // compressed size until the stream hits EOF and the
+                // decompressed one after.
+                auto prog = this->get_index_progress();
+                // Some streams cannot say how much is left -- a multi-member
+                // gzip, whose ISIZE trailer describes only its last member,
+                // is the one to reach for.  A total of 0 is what the file
+                // list reads as "no denominator" and draws a "working" icon
+                // for; the offset still says how far the read has got, so the
+                // size column keeps counting up.  Reporting the two as equal
+                // instead would claim the file was finished on every tick.
+                const auto done = prog ? prog->first : this->lf_index_size;
+                const auto total = prog ? prog->second : 0;
+
+                // The total goes first so a reader that catches the pair
+                // mid-update sees a denominator at least as large as the
+                // numerator.
+                this->lf_index_progress.ip_total.store(
+                    total, std::memory_order_relaxed);
+                this->lf_index_progress.ip_offset.store(
+                    done, std::memory_order_relaxed);
+
+                if (this->lf_index_progress.ip_abort.load(
+                        std::memory_order_relaxed))
+                {
+                    log_debug("indexing interrupted");
                     break;
                 }
             }
@@ -661,39 +2263,77 @@ logfile::rebuild_index(nonstd::optional<ui_clock::time_point> deadline)
                 break;
             }
 #endif
-            if (this->lf_format) {
-                if (!this->lf_applicable_taggers.empty()) {
-                    auto sf = sbr.to_string_fragment();
+            // Tags, partitions, and watch expressions are keyed by line number
+            // and have side effects, neither of which fits a streaming read.
+            if (this->lf_format && li.li_utf8_scan_result.is_valid()
+                && !this->lf_options.loo_streaming)
+            {
+                auto sf = sbr.to_string_fragment();
 
-                    for (const auto& td : this->lf_applicable_taggers) {
-                        auto curr_ll = this->end() - 1;
+                for (const auto& td : this->lf_applicable_taggers) {
+                    thread_local auto tag_md
+                        = lnav::pcre2pp::match_data::unitialized();
+                    auto curr_ll = this->end() - 1;
 
-                        if (td->ftd_level != LEVEL_UNKNOWN
-                            && td->ftd_level != curr_ll->get_msg_level())
-                        {
-                            continue;
+                    if (td->ftd_level != LEVEL_UNKNOWN
+                        && td->ftd_level != curr_ll->get_msg_level())
+                    {
+                        continue;
+                    }
+
+                    auto match_res = td->ftd_pattern.pp_value->capture_from(sf)
+                                         .into(tag_md)
+                                         .matches(PCRE2_NO_UTF_CHECK)
+                                         .ignore_error();
+                    if (match_res) {
+                        while (curr_ll->is_continued()) {
+                            --curr_ll;
                         }
+                        curr_ll->set_meta_mark(true);
+                        auto line_number = static_cast<uint32_t>(
+                            std::distance(this->begin(), curr_ll));
 
-                        if (td->ftd_pattern.pp_value
-                                ->find_in(sf, PCRE2_NO_UTF_CHECK)
-                                .ignore_error()
-                                .has_value())
-                        {
-                            curr_ll->set_mark(true);
-                            while (curr_ll->is_continued()) {
-                                --curr_ll;
-                            }
-                            auto line_number = static_cast<uint32_t>(
-                                std::distance(this->begin(), curr_ll));
+                        this->lf_bookmark_metadata[line_number].add_tag(
+                            tag_md.get_count() > 1
+                                ? td->ftd_name + tag_md.to_string()
+                                : td->ftd_name,
+                            bookmark_metadata::meta_source::format);
+                    }
+                }
 
-                            this->lf_bookmark_metadata[line_number].add_tag(
-                                td->ftd_name);
+                for (const auto& pd : this->lf_applicable_partitioners) {
+                    thread_local auto part_md
+                        = lnav::pcre2pp::match_data::unitialized();
+
+                    auto curr_ll = this->end() - 1;
+
+                    if (pd->fpd_level != LEVEL_UNKNOWN
+                        && pd->fpd_level != curr_ll->get_msg_level())
+                    {
+                        continue;
+                    }
+
+                    auto match_res = pd->fpd_pattern.pp_value->capture_from(sf)
+                                         .into(part_md)
+                                         .matches(PCRE2_NO_UTF_CHECK)
+                                         .ignore_error();
+                    if (match_res) {
+                        while (curr_ll->is_continued()) {
+                            --curr_ll;
                         }
+                        curr_ll->set_meta_mark(true);
+                        auto line_number = static_cast<uint32_t>(
+                            std::distance(this->begin(), curr_ll));
+
+                        this->lf_bookmark_metadata[line_number].bm_name
+                            = part_md.to_string();
+                        this->lf_bookmark_metadata[line_number].bm_name_source
+                            = bookmark_metadata::meta_source::format;
                     }
                 }
 
                 if (!this->back().is_continued()) {
-                    lnav::log::watch::eval_with(*this, this->end() - 1);
+                    lnav::log::watch::eval_for(*this, this->end() - 1);
                 }
             }
 
@@ -701,6 +2341,10 @@ logfile::rebuild_index(nonstd::optional<ui_clock::time_point> deadline)
                 // The last read was at the end of the file, so break.  We'll
                 // need to cycle back around to pop off this partial line in
                 // order to continue reading correctly.
+                break;
+            }
+
+            if (this->lf_upper_bound_size) {
                 break;
             }
 
@@ -713,36 +2357,36 @@ logfile::rebuild_index(nonstd::optional<ui_clock::time_point> deadline)
             && st.st_size >= this->lf_options.loo_visible_size_limit)
         {
             log_info("file has unknown format and is too large: %s",
-                     this->lf_filename.c_str());
+                     this->lf_filename_as_string.c_str());
             this->lf_indexing = false;
-            this->lf_notes.writeAccess()->emplace(
-                note_type::indexing_disabled,
-                "not indexing large file with no discernible log format");
-            if (this->lf_logfile_observer != nullptr) {
-                this->lf_logfile_observer->logfile_indexing(
-                    this->shared_from_this(), 0, 0);
-            }
+            auto note_um
+                = lnav::console::user_message::warning(
+                      "skipping indexing for file")
+                      .with_reason(
+                          "file is large and has no discernible log format")
+                      .move();
+            this->lf_notes.writeAccess()->insert(note_type::indexing_disabled,
+                                                 note_um);
+            this->lf_index_progress.ip_offset.store(0,
+                                                    std::memory_order_relaxed);
+            this->lf_index_progress.ip_total.store(0,
+                                                   std::memory_order_relaxed);
         }
 
         if (this->lf_logline_observer != nullptr) {
             this->lf_logline_observer->logline_eof(*this);
         }
 
-        if (record_rusage
-            && (prev_range.fr_offset - begin_index_size) > (500 * 1024))
-        {
-            struct rusage end_rusage;
+        if (this->lf_index.size() > begin_size) {
+            struct timespec cpu_end{};
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end);
+            const auto wall_end = std::chrono::steady_clock::now();
 
-            getrusage(RUSAGE_SELF, &end_rusage);
-            rusagesub(end_rusage,
-                      begin_rusage,
-                      this->lf_activity.la_initial_index_rusage);
-            log_info("Resource usage for initial indexing of file: %s:%d-%d",
-                     this->lf_filename.c_str(),
-                     begin_size,
-                     this->lf_index.size());
-            log_rusage(lnav_log_level_t::INFO,
-                       this->lf_activity.la_initial_index_rusage);
+            this->lf_activity.la_index.is_wall_us
+                += std::chrono::duration_cast<std::chrono::microseconds>(
+                    wall_end - wall_begin);
+            this->lf_activity.la_index.is_cpu_us
+                += to_us(cpu_end) - to_us(cpu_begin);
         }
 
         /*
@@ -752,119 +2396,329 @@ logfile::rebuild_index(nonstd::optional<ui_clock::time_point> deadline)
          */
         this->lf_index_size = prev_range.next_offset();
         this->lf_stat = st;
+        this->lf_time_rollovers = std::move(sbc.sbc_time_rollovers);
 
+        this->lf_value_stats.resize(sbc.sbc_value_stats.size());
+        for (size_t lpc = 0; lpc < sbc.sbc_value_stats.size(); lpc++) {
+            this->lf_value_stats[lpc].merge(sbc.sbc_value_stats[lpc]);
+        }
         {
-            safe::WriteAccess<logfile::safe_opid_map> writable_opid_map(
+            safe::WriteAccess<safe_opid_state> writable_opid_map(
                 this->lf_opids);
 
-            for (const auto& opid_pair : sbc.sbc_opids) {
-                auto opid_iter = writable_opid_map->find(opid_pair.first);
+            for (const auto& opid_pair : sbc.sbc_opids.los_opid_ranges) {
+                auto opid_iter
+                    = writable_opid_map->los_opid_ranges.find(opid_pair.first);
 
-                if (opid_iter == writable_opid_map->end()) {
-                    writable_opid_map->emplace(opid_pair);
+                if (opid_iter == writable_opid_map->los_opid_ranges.end()) {
+                    writable_opid_map->los_opid_ranges.emplace(opid_pair);
                 } else {
-                    if (opid_pair.second.otr_begin
-                        < opid_iter->second.otr_begin)
-                    {
-                        opid_iter->second.otr_begin
-                            = opid_pair.second.otr_begin;
-                    }
-                    if (opid_iter->second.otr_end < opid_pair.second.otr_end) {
-                        opid_iter->second.otr_end = opid_pair.second.otr_end;
-                    }
+                    opid_iter->second |= opid_pair.second;
                 }
             }
+            log_debug(
+                "%s: opid_map size: count=%zu; sizeof(otr)=%zu; alloc=%zu",
+                this->lf_filename_as_string.c_str(),
+                writable_opid_map->los_opid_ranges.size(),
+                sizeof(opid_time_range),
+                this->lf_allocator.getNumBytesAllocated());
+        }
+        {
+            auto tids = this->lf_thread_ids.writeAccess();
+
+            sbc.sbc_tids.flush_no_tid(sbc.sbc_allocator);
+            for (const auto& tid_pair : sbc.sbc_tids.ltis_tid_ranges) {
+                auto tid_iter = tids->ltis_tid_ranges.find(tid_pair.first);
+                if (tid_iter == tids->ltis_tid_ranges.end()) {
+                    tids->ltis_tid_ranges.emplace(tid_pair);
+                } else {
+                    tid_iter->second |= tid_pair.second;
+                }
+            }
+            log_debug("%s: tid_map size: count=%zu; sizeof(otr)=%zu; alloc=%zu",
+                      this->lf_filename_as_string.c_str(),
+                      tids->ltis_tid_ranges.size(),
+                      sizeof(opid_time_range),
+                      this->lf_allocator.getNumBytesAllocated());
         }
 
-        if (sort_needed) {
+        if (begin_size > this->lf_index.size()) {
+            log_info("overwritten file detected, closing -- %s",
+                     this->lf_filename_as_string.c_str());
+            this->close();
+            return rebuild_result_t::INVALID;
+        }
+
+        if (sort_needed || begin_size > this->lf_index.size()) {
             retval = rebuild_result_t::NEW_ORDER;
         } else {
             retval = rebuild_result_t::NEW_LINES;
         }
-    } else if (this->lf_sort_needed) {
-        retval = rebuild_result_t::NEW_ORDER;
-        this->lf_sort_needed = false;
+
+        if (!this->lf_options.loo_streaming) {
+            auto est_rem = this->estimated_remaining_lines();
+            if (est_rem > 0) {
+                this->lf_index.reserve(this->lf_index.size() + est_rem);
+            }
+        }
+
+        if (this->lf_format != nullptr
+            && this->lf_options.loo_time_range.has_bounds()
+            && (this->lf_index.size() >= RETRY_MATCH_SIZE
+                || this->lf_index_size == this->get_content_size())
+            && this->lf_file_size_at_map_time != this->get_content_size())
+        {
+            switch (this->build_content_map()) {
+                case rebuild_result_t::NEW_ORDER:
+                    retval = rebuild_result_t::NEW_ORDER;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        for (auto& lvs : this->lf_value_stats) {
+            lvs.finalize();
+        }
+    } else {
+        this->lf_stat = st;
+        if (this->lf_sort_needed) {
+            retval = rebuild_result_t::NEW_ORDER;
+            this->lf_sort_needed = false;
+        }
     }
 
-    this->lf_index_time = this->lf_line_buffer.get_file_time();
-    if (!this->lf_index_time) {
-        this->lf_index_time = st.st_mtime;
+    this->update_time_order(retval == rebuild_result_t::NEW_ORDER);
+
+    this->lf_index_time
+        = std::chrono::seconds{this->lf_line_buffer.get_file_time()};
+    if (this->lf_index_time.count() == 0) {
+        this->lf_index_time = std::chrono::seconds{st.st_mtime};
     }
 
     if (this->lf_out_of_time_order_count) {
         log_info("Detected %d out-of-time-order lines in file: %s",
                  this->lf_out_of_time_order_count,
-                 this->lf_filename.c_str());
+                 this->lf_filename_as_string.c_str());
         this->lf_out_of_time_order_count = 0;
     }
+
+    this->lf_activity.la_index.is_memory_bytes
+        = (this->lf_index.capacity() * sizeof(logline))
+        + (this->lf_time_order.capacity() * sizeof(uint32_t))
+        + (this->lf_value_stats.capacity() * sizeof(logline_value_stats))
+        + this->lf_plain_msg_buffer.capacity()
+        + this->lf_allocator.getNumBytesAllocated();
+    this->lf_activity.la_line_buffer_memory_bytes
+        = this->lf_line_buffer.get_byte_size();
+
+    // Whatever eval_for() batched during the loop above is this file's, and
+    // this is the last chance to send it before the caller moves on.
+    lnav::log::watch::flush_pending();
 
     return retval;
 }
 
+std::pair<logfile::iterator, logfile::iterator>
+logfile::message_lines(iterator ll)
+{
+    auto starting_ll = ll;
+    while (starting_ll != this->begin()) {
+        if (!starting_ll->is_continued()) {
+            break;
+        }
+        --starting_ll;
+    }
+    auto ending_ll = starting_ll;
+    while (ending_ll != this->end()) {
+        if (ending_ll->get_sub_offset() != 0) {
+            break;
+        }
+        if (!ending_ll->is_continued()) {
+            break;
+        }
+        ++ending_ll;
+    }
+    return std::make_pair(starting_ll, ending_ll);
+}
+
 Result<shared_buffer_ref, std::string>
-logfile::read_line(logfile::iterator ll)
+logfile::read_line(iterator ll, subline_options opts)
 {
     try {
+        if (this->lf_format && this->lf_format->lf_formatted_lines) {
+            auto raw_read_res = this->read_raw_message(this->message_start(ll));
+            if (raw_read_res.isErr()) {
+                return Err(raw_read_res.unwrapErr());
+            }
+            auto sbr = raw_read_res.unwrap();
+            sbr.rtrim(is_line_ending);
+            auto& sbr_meta = sbr.get_metadata();
+            if (opts.scrub_invalid_utf8 && !sbr_meta.m_valid_utf) {
+                scrub_to_utf8(sbr.get_writable_data(), sbr.length());
+                sbr_meta.m_valid_utf = true;
+            }
+            this->lf_format->get_subline(
+                this->get_format_file_state(), *ll, sbr, opts);
+            return Ok(std::move(sbr));
+        }
+
         auto get_range_res = this->get_file_range(ll, false);
         return this->lf_line_buffer.read_range(get_range_res)
-            .map([&ll, &get_range_res, this](auto sbr) {
+            .map([&ll, &get_range_res, &opts, this](auto sbr) {
                 sbr.rtrim(is_line_ending);
-                if (!get_range_res.fr_metadata.m_valid_utf) {
+                if (opts.scrub_invalid_utf8
+                    && !get_range_res.fr_metadata.m_valid_utf)
+                {
                     scrub_to_utf8(sbr.get_writable_data(), sbr.length());
                     sbr.get_metadata().m_valid_utf = true;
                 }
 
                 if (this->lf_format != nullptr) {
-                    this->lf_format->get_subline(*ll, sbr);
+                    this->lf_format->get_subline(
+                        this->get_format_file_state(), *ll, sbr, opts);
                 }
-
                 return sbr;
             });
     } catch (const line_buffer::error& e) {
-        return Err(std::string(strerror(e.e_err)));
+        return Err(std::error_code{e.e_err, std::generic_category()}.message());
     }
 }
 
-Result<std::string, std::string>
-logfile::read_file()
+Result<logfile::read_file_result, std::string>
+logfile::read_file(read_format_t format)
 {
     if (this->lf_stat.st_size > line_buffer::MAX_LINE_BUFFER_SIZE) {
         return Err(std::string("file is too large to read"));
     }
 
-    auto retval
-        = TRY(this->lf_line_buffer.read_range({0, this->lf_stat.st_size}));
+    auto retval = read_file_result{};
+    retval.rfr_content.reserve(this->lf_stat.st_size);
 
-    return Ok(to_string(retval));
+    if (format == read_format_t::with_framing) {
+        retval.rfr_content.append(this->lf_line_buffer.get_piper_header_size(),
+                                  '\x16');
+    }
+    for (auto iter = this->begin(); iter != this->end(); ++iter) {
+        const auto fr = this->get_file_range(iter);
+        retval.rfr_range.fr_metadata |= fr.fr_metadata;
+        retval.rfr_range.fr_size = fr.next_offset();
+        auto sbr = TRY(this->lf_line_buffer.read_range(fr));
+
+        if (format == read_format_t::with_framing
+            && this->lf_line_buffer.is_piper())
+        {
+            retval.rfr_content.append(22, '\x16');
+        }
+        retval.rfr_content.append(sbr.get_data(), sbr.length());
+        if ((file_ssize_t) retval.rfr_content.size() < this->lf_stat.st_size) {
+            retval.rfr_content.push_back('\n');
+        }
+    }
+
+    return Ok(std::move(retval));
+}
+
+Result<shared_buffer_ref, std::string>
+logfile::read_range(const file_range& fr)
+{
+    return this->lf_line_buffer.read_range(fr);
+}
+
+size_t
+logfile::get_line_number(const_iterator ll) const
+{
+    size_t retval = 1;
+
+    if (this->lf_format != nullptr && this->lf_format->lf_formatted_lines) {
+        for (auto iter = this->begin(); iter != ll; ++iter) {
+            if (iter->get_sub_offset() == 0) {
+                retval += 1;
+            }
+        }
+    } else {
+        retval += std::distance(this->begin(), ll);
+    }
+
+    return retval;
 }
 
 void
-logfile::read_full_message(logfile::const_iterator ll,
+logfile::read_full_message(const_iterator ll,
                            shared_buffer_ref& msg_out,
-                           int max_lines)
+                           line_buffer::scan_direction dir,
+                           read_format_t format)
 {
     require(ll->get_sub_offset() == 0);
 
 #if 0
     log_debug(
-        "%s: reading msg at %d", this->lf_filename.c_str(), ll->get_offset());
+        "%s: reading msg at %d", this->lf_filename_as_string.c_str(), ll->get_offset());
 #endif
 
     msg_out.disown();
-    auto range_for_line = this->get_file_range(ll);
+    auto mlr = this->message_byte_length(ll);
+    auto range_for_line
+        = file_range{ll->get_offset(), mlr.mlr_length, mlr.mlr_metadata};
     try {
-        auto read_result = this->lf_line_buffer.read_range(range_for_line);
-
-        if (read_result.isErr()) {
-            log_error("unable to read range %d:%d",
-                      range_for_line.fr_offset,
-                      range_for_line.fr_size);
-            return;
+        if (range_for_line.fr_size > line_buffer::MAX_LINE_BUFFER_SIZE) {
+            range_for_line.fr_size = line_buffer::MAX_LINE_BUFFER_SIZE;
         }
-        msg_out = read_result.unwrap();
-        msg_out.get_metadata() = range_for_line.fr_metadata;
+        if (format == read_format_t::plain && mlr.mlr_line_count > 1
+            && this->lf_line_buffer.is_piper())
+        {
+            this->lf_plain_msg_shared.invalidate_refs();
+            this->lf_plain_msg_buffer.expand_to(mlr.mlr_length);
+            this->lf_plain_msg_buffer.clear();
+            auto curr_ll = ll;
+            do {
+                const auto curr_range = this->get_file_range(curr_ll, false);
+                auto read_result
+                    = this->lf_line_buffer.read_range(curr_range, dir);
+
+                if (curr_ll != ll) {
+                    this->lf_plain_msg_buffer.push_back('\n');
+                }
+                if (read_result.isErr()) {
+                    auto errmsg = read_result.unwrapErr();
+                    log_error("%s:%zu:unable to read range %lld:%lld -- %s",
+                              this->get_unique_path().c_str(),
+                              std::distance(this->cbegin(), ll),
+                              range_for_line.fr_offset,
+                              range_for_line.fr_size,
+                              errmsg.c_str());
+                    return;
+                }
+
+                auto curr_buf = read_result.unwrap();
+                this->lf_plain_msg_buffer.append(curr_buf.to_string_view());
+
+                ++curr_ll;
+            } while (curr_ll != this->end() && curr_ll->is_continued()
+                     && curr_ll->get_sub_offset() == 0);
+            msg_out.share(this->lf_plain_msg_shared,
+                          this->lf_plain_msg_buffer.data(),
+                          this->lf_plain_msg_buffer.size());
+        } else {
+            auto read_result
+                = this->lf_line_buffer.read_range(range_for_line, dir);
+
+            if (read_result.isErr()) {
+                auto errmsg = read_result.unwrapErr();
+                log_error("%s:%zu:unable to read range %lld:%lld -- %s",
+                          this->get_unique_path().c_str(),
+                          std::distance(this->cbegin(), ll),
+                          range_for_line.fr_offset,
+                          range_for_line.fr_size,
+                          errmsg.c_str());
+                return;
+            }
+            msg_out = read_result.unwrap();
+            msg_out.get_metadata() = range_for_line.fr_metadata;
+        }
         if (this->lf_format.get() != nullptr) {
-            this->lf_format->get_subline(*ll, msg_out, true);
+            this->lf_format->get_subline(
+                this->get_format_file_state(), *ll, msg_out, {true});
         }
     } catch (const line_buffer::error& e) {
         log_error("failed to read line");
@@ -883,6 +2737,19 @@ logfile::set_logline_observer(logline_observer* llo)
 void
 logfile::reobserve_from(iterator iter)
 {
+    if (this->lf_logline_observer == nullptr) {
+        // Every line below is read only so the observer can be told about it,
+        // so with no observer there is nothing to do.
+        return;
+    }
+
+    // This is work starting, so it owns the flag from here.  An interrupted
+    // indexing pass leaves it set, and only begin_indexing_progress() clears
+    // it -- which runs from the pre-scan, not from here -- so without this a
+    // filter change between the interrupt and the next pre-scan would break
+    // out on the first line and leave the filter state unbuilt.
+    this->lf_index_progress.ip_abort.store(false, std::memory_order_relaxed);
+
     for (; iter != this->end(); ++iter) {
         off_t offset = std::distance(this->begin(), iter);
 
@@ -890,12 +2757,12 @@ logfile::reobserve_from(iterator iter)
             continue;
         }
 
-        if (this->lf_logfile_observer != nullptr) {
-            auto indexing_res = this->lf_logfile_observer->logfile_indexing(
-                this->shared_from_this(), offset, this->size());
-            if (indexing_res == logfile_observer::indexing_result::BREAK) {
-                break;
-            }
+        this->lf_index_progress.ip_total.store(this->size(),
+                                               std::memory_order_relaxed);
+        this->lf_index_progress.ip_offset.store(offset,
+                                                std::memory_order_relaxed);
+        if (this->lf_index_progress.ip_abort.load(std::memory_order_relaxed)) {
+            break;
         }
 
         this->read_line(iter).then([this, iter](auto sbr) {
@@ -908,36 +2775,53 @@ logfile::reobserve_from(iterator iter)
                 *this, iter, iter_end, sbr);
         });
     }
-    if (this->lf_logfile_observer != nullptr) {
-        this->lf_logfile_observer->logfile_indexing(
-            this->shared_from_this(), this->size(), this->size());
-        this->lf_logline_observer->logline_eof(*this);
-    }
+    this->lf_index_progress.ip_total.store(this->size(),
+                                           std::memory_order_relaxed);
+    this->lf_index_progress.ip_offset.store(this->size(),
+                                            std::memory_order_relaxed);
+    this->lf_logline_observer->logline_eof(*this);
 }
 
-ghc::filesystem::path
+std::filesystem::path
 logfile::get_path() const
 {
     return this->lf_filename;
 }
 
+const logline_value_stats*
+logfile::stats_for_value(intern_string_t name) const
+{
+    const logline_value_stats* retval = nullptr;
+    if (this->lf_format != nullptr) {
+        auto index_opt = this->lf_format->stats_index_for_value(name);
+        if (index_opt.has_value()) {
+            retval = &this->lf_value_stats[index_opt.value()];
+        }
+    }
+
+    return retval;
+}
+
 logfile::message_length_result
-logfile::message_byte_length(logfile::const_iterator ll, bool include_continues)
+logfile::message_byte_length(const_iterator ll, bool include_continues)
 {
     auto next_line = ll;
     file_range::metadata meta;
-    size_t retval;
+    file_ssize_t retval;
+    size_t line_count = 0;
 
     if (!include_continues && this->lf_next_line_cache) {
         if (ll->get_offset() == (*this->lf_next_line_cache).first) {
             return {
                 (file_ssize_t) this->lf_next_line_cache->second,
+                1,
                 {ll->is_valid_utf(), ll->has_ansi()},
             };
         }
     }
 
     do {
+        line_count += 1;
         meta.m_has_ansi = meta.m_has_ansi || next_line->has_ansi();
         meta.m_valid_utf = meta.m_valid_utf && next_line->is_valid_utf();
         ++next_line;
@@ -946,30 +2830,91 @@ logfile::message_byte_length(logfile::const_iterator ll, bool include_continues)
                  || (include_continues && next_line->is_continued())));
 
     if (next_line == this->end()) {
-        retval = this->lf_index_size - ll->get_offset();
+        if (this->lf_upper_bound_size) {
+            retval = this->lf_upper_bound_size.value() - ll->get_offset();
+        } else if (this->lf_index_size > ll->get_offset()) {
+            retval = this->lf_index_size - ll->get_offset();
+        } else if (ll->get_offset()
+                   == this->lf_last_line_info.li_file_range.fr_offset)
+        {
+            retval = this->lf_last_line_info.li_file_range.fr_size;
+        } else {
+            retval = 0;
+        }
         if (retval > line_buffer::MAX_LINE_BUFFER_SIZE) {
             retval = line_buffer::MAX_LINE_BUFFER_SIZE;
         }
-        if (retval > 0 && !this->lf_partial_line) {
+        if (retval > 0 && !this->lf_last_line_info.li_partial) {
             retval -= 1;
         }
+        require_ge(retval, 0);
     } else {
         retval = next_line->get_offset() - ll->get_offset() - 1;
         if (!include_continues) {
-            this->lf_next_line_cache = nonstd::make_optional(
-                std::make_pair(ll->get_offset(), retval));
+            this->lf_next_line_cache
+                = std::make_optional(std::make_pair(ll->get_offset(), retval));
         }
+        require_ge(retval, 0);
     }
 
-    return {(file_ssize_t) retval, meta};
+    return {retval, line_count, meta};
 }
 
 Result<shared_buffer_ref, std::string>
-logfile::read_raw_message(logfile::const_iterator ll)
+logfile::read_raw_message(const_iterator ll)
 {
     require(ll->get_sub_offset() == 0);
 
-    return this->lf_line_buffer.read_range(this->get_file_range(ll));
+    auto ending_ll = std::next(ll);
+    while (ending_ll != this->end()) {
+        if (!ending_ll->is_continued()) {
+            // hit the next log message
+            break;
+        }
+        if (ending_ll->get_sub_offset() != 0) {
+            // hit a synthesized line
+            break;
+        }
+        ++ending_ll;
+    }
+
+    auto line_count = std::distance(ll, ending_ll);
+    if (line_count == 1) {
+        const auto curr_range = this->get_file_range(ll, false);
+        auto read_res = this->lf_line_buffer.read_range(
+            curr_range, line_buffer::scan_direction::forward);
+        if (read_res.isErr()) {
+            return Err(read_res.unwrapErr());
+        }
+        auto sbr = read_res.unwrap();
+        sbr.rtrim(is_line_ending);
+        return Ok(std::move(sbr));
+    }
+
+    this->lf_plain_msg_shared.invalidate_refs();
+    this->lf_plain_msg_buffer.clear();
+
+    auto curr_ll = ll;
+    while (curr_ll != ending_ll) {
+        const auto curr_range = this->get_file_range(curr_ll, false);
+        auto read_res = this->lf_line_buffer.read_range(
+            curr_range, line_buffer::scan_direction::forward);
+        if (read_res.isErr()) {
+            return Err(read_res.unwrapErr());
+        }
+        auto sbr = read_res.unwrap();
+        this->lf_plain_msg_buffer.append(sbr.to_string_view());
+        ++curr_ll;
+        if (curr_ll != ending_ll) {
+            this->lf_plain_msg_buffer.push_back('\n');
+        }
+    }
+
+    shared_buffer_ref retval;
+    retval.share(this->lf_plain_msg_shared,
+                 this->lf_plain_msg_buffer.data(),
+                 this->lf_plain_msg_buffer.size());
+    return Ok(std::move(retval));
 }
 
 intern_string_t
@@ -982,32 +2927,41 @@ logfile::get_format_name() const
     return {};
 }
 
-nonstd::optional<logfile::const_iterator>
-logfile::find_from_time(const timeval& tv) const
+logfile::const_iterator
+logfile::find_from_time(const std::chrono::microseconds us) const
 {
-    auto retval
-        = std::lower_bound(this->lf_index.begin(), this->lf_index.end(), tv);
-    if (retval == this->lf_index.end()) {
-        return nonstd::nullopt;
-    }
-
-    return retval;
+    return std::lower_bound(this->lf_index.begin(), this->lf_index.end(), us);
 }
 
-void
+bool
 logfile::mark_as_duplicate(const std::string& name)
 {
+    safe::WriteAccess<safe_notes> notes(this->lf_notes);
+
+    if (notes->contains(note_type::duplicate)) {
+        return false;
+    }
+
     this->lf_indexing = false;
     this->lf_options.loo_is_visible = false;
-    this->lf_notes.writeAccess()->emplace(
-        note_type::duplicate,
-        fmt::format(FMT_STRING("hiding duplicate of {}"), name));
+    auto note_um
+        = lnav::console::user_message::warning("hiding duplicate file")
+              .with_reason(
+                  attr_line_t("this file appears to have the same content as ")
+                      .append(lnav::roles::file(name)))
+              .move();
+    notes->insert(note_type::duplicate, note_um);
+    return true;
 }
 
 void
 logfile::adjust_content_time(int line, const timeval& tv, bool abs_offset)
 {
-    struct timeval old_time = this->lf_time_offset;
+    if (this->lf_time_offset == tv) {
+        return;
+    }
+
+    auto old_time = this->lf_time_offset;
 
     this->lf_time_offset_line = line;
     if (abs_offset) {
@@ -1016,14 +2970,37 @@ logfile::adjust_content_time(int line, const timeval& tv, bool abs_offset)
         timeradd(&old_time, &tv, &this->lf_time_offset);
     }
     for (auto& iter : *this) {
-        struct timeval curr, diff, new_time;
+        timeval curr, diff, new_time;
 
         curr = iter.get_timeval();
         timersub(&curr, &old_time, &diff);
         timeradd(&diff, &this->lf_time_offset, &new_time);
         iter.set_time(new_time);
     }
+    this->reset_time_order();
     this->lf_sort_needed = true;
+    this->lf_index_generation += 1;
+}
+
+std::filesystem::path
+logfile::get_path_for_key() const
+{
+    if (this->lf_options.loo_temp_dev == 0 && this->lf_options.loo_temp_ino == 0
+        && this->lf_line_buffer.is_piper())
+    {
+        return this->lf_actual_path.value_or(this->lf_filename);
+    }
+    return this->lf_filename;
+}
+
+std::string
+logfile::get_stub_key() const
+{
+    if (!this->lf_options.loo_scan_key.empty()) {
+        return this->lf_options.loo_scan_key;
+    }
+
+    return this->lf_actual_path.value_or(this->lf_filename).string();
 }
 
 void
@@ -1031,17 +3008,31 @@ logfile::set_filename(const std::string& filename)
 {
     if (this->lf_filename != filename) {
         this->lf_filename = filename;
-        ghc::filesystem::path p(filename);
+        this->lf_filename_as_string = this->lf_filename.string();
+        std::filesystem::path p(filename);
         this->lf_basename = p.filename();
     }
 }
 
+time_t
+logfile::get_origin_mtime() const
+{
+    if (!this->is_valid_filename()) {
+        struct stat st;
+        if (lnav::filesystem::statp(this->lf_filename, &st) == 0) {
+            return st.st_mtime;
+        }
+    }
+
+    return this->lf_stat.st_mtime;
+}
+
 struct timeval
-logfile::original_line_time(logfile::iterator ll)
+logfile::original_line_time(iterator ll)
 {
     if (this->is_time_adjusted()) {
-        struct timeval line_time = ll->get_timeval();
-        struct timeval retval;
+        auto line_time = ll->get_timeval();
+        timeval retval;
 
         timersub(&line_time, &this->lf_time_offset, &retval);
         return retval;
@@ -1050,7 +3041,30 @@ logfile::original_line_time(logfile::iterator ll)
     return ll->get_timeval();
 }
 
-nonstd::optional<logfile::const_iterator>
+std::optional<std::pair<file_off_t, file_ssize_t>>
+logfile::get_index_progress() const
+{
+    const auto lb_size = this->lf_line_buffer.get_file_size();
+    if (lb_size != -1) {
+        return std::make_pair(this->lf_index_size, lb_size);
+    }
+
+    if (this->is_compressed()) {
+        const auto isize_opt = this->lf_line_buffer.uncompressed_size();
+
+        if (isize_opt && isize_opt.value() > 0
+            && this->lf_index_size <= isize_opt.value())
+        {
+            return std::make_pair(this->lf_index_size, isize_opt.value());
+        }
+        return std::nullopt;
+    }
+
+    return std::make_pair(this->lf_index_size,
+                          static_cast<file_ssize_t>(this->lf_stat.st_size));
+}
+
+std::optional<logfile::const_iterator>
 logfile::line_for_offset(file_off_t off) const
 {
     struct cmper {
@@ -1066,7 +3080,7 @@ logfile::line_for_offset(file_off_t off) const
     };
 
     if (this->lf_index.empty()) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     auto iter = std::lower_bound(
@@ -1075,16 +3089,16 @@ logfile::line_for_offset(file_off_t off) const
         if (this->lf_index.back().get_offset() <= off
             && off < this->lf_index_size)
         {
-            return nonstd::make_optional(iter);
+            return std::make_optional(iter);
         }
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     if (off < iter->get_offset() && iter != this->lf_index.begin()) {
         --iter;
     }
 
-    return nonstd::make_optional(iter);
+    return std::make_optional(iter);
 }
 
 void
@@ -1095,10 +3109,17 @@ logfile::dump_stats()
     if (buf_stats.empty()) {
         return;
     }
-    log_info("line buffer stats for file: %s", this->lf_filename.c_str());
+    log_info("memory usage:");
+    log_info("  index=%zu", this->lf_index.capacity() * sizeof(logline));
+    log_info("  value_stats=%zu",
+             this->lf_value_stats.capacity() * sizeof(logline_value_stats));
+    log_info("  plain_msg_buffer=%zu", this->lf_plain_msg_buffer.capacity());
+    log_info("  allocator=%zu", this->lf_allocator.getNumBytesAllocated());
+    log_info("line buffer stats for file: %s",
+             this->lf_filename_as_string.c_str());
     log_info("  file_size=%lld", this->lf_line_buffer.get_file_size());
     log_info("  buffer_size=%ld", this->lf_line_buffer.get_buffer_size());
-    log_info("  read_hist=[%4lu %4lu %4lu %4lu %4lu %4lu %4lu %4lu %4lu %4lu]",
+    log_info("  read_hist=[%4u %4u %4u %4u %4u %4u %4u %4u %4u %4u]",
              buf_stats.s_hist[0],
              buf_stats.s_hist[1],
              buf_stats.s_hist[2],
@@ -1109,8 +3130,124 @@ logfile::dump_stats()
              buf_stats.s_hist[7],
              buf_stats.s_hist[8],
              buf_stats.s_hist[9]);
-    log_info("  decompressions=%lu", buf_stats.s_decompressions);
-    log_info("  preads=%lu", buf_stats.s_preads);
-    log_info("  requested_preloads=%lu", buf_stats.s_requested_preloads);
-    log_info("  used_preloads=%lu", buf_stats.s_used_preloads);
+    log_info("  decompressions=%u", buf_stats.s_decompressions);
+    log_info("  preads=%u", buf_stats.s_preads);
+    log_info("  preload_wait_time=%lld", buf_stats.s_preload_wait_time.count());
+    log_info("  requested_preloads=%u", buf_stats.s_requested_preloads);
+    log_info("  used_preloads=%u", buf_stats.s_used_preloads);
+}
+
+void
+logfile::set_logline_opid(uint32_t line_number, string_fragment opid)
+{
+    if (line_number >= this->lf_index.size()) {
+        log_error("invalid line number: %u", line_number);
+        return;
+    }
+
+    auto bm_iter = this->lf_bookmark_metadata.find(line_number);
+    if (bm_iter != this->lf_bookmark_metadata.end()) {
+        if (bm_iter->second.bm_opid == opid) {
+            return;
+        }
+    }
+
+    auto write_opids = this->lf_opids.writeAccess();
+
+    if (bm_iter != this->lf_bookmark_metadata.end()
+        && !bm_iter->second.bm_opid.empty())
+    {
+        auto old_opid_iter = write_opids->los_opid_ranges.find(opid);
+        if (old_opid_iter != write_opids->los_opid_ranges.end()) {
+            this->lf_invalidated_opids.insert(old_opid_iter->first);
+        }
+    }
+
+    auto& ll = this->lf_index[line_number];
+    auto log_us = ll.get_time<>();
+    const auto opid_hf = hashed_frag::from(opid);
+    auto opid_iter
+        = write_opids->insert_op(this->lf_allocator,
+                                 opid_hf,
+                                 log_us,
+                                 timestamp_point_of_reference_t::end);
+    auto& otr = opid_iter->second;
+
+    otr.otr_level_stats.update_msg_count(ll.get_msg_level());
+    ll.merge_bloom_bits(opid_hf.bloom_bits());
+    this->lf_bookmark_metadata[line_number].bm_opid = opid.to_string();
+}
+
+void
+logfile::set_opid_description(string_fragment opid, string_fragment desc)
+{
+    auto opid_guard = this->lf_opids.writeAccess();
+
+    auto opid_iter = opid_guard->los_opid_ranges.find(opid);
+    if (opid_iter == opid_guard->los_opid_ranges.end()) {
+        return;
+    }
+    opid_iter->second.otr_description.lod_index = std::nullopt;
+    opid_iter->second.otr_description.lod_elements.clear();
+    opid_iter->second.otr_description.lod_elements.insert(0, desc.to_string());
+}
+
+void
+logfile::clear_logline_opid(uint32_t line_number)
+{
+    if (line_number >= this->lf_index.size()) {
+        return;
+    }
+
+    auto iter = this->lf_bookmark_metadata.find(line_number);
+    if (iter == this->lf_bookmark_metadata.end()) {
+        return;
+    }
+
+    if (iter->second.bm_opid.empty()) {
+        return;
+    }
+
+    auto& ll = this->lf_index[line_number];
+    auto opid = std::move(iter->second.bm_opid);
+    auto opid_sf = string_fragment::from_str(opid);
+
+    if (iter->second.empty(bookmark_metadata::categories::any)) {
+        this->lf_bookmark_metadata.erase(iter);
+    }
+    {
+        auto writeOpids = this->lf_opids.writeAccess();
+
+        auto otr_iter = writeOpids->los_opid_ranges.find(opid_sf);
+        if (otr_iter == writeOpids->los_opid_ranges.end()) {
+            return;
+        }
+
+        if (otr_iter->second.otr_range.tr_begin != ll.get_time<>()
+            && otr_iter->second.otr_range.tr_end != ll.get_time<>())
+        {
+            otr_iter->second.otr_level_stats.update_msg_count(
+                ll.get_msg_level(), -1);
+            return;
+        }
+
+        this->lf_invalidated_opids.insert(otr_iter->first);
+        writeOpids->los_opid_ranges.erase(otr_iter);
+    }
+}
+
+size_t
+logfile::estimated_remaining_lines() const
+{
+    if (this->lf_index.empty() || this->is_compressed()) {
+        return 10;
+    }
+
+    const auto bytes_per_line = this->lf_index_size / this->lf_index.size();
+    if (this->lf_index_size > this->lf_stat.st_size) {
+        return 0;
+    }
+    const auto remaining_bytes = this->lf_stat.st_size - this->lf_index_size;
+
+    return remaining_bytes / bytes_per_line;
 }

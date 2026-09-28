@@ -4,8 +4,25 @@ Hotkey Reference
 ================
 
 This reference covers the keys used to control **lnav**.  Consult the `built-in
-help <https://github.com/tstack/lnav/blob/master/src/help.txt>`_ in **lnav** for
+help <https://github.com/tstack/lnav/blob/master/src/help.md>`_ in **lnav** for
 a more detailed explanation of each key.
+
+Global
+------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 6 20
+
+   * - Keypress
+     - Command
+
+   * - :kbd:`Ctrl` + :kbd:`C`
+     - If the focused line is from a file connected to an open pipe (the "↻"
+       icon will be next to the file name), a SIGINT will be sent to the
+       child process.  Otherwise, **lnav** will quickly exit.  If **lnav**
+       seems to be stuck in a loop, pressing :kbd:`Ctrl` + :kbd:`C` three
+       times will trigger an abort exit.
 
 Spatial Navigation
 ------------------
@@ -32,6 +49,11 @@ The majority of these hotkeys should be available in all views.
      - :kbd:`Backspace`
      - :kbd:`PgUp`
      - Up a page
+   * - :kbd:`Shift` + :kbd:`b`
+     -
+     -
+     - Move to the first line of a multi-line log message.  If the currently
+       focused line is the first, move up by a tenth of the content height.
    * - :kbd:`Ctrl` + :kbd:`u`
      -
      -
@@ -57,7 +79,12 @@ The majority of these hotkeys should be available in all views.
    * - :kbd:`l`
      - :kbd:`→`
      -
-     - Right half a page
+     - Right half a page.  In the log view, pressing right while at the start
+       of the message text can hide the timestamp/level fields in the message
+       and insert a shorter timestamp column on the left side.  The column
+       should take less space than the existing field and aligns all
+       timestamps across all log formats.  This feature is gated by the
+       :ref:`/ui/views/log/time-column<config_log_time_column>` setting.
    * - :kbd:`Shift` + :kbd:`l`
      - :kbd:`Shift` + :kbd:`→`
      -
@@ -81,11 +108,17 @@ The majority of these hotkeys should be available in all views.
    * - :kbd:`n`
      - :kbd:`Shift` + :kbd:`n`
      -
-     - Next/previous search hit
+     - Next/previous hit of the focused search, or of every search when
+       none is focused
    * - :kbd:`>`
      - :kbd:`<`
      -
-     - Next/previous search hit (horizontal)
+     - Next/previous search hit (horizontal), narrowed the same way
+   * - :kbd:`.`
+     - :kbd:`,`
+     -
+     - Focus the next/previous :ref:`named search<named_searches>` so that the
+       keys above move through its hits alone
    * - :kbd:`f`
      - :kbd:`Shift` + :kbd:`f`
      -
@@ -105,7 +138,20 @@ The majority of these hotkeys should be available in all views.
    * - :kbd:`{`
      - :kbd:`}`
      -
-     - Previous/next location in history
+     - Previous/next section in the view.  For the LOG view, if the cursor
+       is in the middle of a multi-line log message, this will move to the
+       start of the message or the next message.  Otherwise, it will move
+       to the adjacent :ref:`partition<partitions>`.  For the TEXT view,
+       the following document types have recognizable sections: JSON, man,
+       diff, and Markdown.
+   * - :kbd:`F7`
+     - :kbd:`F8`
+     -
+     - Previous/next breakpoint
+   * - :kbd:`CTRL` + :kbd:`b`
+     -
+     -
+     - Toggle a breakpoint for the focused log line
 
 Chronological Navigation
 ------------------------
@@ -148,9 +194,10 @@ status bar.
 
    * - Keypress
      - Description
+   * - :kbd:`\``
+     - Focus on the breadcrumb bar.
    * - :kbd:`ENTER`
-     - Focus on the breadcrumb bar.  Or, if the bar is currently focused,
-       accept the selected value and drop focus.
+     - If the bar is currently focused, accept the selected value and drop focus.
    * - :kbd:`Escape`
      - Drop focus on the breadcrumb bar.
    * - :kbd:`←`
@@ -187,7 +234,7 @@ Bookmarks
    * - Keypress
      - Command
    * - :kbd:`m`
-     - Mark/unmark the top line
+     - Mark/unmark the top line or focused line when in cursor mode
    * - :kbd:`Shift` + :kbd:`m`
      - Mark/unmark the range of lines from the last marked to the top
    * - :kbd:`Shift` + :kbd:`j`
@@ -198,6 +245,9 @@ Bookmarks
      - Copy marked lines to the clipboard
    * - :kbd:`Shift` + :kbd:`c`
      - Clear marked lines
+   * - :kbd:`Ctrl` + :kbd:`s`
+     - Toggle a sticky header for the focused line.  Sticky headers remain
+       visible at the top of the view as you scroll past them.
 
 .. _hotkeys_display:
 
@@ -210,7 +260,7 @@ Display
 
    * - Keypress
      - Command
-   * - :kbd:`?`
+   * - :kbd:`?` or :kbd:`F1`
      - View/leave builtin help
    * - :kbd:`q`
      - Return to the previous view/quit
@@ -223,13 +273,24 @@ Display
    * - :kbd:`Shift` + :kbd:`p`
      - Switch to/from the pretty-printed view of the displayed log or text files
    * - :kbd:`Shift` + :kbd:`t`
-     - Display elapsed time between lines
+     - Display the elapsed time from a bookmark to a given line.  In the TEXT view,
+       this only works for content that was captured from stdin or a :code:`:sh`
+       command.
    * - :kbd:`t`
      - Switch to/from the text file view
    * - :kbd:`i`
      - Switch to/from the histogram view
    * - :kbd:`Shift` + :kbd:`i`
-     - Switch to/from the histogram view
+     - Switch to/from the histogram view while keeping the time of the focused
+       line in sync
+   * - :kbd:`z`
+     - In the HIST or SPECTRO views, zoom in to finer-grained times.  In the
+       LOG, TEXT, or TIMELINE views, increase the filter context by one
+       message.
+   * - :kbd:`Shift` + :kbd:`Z`
+     - In the HIST or SPECTRO views, zoom out to larger-grained times.  In
+       the LOG, TEXT, or TIMELINE views, decrease the filter context by one
+       message.
    * - :kbd:`v`
      - Switch to/from the SQL result view
    * - :kbd:`Shift` + :kbd:`v`
@@ -239,8 +300,7 @@ Display
      - Toggle the display of the log parser results
    * - :kbd:`Tab`
      - In the log/text views, focus on the configuration panel for editing
-       filters and examining the list of loaded files.  In the SQL result view,
-       cycle through columns to display as bar graphs
+       filters and examining the list of loaded files.
    * - :kbd:`Ctrl` + :kbd:`l`
      - Switch to lo-fi mode.  The displayed log lines will be dumped to the
        terminal without any decorations so they can be copied easily.
@@ -255,10 +315,17 @@ Display
      - Toggle the hiding of log message fields. The hidden fields will be
        replaced with three bullets and highlighted in yellow.
    * - :kbd:`Ctrl` + :kbd:`x`
-     - Toggle the cursor mode. Allows moving the selected line instead of
+     - Toggle the cursor mode. Allows moving the focused line instead of
        keeping it fixed at the top of the current screen.
    * - :kbd:`=`
      - Pause/unpause loading of new file data.
+   * - :kbd:`X`
+     - Close the current text file or log file.
+   * - :kbd:`F2`
+     - Toggle mouse support.
+   * - :kbd:`F5`
+     - Reload the current view.  Re-runs the SQL query for the DB view
+       or rebuilds the index for the TIMELINE view.
 
 Session
 -------
@@ -293,8 +360,150 @@ Query Prompts
    * - :kbd:`Ctrl` + :kbd:`]`
      - Abort the prompt
 
+Prompt
+------
+
+After activating the prompt, the following shortcuts are available for
+editing:
+
+.. list-table::
+    :header-rows: 1
+    :widths: 6 6 20
+
+    * - Keypress
+      -
+      - Command
+    * - :kbd:`Escape`
+      -
+      - Depending on the mode: close the completion popup; exit search
+        mode; cancel the prompt
+    * - :kbd:`Enter`
+      -
+      - In single line mode, exit the prompt and perform the operation.
+        In multi-line mode, insert a new line.
+    * - :kbd:`Ctrl` + :kbd:`X`
+      -
+      - Exit the prompt and perform the operation
+    * - :kbd:`F1`
+      -
+      - Open the help text for the prompt
+    * - :kbd:`←`
+      -
+      - Move left one character
+    * - :kbd:`→`
+      -
+      - Move right one character
+    * - :kbd:`Shift` + :kbd:`←`
+      -
+      - Move left one character and include it in the selection
+    * - :kbd:`Shift` + :kbd:`→`
+      -
+      - Move right one character and include it in the selection
+    * - :kbd:`Alt` + :kbd:`←`
+      - :kbd:`Alt` + :kbd:`b`
+      - Move to the start of the previous word
+    * - :kbd:`Alt` + :kbd:`→`
+      - :kbd:`Alt` + :kbd:`f`
+      - Move to the start of the next word
+    * - :kbd:`↑`
+      - :kbd:`Ctrl` + :kbd:`P`
+      - In single-line mode, search the history with the current contents.
+        In multi-line mode, move the cursor up a line.  If a popup is open,
+        move the selection up.
+    * - :kbd:`↓`
+      - :kbd:`Ctrl` + :kbd:`N`
+      - In multi-line mode, move the cursor down a line.  If a popup is open,
+        move the selection down.
+    * - :kbd:`Ctrl` + :kbd:`A`
+      -
+      - Move to the beginning of the line
+    * - :kbd:`Ctrl` + :kbd:`E`
+      -
+      - Move to the end of the line
+    * - :kbd:`Ctrl` + :kbd:`T`
+      -
+      - Transpose the two characters before the cursor
+    * - :kbd:`Alt` + :kbd:`l`
+      -
+      - Convert the next word to lower-case and move to the end of it
+    * - :kbd:`Alt` + :kbd:`u`
+      -
+      - Convert the next word to upper-case and move to the end of it
+    * - :kbd:`Alt` + :kbd:`c`
+      -
+      - Capitalize the next word and move to the end of it
+    * - :kbd:`Ctrl` + :kbd:`K`
+      -
+      - Cut to the end of the line into the clipboard
+    * - :kbd:`Ctrl` + :kbd:`U`
+      -
+      - Cut from the beginning of the line to the cursor into the clipboard
+    * - :kbd:`Ctrl` + :kbd:`W`
+      - :kbd:`Alt` + :kbd:`Backspace`
+      - Cut from the beginning of the previous word into the clipboard
+    * - :kbd:`Alt` + :kbd:`d`
+      -
+      - Cut to the end of the next word into the clipboard
+    * - :kbd:`Ctrl` + :kbd:`Y`
+      -
+      - Paste the clipboard contents
+    * - :kbd:`Tab`
+      - :kbd:`Enter`
+      - Accept a completion suggestion
+    * - :kbd:`Ctrl` + :kbd:`_`
+      -
+      - Undo a change
+    * - :kbd:`Ctrl` + :kbd:`L`
+      -
+      - In the SQL prompt, reformat the contents of the prompt and switch
+        to multi-line mode
+    * - :kbd:`Ctrl` + :kbd:`O`
+      -
+      - Save the contents of the prompt in a script file named
+        :code:`saved-prompt` and, if available, open the file in
+        the :ref:`configured external editor <config_external_editor>`
+    * - :kbd:`Ctrl` + :kbd:`S`
+      -
+      - In multi-line mode, switch to search mode.  If already in search
+        mode, find the next occurrence.
+    * - :kbd:`Ctrl` + :kbd:`R`
+      -
+      - In search mode, search for the previous occurrence.  Otherwise,
+        search history using current contents of the prompt
+    * - :kbd:`Alt` + :kbd:`=`
+      -
+      - In multi-line mode, grow the prompt by one line.  The prompt's
+        status bar can also be dragged with the mouse to resize.
+    * - :kbd:`Alt` + :kbd:`-`
+      -
+      - In multi-line mode, shrink the prompt by one line.
+
 Customizing
 -----------
 
-You can customize the behavior of hotkeys by defining your own keymaps.
+New hotkeys can be defined and existing behaviors changed by updating lnav's
+configuration.  Since most of lnav's functionality is exposed through
+:ref:`SQLite functions<sql-ext>` and :ref:`SQLite virtual tables<sql-tab>`,
+quite a lot is possible.  For example, if you regularly want to find a log
+message with a particular pattern, like "Starting execution".  The following
+command will find the next occurrence after the currently focused message:
+
+.. code-block:: custsqlite
+
+    ;SELECT log_line FROM all_logs WHERE log_line > log_msg_line() AND log_body LIKE '%Starting execution%' LIMIT 1
+
+To then move the focus in the log view to the line found by the above command,
+you can run the following:
+
+.. code-block:: custsqlite
+
+    ;UPDATE lnav_views SET selection = (SELECT log_line FROM all_logs WHERE log_line > log_msg_line() AND log_body LIKE '%Starting execution%' LIMIT 1) WHERE name = 'log'
+
+To bind that command to a key, like F9, you can run the following
+:code:`:config` command:
+
+.. code-block:: lnav
+
+    :config /ui/keymap-defs/default/f9/command ;UPDATE lnav_views SET selection = (SELECT log_line FROM all_logs WHERE log_line > log_msg_line() AND log_body LIKE '%Starting execution%' LIMIT 1) WHERE name = 'log'
+
 Consult the :ref:`Keymaps<keymaps>` configuration section for more information.

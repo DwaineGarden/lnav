@@ -27,22 +27,29 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <algorithm>
+
 #include "md4cpp.hh"
 
 #include "base/is_utf8.hh"
 #include "base/lnav_log.hh"
 #include "emojis-json.h"
+#include "pcrepp/pcre2pp.hh"
+#include "scn/scan.h"
+#include "ww898/cp_utf8.hpp"
 #include "xml-entities-json.h"
 #include "yajlpp/yajlpp_def.hh"
 
 namespace md4cpp {
 
-static const typed_json_path_container<xml_entity> xml_entity_handlers = {
-    yajlpp::property_handler("characters").for_field(&xml_entity::xe_chars),
-};
+static const typed_json_path_container<xml_entity_map>&
+get_xml_entity_map_handlers()
+{
+    static const typed_json_path_container<xml_entity> xml_entity_handlers = {
+        yajlpp::property_handler("characters").for_field(&xml_entity::xe_chars),
+    };
 
-static const typed_json_path_container<xml_entity_map> xml_entity_map_handlers
-    = {
+    static const typed_json_path_container<xml_entity_map> retval = {
         yajlpp::pattern_property_handler("(?<var_name>\\&\\w+;?)")
             .with_synopsis("<name>")
             .with_path_provider<xml_entity_map>(
@@ -58,27 +65,38 @@ static const typed_json_path_container<xml_entity_map> xml_entity_map_handlers
                     return &xem->xem_entities[entity_name];
                 })
             .with_children(xml_entity_handlers),
-};
+    };
 
-static const typed_json_path_container<emoji> emoji_handlers = {
-    yajlpp::property_handler("emoji").for_field(&emoji::e_value),
-    yajlpp::property_handler("shortname").for_field(&emoji::e_shortname),
-};
+    return retval;
+}
 
-static const typed_json_path_container<emoji_map> emoji_map_handlers = {
-    yajlpp::property_handler("emojis#")
-        .for_field(&emoji_map::em_emojis)
-        .with_children(emoji_handlers),
-};
+static const typed_json_path_container<emoji_map>&
+get_emoji_map_handlers()
+{
+    static const typed_json_path_container<emoji> emoji_handlers = {
+        yajlpp::property_handler("emoji").for_field(&emoji::e_value),
+        yajlpp::property_handler("shortname").for_field(&emoji::e_shortname),
+    };
+
+    static const typed_json_path_container<emoji_map> retval = {
+        yajlpp::property_handler("emojis#")
+            .for_field(&emoji_map::em_emojis)
+            .with_children(emoji_handlers),
+    };
+
+    return retval;
+}
 
 static xml_entity_map
 load_xml_entity_map()
 {
     static const intern_string_t name
         = intern_string::lookup(xml_entities_json.get_name());
-    auto parse_res
-        = xml_entity_map_handlers.parser_for(name).with_ignore_unused(true).of(
-            xml_entities_json.to_string_fragment());
+    auto sfp = xml_entities_json.to_string_fragment_producer();
+    auto parse_res = get_xml_entity_map_handlers()
+                         .parser_for(name)
+                         .with_ignore_unused(true)
+                         .of(*sfp);
 
     assert(parse_res.isOk());
 
@@ -98,9 +116,10 @@ load_emoji_map()
 {
     static const intern_string_t name
         = intern_string::lookup(emojis_json.get_name());
+    auto sfp = emojis_json.to_string_fragment_producer();
     auto parse_res
-        = emoji_map_handlers.parser_for(name).with_ignore_unused(true).of(
-            emojis_json.to_string_fragment());
+        = get_emoji_map_handlers().parser_for(name).with_ignore_unused(true).of(
+            *sfp);
 
     assert(parse_res.isOk());
 
@@ -120,19 +139,158 @@ get_emoji_map()
     return retval;
 }
 
+text_auto_buffer
+escape_html(string_fragment content)
+{
+    auto retval = auto_buffer::alloc(content.length());
+
+    for (const auto ch : content) {
+        switch (ch) {
+            case '"':
+                retval.append("&quot;");
+                break;
+            case '\'':
+                retval.append("&apos;");
+                break;
+            case '<':
+                retval.append("&lt;");
+                break;
+            case '>':
+                retval.append("&gt;");
+                break;
+            case '&':
+                retval.append("&amp;");
+                break;
+            default:
+                retval.push_back(ch);
+                break;
+        }
+    }
+
+    return text_auto_buffer{std::move(retval)};
+}
+
+std::optional<std::string>
+decode_numeric_entity(string_fragment sf)
+{
+    if (!sf.startswith("&#") || !sf.endswith(";")) {
+        return std::nullopt;
+    }
+
+    auto digits = sf.substr(2).sub_range(0, sf.length() - 3);
+    auto base = 10;
+    if (digits.startswith("x") || digits.startswith("X")) {
+        digits = digits.substr(1);
+        base = 16;
+    }
+    auto scan_res = scn::scan_int<uint32_t>(digits.to_string_view(), base);
+    if (!scan_res || !scan_res->range().empty()) {
+        return std::nullopt;
+    }
+
+    auto cp = scan_res->value();
+    if (cp == 0 || (0xD800 <= cp && cp <= 0xDFFF) || cp > 0x10FFFF) {
+        return std::nullopt;
+    }
+
+    std::string retval;
+    ww898::utf::utf8::write(cp, [&retval](uint8_t ch) {
+        retval.push_back(static_cast<char>(ch));
+    });
+    return retval;
+}
+
+file
+parse_file(const std::filesystem::path& src, const string_fragment& sf)
+{
+    static const auto FRONTMATTER_RE = lnav::pcre2pp::code::from_const(
+        R"(\A(?:---\r?\n(?:(.*?)\r?\n)?---\r?\n|\+\+\+\r?\n(?:(.*?)\r?\n)?\+\+\+\r?\n))",
+        PCRE2_DOTALL);
+    thread_local auto md = FRONTMATTER_RE.create_match_data();
+
+    auto frontmatter_sf = string_fragment{};
+    auto frontmatter_format = text_format_t::TF_PLAINTEXT;
+    auto content_sf = sf;
+
+    auto cap_res = FRONTMATTER_RE.capture_from(content_sf)
+                       .into(md)
+                       .matches()
+                       .ignore_error();
+    if (cap_res) {
+        // The capture is absent for an empty block, so the delimiter
+        // decides the format.
+        if (content_sf.startswith("---")) {
+            frontmatter_format = text_format_t::TF_YAML;
+            frontmatter_sf = md[1].value_or(string_fragment{});
+        } else {
+            frontmatter_format = text_format_t::TF_TOML;
+            frontmatter_sf = md[2].value_or(string_fragment{});
+        }
+        content_sf = cap_res->f_remaining;
+    } else if (content_sf.startswith("{")) {
+        yajlpp_parse_context ypc(intern_string::lookup(src));
+        auto handle = yajlpp::alloc_handle(&ypc.ypc_callbacks, &ypc);
+
+        yajl_config(handle.in(), yajl_allow_trailing_garbage, 1);
+        ypc.with_ignore_unused(true)
+            .with_handle(handle.in())
+            .with_error_reporter([&src](const auto& ypc, const auto& um) {
+                log_error(
+                    "%s: failed to parse JSON front matter "
+                    "-- %s",
+                    src.c_str(),
+                    um.um_reason.al_string.c_str());
+            });
+        if (ypc.parse_doc(content_sf)) {
+            ssize_t consumed = ypc.ypc_total_consumed;
+            auto rest_sf = content_sf.substr(consumed);
+            if (rest_sf.startswith("\n") || rest_sf.startswith("\r\n")) {
+                frontmatter_format = text_format_t::TF_JSON;
+                frontmatter_sf = sf.sub_range(0, consumed);
+                content_sf = content_sf.substr(consumed);
+            }
+        }
+    }
+
+    return {
+        frontmatter_sf,
+        frontmatter_format,
+        content_sf,
+    };
+}
+
 struct parse_userdata {
     event_handler& pu_handler;
     std::string pu_error_msg;
 };
 
-static event_handler::block
-build_block(MD_BLOCKTYPE type, void* detail)
+void
+event_handler::set_line_number_from(const char* text)
+{
+    // md4c only hands back pointers into the source for some details (e.g.
+    // not for indented code or an escaped language), so zero out the line
+    // number instead of leaving the previous block's value.
+    this->eh_line_number = 0;
+    if (text == nullptr || text < this->eh_fragment.begin()
+        || this->eh_fragment.end() <= text)
+    {
+        return;
+    }
+
+    size_t off = text - this->eh_fragment.begin();
+    this->eh_tree->visit_overlapping(off, [this](const auto& cintv) {
+        this->eh_line_number = cintv.value;
+    });
+}
+
+event_handler::block
+event_handler::build_block(MD_BLOCKTYPE type, void* detail)
 {
     switch (type) {
         case MD_BLOCK_DOC:
-            return event_handler::block_doc{};
+            return block_doc{};
         case MD_BLOCK_QUOTE:
-            return event_handler::block_quote{};
+            return block_quote{};
         case MD_BLOCK_UL:
             return static_cast<MD_BLOCK_UL_DETAIL*>(detail);
         case MD_BLOCK_OL:
@@ -140,150 +298,156 @@ build_block(MD_BLOCKTYPE type, void* detail)
         case MD_BLOCK_LI:
             return static_cast<MD_BLOCK_LI_DETAIL*>(detail);
         case MD_BLOCK_HR:
-            return event_handler::block_hr{};
+            return block_hr{};
         case MD_BLOCK_H:
             return static_cast<MD_BLOCK_H_DETAIL*>(detail);
-        case MD_BLOCK_CODE:
-            return static_cast<MD_BLOCK_CODE_DETAIL*>(detail);
+        case MD_BLOCK_CODE: {
+            auto retval = static_cast<MD_BLOCK_CODE_DETAIL*>(detail);
+
+            this->set_line_number_from(retval->lang.text);
+            return retval;
+        }
         case MD_BLOCK_HTML:
-            return event_handler::block_html{};
+            return block_html{};
         case MD_BLOCK_P:
-            return event_handler::block_p{};
+            return block_p{};
         case MD_BLOCK_TABLE:
             return static_cast<MD_BLOCK_TABLE_DETAIL*>(detail);
         case MD_BLOCK_THEAD:
-            return event_handler::block_thead{};
+            return block_thead{};
         case MD_BLOCK_TBODY:
-            return event_handler::block_tbody{};
+            return block_tbody{};
         case MD_BLOCK_TR:
-            return event_handler::block_tr{};
+            return block_tr{};
         case MD_BLOCK_TH:
-            return event_handler::block_th{};
+            return block_th{};
         case MD_BLOCK_TD:
             return static_cast<MD_BLOCK_TD_DETAIL*>(detail);
     }
 
-    return {};
+    log_warning("unhandled markdown block type: %d", type);
+    return block_unknown{};
 }
 
-static event_handler::span
-build_span(MD_SPANTYPE type, void* detail)
+event_handler::span
+event_handler::build_span(MD_SPANTYPE type, void* detail)
 {
     switch (type) {
         case MD_SPAN_EM:
-            return event_handler::span_em{};
+            return span_em{};
         case MD_SPAN_STRONG:
-            return event_handler::span_strong{};
+            return span_strong{};
         case MD_SPAN_A:
             return static_cast<MD_SPAN_A_DETAIL*>(detail);
         case MD_SPAN_IMG:
             return static_cast<MD_SPAN_IMG_DETAIL*>(detail);
         case MD_SPAN_CODE:
-            return event_handler::span_code{};
+            return span_code{};
         case MD_SPAN_DEL:
-            return event_handler::span_del{};
+            return span_del{};
         case MD_SPAN_U:
-            return event_handler::span_u{};
+            return span_u{};
         default:
             break;
     }
 
-    return {};
+    log_warning("unhandled markdown span type: %d", type);
+    return span_unknown{};
+}
+
+template<typename F>
+static int
+md4cpp_call(void* userdata, F&& func)
+{
+    auto* pu = static_cast<parse_userdata*>(userdata);
+
+    auto res = func(pu->pu_handler);
+    if (res.isErr()) {
+        pu->pu_error_msg = res.unwrapErr();
+        return 1;
+    }
+
+    return 0;
 }
 
 static int
 md4cpp_enter_block(MD_BLOCKTYPE type, void* detail, void* userdata)
 {
-    auto* pu = static_cast<parse_userdata*>(userdata);
-
-    auto enter_res = pu->pu_handler.enter_block(build_block(type, detail));
-    if (enter_res.isErr()) {
-        pu->pu_error_msg = enter_res.unwrapErr();
-        return 1;
-    }
-
-    return 0;
+    return md4cpp_call(userdata, [&](event_handler& eh) {
+        return eh.enter_block(eh.build_block(type, detail));
+    });
 }
 
 static int
 md4cpp_leave_block(MD_BLOCKTYPE type, void* detail, void* userdata)
 {
-    auto* pu = static_cast<parse_userdata*>(userdata);
-
-    auto leave_res = pu->pu_handler.leave_block(build_block(type, detail));
-    if (leave_res.isErr()) {
-        pu->pu_error_msg = leave_res.unwrapErr();
-        return 1;
-    }
-
-    return 0;
+    return md4cpp_call(userdata, [&](event_handler& eh) {
+        return eh.leave_block(eh.build_block(type, detail));
+    });
 }
 
 static int
 md4cpp_enter_span(MD_SPANTYPE type, void* detail, void* userdata)
 {
-    auto* pu = static_cast<parse_userdata*>(userdata);
-
-    auto enter_res = pu->pu_handler.enter_span(build_span(type, detail));
-    if (enter_res.isErr()) {
-        pu->pu_error_msg = enter_res.unwrapErr();
-        return 1;
-    }
-
-    return 0;
+    return md4cpp_call(userdata, [&](event_handler& eh) {
+        return eh.enter_span(eh.build_span(type, detail));
+    });
 }
 
 static int
 md4cpp_leave_span(MD_SPANTYPE type, void* detail, void* userdata)
 {
-    auto* pu = static_cast<parse_userdata*>(userdata);
-
-    auto leave_res = pu->pu_handler.leave_span(build_span(type, detail));
-    if (leave_res.isErr()) {
-        pu->pu_error_msg = leave_res.unwrapErr();
-        return 1;
-    }
-
-    return 0;
+    return md4cpp_call(userdata, [&](event_handler& eh) {
+        return eh.leave_span(eh.build_span(type, detail));
+    });
 }
 
 static int
 md4cpp_text(MD_TEXTTYPE type, const MD_CHAR* text, MD_SIZE size, void* userdata)
 {
-    auto* pu = static_cast<parse_userdata*>(userdata);
-    auto text_res = pu->pu_handler.text(type, string_fragment(text, 0, size));
-    if (text_res.isErr()) {
-        pu->pu_error_msg = text_res.unwrapErr();
-        return 1;
-    }
-
-    return 0;
+    return md4cpp_call(userdata, [&](event_handler& eh) {
+        return eh.text(type, string_fragment(text, 0, size));
+    });
 }
 
 namespace details {
 Result<void, std::string>
 parse(const string_fragment& sf, event_handler& eh)
 {
-    const char* utf8_errmsg = nullptr;
-    int utf8_faulty_bytes = 0;
-
-    auto scan_res = is_utf8((unsigned char*) sf.data(),
-                            sf.length(),
-                            &utf8_errmsg,
-                            &utf8_faulty_bytes);
-    if (utf8_errmsg != nullptr) {
+    auto scan_res = is_utf8(sf);
+    if (!scan_res.is_valid()) {
         return Err(
             fmt::format(FMT_STRING("file has invalid UTF-8 at offset {}: {}"),
-                        scan_res.usr_end,
-                        utf8_errmsg));
+                        scan_res.usr_valid_frag.sf_end,
+                        scan_res.usr_message));
+    }
+
+    auto eols = std::vector<event_handler::line_type_t>{};
+    // The fragment can start partway into a file (e.g. the body after the
+    // front matter), so count the lines that precede it to keep the line
+    // numbers relative to the start of the file.
+    int lineno = 1
+        + std::count(sf.sf_string, sf.sf_string + sf.sf_begin, '\n');
+
+    auto rest_sf = sf;
+    while (!rest_sf.empty()) {
+        auto split_pair = rest_sf.split_when(string_fragment::tag1{'\n'});
+        auto line_sf = split_pair.first;
+
+        eols.emplace_back(line_sf.sf_begin - sf.sf_begin,
+                          line_sf.sf_end - sf.sf_begin,
+                          lineno++);
+        rest_sf = split_pair.second;
     }
 
     MD_PARSER parser = {0};
+    eh.eh_fragment = sf;
+    eh.eh_tree = std::make_unique<event_handler::lines_tree_t>(std::move(eols));
     auto pu = parse_userdata{eh};
 
     parser.abi_version = 0;
-    parser.flags = (MD_DIALECT_GITHUB | MD_FLAG_UNDERLINE)
-        & ~(MD_FLAG_PERMISSIVEAUTOLINKS);
+    parser.flags
+        = (MD_DIALECT_GITHUB | MD_FLAG_UNDERLINE) & ~MD_FLAG_PERMISSIVEAUTOLINKS;
     parser.enter_block = md4cpp_enter_block;
     parser.leave_block = md4cpp_leave_block;
     parser.enter_span = md4cpp_enter_span;
@@ -292,8 +456,16 @@ parse(const string_fragment& sf, event_handler& eh)
 
     auto rc = md_parse(sf.data(), sf.length(), &parser, &pu);
 
+    // The fragment belongs to the caller and need not outlive this call.
+    eh.eh_fragment = string_fragment{};
+    eh.eh_tree.reset();
+
     if (rc == 0) {
         return Ok();
+    }
+
+    if (pu.pu_error_msg.empty()) {
+        return Err(fmt::format(FMT_STRING("markdown parser failed ({})"), rc));
     }
 
     return Err(pu.pu_error_msg);

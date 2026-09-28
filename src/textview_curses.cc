@@ -28,23 +28,64 @@
  */
 
 #include <algorithm>
+#include <climits>
+#include <string>
 #include <vector>
 
 #include "textview_curses.hh"
 
 #include "base/ansi_scrubber.hh"
+#include "base/humanize.time.hh"
 #include "base/injector.hh"
+#include "base/lnav_log.hh"
 #include "base/time_util.hh"
+#include "command_executor.hh"
 #include "config.h"
-#include "data_parser.hh"
+#include "data_scanner.hh"
 #include "fmt/format.h"
 #include "lnav_config.hh"
-#include "log_format.hh"
+#include "log_format_fwd.hh"
 #include "logfile.hh"
 #include "shlex.hh"
+#include "sql_util.hh"
 #include "view_curses.hh"
+#include "yajlpp/yajlpp_def.hh"
 
-const auto REVERSE_SEARCH_OFFSET = 2000_vl;
+constexpr auto REVERSE_SEARCH_OFFSET = 2000_vl;
+
+using namespace std::literals::chrono_literals;
+
+const std::chrono::microseconds text_time_translator::ZOOM_LEVELS[ZOOM_COUNT]
+    = {
+        1s,
+        30s,
+        60s,
+        5min,
+        15min,
+        1h,
+        4h,
+        8h,
+        24h,
+        7 * 24h,
+        30 * 24h,
+        365 * 24h,
+};
+
+const std::array<string_fragment, text_time_translator::ZOOM_COUNT>
+    text_time_translator::ZOOM_STRINGS = {
+        "1-second"_frag,
+        "30-second"_frag,
+        "1-minute"_frag,
+        "5-minute"_frag,
+        "15-minute"_frag,
+        "1-hour"_frag,
+        "4-hour"_frag,
+        "8-hour"_frag,
+        "1-day"_frag,
+        "1-week"_frag,
+        "1-month"_frag,
+        "1-year"_frag,
+};
 
 void
 text_filter::revert_to_last(logfile_filter_state& lfs, size_t rollback_size)
@@ -55,6 +96,8 @@ text_filter::revert_to_last(logfile_filter_state& lfs, size_t rollback_size)
         = lfs.tfs_last_message_matched[this->lf_index];
     lfs.tfs_lines_for_message[this->lf_index]
         = lfs.tfs_last_lines_for_message[this->lf_index];
+    lfs.tfs_hits_for_message[this->lf_index]
+        = lfs.tfs_last_hits_for_message[this->lf_index];
 
     for (size_t lpc = 0; lpc < lfs.tfs_lines_for_message[this->lf_index]; lpc++)
     {
@@ -76,20 +119,24 @@ text_filter::revert_to_last(logfile_filter_state& lfs, size_t rollback_size)
     }
 }
 
-void
+bool
 text_filter::add_line(logfile_filter_state& lfs,
                       logfile::const_iterator ll,
-                      shared_buffer_ref& line)
+                      const shared_buffer_ref& line)
 {
-    bool match_state = this->matches(*lfs.tfs_logfile, ll, line);
-
     if (ll->is_message()) {
         this->end_of_message(lfs);
     }
+    auto retval = this->matches(line_source{*lfs.tfs_logfile, ll}, line);
 
     lfs.tfs_message_matched[this->lf_index]
-        = lfs.tfs_message_matched[this->lf_index] || match_state;
+        = lfs.tfs_message_matched[this->lf_index] || retval;
     lfs.tfs_lines_for_message[this->lf_index] += 1;
+    if (retval) {
+        lfs.tfs_hits_for_message[this->lf_index] += 1;
+    }
+
+    return retval;
 }
 
 void
@@ -101,35 +148,115 @@ text_filter::end_of_message(logfile_filter_state& lfs)
 
     for (size_t lpc = 0; lpc < lfs.tfs_lines_for_message[this->lf_index]; lpc++)
     {
-        require(lfs.tfs_filter_count[this->lf_index]
-                <= lfs.tfs_logfile->size());
-
         size_t line_number = lfs.tfs_filter_count[this->lf_index];
+        require(line_number <= lfs.tfs_logfile->size());
 
+        if (line_number == lfs.tfs_logfile->size()) {
+            continue;
+        }
         if (lfs.tfs_message_matched[this->lf_index]) {
             lfs.tfs_mask[line_number] |= mask;
         } else {
             lfs.tfs_mask[line_number] &= ~mask;
         }
         lfs.tfs_filter_count[this->lf_index] += 1;
-        if (lfs.tfs_message_matched[this->lf_index]) {
-            lfs.tfs_filter_hits[this->lf_index] += 1;
-        }
     }
+    lfs.tfs_filter_hits[this->lf_index]
+        += lfs.tfs_hits_for_message[this->lf_index];
     lfs.tfs_last_message_matched[this->lf_index]
         = lfs.tfs_message_matched[this->lf_index];
     lfs.tfs_last_lines_for_message[this->lf_index]
         = lfs.tfs_lines_for_message[this->lf_index];
+    lfs.tfs_last_hits_for_message[this->lf_index]
+        = lfs.tfs_hits_for_message[this->lf_index];
     lfs.tfs_message_matched[this->lf_index] = false;
     lfs.tfs_lines_for_message[this->lf_index] = 0;
+    lfs.tfs_hits_for_message[this->lf_index] = 0;
 }
 
-const bookmark_type_t textview_curses::BM_USER("user");
-const bookmark_type_t textview_curses::BM_USER_EXPR("user-expr");
-const bookmark_type_t textview_curses::BM_SEARCH("search");
-const bookmark_type_t textview_curses::BM_META("meta");
+void
+text_time_translator::add_time_commands_for_session(
+    const std::function<void(const std::string&)>& receiver)
+{
+    auto min_time_opt = this->get_min_row_time();
+    if (min_time_opt) {
+        auto min_time_str = lnav::to_rfc3339_string(min_time_opt.value(), 'T');
+        receiver(fmt::format(FMT_STRING("hide-lines-before {}"), min_time_str));
+    }
+    auto max_time_opt = this->get_max_row_time();
+    if (max_time_opt) {
+        auto max_time_str = lnav::to_rfc3339_string(max_time_opt.value(), 'T');
+        receiver(fmt::format(FMT_STRING("hide-lines-after {}"), max_time_str));
+    }
+}
 
-textview_curses::textview_curses() : tc_search_action(noop_func{})
+log_accel::direction_t
+text_accel_source::get_line_accel_direction(vis_line_t vl)
+{
+    log_accel la;
+
+    while (vl >= 0) {
+        const auto* curr_line = this->text_accel_get_line(vl);
+
+        if (!curr_line->is_message()) {
+            --vl;
+            continue;
+        }
+
+        if (!la.add_point(
+                curr_line->get_time<std::chrono::milliseconds>().count()))
+        {
+            break;
+        }
+
+        --vl;
+    }
+
+    return la.get_direction();
+}
+
+std::string
+text_accel_source::get_time_offset_for_line(textview_curses& tc, vis_line_t vl)
+{
+    auto ll = this->text_accel_get_line(vl);
+    auto curr = ll->get_time();
+    std::chrono::microseconds diff;
+
+    auto prev_umark = tc.get_bookmarks()[&textview_curses::BM_USER].prev(vl);
+    auto next_umark = tc.get_bookmarks()[&textview_curses::BM_USER].next(vl);
+    auto prev_emark
+        = tc.get_bookmarks()[&textview_curses::BM_USER_EXPR].prev(vl);
+    auto next_emark
+        = tc.get_bookmarks()[&textview_curses::BM_USER_EXPR].next(vl);
+    if (!prev_umark && !prev_emark && (next_umark || next_emark)) {
+        auto next_line = this->text_accel_get_line(
+            std::max(next_umark.value_or(0_vl), next_emark.value_or(0_vl)));
+
+        diff = curr - next_line->get_time();
+    } else {
+        auto prev_row
+            = std::max(prev_umark.value_or(0_vl), prev_emark.value_or(0_vl));
+        auto* first_line = this->text_accel_get_line(prev_row);
+        diff = curr - first_line->get_time();
+    }
+
+    return humanize::time::duration::from(diff).to_string();
+}
+
+const DIST_SLICE(bm_types) bookmark_type_t textview_curses::BM_ERRORS("error");
+const DIST_SLICE(bm_types)
+    bookmark_type_t textview_curses::BM_WARNINGS("warning");
+const DIST_SLICE(bm_types) bookmark_type_t textview_curses::BM_USER("user");
+const DIST_SLICE(bm_types)
+    bookmark_type_t textview_curses::BM_USER_EXPR("user-expr");
+const DIST_SLICE(bm_types) bookmark_type_t textview_curses::BM_SEARCH("search");
+const DIST_SLICE(bm_types) bookmark_type_t textview_curses::BM_META("meta");
+const DIST_SLICE(bm_types)
+    bookmark_type_t textview_curses::BM_PARTITION("partition");
+const DIST_SLICE(bm_types) bookmark_type_t textview_curses::BM_STICKY("sticky");
+
+textview_curses::textview_curses()
+    : lnav_config_listener(__FILE__), tc_search_action(noop_func{})
 {
     this->set_data_source(this);
 }
@@ -140,9 +267,21 @@ textview_curses::~textview_curses()
 }
 
 void
+textview_curses::deinit()
+{
+    listview_curses::deinit();
+    this->set_sub_source(nullptr);
+    this->set_overlay_source(nullptr);
+    this->tc_delegate.reset();
+    this->tc_search_proc.reset();
+    this->tc_meta_search_proc.reset();
+}
+
+void
 textview_curses::reload_config(error_reporter& reporter)
 {
     const static auto DEFAULT_THEME_NAME = std::string("default");
+    const auto& vc = view_colors::singleton();
 
     for (auto iter = this->tc_highlights.begin();
          iter != this->tc_highlights.end();)
@@ -155,13 +294,6 @@ textview_curses::reload_config(error_reporter& reporter)
         iter = this->tc_highlights.erase(iter);
     }
 
-    std::map<std::string, std::string> vars;
-    auto curr_theme_iter
-        = lnav_config.lc_ui_theme_defs.find(lnav_config.lc_ui_theme);
-    if (curr_theme_iter != lnav_config.lc_ui_theme_defs.end()) {
-        vars = curr_theme_iter->second.lt_vars;
-    }
-
     for (const auto& theme_name : {DEFAULT_THEME_NAME, lnav_config.lc_ui_theme})
     {
         auto theme_iter = lnav_config.lc_ui_theme_defs.find(theme_name);
@@ -170,68 +302,59 @@ textview_curses::reload_config(error_reporter& reporter)
             continue;
         }
 
+        auto vars = &theme_iter->second.lt_vars;
         for (const auto& hl_pair : theme_iter->second.lt_highlights) {
-            if (hl_pair.second.hc_regex.empty()) {
-                continue;
-            }
-
-            auto regex = lnav::pcre2pp::code::from(hl_pair.second.hc_regex);
-
-            if (regex.isErr()) {
-                const static intern_string_t PATTERN_SRC
-                    = intern_string::lookup("pattern");
-
-                auto ce = regex.unwrapErr();
-                reporter(&hl_pair.second.hc_regex,
-                         lnav::console::to_user_message(PATTERN_SRC, ce));
+            if (hl_pair.second.hc_regex.pp_value == nullptr) {
                 continue;
             }
 
             const auto& sc = hl_pair.second.hc_style;
-            std::string fg1, bg1, fg_color, bg_color, errmsg;
+            std::string fg_color, bg_color, errmsg;
             bool invalid = false;
             text_attrs attrs;
 
-            fg1 = sc.sc_color;
-            bg1 = sc.sc_background_color;
-            shlex(fg1).eval(fg_color, vars);
-            shlex(bg1).eval(bg_color, vars);
+            auto fg1 = sc.sc_color.pp_value;
+            auto bg1 = sc.sc_background_color.pp_value;
+            shlex(fg1).eval(fg_color, scoped_resolver{vars});
+            shlex(bg1).eval(bg_color, scoped_resolver{vars});
 
-            auto fg = styling::color_unit::from_str(fg_color).unwrapOrElse(
-                [&](const auto& msg) {
-                    reporter(&sc.sc_color,
-                             lnav::console::user_message::error(
-                                 attr_line_t("invalid color -- ")
-                                     .append_quoted(sc.sc_color))
-                                 .with_reason(msg));
-                    invalid = true;
-                    return styling::color_unit::make_empty();
-                });
-            auto bg = styling::color_unit::from_str(bg_color).unwrapOrElse(
-                [&](const auto& msg) {
-                    reporter(&sc.sc_background_color,
-                             lnav::console::user_message::error(
-                                 attr_line_t("invalid background color -- ")
-                                     .append_quoted(sc.sc_background_color))
-                                 .with_reason(msg));
-                    invalid = true;
-                    return styling::color_unit::make_empty();
-                });
+            attrs.ta_fg_color = vc.match_color(
+                styling::color_unit::from_str(fg_color).unwrapOrElse(
+                    [&](const auto& msg) {
+                        reporter(&sc.sc_color,
+                                 lnav::console::user_message::error(
+                                     attr_line_t("invalid color -- ")
+                                         .append_quoted(sc.sc_color.pp_value))
+                                     .with_reason(msg));
+                        invalid = true;
+                        return styling::color_unit::EMPTY;
+                    }));
+            attrs.ta_bg_color = vc.match_color(
+                styling::color_unit::from_str(bg_color).unwrapOrElse(
+                    [&](const auto& msg) {
+                        reporter(&sc.sc_background_color,
+                                 lnav::console::user_message::error(
+                                     attr_line_t("invalid background color -- ")
+                                         .append_quoted(
+                                             sc.sc_background_color.pp_value))
+                                     .with_reason(msg));
+                        invalid = true;
+                        return styling::color_unit::EMPTY;
+                    }));
             if (invalid) {
                 continue;
             }
 
             if (sc.sc_bold) {
-                attrs.ta_attrs |= A_BOLD;
+                attrs |= text_attrs::style::bold;
             }
             if (sc.sc_underline) {
-                attrs.ta_attrs |= A_UNDERLINE;
+                attrs |= text_attrs::style::underline;
             }
             this->tc_highlights[{highlight_source_t::THEME, hl_pair.first}]
-                = highlighter(regex.unwrap().to_shared())
+                = highlighter(hl_pair.second.hc_regex.pp_value)
                       .with_attrs(attrs)
-                      .with_color(fg, bg)
-                      .with_nestable(false);
+                      .with_nestable(hl_pair.second.hc_nestable);
         }
     }
 
@@ -241,66 +364,664 @@ textview_curses::reload_config(error_reporter& reporter)
 }
 
 void
+textview_curses::invoke_scroll()
+{
+    this->tc_selected_text = std::nullopt;
+    if (this->tc_sub_source != nullptr) {
+        this->tc_sub_source->scroll_invoked(this);
+    }
+
+    listview_curses::invoke_scroll();
+}
+
+const text_mark_scanner*
+textview_curses::mark_scanner_for(const bookmark_type_t* bt) const
+{
+    const auto* retval = dynamic_cast<text_mark_scanner*>(this->tc_sub_source);
+
+    if (retval != nullptr && !retval->text_scans_mark(bt)) {
+        retval = nullptr;
+    }
+
+    return retval;
+}
+
+std::optional<vis_line_t>
+textview_curses::adjacent_mark(const bookmark_type_t* bt,
+                               vis_line_t from,
+                               text_anchors::direction dir) const
+{
+    const auto* scanner = this->mark_scanner_for(bt);
+
+    if (scanner != nullptr) {
+        return scanner->text_adjacent_mark(bt, from, dir);
+    }
+
+    const auto& bv = this->tc_bookmarks[bt];
+
+    switch (dir) {
+        case text_anchors::direction::next:
+            return bv.next(from);
+        case text_anchors::direction::prev:
+            return bv.prev(from);
+    }
+
+    return std::nullopt;
+}
+
+bool
+textview_curses::mark_at_row(const bookmark_type_t* bt, vis_line_t vl) const
+{
+    const auto* scanner = this->mark_scanner_for(bt);
+
+    if (scanner != nullptr) {
+        return scanner->text_mark_at_row(bt, vl);
+    }
+
+    return this->tc_bookmarks[bt].bv_tree.exists(vl);
+}
+
+bool
+textview_curses::any_mark_in_range(const bookmark_type_t* bt,
+                                   vis_line_t start,
+                                   vis_line_t stop) const
+{
+    if (start >= stop) {
+        return false;
+    }
+
+    const auto* scanner = this->mark_scanner_for(bt);
+
+    if (scanner != nullptr) {
+        return scanner->text_any_mark_in_range(bt, start, stop);
+    }
+
+    // next() is strictly-after, so the row before the range is what asks
+    // "anything at or after start".
+    auto next = this->tc_bookmarks[bt].next(start - 1_vl);
+
+    return next && next.value() < stop;
+}
+
+void
 textview_curses::reload_data()
 {
+    this->tc_selected_text = std::nullopt;
     if (this->tc_sub_source != nullptr) {
         this->tc_sub_source->text_update_marks(this->tc_bookmarks);
-    }
-    if (this->tc_sub_source != nullptr) {
+
         auto* ttt = dynamic_cast<text_time_translator*>(this->tc_sub_source);
 
         if (ttt != nullptr) {
             ttt->data_reloaded(this);
         }
+        listview_curses::reload_data();
     }
+}
+
+void
+textview_curses::grep_reset(grep_proc<vis_line_t>& gp,
+                            vis_line_t start,
+                            vis_line_t stop,
+                            grep_pattern_mask_t patterns)
+{
+    // This range is about to be scanned again for these patterns, so drop what
+    // they previously found in it.  Only the union is rebuilt, so lines that
+    // some other pattern still matches keep their mark.
+    for (size_t slot = 0; slot < GREP_MAX_PATTERNS; slot++) {
+        if (!(patterns & grep_pattern_bit(slot))) {
+            continue;
+        }
+
+        auto& slot_bv = this->tc_search_matches[slot];
+        auto slot_range = slot_bv.equal_range(start, stop);
+        auto to_del = std::vector<vis_line_t>{};
+
+        for (auto iter = slot_range.first; iter != slot_range.second; ++iter) {
+            to_del.emplace_back(*iter);
+        }
+        for (auto cl : to_del) {
+            slot_bv.bv_tree.erase(cl);
+        }
+    }
+
+    this->rebuild_search_marks(start, stop);
+
     listview_curses::reload_data();
 }
 
 void
 textview_curses::grep_begin(grep_proc<vis_line_t>& gp,
                             vis_line_t start,
-                            vis_line_t stop)
+                            vis_line_t stop,
+                            grep_pattern_mask_t patterns)
 {
     require(this->tc_searching >= 0);
+
+    auto op_guard = lnav_opid_guard::resume(this->tc_search_op_id.value_or(""));
 
     this->tc_searching += 1;
     this->tc_search_action(this);
 
-    if (start != -1_vl) {
-        auto& search_bv = this->tc_bookmarks[&BM_SEARCH];
-        auto pair = search_bv.equal_range(start, stop);
+    this->grep_reset(gp, start, stop, patterns);
+    listview_curses::reload_data();
+}
 
-        if (pair.first != pair.second) {
-            this->set_needs_update();
-        }
-        for (auto mark_iter = pair.first; mark_iter != pair.second; ++mark_iter)
-        {
-            if (this->tc_sub_source) {
-                this->tc_sub_source->text_mark(&BM_SEARCH, *mark_iter, false);
+void
+textview_curses::rebuild_search_marks(vis_line_t start, vis_line_t stop)
+{
+    auto& search_bv = this->tc_bookmarks[&BM_SEARCH];
+    auto pair = search_bv.equal_range(start, stop);
+    auto to_del = std::vector<vis_line_t>{};
+
+    for (auto mark_iter = pair.first; mark_iter != pair.second; ++mark_iter) {
+        auto still_matched = false;
+
+        for (size_t slot = 0; slot < GREP_MAX_PATTERNS; slot++) {
+            if (this->tc_disabled_search_slots & grep_pattern_bit(slot)) {
+                continue;
+            }
+            if (this->tc_search_matches[slot].contains(*mark_iter)) {
+                still_matched = true;
+                break;
             }
         }
-        if (pair.first != pair.second) {
-            search_bv.erase(pair.first, pair.second);
+        if (!still_matched) {
+            to_del.emplace_back(*mark_iter);
         }
     }
 
-    listview_curses::reload_data();
+    if (!to_del.empty()) {
+        this->set_needs_update();
+    }
+    for (auto cl : to_del) {
+        if (this->tc_sub_source) {
+            this->tc_sub_source->text_mark(&BM_SEARCH, cl, false);
+        }
+        search_bv.bv_tree.erase(cl);
+    }
+}
+
+std::optional<size_t>
+textview_curses::alloc_search_slot()
+{
+    for (size_t slot = SEARCH_SLOT_INTERACTIVE + 1; slot < GREP_MAX_PATTERNS;
+         slot++)
+    {
+        if (!this->tc_search_slots_used.test(slot)) {
+            this->tc_search_slots_used.set(slot);
+            return slot;
+        }
+    }
+
+    return std::nullopt;
+}
+
+void
+textview_curses::free_search_slot(size_t slot)
+{
+    require(slot != SEARCH_SLOT_INTERACTIVE);
+    require(slot < GREP_MAX_PATTERNS);
+
+    this->tc_search_slots_used.reset(slot);
+    if (this->tc_focused_search_slot == slot) {
+        // The slot is about to be handed to another search, so the focus
+        // cannot follow it.
+        this->tc_focused_search_slot = std::nullopt;
+    }
+    // clear_pattern() only takes effect on the next fork, so a run that is
+    // already in flight has to be cancelled as well.  Otherwise it keeps
+    // reporting this slot, refilling it after the caller has dropped its
+    // matches -- and the slot may already have been handed to another search
+    // by then, since alloc_search_slot() hands out the lowest free one.
+    if (this->tc_search_proc != nullptr) {
+        this->tc_search_proc->clear_pattern(slot);
+        this->tc_search_proc->invalidate(grep_pattern_bit(slot));
+    }
+    if (this->tc_meta_search_proc != nullptr) {
+        this->tc_meta_search_proc->clear_pattern(slot);
+        this->tc_meta_search_proc->invalidate(grep_pattern_bit(slot));
+    }
+}
+
+Result<void, lnav::console::user_message>
+textview_curses::validate_search_name(const std::string& name)
+{
+    if (name.empty()) {
+        return Err(lnav::console::user_message::error(
+            "a named search must have a name"));
+    }
+
+    for (const auto ch : name) {
+        if (isspace((unsigned char) ch) || ch == '\'' || ch == '"') {
+            return Err(
+                lnav::console::user_message::error(
+                    attr_line_t()
+                        .append_quoted(name)
+                        .append(" is not a valid name for a search"))
+                    .with_reason("a name cannot contain whitespace or quotes")
+                    .with_help(
+                        "the name is written verbatim into the "
+                        "create-named-search command that is saved in the "
+                        "session, so it must be a single, unquoted word"));
+        }
+    }
+
+    static const auto NOT_AN_IDENT_HELP = attr_line_t(
+        "the name is also used for the SQL table that contains the hits for "
+        "this search, so it must start with a letter or underscore, contain "
+        "only letters, numbers, and underscores, and not be an SQL keyword");
+
+    if (sql_ident_needs_quote(name.c_str()) || isdigit((unsigned char) name[0]))
+    {
+        return Err(lnav::console::user_message::error(
+                       attr_line_t()
+                           .append_quoted(name)
+                           .append(" is not a valid name for a search"))
+                       .with_reason("a name must be a valid SQL identifier")
+                       .with_help(NOT_AN_IDENT_HELP));
+    }
+
+    auto upper_name = toupper(name);
+    if (std::binary_search(std::begin(sqlite_keywords),
+                           std::end(sqlite_keywords),
+                           upper_name))
+    {
+        return Err(lnav::console::user_message::error(
+                       attr_line_t()
+                           .append_quoted(name)
+                           .append(" is not a valid name for a search"))
+                       .with_reason(attr_line_t()
+                                        .append_quoted(upper_name)
+                                        .append(" is an SQL keyword"))
+                       .with_help(NOT_AN_IDENT_HELP));
+    }
+
+    return Ok();
+}
+
+void
+textview_curses::add_named_search_highlight(
+    const std::string& name, const std::shared_ptr<lnav::pcre2pp::code>& code)
+{
+    highlighter hl(code);
+    // The name picks the background color, so each named search reads as its
+    // own block of highlighting.  Only the background is set: the renderer
+    // pushes whatever foreground the line already has into readable contrast
+    // against it (see the lab_color::readable() pass in view_curses.cc), which
+    // adapts to the format's own field coloring instead of fighting it.
+    text_attrs attrs;
+    attrs.ta_bg_color = view_colors::singleton().color_for_ident(
+        string_fragment::from_str(name));
+    hl.with_attrs(attrs);
+    this->tc_highlights[{highlight_source_t::NAMED_SEARCH, name}] = hl;
+}
+
+Result<void, lnav::console::user_message>
+textview_curses::create_named_search(const std::string& name,
+                                     const std::string& pattern,
+                                     search_adoption_t adoption)
+{
+    static const intern_string_t PATTERN_SRC = intern_string::lookup("pattern");
+
+    TRY(validate_search_name(name));
+
+    for (const auto& ns : this->tc_named_searches) {
+        if (ns.ns_name == name) {
+            return Err(lnav::console::user_message::error(
+                attr_line_t()
+                    .append_quoted(name)
+                    .append(" is already a named search")));
+        }
+    }
+
+    auto compile_res = lnav::pcre2pp::code::from(pattern, PCRE2_CASELESS);
+    if (compile_res.isErr()) {
+        return Err(lnav::console::to_user_message(
+            PATTERN_SRC, compile_res.unwrapErr()));
+    }
+    auto code = compile_res.unwrap().to_shared();
+
+    auto slot_opt = this->alloc_search_slot();
+    if (!slot_opt) {
+        return Err(lnav::console::user_message::error(
+                       "too many searches are active")
+                       .with_reason(attr_line_t()
+                                        .append("only ")
+                                        .append(fmt::to_string(
+                                            GREP_MAX_PATTERNS - 1))
+                                        .append(" named searches can be "
+                                                "active at a time")));
+    }
+    auto slot = slot_opt.value();
+
+    if (this->tc_on_named_search_created) {
+        auto hook_res = this->tc_on_named_search_created(*this, name, code);
+
+        if (hook_res.isErr()) {
+            // Nothing has been added to the view yet, so giving the slot
+            // back is all it takes to leave things as they were.
+            this->free_search_slot(slot);
+            return Err(hook_res.unwrapErr());
+        }
+    }
+
+    auto* gp = this->ensure_search_procs();
+    gp->set_pattern(slot, code);
+    if (this->tc_meta_search_proc != nullptr) {
+        this->tc_meta_search_proc->set_pattern(slot, code);
+    }
+
+    this->add_named_search_highlight(name, code);
+
+    this->tc_named_searches.emplace_back(
+        named_search{name, pattern, slot, code});
+
+    // The interactive search has already found exactly these lines, so take a
+    // copy of its results rather than scanning for them again.  This is only
+    // valid once that scan has finished; a search still in flight has only
+    // partly filled its slot.
+    //
+    // The comparison is against the compiled form, since that is what the
+    // callers hand over and what was actually matched against.  A search whose
+    // text had to be quoted to compile does not match what was typed.
+    if (pattern == this->tc_current_search_pattern && !this->is_searching()) {
+        this->tc_search_matches[slot]
+            = this->tc_search_matches[SEARCH_SLOT_INTERACTIVE];
+        if (adoption == search_adoption_t::promote) {
+            // The pattern came from the active search, so that search steps
+            // aside for the named one.  A caller that supplied a pattern of
+            // its own keeps its search, hits and all.
+            this->execute_search("");
+        }
+    } else if (this->tc_defer_searches) {
+        // The caller is creating searches in bulk and will scan for all of
+        // them at once.
+        this->tc_deferred_search_slots |= grep_pattern_bit(slot);
+    } else if (this->tc_sub_source != nullptr) {
+        this->queue_search_for(grep_pattern_bit(slot));
+    }
+
+    return Ok();
+}
+
+void
+textview_curses::queue_search_for(grep_pattern_mask_t patterns)
+{
+    if (this->tc_sub_source == nullptr || patterns == 0) {
+        return;
+    }
+
+    auto* gp = this->ensure_search_procs();
+    const auto line_count = vis_line_t(this->tc_sub_source->text_line_count());
+
+    gp->queue_request(0_vl, line_count, patterns);
+    gp->start();
+    if (this->tc_meta_search_proc != nullptr) {
+        auto& sgp = this->tc_meta_search_proc;
+
+        sgp->queue_request(0_vl, line_count, patterns);
+        sgp->start();
+    }
+    this->tc_searched_through = line_count;
+}
+
+void
+textview_curses::flush_deferred_searches()
+{
+    auto patterns = this->tc_deferred_search_slots;
+
+    this->tc_deferred_search_slots = 0;
+    // One pass covers every search that was created while the guard was up.
+    this->queue_search_for(patterns);
+}
+
+grep_pattern_mask_t
+textview_curses::named_search_matches(vis_line_t start, vis_line_t end) const
+{
+    grep_pattern_mask_t retval = 0;
+
+    for (const auto& ns : this->tc_named_searches) {
+        if (!ns.ns_enabled) {
+            continue;
+        }
+
+        const auto& slot_bv = this->tc_search_matches[ns.ns_slot];
+        auto range = slot_bv.equal_range(start, end);
+
+        if (range.first != range.second) {
+            retval |= grep_pattern_bit(ns.ns_slot);
+        }
+    }
+
+    return retval;
+}
+
+const textview_curses::named_search*
+textview_curses::find_named_search(const std::string& name) const
+{
+    for (const auto& ns : this->tc_named_searches) {
+        if (ns.ns_name == name) {
+            return &ns;
+        }
+    }
+
+    return nullptr;
+}
+
+bool
+textview_curses::set_named_search_enabled(const std::string& name, bool enabled)
+{
+    auto iter = std::find_if(
+        this->tc_named_searches.begin(),
+        this->tc_named_searches.end(),
+        [&name](const auto& ns) { return ns.ns_name == name; });
+
+    if (iter == this->tc_named_searches.end()) {
+        return false;
+    }
+    if (iter->ns_enabled == enabled) {
+        return true;
+    }
+
+    iter->ns_enabled = enabled;
+    if (enabled) {
+        this->tc_disabled_search_slots &= ~grep_pattern_bit(iter->ns_slot);
+        this->add_named_search_highlight(iter->ns_name, iter->ns_code);
+        // The hits were kept while the search was off, so the marks can be
+        // put back without another scan.
+        for (const auto vl : this->tc_search_matches[iter->ns_slot].bv_tree) {
+            this->tc_bookmarks[&BM_SEARCH].insert_once(vl);
+            if (this->tc_sub_source != nullptr) {
+                this->tc_sub_source->text_mark(&BM_SEARCH, vl, true);
+            }
+        }
+    } else {
+        this->tc_disabled_search_slots |= grep_pattern_bit(iter->ns_slot);
+        if (this->tc_focused_search_slot == iter->ns_slot) {
+            // A search that is not being highlighted should not be the one
+            // that n/N is walking either.
+            this->tc_focused_search_slot = std::nullopt;
+        }
+        this->tc_highlights.erase({highlight_source_t::NAMED_SEARCH, name});
+        // Rebuilding the union drops the marks that only this search was
+        // holding, while lines that another search matched keep theirs.
+        // equal_range() treats a stop of -1 as "through the end".
+        this->rebuild_search_marks(0_vl, -1_vl);
+    }
+    this->set_needs_update();
+
+    return true;
+}
+
+bool
+textview_curses::delete_named_search(const std::string& name)
+{
+    auto iter = std::find_if(
+        this->tc_named_searches.begin(),
+        this->tc_named_searches.end(),
+        [&name](const auto& ns) { return ns.ns_name == name; });
+
+    if (iter == this->tc_named_searches.end()) {
+        return false;
+    }
+
+    if (this->tc_on_named_search_deleted) {
+        this->tc_on_named_search_deleted(*this, name);
+    }
+    this->tc_highlights.erase({highlight_source_t::NAMED_SEARCH, name});
+    this->free_search_slot(iter->ns_slot);
+    this->tc_disabled_search_slots &= ~grep_pattern_bit(iter->ns_slot);
+    // Drops the slot's matches and rebuilds the union, so lines that another
+    // search also matched keep their mark.
+    this->match_reset(grep_pattern_bit(iter->ns_slot));
+    this->tc_named_searches.erase(iter);
+    this->set_needs_update();
+
+    return true;
+}
+
+void
+textview_curses::clear_named_searches()
+{
+    grep_pattern_mask_t patterns = 0;
+
+    for (const auto& ns : this->tc_named_searches) {
+        if (this->tc_on_named_search_deleted) {
+            this->tc_on_named_search_deleted(*this, ns.ns_name);
+        }
+        this->tc_highlights.erase(
+            {highlight_source_t::NAMED_SEARCH, ns.ns_name});
+        this->free_search_slot(ns.ns_slot);
+        patterns |= grep_pattern_bit(ns.ns_slot);
+    }
+    this->tc_named_searches.clear();
+    this->tc_disabled_search_slots = 0;
+    if (patterns != 0) {
+        // The marks are rebuilt once for all of the slots instead of once per
+        // search.
+        this->match_reset(patterns);
+        this->set_needs_update();
+    }
+}
+
+bool
+textview_curses::focus_named_search(const std::string& name)
+{
+    const auto* ns = this->find_named_search(name);
+
+    if (ns == nullptr || !ns->ns_enabled) {
+        return false;
+    }
+
+    this->tc_focused_search_slot = ns->ns_slot;
+    this->set_needs_update();
+
+    return true;
+}
+
+std::optional<size_t>
+textview_curses::cycle_search_focus(int dir)
+{
+    // The stops of the cycle, in order, with "nothing focused" as the first.
+    std::vector<std::optional<size_t>> stops{std::nullopt};
+
+    if (!this->tc_current_search.empty()) {
+        stops.emplace_back(SEARCH_SLOT_INTERACTIVE);
+    }
+    for (const auto& ns : this->tc_named_searches) {
+        if (ns.ns_enabled) {
+            stops.emplace_back(ns.ns_slot);
+        }
+    }
+
+    auto iter = std::find(stops.begin(), stops.end(),
+                          this->tc_focused_search_slot);
+    // A focus that is no longer a stop -- the interactive search was cleared,
+    // say -- restarts the cycle rather than sticking.
+    auto index = iter == stops.end() ? 0 : std::distance(stops.begin(), iter);
+    auto count = static_cast<ssize_t>(stops.size());
+
+    index = ((index + dir) % count + count) % count;
+    this->tc_focused_search_slot = stops[index];
+    this->set_needs_update();
+
+    return this->tc_focused_search_slot;
+}
+
+std::optional<std::string>
+textview_curses::get_focused_search_name() const
+{
+    if (!this->tc_focused_search_slot) {
+        return std::nullopt;
+    }
+
+    for (const auto& ns : this->tc_named_searches) {
+        if (ns.ns_slot == this->tc_focused_search_slot.value()) {
+            return ns.ns_name;
+        }
+    }
+
+    return std::nullopt;
+}
+
+void
+textview_curses::match_reset(grep_pattern_mask_t patterns)
+{
+    for (size_t slot = 0; slot < GREP_MAX_PATTERNS; slot++) {
+        if (patterns & grep_pattern_bit(slot)) {
+            this->tc_search_matches[slot].clear();
+        }
+    }
+
+    auto marks_remain = false;
+    for (size_t slot = 0; slot < GREP_MAX_PATTERNS; slot++) {
+        if (this->tc_disabled_search_slots & grep_pattern_bit(slot)) {
+            // A disabled search keeps its hits but contributes no marks.
+            continue;
+        }
+        if (!this->tc_search_matches[slot].empty()) {
+            marks_remain = true;
+            break;
+        }
+    }
+
+    if (!marks_remain) {
+        // With nothing left to mark, the marks can go outright.  That is worth
+        // preferring over walking the rows: a row number recorded in the
+        // bookmarks is stale as soon as a filter changes which lines are
+        // visible, while clearing by content line is not.
+        this->tc_bookmarks[&BM_SEARCH].clear();
+        if (this->tc_sub_source != nullptr) {
+            this->tc_sub_source->text_clear_marks(&BM_SEARCH);
+        }
+    } else {
+        // equal_range() treats a stop of -1 as "through the end".
+        this->rebuild_search_marks(0_vl, -1_vl);
+    }
 }
 
 void
 textview_curses::grep_end_batch(grep_proc<vis_line_t>& gp)
 {
+    auto op_guard = lnav_opid_guard::resume(this->tc_search_op_id.value_or(""));
+
     if (this->tc_follow_deadline.tv_sec
-        && this->tc_follow_top == this->get_top())
+        && this->tc_follow_selection == this->get_selection())
     {
-        struct timeval now;
+        timeval now;
 
         gettimeofday(&now, nullptr);
         if (this->tc_follow_deadline < now) {
+            // The search did not turn up anything to move to in time, so stop
+            // looking and let go of the callback.
+            this->tc_follow_deadline = {0, 0};
+            this->tc_follow_func = {};
         } else {
             if (this->tc_follow_func) {
                 if (this->tc_follow_func()) {
                     this->tc_follow_deadline = {0, 0};
+                    this->tc_follow_func = {};
                 }
             } else {
                 this->tc_follow_deadline = {0, 0};
@@ -313,8 +1034,20 @@ textview_curses::grep_end_batch(grep_proc<vis_line_t>& gp)
 void
 textview_curses::grep_end(grep_proc<vis_line_t>& gp)
 {
+    auto op_guard = lnav_opid_guard::resume(this->tc_search_op_id.value_or(""));
+
     this->tc_searching -= 1;
     this->grep_end_batch(gp);
+    if (this->tc_searching == 0 && this->tc_search_start_time) {
+        const auto now = std::chrono::steady_clock::now();
+        this->tc_search_duration
+            = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - this->tc_search_start_time.value());
+        this->tc_search_start_time = std::nullopt;
+        if (this->tc_state_event_handler) {
+            this->tc_state_event_handler(*this);
+        }
+    }
 
     ensure(this->tc_searching >= 0);
 }
@@ -322,9 +1055,20 @@ textview_curses::grep_end(grep_proc<vis_line_t>& gp)
 void
 textview_curses::grep_match(grep_proc<vis_line_t>& gp,
                             vis_line_t line,
-                            int start,
-                            int end)
+                            grep_pattern_mask_t patterns)
 {
+    for (size_t slot = 0; slot < GREP_MAX_PATTERNS; slot++) {
+        if (patterns & grep_pattern_bit(slot)) {
+            this->tc_search_matches[slot].insert_once(vis_line_t(line));
+        }
+    }
+
+    // A disabled search keeps collecting hits so that it can be turned back
+    // on without a rescan, but it must not mark the line.
+    if ((patterns & ~this->tc_disabled_search_slots) == 0) {
+        return;
+    }
+
     this->tc_bookmarks[&BM_SEARCH].insert_once(vis_line_t(line));
     if (this->tc_sub_source != nullptr) {
         this->tc_sub_source->text_mark(&BM_SEARCH, line, true);
@@ -342,6 +1086,38 @@ textview_curses::listview_value_for_rows(const listview_curses& lv,
 {
     for (auto& al : rows_out) {
         this->textview_value_for_row(row, al);
+
+        auto& sa = al.al_attrs;
+        if (this->is_selectable() && this->tc_cursor_role
+            && this->tc_disabled_cursor_role)
+        {
+            auto sel_end = this->get_selection().value_or(0_vl);
+            auto sel_start = sel_end;
+            if (this->tc_selection_start) {
+                if (this->tc_selection_start.value() < sel_end) {
+                    sel_start = this->tc_selection_start.value();
+                } else {
+                    sel_end = this->tc_selection_start.value();
+                }
+            }
+
+            if (sel_start <= row && row <= sel_end) {
+                auto role = (this->get_overlay_selection() || !this->vc_enabled)
+                    ? this->tc_disabled_cursor_role.value()
+                    : this->tc_cursor_role.value();
+
+                sa.emplace_back(line_range{0, -1}, VC_ROLE.value(role));
+            }
+        }
+
+        if (this->tc_selected_text) {
+            const auto& sti = this->tc_selected_text.value();
+            if (sti.sti_line == row) {
+                sa.emplace_back(sti.sti_range,
+                                VC_ROLE.value(role_t::VCR_SELECTED_TEXT));
+            }
+        }
+
         ++row;
     }
 }
@@ -349,85 +1125,423 @@ textview_curses::listview_value_for_rows(const listview_curses& lv,
 bool
 textview_curses::handle_mouse(mouse_event& me)
 {
-    unsigned long width;
-    vis_line_t height;
-
-    if (this->tc_selection_start == -1_vl && listview_curses::handle_mouse(me))
-    {
-        return true;
-    }
-
-    if (this->tc_delegate != nullptr
-        && this->tc_delegate->text_handle_mouse(*this, me))
-    {
-        return true;
-    }
-
-    if (me.me_button != mouse_button_t::BUTTON_LEFT) {
+    if (!this->vc_visible || this->lv_height == 0) {
         return false;
     }
 
-    vis_line_t mouse_line(this->get_top() + me.me_y);
-
-    if (mouse_line > this->get_bottom()) {
-        mouse_line = this->get_bottom();
+    if (!this->tc_selection_start && listview_curses::handle_mouse(me)) {
+        return true;
     }
 
-    this->get_dimensions(height, width);
+    auto mouse_line = (me.me_y < 0 || me.me_y >= this->lv_display_lines.size())
+        ? empty_space{}
+        : this->lv_display_lines[me.me_y];
+    auto [height, width] = this->get_dimensions();
+
+    if (!mouse_line.is<overlay_menu>()
+        && (me.me_button != mouse_button_t::BUTTON_LEFT
+            || me.me_state != mouse_button_state_t::BUTTON_STATE_RELEASED))
+    {
+        this->tc_selected_text = std::nullopt;
+        this->set_needs_update();
+    }
+
+    std::optional<int> overlay_content_min_y;
+    std::optional<int> overlay_content_max_y;
+    if (this->tc_press_line.is<overlay_content>()) {
+        auto main_line
+            = this->tc_press_line.get<overlay_content>().oc_main_line;
+        for (size_t lpc = 0; lpc < this->lv_display_lines.size(); lpc++) {
+            if (overlay_content_min_y
+                && !this->lv_display_lines[lpc].is<static_overlay_content>()
+                && !this->lv_display_lines[lpc].is<overlay_content>())
+            {
+                overlay_content_max_y = lpc;
+                break;
+            }
+            if (this->lv_display_lines[lpc].is<main_content>()) {
+                auto& mc = this->lv_display_lines[lpc].get<main_content>();
+                if (mc.mc_line == main_line) {
+                    overlay_content_min_y = lpc;
+                }
+            }
+        }
+        if (overlay_content_min_y && !overlay_content_max_y) {
+            overlay_content_max_y = this->lv_display_lines.size();
+        }
+    }
+
+    auto* sub_delegate = dynamic_cast<text_delegate*>(this->tc_sub_source);
 
     switch (me.me_state) {
-        case mouse_button_state_t::BUTTON_STATE_PRESSED:
-            this->tc_selection_start = mouse_line;
-            this->tc_selection_last = -1_vl;
-            this->tc_selection_cleared = false;
-            break;
-        case mouse_button_state_t::BUTTON_STATE_DRAGGED:
-            if (me.me_y <= 0) {
-                this->shift_top(-1_vl);
-                me.me_y = 0;
-                mouse_line = this->get_top();
+        case mouse_button_state_t::BUTTON_STATE_PRESSED: {
+            this->tc_selection_at_press = this->get_selection();
+            this->tc_press_line = mouse_line;
+            this->tc_press_left = this->lv_left + me.me_press_x;
+            if (!this->lv_selectable) {
+                this->set_selectable(true);
             }
-            if (me.me_y >= height
-                && this->get_top() < this->get_top_for_last_row())
-            {
-                this->shift_top(1_vl);
-                me.me_y = height;
-                mouse_line = this->get_bottom();
-            }
-
-            if (this->tc_selection_last == mouse_line)
-                break;
-
-            if (this->tc_selection_last != -1) {
-                this->toggle_user_mark(&textview_curses::BM_USER,
-                                       this->tc_selection_start,
-                                       this->tc_selection_last);
-            }
-            if (this->tc_selection_start == mouse_line) {
-                this->tc_selection_last = -1_vl;
-            } else {
-                if (!this->tc_selection_cleared) {
-                    if (this->tc_sub_source != nullptr) {
-                        this->tc_sub_source->text_clear_marks(&BM_USER);
+            mouse_line.match(
+                [this, &me, sub_delegate, &mouse_line](const main_content& mc) {
+                    this->tc_text_selection_active = true;
+                    this->tc_press_left
+                        = mc.mc_line_range.lr_start + me.me_press_x;
+                    if (this->vc_enabled) {
+                        if (this->tc_supports_marks
+                            && me.me_button == mouse_button_t::BUTTON_LEFT
+                            && (me.is_modifier_pressed(
+                                    mouse_event::modifier_t::shift)
+                                || me.is_modifier_pressed(
+                                    mouse_event::modifier_t::ctrl)))
+                        {
+                            this->tc_selection_start = mc.mc_line;
+                        }
+                        this->set_selection_without_context(mc.mc_line);
+                        this->tc_press_event = me;
                     }
-                    this->tc_bookmarks[&BM_USER].clear();
-
-                    this->tc_selection_cleared = true;
-                }
-                this->toggle_user_mark(
-                    &BM_USER, this->tc_selection_start, mouse_line);
-                this->tc_selection_last = mouse_line;
+                    if (this->tc_delegate != nullptr) {
+                        this->tc_delegate->text_handle_mouse(
+                            *this, mouse_line, me);
+                    }
+                    if (sub_delegate != nullptr) {
+                        sub_delegate->text_handle_mouse(*this, mouse_line, me);
+                    }
+                },
+                [](const overlay_menu& om) {},
+                [](const static_overlay_content& soc) {},
+                [this](const overlay_content& oc) {
+                    this->set_selection(oc.oc_main_line);
+                    this->set_overlay_selection(oc.oc_line);
+                },
+                [](const empty_space& es) {});
+            break;
+        }
+        case mouse_button_state_t::BUTTON_STATE_DOUBLE_CLICK: {
+            if (!this->lv_selectable) {
+                this->set_selectable(true);
             }
-            this->reload_data();
+            this->tc_text_selection_active = false;
+            mouse_line.match(
+                [this, &me, &mouse_line, sub_delegate](const main_content& mc) {
+                    if (this->vc_enabled) {
+                        if (this->tc_supports_marks
+                            && me.me_button == mouse_button_t::BUTTON_LEFT)
+                        {
+                            attr_line_t al;
+
+                            this->textview_value_for_row(mc.mc_line, al);
+                            auto line_sf
+                                = string_fragment::from_str(al.get_string());
+                            auto cursor_sf = line_sf.sub_cell_range(
+                                mc.mc_line_range.lr_start + me.me_x,
+                                mc.mc_line_range.lr_start + me.me_x);
+                            auto ds = data_scanner(line_sf);
+                            auto tf = this->tc_sub_source->get_text_format();
+                            while (true) {
+                                auto tok_res = ds.tokenize2(
+                                    tf.value_or(text_format_t::TF_PLAINTEXT));
+                                if (!tok_res) {
+                                    break;
+                                }
+
+                                auto tok = tok_res.value();
+                                auto tok_sf
+                                    = (tok.tr_token
+                                           == data_token_t::DT_QUOTED_STRING
+                                       && (cursor_sf.sf_begin
+                                               == tok.to_string_fragment()
+                                                      .sf_begin
+                                           || cursor_sf.sf_begin
+                                               == tok.to_string_fragment()
+                                                       .sf_end
+                                                   - 1))
+                                    ? tok.to_string_fragment()
+                                    : tok.inner_string_fragment();
+                                if (tok_sf.contains(cursor_sf)
+                                    && tok.tr_token != data_token_t::DT_WHITE)
+                                {
+                                    auto group_tok = ds.find_matching_bracket(
+                                        tf.value_or(
+                                            text_format_t::TF_PLAINTEXT),
+                                        tok);
+                                    if (group_tok) {
+                                        tok_sf = group_tok.value()
+                                                     .to_string_fragment();
+                                    }
+                                    this->tc_selected_text = selected_text_info{
+                                        me.me_x,
+                                        mc.mc_line,
+                                        line_range{
+                                            tok_sf.sf_begin,
+                                            tok_sf.sf_end,
+                                        },
+                                        al.al_attrs,
+                                        tok_sf.to_string(),
+                                    };
+                                    this->set_needs_update();
+                                    break;
+                                }
+                            }
+                        }
+                        this->set_selection_without_context(mc.mc_line);
+                    }
+                    if (this->tc_delegate != nullptr) {
+                        this->tc_delegate->text_handle_mouse(
+                            *this, mouse_line, me);
+                    }
+                    if (sub_delegate != nullptr) {
+                        sub_delegate->text_handle_mouse(*this, mouse_line, me);
+                    }
+                },
+                [](const static_overlay_content& soc) {},
+                [](const overlay_menu& om) {},
+                [](const overlay_content& oc) {},
+                [](const empty_space& es) {});
             break;
-        case mouse_button_state_t::BUTTON_STATE_RELEASED:
-            this->tc_selection_start = -1_vl;
-            this->tc_selection_last = -1_vl;
-            this->tc_selection_cleared = false;
+        }
+        case mouse_button_state_t::BUTTON_STATE_DRAGGED: {
+            auto same_line = (this->tc_press_line.is<main_content>()
+                              && mouse_line.is<main_content>()
+                              && this->tc_press_line.get<main_content>().mc_line
+                                  == mouse_line.get<main_content>().mc_line);
+            this->tc_text_selection_active = true;
+            if (!this->vc_enabled) {
+            } else if (same_line) {
+                const auto& mc = mouse_line.get<main_content>();
+                attr_line_t al;
+                auto low_x
+                    = std::min(this->tc_press_left,
+                               (int) mc.mc_line_range.lr_start + me.me_x);
+                auto high_x
+                    = std::max(this->tc_press_left,
+                               (int) mc.mc_line_range.lr_start + me.me_x);
+
+                this->set_selection_without_context(mc.mc_line);
+                if (this->tc_supports_marks
+                    && me.me_button == mouse_button_t::BUTTON_LEFT)
+                {
+                    this->textview_value_for_row(mc.mc_line, al);
+                    auto line_sf = string_fragment::from_str(al.get_string());
+                    auto cursor_sf = line_sf.sub_cell_range(low_x, high_x);
+                    if (this->lv_word_wrap) {
+                    } else if (me.me_x <= 1) {
+                        this->set_left(this->lv_left - 1);
+                    } else if (me.me_x >= width - 1) {
+                        this->set_left(this->lv_left + 1);
+                    }
+                    if (!cursor_sf.empty()) {
+                        this->tc_selected_text = {
+                            me.me_x,
+                            mc.mc_line,
+                            line_range{
+                                cursor_sf.sf_begin,
+                                cursor_sf.sf_end,
+                            },
+                            al.al_attrs,
+                            cursor_sf.to_string(),
+                        };
+                    }
+                }
+            } else {
+                if (this->tc_press_line.is<main_content>()) {
+                    if (me.me_y < 0) {
+                        this->shift_selection(shift_amount_t::up_line);
+                    } else if (me.me_y >= height) {
+                        this->shift_selection(shift_amount_t::down_line);
+                    } else if (mouse_line.is<main_content>()) {
+                        this->set_selection_without_context(
+                            mouse_line.get<main_content>().mc_line);
+                    }
+                } else if (this->tc_press_line.is<overlay_content>()
+                           && overlay_content_min_y && overlay_content_max_y)
+                {
+                    if (me.me_y < overlay_content_min_y.value()) {
+                        this->set_overlay_selection(
+                            this->get_overlay_selection().value_or(0_vl)
+                            - 1_vl);
+                    } else if (me.me_y >= overlay_content_max_y.value()) {
+                        this->set_overlay_selection(
+                            this->get_overlay_selection().value_or(0_vl)
+                            + 1_vl);
+                    } else if (mouse_line.is<overlay_content>()) {
+                        this->set_overlay_selection(
+                            mouse_line.get<overlay_content>().oc_line);
+                    }
+                }
+            }
             break;
+        }
+        case mouse_button_state_t::BUTTON_STATE_RELEASED: {
+            auto* ov = this->get_overlay_source();
+            if (ov != nullptr && mouse_line.is<overlay_menu>()
+                && this->tc_selected_text)
+            {
+                auto& om = mouse_line.get<overlay_menu>();
+                auto& sti = this->tc_selected_text.value();
+
+                for (const auto& mi : ov->los_menu_items) {
+                    if (om.om_line == mi.mi_line
+                        && me.is_click_in(mouse_button_t::BUTTON_LEFT,
+                                          mi.mi_range))
+                    {
+                        mi.mi_action(sti.sti_value);
+                        break;
+                    }
+                }
+            }
+            this->tc_text_selection_active = false;
+            if (this->vc_enabled) {
+                if (this->tc_selection_start) {
+                    this->toggle_user_mark(&BM_USER,
+                                           this->tc_selection_start.value(),
+                                           this->get_selection().value());
+                    this->reload_data();
+                }
+                this->tc_selection_start = std::nullopt;
+            }
+            if (mouse_line.is<main_content>()) {
+                const auto mc = mouse_line.get<main_content>();
+                attr_line_t al;
+
+                this->textview_value_for_row(mc.mc_line, al);
+                auto line_sf = string_fragment::from_str(al.get_string());
+                auto cursor_sf = line_sf.sub_cell_range(
+                    mc.mc_line_range.lr_start + me.me_x,
+                    mc.mc_line_range.lr_start + me.me_x);
+                auto consumed = false;
+                if (this->tc_on_click) {
+                    consumed
+                        = this->tc_on_click(*this, al, cursor_sf.sf_begin, me);
+                }
+                if (!consumed) {
+                    if (this->tc_press_line.is<main_content>()
+                        && me.is_click_in(
+                            mouse_button_t::BUTTON_RIGHT, 0, INT_MAX))
+                    {
+                        auto* lov = this->get_overlay_source();
+                        if (lov != nullptr
+                            && (!lov->get_show_details_in_overlay()
+                                || this->tc_selection_at_press
+                                    == this->get_selection()))
+                        {
+                            this->set_show_details_in_overlay(
+                                !lov->get_show_details_in_overlay());
+                        }
+                    }
+                    auto link_iter = find_string_attr_containing(
+                        al.get_attrs(), &VC_HYPERLINK, cursor_sf.sf_begin);
+                    if (link_iter != al.get_attrs().end()) {
+                        auto href = link_iter->sa_value.get<std::string>();
+                        auto* ta
+                            = dynamic_cast<text_anchors*>(this->tc_sub_source);
+
+                        if (me.me_button == mouse_button_t::BUTTON_LEFT
+                            && ta != nullptr && startswith(href, "#")
+                            && !startswith(href, "#/frontmatter"))
+                        {
+                            auto row_opt = ta->row_for_anchor(href);
+
+                            if (row_opt.has_value()) {
+                                this->set_selection(row_opt.value());
+                            }
+                        } else {
+                            this->tc_selected_text = selected_text_info{
+                                me.me_x,
+                                mc.mc_line,
+                                link_iter->sa_range,
+                                al.get_attrs(),
+                                al.to_string_fragment(link_iter).to_string(),
+                                href,
+                            };
+                            this->set_needs_update();
+                        }
+                    }
+                }
+            }
+            if (mouse_line.is<overlay_content>()) {
+                const auto& oc = mouse_line.get<overlay_content>();
+                std::vector<attr_line_t> ov_lines;
+
+                this->lv_overlay_source->list_value_for_overlay(
+                    *this, oc.oc_main_line, ov_lines);
+                const auto& al = ov_lines[oc.oc_line];
+                auto line_sf = string_fragment::from_str(al.get_string());
+                auto cursor_sf = line_sf.sub_cell_range(
+                    this->lv_left + me.me_x, this->lv_left + me.me_x);
+                auto link_iter = find_string_attr_containing(
+                    al.get_attrs(), &VC_HYPERLINK, cursor_sf.sf_begin);
+                if (link_iter != al.get_attrs().end()) {
+                    auto href = link_iter->sa_value.get<std::string>();
+                    auto* ta = dynamic_cast<text_anchors*>(this->tc_sub_source);
+
+                    if (me.me_button == mouse_button_t::BUTTON_LEFT
+                        && ta != nullptr && startswith(href, "#")
+                        && !startswith(href, "#/frontmatter"))
+                    {
+                        auto row_opt = ta->row_for_anchor(href);
+
+                        if (row_opt.has_value()) {
+                            this->tc_sub_source->get_location_history() |
+                                [&oc](auto lh) {
+                                    lh->loc_history_append(oc.oc_main_line);
+                                };
+                            this->set_selection(row_opt.value());
+                        }
+                    }
+                }
+                if (this->tc_on_click) {
+                    this->tc_on_click(*this, al, cursor_sf.sf_begin, me);
+                }
+            }
+            if (this->tc_delegate != nullptr) {
+                this->tc_delegate->text_handle_mouse(*this, mouse_line, me);
+            }
+            if (sub_delegate != nullptr) {
+                sub_delegate->text_handle_mouse(*this, mouse_line, me);
+            }
+            if (mouse_line.is<overlay_menu>()) {
+                this->tc_selected_text = std::nullopt;
+                this->set_needs_update();
+            }
+            break;
+        }
     }
 
     return true;
+}
+
+void
+textview_curses::apply_highlights(attr_line_t& al,
+                                  const line_range& body,
+                                  const line_range& orig_line)
+{
+    auto source_format = this->tc_sub_source->get_text_format();
+    if (source_format.value_or(text_format_t::TF_BINARY)
+        == text_format_t::TF_BINARY)
+    {
+        return;
+    }
+    for (const auto& tc_highlight : this->tc_highlights) {
+        bool internal_hl
+            = tc_highlight.first.first == highlight_source_t::INTERNAL
+            || tc_highlight.first.first == highlight_source_t::THEME;
+
+        if (!tc_highlight.second.applies_to_format(source_format.value())) {
+            continue;
+        }
+
+        if (this->tc_disabled_highlights.is_set(tc_highlight.first.first)) {
+            continue;
+        }
+
+        // Internal highlights should only apply to the log message body so
+        // that we don't start highlighting other fields.  User-provided
+        // highlights should apply only to the line itself and not any of
+        // the surrounding decorations that are added (for example, the file
+        // lines that are inserted at the beginning of the log view).
+        auto lr = internal_hl ? body : orig_line;
+        tc_highlight.second.annotate(al, lr);
+    }
 }
 
 void
@@ -435,150 +1549,103 @@ textview_curses::textview_value_for_row(vis_line_t row, attr_line_t& value_out)
 {
     auto& sa = value_out.get_attrs();
     auto& str = value_out.get_string();
-    auto source_format = this->tc_sub_source->get_text_format();
-    intern_string_t format_name;
 
     this->tc_sub_source->text_value_for_line(*this, row, str);
     this->tc_sub_source->text_attrs_for_line(*this, row, sa);
 
-    scrub_ansi_string(str, &sa);
+    for (const auto& attr : sa) {
+        require_ge(attr.sa_range.lr_start, 0);
+    }
 
-    struct line_range body, orig_line;
-
-    body = find_string_attr_range(sa, &SA_BODY);
-    if (body.lr_start == -1) {
+    auto body = find_string_attr_range(sa, &SA_BODY);
+    if (!body.is_valid()) {
         body.lr_start = 0;
         body.lr_end = str.size();
     }
 
-    orig_line = find_string_attr_range(sa, &SA_ORIGINAL_LINE);
+    auto orig_line = find_string_attr_range(sa, &SA_ORIGINAL_LINE);
     if (!orig_line.is_valid()) {
         orig_line.lr_start = 0;
         orig_line.lr_end = str.size();
     }
 
-    auto format_attr_opt = get_string_attr(sa, SA_FORMAT);
-    if (format_attr_opt) {
-        format_name = format_attr_opt.value().get();
+    if (!body.empty() || !orig_line.empty()) {
+        this->apply_highlights(value_out, body, orig_line);
     }
 
-    if (this->is_selectable() && row == this->get_selection()
-        && this->tc_cursor_role)
-    {
-        sa.emplace_back(line_range{orig_line.lr_start, -1},
-                        VC_ROLE.value(this->tc_cursor_role.value()));
-    }
-
-    for (auto& tc_highlight : this->tc_highlights) {
-        bool internal_hl
-            = tc_highlight.first.first == highlight_source_t::INTERNAL
-            || tc_highlight.first.first == highlight_source_t::THEME;
-
-        if (!tc_highlight.second.h_text_formats.empty()
-            && tc_highlight.second.h_text_formats.count(source_format) == 0)
-        {
-            continue;
-        }
-
-        if (!tc_highlight.second.h_format_name.empty()
-            && tc_highlight.second.h_format_name != format_name)
-        {
-            continue;
-        }
-
-        if (this->tc_disabled_highlights.count(tc_highlight.first.first)) {
-            continue;
-        }
-
-        // Internal highlights should only apply to the log message body so
-        // that we don't start highlighting other fields.  User-provided
-        // highlights should apply only to the line itself and not any of the
-        // surrounding decorations that are added (for example, the file lines
-        // that are inserted at the beginning of the log view).
-        int start_pos = internal_hl ? body.lr_start : orig_line.lr_start;
-        tc_highlight.second.annotate(value_out, start_pos);
-    }
-
-    if (this->tc_hide_fields) {
-        value_out.apply_hide();
-    }
-
-#if 0
-    typedef std::map<std::string, role_t> key_map_t;
-    static key_map_t key_roles;
-
-    data_scanner ds(str);
-    data_parser  dp(&ds);
-
-    dp.parse();
-
-    for (list<data_parser::element>::iterator iter = dp.dp_stack.begin();
-         iter != dp.dp_stack.end();
-         ++iter) {
-        view_colors &vc = view_colors::singleton();
-
-        if (iter->e_token == DNT_PAIR) {
-            list<data_parser::element>::iterator pair_iter;
-            key_map_t::iterator km_iter;
-            data_token_t        value_token;
-            struct line_range   lr;
-            string key;
-
-            value_token =
-                iter->e_sub_elements->back().e_sub_elements->front().e_token;
-            if (value_token == DT_STRING) {
-                continue;
-            }
-
-            lr.lr_start = iter->e_capture.c_begin;
-            lr.lr_end   = iter->e_capture.c_end;
-
-            key = ds.get_input().get_substr(
-                &iter->e_sub_elements->front().e_capture);
-            if ((km_iter = key_roles.find(key)) == key_roles.end()) {
-                key_roles[key] = vc.next_highlight();
-            }
-            /* fprintf(stderr, "key = %s\n", key.c_str()); */
-            sa[lr].insert(make_string_attr("style",
-                                           vc.attrs_for_role(key_roles[key])));
-
-            pair_iter = iter->e_sub_elements->begin();
-            ++pair_iter;
-
-            lr.lr_start = pair_iter->e_capture.c_begin;
-            lr.lr_end   = pair_iter->e_capture.c_end;
-            sa[lr].insert(make_string_attr("style",
-                                           COLOR_PAIR(view_colors::VC_WHITE) |
-                                           A_BOLD));
-        }
-    }
-#endif
+    value_out.apply_hide(this->tc_hide_fields);
 
     const auto& user_marks = this->tc_bookmarks[&BM_USER];
     const auto& user_expr_marks = this->tc_bookmarks[&BM_USER_EXPR];
-    if (binary_search(user_marks.begin(), user_marks.end(), row)
-        || binary_search(user_expr_marks.begin(), user_expr_marks.end(), row))
+    if (this->tc_mark_style
+        && (user_marks.bv_tree.exists(row)
+            || user_expr_marks.bv_tree.exists(row)))
     {
         sa.emplace_back(line_range{orig_line.lr_start, -1},
-                        VC_STYLE.value(text_attrs{A_REVERSE}));
+                        this->tc_mark_style.value());
     }
+}
+
+grep_proc<vis_line_t>*
+textview_curses::ensure_search_procs()
+{
+    // The procs are built without a pattern; execute_search() and the named
+    // searches fill in the slots.  injector::get() binds its arguments by
+    // lvalue reference, so this cannot be a temporary.
+    std::shared_ptr<lnav::pcre2pp::code> no_code;
+
+    if (this->tc_search_proc == nullptr) {
+        this->tc_search_proc
+            = injector::get<std::shared_ptr<grep_proc<vis_line_t>>>(no_code,
+                                                                    *this);
+        this->tc_search_proc->set_sink(this);
+    }
+    if (this->tc_meta_search_proc == nullptr && this->tc_sub_source != nullptr)
+    {
+        this->tc_sub_source->get_grepper() | [this, &no_code](auto pair) {
+            auto sgp = injector::get<std::shared_ptr<grep_proc<vis_line_t>>>(
+                no_code, *pair.first);
+
+            sgp->set_sink(pair.second);
+            // This proc can be built long after the searches were set up --
+            // it is rebuilt whenever the source changes -- so it starts from
+            // whatever the main proc is already looking for.
+            for (size_t slot = 0; slot < GREP_MAX_PATTERNS; slot++) {
+                const auto& code = this->tc_search_proc->get_pattern(slot);
+
+                if (code != nullptr) {
+                    sgp->set_pattern(slot, code);
+                }
+            }
+            this->tc_meta_search_proc = sgp;
+        };
+    }
+
+    return this->tc_search_proc.get();
 }
 
 void
 textview_curses::execute_search(const std::string& regex_orig)
 {
+    static auto op = lnav_operation{"grep"};
+    static constexpr auto INTERACTIVE_PATTERN
+        = grep_pattern_bit(SEARCH_SLOT_INTERACTIVE);
+
+    // The pattern that is compiled can end up being an escaped form of what
+    // was typed, but tc_current_search has to keep the original.
     std::string regex = regex_orig;
-    std::shared_ptr<lnav::pcre2pp::code> code;
 
-    if ((this->tc_search_child == nullptr)
-        || (regex != this->tc_current_search))
+    if ((this->tc_search_proc == nullptr)
+        || (regex_orig != this->tc_current_search))
     {
-        this->match_reset();
+        auto op_guard = lnav_opid_guard::async(op);
+        std::shared_ptr<lnav::pcre2pp::code> code;
 
-        this->tc_search_child.reset();
-        this->tc_source_search_child.reset();
+        this->tc_search_op_id = std::nullopt;
 
-        log_debug("start search for: '%s'", regex.c_str());
+        log_debug("%s: start search for: '%s'",
+                  this->vc_title.c_str(),
+                  regex.c_str());
 
         if (regex.empty()) {
         } else {
@@ -605,64 +1672,121 @@ textview_curses::execute_search(const std::string& regex_orig)
             }
         }
 
-        if (code != nullptr) {
+        auto* gp = this->ensure_search_procs();
+        auto& hm = this->get_highlights();
+
+        // Retire the previous interactive pattern without disturbing anything
+        // else occupying a slot.
+        gp->invalidate(INTERACTIVE_PATTERN);
+        if (this->tc_meta_search_proc != nullptr) {
+            this->tc_meta_search_proc->invalidate(INTERACTIVE_PATTERN);
+        }
+        this->match_reset(INTERACTIVE_PATTERN);
+        hm.erase({highlight_source_t::PREVIEW, "search"});
+
+        if (code == nullptr) {
+            gp->clear_pattern(SEARCH_SLOT_INTERACTIVE);
+            if (this->tc_meta_search_proc != nullptr) {
+                this->tc_meta_search_proc->clear_pattern(
+                    SEARCH_SLOT_INTERACTIVE);
+            }
+        } else {
             highlighter hl(code);
 
             hl.with_role(role_t::VCR_SEARCH);
-
-            auto& hm = this->get_highlights();
             hm[{highlight_source_t::PREVIEW, "search"}] = hl;
 
-            auto gp = injector::get<std::shared_ptr<grep_proc<vis_line_t>>>(
-                code, *this);
+            gp->set_pattern(SEARCH_SLOT_INTERACTIVE, code);
+            if (this->tc_meta_search_proc != nullptr) {
+                this->tc_meta_search_proc->set_pattern(SEARCH_SLOT_INTERACTIVE,
+                                                       code);
+            }
 
-            gp->set_sink(this);
             auto top = this->get_top();
             if (top < REVERSE_SEARCH_OFFSET) {
                 top = 0_vl;
             } else {
                 top -= REVERSE_SEARCH_OFFSET;
             }
-            gp->queue_request(top);
-            if (top > 0) {
-                gp->queue_request(0_vl, top);
+            this->tc_search_op_id = std::move(op_guard).suspend();
+            if (this->tc_sub_source != nullptr) {
+                const auto line_count
+                    = vis_line_t(this->tc_sub_source->text_line_count());
+
+                gp->queue_request(top, line_count, INTERACTIVE_PATTERN);
+                if (top > 0) {
+                    gp->queue_request(0_vl, top, INTERACTIVE_PATTERN);
+                }
+                // The pair of requests covers the whole view.
+                this->tc_searched_through = line_count;
             }
+            this->tc_search_start_time = std::chrono::steady_clock::now();
+            this->tc_search_duration = std::nullopt;
+
+            auto resume_guard
+                = lnav_opid_guard::resume(this->tc_search_op_id.value());
             gp->start();
 
-            this->tc_search_child = std::make_shared<grep_highlighter>(
-                gp, highlight_source_t::PREVIEW, "search", hm);
+            // Queue the metadata proc after the main one has started.  Both
+            // write to the same slot and queue_request() runs grep_begin()
+            // synchronously, so this ordering keeps the metadata proc's range
+            // clear ahead of any results arriving from the main proc.
+            if (this->tc_meta_search_proc != nullptr
+                && this->tc_sub_source != nullptr)
+            {
+                auto& sgp = this->tc_meta_search_proc;
 
-            if (this->tc_sub_source != nullptr) {
-                this->tc_sub_source->get_grepper() | [this, code](auto pair) {
-                    auto sgp
-                        = injector::get<std::shared_ptr<grep_proc<vis_line_t>>>(
-                            code, *pair.first);
-
-                    sgp->set_sink(pair.second);
-                    sgp->queue_request(0_vl);
-                    sgp->start();
-
-                    this->tc_source_search_child = sgp;
-                };
+                sgp->queue_request(
+                    0_vl,
+                    vis_line_t(this->tc_sub_source->text_line_count()),
+                    INTERACTIVE_PATTERN);
+                sgp->start();
             }
         }
+
+        // A pattern that could not be compiled at all, even quoted, leaves
+        // nothing to search for, so it does not become the current search
+        // either -- the status bar would otherwise show a term that can never
+        // match and no highlight to go with it.
+        this->tc_current_search = code == nullptr ? std::string() : regex_orig;
+        this->tc_current_search_pattern
+            = code == nullptr ? std::string() : regex;
     }
 
-    this->tc_current_search = regex;
     if (this->tc_state_event_handler) {
         this->tc_state_event_handler(*this);
     }
 }
 
-nonstd::optional<std::pair<int, int>>
+std::optional<std::pair<int, int>>
 textview_curses::horiz_shift(vis_line_t start, vis_line_t end, int off_start)
 {
-    auto hl_iter
-        = this->tc_highlights.find({highlight_source_t::PREVIEW, "search"});
-    if (hl_iter == this->tc_highlights.end()
-        || hl_iter->second.h_regex == nullptr)
-    {
-        return nonstd::nullopt;
+    // Collect the interactive search along with any named searches so that
+    // '<' and '>' step through every kind of search hit.  A focused search
+    // narrows this the same way it narrows n/N.
+    std::vector<const lnav::pcre2pp::code*> regexes;
+    auto focused_name = this->get_focused_search_name();
+
+    for (const auto& hl_pair : this->tc_highlights) {
+        auto is_search
+            = (hl_pair.first.first == highlight_source_t::PREVIEW
+               && hl_pair.first.second == "search")
+            || hl_pair.first.first == highlight_source_t::NAMED_SEARCH;
+
+        if (focused_name) {
+            is_search = hl_pair.first.first == highlight_source_t::NAMED_SEARCH
+                && hl_pair.first.second == focused_name.value();
+        } else if (this->tc_focused_search_slot) {
+            // The interactive search is focused, so only its highlight counts.
+            is_search = hl_pair.first.first == highlight_source_t::PREVIEW
+                && hl_pair.first.second == "search";
+        }
+        if (is_search && hl_pair.second.h_regex != nullptr) {
+            regexes.push_back(hl_pair.second.h_regex.get());
+        }
+    }
+    if (regexes.empty()) {
+        return std::nullopt;
     }
     int prev_hit = -1, next_hit = INT_MAX;
 
@@ -671,8 +1795,8 @@ textview_curses::horiz_shift(vis_line_t start, vis_line_t end, int off_start)
         this->listview_value_for_rows(*this, start, rows);
 
         const auto& str = rows[0].get_string();
-        hl_iter->second.h_regex->capture_from(str).for_each(
-            [&](lnav::pcre2pp::match_data& md) {
+        for (const auto* re : regexes) {
+            re->capture_from(str).for_each([&](lnav::pcre2pp::match_data& md) {
                 auto cap = md[0].value();
                 if (cap.sf_begin < off_start) {
                     prev_hit = std::max(prev_hit, cap.sf_begin);
@@ -680,10 +1804,11 @@ textview_curses::horiz_shift(vis_line_t start, vis_line_t end, int off_start)
                     next_hit = std::min(next_hit, cap.sf_begin);
                 }
             });
+        }
     }
 
     if (prev_hit == -1 && next_hit == INT_MAX) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
     return std::make_pair(prev_hit, next_hit);
 }
@@ -693,15 +1818,18 @@ textview_curses::set_user_mark(const bookmark_type_t* bm,
                                vis_line_t vl,
                                bool marked)
 {
-    bookmark_vector<vis_line_t>& bv = this->tc_bookmarks[bm];
-    bookmark_vector<vis_line_t>::iterator iter;
+    auto& bv = this->tc_bookmarks[bm];
 
     if (marked) {
-        bv.insert_once(vl);
+        auto insert_res = bv.insert_once(vl);
+        if (!insert_res.second) {
+            // already inserted
+            return;
+        }
     } else {
-        iter = std::lower_bound(bv.begin(), bv.end(), vl);
-        if (iter != bv.end() && *iter == vl) {
-            bv.erase(iter);
+        if (bv.erase(vl) == 0) {
+            // not a bookmark
+            return;
         }
     }
     if (this->tc_sub_source) {
@@ -709,17 +1837,18 @@ textview_curses::set_user_mark(const bookmark_type_t* bm,
     }
 
     if (marked) {
-        this->search_range(vl, vl + 1_vl);
-        this->search_new_data();
+        this->rescan_range(vl, vl + 1_vl);
     }
     this->set_needs_update();
 }
 
-void
+textview_curses::mark_toggle_result
 textview_curses::toggle_user_mark(const bookmark_type_t* bm,
                                   vis_line_t start_line,
                                   vis_line_t end_line)
 {
+    mark_toggle_result retval;
+
     if (end_line == -1) {
         end_line = start_line;
     }
@@ -728,47 +1857,134 @@ textview_curses::toggle_user_mark(const bookmark_type_t* bm,
     }
 
     if (start_line >= this->get_inner_height()) {
-        return;
+        return retval;
     }
     if (end_line >= this->get_inner_height()) {
         end_line = vis_line_t(this->get_inner_height() - 1);
     }
-    for (vis_line_t curr_line = start_line; curr_line <= end_line; ++curr_line)
-    {
-        bookmark_vector<vis_line_t>& bv = this->tc_bookmarks[bm];
-        bookmark_vector<vis_line_t>::iterator iter;
-        bool added;
-
-        iter = bv.insert_once(curr_line);
-        if (iter == bv.end()) {
-            added = true;
+    for (auto curr_line = start_line; curr_line <= end_line; ++curr_line) {
+        auto& bv = this->tc_bookmarks[bm];
+        auto [insert_iter, added] = bv.insert_once(curr_line);
+        if (!added) {
+            bv.erase(curr_line);
+            retval.mtr_unmarked += 1;
         } else {
-            bv.erase(iter);
-            added = false;
+            retval.mtr_marked += 1;
         }
         if (this->tc_sub_source) {
             this->tc_sub_source->text_mark(bm, curr_line, added);
         }
     }
-    this->search_range(start_line, end_line + 1_vl);
-    this->search_new_data();
+    this->rescan_range(start_line, end_line + 1_vl);
+
+    return retval;
 }
 
 void
 textview_curses::redo_search()
 {
-    if (this->tc_search_child) {
-        auto* gp = this->tc_search_child->get_grep_proc();
+    if (this->tc_search_proc && this->tc_sub_source != nullptr) {
+        auto op_guard
+            = lnav_opid_guard::resume(this->tc_search_op_id.value_or(""));
 
-        gp->invalidate();
-        this->match_reset();
-        gp->queue_request(0_vl).start();
+        auto* gp = this->tc_search_proc.get();
+        auto patterns = gp->all_patterns_mask();
 
-        if (this->tc_source_search_child) {
-            this->tc_source_search_child->invalidate()
-                .queue_request(0_vl)
-                .start();
+        if (patterns == 0) {
+            return;
         }
+
+        const auto line_count
+            = vis_line_t(this->tc_sub_source->text_line_count());
+
+        gp->invalidate(patterns);
+        this->match_reset(patterns);
+        gp->queue_request(0_vl, line_count, patterns).start();
+
+        if (this->tc_meta_search_proc) {
+            auto& sgp = this->tc_meta_search_proc;
+            auto meta_patterns = sgp->all_patterns_mask();
+
+            if (meta_patterns != 0) {
+                sgp->invalidate(meta_patterns);
+                sgp->queue_request(0_vl, line_count, meta_patterns).start();
+            }
+        }
+        this->tc_searched_through = line_count;
+    }
+}
+
+void
+textview_curses::search_range(vis_line_t start,
+                              vis_line_t stop)
+{
+    // The default mask covers every pattern that is currently installed, which
+    // is what an incremental range scan wants.
+    if (this->tc_search_proc) {
+        auto op_guard
+            = lnav_opid_guard::resume(this->tc_search_op_id.value_or(""));
+        this->tc_search_proc->queue_request(start, stop);
+    }
+    if (this->tc_meta_search_proc) {
+        auto op_guard
+            = lnav_opid_guard::resume(this->tc_search_op_id.value_or(""));
+        this->tc_meta_search_proc->queue_request(start, stop);
+    }
+}
+
+void
+textview_curses::rescan_range(vis_line_t start,
+                              vis_line_t stop)
+{
+    this->search_range(start, stop);
+
+    if (this->tc_search_proc) {
+        auto op_guard
+            = lnav_opid_guard::resume(this->tc_search_op_id.value_or(""));
+
+        this->tc_search_proc->start();
+    }
+    if (this->tc_meta_search_proc) {
+        auto op_guard
+            = lnav_opid_guard::resume(this->tc_search_op_id.value_or(""));
+
+        this->tc_meta_search_proc->start();
+    }
+}
+
+void
+textview_curses::search_new_data()
+{
+    // Clamped because a source that has shrunk leaves the frontier past its
+    // end, and there is nothing new to search in that case.
+    this->search_new_data(
+        std::min(this->tc_searched_through,
+                 vis_line_t(this->tc_sub_source == nullptr
+                                ? 0
+                                : this->tc_sub_source->text_line_count())));
+}
+
+void
+textview_curses::search_new_data(vis_line_t start)
+{
+    if (this->tc_sub_source != nullptr) {
+        const auto line_count
+            = vis_line_t(this->tc_sub_source->text_line_count());
+
+        this->search_range(start, line_count);
+        this->tc_searched_through = line_count;
+    }
+    if (this->tc_search_proc) {
+        auto op_guard
+            = lnav_opid_guard::resume(this->tc_search_op_id.value_or(""));
+
+        this->tc_search_proc->start();
+    }
+    if (this->tc_meta_search_proc) {
+        auto op_guard
+            = lnav_opid_guard::resume(this->tc_search_op_id.value_or(""));
+
+        this->tc_meta_search_proc->start();
     }
 }
 
@@ -795,39 +2011,258 @@ textview_curses&
 textview_curses::set_sub_source(text_sub_source* src)
 {
     if (this->tc_sub_source != src) {
+        if (this->tc_sub_source != nullptr) {
+            this->remove_input_delegate(*this->tc_sub_source);
+        }
         this->tc_bookmarks.clear();
+        for (auto& slot_bv : this->tc_search_matches) {
+            slot_bv.clear();
+        }
+        // Nothing in the new source has been searched.
+        this->tc_searched_through = 0_vl;
+        // The metadata proc is bound to the old source's grepper, so it cannot
+        // outlive it.  It is rebuilt by the search below.
+        this->tc_meta_search_proc.reset();
         this->tc_sub_source = src;
+        if (this->tc_search_proc != nullptr) {
+            // Any child still running was forked from the source that was just
+            // replaced, so the lines it is about to report have nothing to do
+            // with the one coming in.  This is done after the swap since the
+            // end-of-search callbacks work off of the current source and some
+            // callers free the old one before handing over the new.
+            this->tc_search_proc->invalidate();
+        }
         if (src) {
             src->register_view(this);
+            this->add_input_delegate(*src);
+            // The patterns are still installed, but everything they found
+            // belonged to the old source, so they have to be run again.
+            if (this->tc_search_proc != nullptr) {
+                this->queue_search_for(
+                    this->tc_search_proc->all_patterns_mask());
+            }
         }
         this->reload_data();
     }
     return *this;
 }
 
+textview_curses&
+textview_curses::set_owned_sub_source(std::unique_ptr<text_sub_source> src)
+{
+    auto* raw = src.get();
+
+    this->set_sub_source(raw);
+    this->tc_owned_sub_source = std::move(src);
+
+    return *this;
+}
+
 bool
+text_sub_source::list_input_handle_key(listview_curses& lv, const ncinput& ch)
+{
+    // Only intercept plain Left/Right; let everything else fall through to
+    // listview_curses::handle_key so the existing 10-char / half-width /
+    // line-nav behavior applies unchanged.
+    if (ncinput_shift_p(&ch) || this->tss_view == nullptr) {
+        return false;
+    }
+    int direction;
+    switch (ch.eff_text[0]) {
+        case NCKEY_LEFT:
+            direction = -1;
+            break;
+        case NCKEY_RIGHT:
+            direction = 1;
+            break;
+        default:
+            return false;
+    }
+
+    auto& tc = *this->tss_view;
+    auto [height, width] = tc.get_dimensions();
+    auto top = tc.get_top();
+    auto count = vis_line_t((int) this->text_line_count());
+    auto start = std::max(0_vl, top - height);
+    auto end = std::min(count, top + 2_vl * height);
+
+    std::set<int> cols;
+    this->text_horiz_columns(tc, start, end, cols);
+    if (cols.empty()) {
+        return false;
+    }
+    cols.insert(0);
+
+    // Step by a viewport width, but don't cross a column boundary in the
+    // press direction.  When the current column is wider than the viewport,
+    // this lets repeated presses scroll through its content; when a
+    // boundary is closer than a viewport away, the press snaps to it.
+    int cur = tc.get_left();
+    int target;
+    if (direction > 0) {
+        while (true) {
+            auto it = cols.upper_bound(cur);
+            int next_boundary = (it != cols.end()) ? *it : INT_MAX;
+            if (next_boundary - cur <= 2) {
+                cur = next_boundary;
+                continue;
+            }
+            target = std::min(cur + (int) width / 2, next_boundary);
+            break;
+        }
+    } else {
+        while (true) {
+            auto it = cols.lower_bound(cur);
+            int prev_boundary = (it != cols.begin()) ? *std::prev(it) : 0;
+            if (prev_boundary < cur && cur - prev_boundary <= 2) {
+                cur = prev_boundary;
+                continue;
+            }
+            target = std::max(cur - (int) width / 2, prev_boundary);
+            break;
+        }
+        if (target < 0) {
+            target = 0;
+        }
+    }
+
+    if (target == cur) {
+        // No movement possible at this edge — fall through so the
+        // listview's default Left/Right behavior (and its right-edge
+        // chime in set_left) applies.
+        return false;
+    }
+    tc.set_left(target);
+    return true;
+}
+
+std::optional<line_info>
 textview_curses::grep_value_for_line(vis_line_t line, std::string& value_out)
 {
-    bool retval = false;
-
+    // log_debug("grep line %d", line);
     if (this->tc_sub_source
         && line < (int) this->tc_sub_source->text_line_count())
     {
-        this->tc_sub_source->text_value_for_line(
+        auto retval = this->tc_sub_source->text_value_for_line(
             *this, line, value_out, text_sub_source::RF_RAW);
-        scrub_ansi_string(value_out, nullptr);
-        retval = true;
+        if (retval.li_utf8_scan_result.is_valid()
+            && retval.li_utf8_scan_result.usr_has_ansi)
+        {
+            // log_debug("has ansi %d",
+            // retval.li_utf8_scan_result.usr_has_ansi);
+            auto new_size = erase_ansi_escapes(value_out);
+            value_out.resize(new_size);
+        }
+        // log_debug("  line off %lld", retval.li_file_range.fr_offset);
+        return retval;
     }
 
-    return retval;
+    return std::nullopt;
 }
 
 void
-text_time_translator::scroll_invoked(textview_curses* tc)
+textview_curses::update_hash_state(hasher& h) const
 {
-    if (tc->get_inner_height() > 0) {
-        this->time_for_row(tc->get_top()) |
-            [this](auto new_top_time) { this->ttt_top_time = new_top_time; };
+    listview_curses::update_hash_state(h);
+
+    if (this->tc_sub_source != nullptr) {
+        this->tc_sub_source->update_filter_hash_state(h);
+    }
+}
+
+void
+textview_curses::clear_preview()
+{
+    auto& hl = this->get_highlights();
+    hl.erase({highlight_source_t::PREVIEW, "preview"});
+    hl.erase({highlight_source_t::PREVIEW, "bodypreview"});
+    if (this->tc_sub_source != nullptr) {
+        this->tc_sub_source->clear_preview();
+    }
+}
+
+void
+text_sub_source::scroll_invoked(textview_curses* tc)
+{
+    auto* ttt = dynamic_cast<text_time_translator*>(this);
+
+    if (ttt != nullptr) {
+        ttt->ttt_scroll_invoked(tc);
+    }
+}
+
+void
+text_sub_source::clear_preview()
+{
+    auto* ttt = dynamic_cast<text_time_translator*>(this);
+
+    if (ttt != nullptr) {
+        ttt->clear_preview_times();
+    }
+    this->tss_preview_min_log_level = std::nullopt;
+}
+
+Result<std::string, lnav::console::user_message>
+text_sub_source::text_reload_data(exec_context& ec)
+{
+    return Ok(std::string());
+}
+
+void
+text_sub_source::add_commands_for_session(
+    const std::function<void(const std::string&)>& receiver)
+{
+    for (const auto& filter : this->tss_filters) {
+        receiver(filter->to_command());
+
+        if (!filter->is_enabled()) {
+            receiver(
+                fmt::format(FMT_STRING("disable-filter {}"), filter->get_id()));
+        }
+    }
+
+    if (this->tss_context_before > 0 || this->tss_context_after > 0) {
+        receiver(fmt::format(FMT_STRING("filter-context {} {}"),
+                             this->tss_context_before,
+                             this->tss_context_after));
+    }
+
+    auto* ttt = dynamic_cast<text_time_translator*>(this);
+    if (ttt != nullptr) {
+        ttt->add_time_commands_for_session(receiver);
+    }
+
+    const auto& hmap = this->tss_view->get_highlights();
+    for (const auto& hl : hmap) {
+        if (hl.first.first != highlight_source_t::INTERACTIVE) {
+            continue;
+        }
+        receiver(fmt::format(FMT_STRING("highlight {}"), hl.first.second));
+    }
+
+    for (const auto& ns : this->tss_view->get_named_searches()) {
+        receiver(fmt::format(
+            FMT_STRING("create-named-search {} {}"), ns.ns_name, ns.ns_pattern));
+
+        if (!ns.ns_enabled) {
+            receiver(fmt::format(FMT_STRING("disable-named-search {}"),
+                                 ns.ns_name));
+        }
+    }
+
+    // A focus on the interactive search is not saved, since that search is
+    // not restored by name.
+    this->tss_view->get_focused_search_name() | [&receiver](const auto& name) {
+        receiver(fmt::format(FMT_STRING("focus-search {}"), name));
+    };
+}
+
+void
+text_time_translator::ttt_scroll_invoked(textview_curses* tc)
+{
+    if (tc->get_inner_height() > 0 && tc->get_selection()) {
+        this->time_for_row(tc->get_selection().value()) |
+            [this](auto new_top_ri) { this->ttt_top_row_info = new_top_ri; };
     }
 }
 
@@ -835,34 +2270,57 @@ void
 text_time_translator::data_reloaded(textview_curses* tc)
 {
     if (tc->get_inner_height() == 0) {
+        this->ttt_top_row_info = std::nullopt;
         return;
     }
-    if (tc->get_top() > tc->get_inner_height()) {
-        if (this->ttt_top_time.tv_sec != 0) {
-            this->row_for_time(this->ttt_top_time) |
-                [tc](auto new_top) { tc->set_top(new_top); };
-        }
+    if (this->ttt_top_row_info) {
+        this->row_for(this->ttt_top_row_info.value()) |
+            [tc](auto new_top) { tc->set_selection(new_top); };
+    }
+}
+
+void
+text_time_translator::set_zoom_level(std::chrono::microseconds level)
+{
+    if (this->ttt_zoom_level == level) {
         return;
     }
-    this->time_for_row(tc->get_top()) | [this, tc](auto top_time) {
-        if (top_time != this->ttt_top_time) {
-            if (this->ttt_top_time.tv_sec != 0) {
-                this->row_for_time(this->ttt_top_time) |
-                    [tc](auto new_top) { tc->set_top(new_top); };
-            }
-            this->time_for_row(tc->get_top()) | [this](auto new_top_time) {
-                this->ttt_top_time = new_top_time;
-            };
-        }
-    };
+    this->ttt_zoom_level = level;
+}
+
+std::string
+text_time_translator::format_zoom_level() const
+{
+    const auto* begin = ZOOM_LEVELS;
+    const auto* end = begin + ZOOM_COUNT;
+    const auto* it = std::find(begin, end, this->ttt_zoom_level);
+    if (it != end) {
+        return ZOOM_STRINGS[it - begin].to_string();
+    }
+    return fmt::format(FMT_STRING("{}us"), this->ttt_zoom_level.count());
+}
+
+std::optional<std::string>
+text_sub_source::text_view_details() const
+{
+    const auto* ttt = dynamic_cast<const text_time_translator*>(this);
+    if (ttt == nullptr) {
+        return std::nullopt;
+    }
+    yajlpp_gen gen;
+    {
+        yajlpp_map root(gen);
+        root.gen("zoom-level");
+        root.gen(ttt->format_zoom_level());
+    }
+    return gen.to_string_fragment().to_string();
 }
 
 template class bookmark_vector<vis_line_t>;
 
 bool
-empty_filter::matches(const logfile& lf,
-                      logfile::const_iterator ll,
-                      shared_buffer_ref& line)
+empty_filter::matches(std::optional<line_source> ls,
+                      const shared_buffer_ref& line)
 {
     return false;
 }
@@ -873,7 +2331,35 @@ empty_filter::to_command() const
     return "";
 }
 
-nonstd::optional<size_t>
+bool
+pcre_filter::matches(std::optional<line_source> ls,
+                     const shared_buffer_ref& line)
+{
+    auto options = 0;
+    if (line.get_metadata().m_valid_utf) {
+        options |= PCRE2_NO_UTF_CHECK;
+    }
+
+    return this->pf_pcre->find_in(line.to_string_fragment(), options)
+        .ignore_error()
+        .has_value();
+}
+
+filter_stack::iterator
+filter_stack::find(size_t index)
+{
+    for (auto iter = this->fs_filters.begin(); iter != this->fs_filters.end();
+         ++iter)
+    {
+        if ((*iter)->get_index() == index) {
+            return iter;
+        }
+    }
+
+    return this->fs_filters.end();
+}
+
+std::optional<size_t>
 filter_stack::next_index()
 {
     bool used[32];
@@ -898,7 +2384,7 @@ filter_stack::next_index()
             return lpc;
         }
     }
-    return nonstd::nullopt;
+    return std::nullopt;
 }
 
 std::shared_ptr<text_filter>
@@ -907,8 +2393,7 @@ filter_stack::get_filter(const std::string& id)
     auto iter = this->fs_filters.begin();
     std::shared_ptr<text_filter> retval;
 
-    for (; iter != this->fs_filters.end() && (*iter)->get_id() != id; iter++) {
-    }
+    for (; iter != this->fs_filters.end() && (*iter)->get_id() != id; iter++) {}
     if (iter != this->fs_filters.end()) {
         retval = *iter;
     }
@@ -921,10 +2406,10 @@ filter_stack::delete_filter(const std::string& id)
 {
     auto iter = this->fs_filters.begin();
 
-    for (; iter != this->fs_filters.end() && (*iter)->get_id() != id; iter++) {
-    }
+    for (; iter != this->fs_filters.end() && (*iter)->get_id() != id; iter++) {}
     if (iter != this->fs_filters.end()) {
         this->fs_filters.erase(iter);
+        this->fs_generation += 1;
         return true;
     }
 
@@ -990,6 +2475,7 @@ void
 filter_stack::add_filter(const std::shared_ptr<text_filter>& filter)
 {
     this->fs_filters.push_back(filter);
+    this->fs_generation += 1;
 }
 
 void
@@ -1002,7 +2488,7 @@ vis_location_history::loc_history_append(vis_line_t top)
     this->vlh_history.push_back(top);
 }
 
-nonstd::optional<vis_line_t>
+std::optional<vis_line_t>
 vis_location_history::loc_history_back(vis_line_t current_top)
 {
     if (this->lh_history_position == 0) {
@@ -1013,7 +2499,7 @@ vis_location_history::loc_history_back(vis_line_t current_top)
     }
 
     if (this->lh_history_position + 1 >= this->vlh_history.size()) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     this->lh_history_position += 1;
@@ -1021,16 +2507,40 @@ vis_location_history::loc_history_back(vis_line_t current_top)
     return this->current_position();
 }
 
-nonstd::optional<vis_line_t>
+std::optional<vis_line_t>
 vis_location_history::loc_history_forward(vis_line_t current_top)
 {
     if (this->lh_history_position == 0) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     this->lh_history_position -= 1;
 
     return this->current_position();
+}
+
+void
+text_sub_source::update_filter_hash_state(hasher& h) const
+{
+    h.update(this->tss_filters.fs_generation);
+
+    const auto* ttt = dynamic_cast<const text_time_translator*>(this);
+    if (ttt != nullptr) {
+        auto min_time = ttt->get_min_row_time();
+        if (min_time) {
+            h.update(min_time->count());
+        } else {
+            h.update(0);
+            h.update(0);
+        }
+        auto max_time = ttt->get_max_row_time();
+        if (max_time) {
+            h.update(max_time->count());
+        } else {
+            h.update(0);
+            h.update(0);
+        }
+    }
 }
 
 void
@@ -1053,6 +2563,7 @@ logfile_filter_state::logfile_filter_state(std::shared_ptr<logfile> lf)
     memset(this->tfs_filter_hits, 0, sizeof(this->tfs_filter_hits));
     memset(this->tfs_message_matched, 0, sizeof(this->tfs_message_matched));
     memset(this->tfs_lines_for_message, 0, sizeof(this->tfs_lines_for_message));
+    memset(this->tfs_hits_for_message, 0, sizeof(this->tfs_hits_for_message));
     memset(this->tfs_last_message_matched,
            0,
            sizeof(this->tfs_last_message_matched));
@@ -1066,10 +2577,18 @@ void
 logfile_filter_state::clear()
 {
     this->tfs_logfile = nullptr;
+    this->clear_for_rebuild();
+}
+
+void
+logfile_filter_state::clear_for_rebuild()
+{
+    log_debug("clearing filter state");
     memset(this->tfs_filter_count, 0, sizeof(this->tfs_filter_count));
     memset(this->tfs_filter_hits, 0, sizeof(this->tfs_filter_hits));
     memset(this->tfs_message_matched, 0, sizeof(this->tfs_message_matched));
     memset(this->tfs_lines_for_message, 0, sizeof(this->tfs_lines_for_message));
+    memset(this->tfs_hits_for_message, 0, sizeof(this->tfs_hits_for_message));
     memset(this->tfs_last_message_matched,
            0,
            sizeof(this->tfs_last_message_matched));
@@ -1087,6 +2606,7 @@ logfile_filter_state::clear_filter_state(size_t index)
     this->tfs_filter_hits[index] = 0;
     this->tfs_message_matched[index] = false;
     this->tfs_lines_for_message[index] = 0;
+    this->tfs_hits_for_message[index] = 0;
     this->tfs_last_message_matched[index] = false;
     this->tfs_last_lines_for_message[index] = 0;
 }
@@ -1117,21 +2637,27 @@ logfile_filter_state::resize(size_t newsize)
     }
 }
 
-nonstd::optional<size_t>
+void
+logfile_filter_state::reserve(size_t expected)
+{
+    this->tfs_mask.reserve(expected);
+}
+
+std::optional<size_t>
 logfile_filter_state::content_line_to_vis_line(uint32_t line)
 {
     if (this->tfs_index.empty()) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     auto iter = std::lower_bound(
         this->tfs_index.begin(), this->tfs_index.end(), line);
 
     if (iter == this->tfs_index.end() || *iter != line) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
-    return nonstd::make_optional(std::distance(this->tfs_index.begin(), iter));
+    return std::make_optional(std::distance(this->tfs_index.begin(), iter));
 }
 
 std::string

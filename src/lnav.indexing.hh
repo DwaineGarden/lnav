@@ -32,14 +32,38 @@
 
 #include "file_collection.hh"
 #include "logfile_fwd.hh"
-#include "optional.hpp"
 
 void rebuild_hist();
-size_t rebuild_indexes(nonstd::optional<ui_clock::time_point> deadline
-                       = nonstd::nullopt);
+
+struct rebuild_indexes_result_t {
+    size_t rir_changes{0};
+    bool rir_completed{true};
+    bool rir_rescan_needed{false};
+};
+
+rebuild_indexes_result_t rebuild_indexes(
+    std::optional<ui_clock::time_point> deadline = std::nullopt);
 void rebuild_indexes_repeatedly();
 bool rescan_files(bool required = false);
 bool update_active_files(file_collection& new_files);
-void do_observer_update(const std::shared_ptr<logfile>& lf);
+lnav::progress_result_t do_observer_update(const logfile* lf);
+
+/**
+ * The UI tick for a parallel indexing pass.  Called on the UI thread while
+ * workers run, with the offsets summed over the files in flight and a
+ * per-file breakdown of the same reading in `in_flight`.
+ *
+ * It drives the loading bar and the file list, but every number it draws for
+ * a file that is still in flight comes out of `in_flight`: the workers are
+ * writing the size, the stat and the decompress error of those very files, so
+ * nothing here may read them.  It publishes `in_flight` to
+ * files_sub_source::fss_index_progress, which is what makes that possible and
+ * what tells the rest of the UI a pass is running -- see the guards in
+ * files_sub_source::text_selection_changed() and refresh_status_bars.
+ */
+lnav::progress_result_t indexing_scan_progress(
+    file_off_t off,
+    file_ssize_t total,
+    const std::vector<index_progress_report>& in_flight);
 
 #endif

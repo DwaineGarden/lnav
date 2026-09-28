@@ -33,14 +33,21 @@
 
 #include "column_namer.hh"
 
+#include "base/intern_string.hh"
 #include "base/itertools.hh"
 #include "base/lnav_log.hh"
 #include "config.h"
 #include "sql_util.hh"
 
-const char column_namer::BUILTIN_COL[] = "col";
+constexpr string_fragment column_namer::BUILTIN_COL = "col"_frag;
 
-column_namer::column_namer(language lang) : cn_language(lang) {}
+column_namer::column_namer(language lang) : cn_language(lang)
+{
+    this->cn_builtin_names.emplace_back(BUILTIN_COL);
+    this->cn_builtin_names.emplace_back("log_time"_frag);
+    this->cn_builtin_names.emplace_back("log_level"_frag);
+    this->cn_builtin_names.emplace_back("log_opid"_frag);
+}
 
 bool
 column_namer::existing_name(const string_fragment& in_name) const
@@ -49,8 +56,10 @@ column_namer::existing_name(const string_fragment& in_name) const
         case language::SQL: {
             auto upped = toupper(in_name.to_string());
 
-            if (std::binary_search(
-                    std::begin(sql_keywords), std::end(sql_keywords), upped)) {
+            if (std::binary_search(std::begin(sqlite_keywords),
+                                   std::end(sqlite_keywords),
+                                   upped))
+            {
                 return true;
             }
             break;
@@ -79,7 +88,7 @@ column_namer::add_column(const string_fragment& in_name)
     int num = 0;
 
     if (in_name.empty()) {
-        base_name = string_fragment::from_const(BUILTIN_COL);
+        base_name = BUILTIN_COL;
     } else {
         base_name = in_name;
     }
@@ -99,10 +108,15 @@ column_namer::add_column(const string_fragment& in_name)
             this->cn_name_counters[counter_name] = num;
         }
 
-        log_debug(
-            "column name already exists: %.*s", retval.length(), retval.data());
         fmt::format_to(
             std::back_inserter(buf), FMT_STRING("{}_{}"), base_name, num);
+#if 0
+        log_trace("column name already exists (%.*s), trying (%.*s)",
+                  retval.length(),
+                  retval.data(),
+                  (int) buf.size(),
+                  buf.data());
+#endif
         retval = string_fragment::from_memory_buffer(buf);
         num += 1;
     }

@@ -28,6 +28,7 @@
  */
 
 #include <assert.h>
+#include <stdlib.h>
 
 #include "config.h"
 #include "log_accel.hh"
@@ -42,13 +43,13 @@ static int64_t SIMPLE_TEST_POINTS[] = {90,
                                        -1};
 
 static log_accel::direction_t SIMPLE_TEST_DIRS[] = {
-    log_accel::A_STEADY,
-    log_accel::A_DECEL,
-    log_accel::A_STEADY,
-    log_accel::A_STEADY,
-    log_accel::A_STEADY,
-    log_accel::A_STEADY,
-    log_accel::A_STEADY,
+    log_accel::direction_t::A_STEADY,
+    log_accel::direction_t::A_DECEL,
+    log_accel::direction_t::A_STEADY,
+    log_accel::direction_t::A_STEADY,
+    log_accel::direction_t::A_STEADY,
+    log_accel::direction_t::A_STEADY,
+    log_accel::direction_t::A_STEADY,
 };
 
 int

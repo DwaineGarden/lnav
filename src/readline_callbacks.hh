@@ -30,21 +30,25 @@
 #ifndef LNAV_READLINE_CALLBACKS_HH
 #define LNAV_READLINE_CALLBACKS_HH
 
-void rl_set_help();
-void rl_change(readline_curses* rc);
-void rl_search(readline_curses* rc);
-void lnav_rl_abort(readline_curses* rc);
-void rl_callback(readline_curses* rc);
-void rl_alt_callback(readline_curses* rc);
-void rl_display_matches(readline_curses* rc);
-void rl_display_next(readline_curses* rc);
-void rl_completion_request(readline_curses* rc);
-void rl_focus(readline_curses* rc);
-void rl_blur(readline_curses* rc);
+#include "lnav.commands.hh"
+#include "textinput_curses.hh"
 
-extern const char* RE_HELP;
-extern const char* RE_EXAMPLE;
-extern const char* SQL_HELP;
-extern const char* SQL_EXAMPLE;
+void rl_set_help();
+void rl_change(textinput_curses& ti);
+void rl_search(textinput_curses& ti);
+void lnav_rl_abort(textinput_curses& ti);
+void rl_callback(textinput_curses& ti);
+void rl_display_matches(textinput_curses& ti);
+void rl_display_next(textinput_curses& ti);
+void rl_completion_request(textinput_curses& ti);
+void rl_focus(textinput_curses& ti);
+void rl_blur(textinput_curses& ti);
+
+lnav::commands::split_result_t prql_splitter(const attr_line_t& stmt);
+
+extern const char* const RE_HELP;
+extern const char* const RE_EXAMPLE;
+extern const char* const SQL_HELP;
+extern const char* const SQL_EXAMPLE;
 
 #endif  // LNAV_READLINE_CALLBACKS_HH

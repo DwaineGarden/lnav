@@ -28,15 +28,23 @@
  */
 
 #include <chrono>
+#include <optional>
+#include <string>
 
 #include "humanize.time.hh"
 
+#include "attr_line.builder.hh"
 #include "config.h"
+#include "date_time_scanner.hh"
 #include "fmt/format.h"
+#include "intern_string.hh"
+#include "math_util.hh"
+#include "ptimec.hh"
+#include "relative_time.hh"
+#include "result.h"
 #include "time_util.hh"
 
-namespace humanize {
-namespace time {
+namespace humanize::time {
 
 using namespace std::chrono_literals;
 
@@ -49,20 +57,25 @@ point::from_tv(const timeval& tv)
 std::string
 point::as_time_ago() const
 {
-    struct timeval current_time
-        = this->p_recent_point.value_or(current_timeval());
+    timeval current_time = this->p_recent_point.value_or(current_timeval());
 
     if (this->p_convert_to_local) {
         current_time.tv_sec = convert_log_time_to_local(current_time.tv_sec);
     }
 
-    auto delta
-        = std::chrono::seconds(current_time.tv_sec - this->p_past_point.tv_sec);
+    auto curr_secs = std::chrono::seconds(current_time.tv_sec);
+    auto past_secs = std::chrono::seconds(this->p_past_point.tv_sec);
+    auto delta = curr_secs - past_secs;
     if (delta < 0s) {
         return "in the future";
     }
-    if (delta < 1min) {
+    if (delta < 5s) {
         return "just now";
+    }
+    if (delta < 1min) {
+        return fmt::format(
+            FMT_STRING("{}s ago"),
+            std::chrono::duration_cast<std::chrono::seconds>(delta).count());
     }
     if (delta < 2min) {
         return "one minute ago";
@@ -95,7 +108,7 @@ point::as_time_ago() const
 std::string
 point::as_precise_time_ago() const
 {
-    struct timeval now, diff;
+    timeval now, diff;
 
     now = this->p_recent_point.value_or(current_timeval());
     if (this->p_convert_to_local) {
@@ -105,30 +118,25 @@ point::as_precise_time_ago() const
     timersub(&now, &this->p_past_point, &diff);
     if (diff.tv_sec < 0) {
         return this->as_time_ago();
-    } else if (diff.tv_sec <= 1) {
+    }
+    if (diff.tv_sec <= 1) {
         return "a second ago";
-    } else if (diff.tv_sec < (10 * 60)) {
+    }
+    if (diff.tv_sec < (10 * 60)) {
         if (diff.tv_sec < 60) {
             return fmt::format(FMT_STRING("{:2} seconds ago"), diff.tv_sec);
         }
 
-        time_t seconds = diff.tv_sec % 60;
-        time_t minutes = diff.tv_sec / 60;
+        lnav::time64_t seconds = diff.tv_sec % 60;
+        lnav::time64_t minutes = diff.tv_sec / 60;
 
         return fmt::format(FMT_STRING("{:2} minute{} and {:2} second{} ago"),
                            minutes,
                            minutes > 1 ? "s" : "",
                            seconds,
                            seconds == 1 ? "" : "s");
-    } else {
-        return this->as_time_ago();
     }
-}
-
-duration
-duration::from_tv(const struct timeval& tv)
-{
-    return duration{tv};
+    return this->as_time_ago();
 }
 
 std::string
@@ -149,30 +157,76 @@ duration::to_string() const
     };
 
     const auto* curr_interval = intervals;
-    auto usecs = std::chrono::duration_cast<std::chrono::microseconds>(
-                     std::chrono::seconds(this->d_timeval.tv_sec))
-        + std::chrono::microseconds(this->d_timeval.tv_usec);
-    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(usecs);
+    auto nsecs = this->d_nsecs;
     std::string retval;
     bool neg = false;
 
-    if (millis < 0s) {
-        neg = true;
-        millis = -millis;
+    if (nsecs == 0ns) {
+        if (!this->d_compact) {
+            retval = "0s";
+        }
+        return retval;
     }
 
-    uint64_t remaining;
-    if (millis >= 10min) {
-        remaining
-            = std::chrono::duration_cast<std::chrono::seconds>(millis).count();
-        curr_interval += 1;
-    } else {
-        remaining = millis.count();
+    if (nsecs < 0ns) {
+        neg = true;
+        nsecs = -nsecs;
+    }
+
+    // Sub-microsecond: render as `Nns`.  Always emitted at full
+    // precision — there's no segmented form below `us`, and rounding
+    // the only value we have produces zeros.
+    if (nsecs < 1us) {
+        auto out = fmt::format(FMT_STRING("{}ns"), nsecs.count());
+        if (neg) {
+            out.insert(0, "-");
+        }
+        return out;
+    }
+
+    // `[1us, 1ms)`: render as `Nus`, truncating any sub-microsecond
+    // remainder.  Matches the pre-nanosecond behavior of the old
+    // timeval-based path which couldn't represent sub-us anyway.
+    if (nsecs < 1ms) {
+        auto usecs
+            = std::chrono::duration_cast<std::chrono::microseconds>(nsecs);
+        auto out = fmt::format(FMT_STRING("{}us"), usecs.count());
+        if (neg) {
+            out.insert(0, "-");
+        }
+        return out;
+    }
+
+    // `>= 1ms`: fall into the segmented hh/mm/ss/ms peeling loop.
+    // Resolution is interpreted in milliseconds here; anything finer
+    // (e.g. `with_resolution(1ns)`) collapses to a 1ms floor — full
+    // sub-ms precision in the segmented form would require extending
+    // the intervals table below the ms tier.
+    auto resolution_ms
+        = std::chrono::duration_cast<std::chrono::milliseconds>(
+              this->d_resolution)
+              .count();
+    if (resolution_ms < 1) {
+        resolution_ms = 1;
+    }
+
+    uint64_t remaining
+        = std::chrono::duration_cast<std::chrono::milliseconds>(nsecs)
+              .count();
+    uint64_t scale = 1;
+    remaining = roundup(remaining, static_cast<uint64_t>(resolution_ms));
+    auto skipped = 0;
+    if (nsecs >= 10min) {
+        remaining /= curr_interval->length;
+        scale *= curr_interval->length;
+        ++curr_interval;
+        skipped = 1;
     }
 
     for (; curr_interval != std::end(intervals); curr_interval++) {
         uint64_t amount;
         char segment[32];
+        auto skip = scale < static_cast<uint64_t>(resolution_ms);
 
         if (curr_interval->length) {
             amount = remaining % curr_interval->length;
@@ -181,9 +235,25 @@ duration::to_string() const
             amount = remaining;
             remaining = 0;
         }
+        scale *= curr_interval->length;
 
-        if (!amount && !remaining) {
+        if (amount == 0 && remaining == 0) {
             break;
+        }
+
+        // In compact mode, suppress the zero "000" ms decoration when
+        // larger segments follow — produces "1m30s" rather than
+        // "1m30s000" for round values.
+        if (this->d_compact && curr_interval == intervals && amount == 0
+            && remaining > 0)
+        {
+            skipped += 1;
+            continue;
+        }
+
+        if (skip) {
+            skipped += 1;
+            continue;
         }
 
         snprintf(segment,
@@ -192,6 +262,12 @@ duration::to_string() const
                  amount,
                  curr_interval->symbol);
         retval.insert(0, segment);
+        if (remaining > 0 && amount < 10 && curr_interval->symbol[0]) {
+            retval.insert(0, "0");
+        }
+    }
+    if (!skipped && !this->d_compact) {
+        retval.append("ms");
     }
 
     if (neg) {
@@ -201,5 +277,4 @@ duration::to_string() const
     return retval;
 }
 
-}  // namespace time
-}  // namespace humanize
+}  // namespace humanize::time

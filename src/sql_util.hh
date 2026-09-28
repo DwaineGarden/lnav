@@ -32,7 +32,9 @@
 #ifndef lnav_sql_util_hh
 #define lnav_sql_util_hh
 
+#include <array>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -41,20 +43,22 @@
 #include <sys/time.h>
 #include <time.h>
 
+#include "base/attr_line.hh"
+#include "base/auto_mem.hh"
 #include "base/intern_string.hh"
 #include "base/lnav.console.hh"
 #include "base/time_util.hh"
-#include "sqlitepp.hh"
 
-extern const char* sql_keywords[145];
+extern const std::array<const char*, 145> sqlite_keywords;
 extern const char* sql_function_names[];
 extern const std::unordered_map<unsigned char, const char*>
     sql_constraint_names;
+extern const char* const LNAV_ATTACH_DB;
 
 inline const char*
 sql_constraint_op_name(unsigned char op)
 {
-    auto iter = sql_constraint_names.find(op);
+    const auto iter = sql_constraint_names.find(op);
     if (iter == sql_constraint_names.end()) {
         return "??";
     }
@@ -63,7 +67,7 @@ sql_constraint_op_name(unsigned char op)
 }
 
 using sqlite_exec_callback = int (*)(void*, int, char**, char**);
-typedef std::vector<std::string> db_table_list_t;
+using db_table_list_t = std::vector<std::string>;
 using db_table_map_t = std::map<std::string, db_table_list_t>;
 
 struct sqlite_metadata_callbacks {
@@ -73,6 +77,7 @@ struct sqlite_metadata_callbacks {
     sqlite_exec_callback smc_table_info;
     sqlite_exec_callback smc_foreign_key_list;
     void* smc_userdata{nullptr};
+    std::string smc_table_name;
     db_table_map_t smc_db_list{};
 };
 
@@ -85,36 +90,30 @@ void attach_sqlite_db(sqlite3* db, const std::string& filename);
 inline ssize_t
 sql_strftime(char* buffer,
              size_t buffer_size,
-             lnav::time64_t tim,
-             int millis,
+             std::chrono::microseconds micros,
              char sep = ' ')
 {
-    return lnav::strftime_rfc3339(buffer, buffer_size, tim, millis, sep);
+    return lnav::strftime_rfc3339(buffer, buffer_size, micros, sep);
 }
 
 inline ssize_t
 sql_strftime(char* buffer,
              size_t buffer_size,
-             const struct timeval& tv,
+             const timeval& tv,
              char sep = ' ')
 {
-    return sql_strftime(buffer, buffer_size, tv.tv_sec, tv.tv_usec / 1000, sep);
+    return sql_strftime(buffer, buffer_size, to_us(tv), sep);
 }
 
 void sql_install_logger();
 
 bool sql_ident_needs_quote(const char* ident);
 
-char* sql_quote_ident(const char* ident);
+auto_mem<char, sqlite3_free> sql_quote_ident(const char* ident);
 
 std::string sql_safe_ident(const string_fragment& ident);
 
-void sql_execute_script(
-    sqlite3* db,
-    const std::map<std::string, scoped_value_t>& global_vars,
-    const char* src_name,
-    const char* script,
-    std::vector<lnav::console::user_message>& errors);
+std::string sql_quote_text(const std::string& str);
 
 int guess_type_from_pcre(const std::string& pattern, std::string& collator);
 
@@ -132,5 +131,34 @@ int sqlite_authorizer(void* pUserData,
                       const char* detail2,
                       const char* detail3,
                       const char* detail4);
+
+// RAII helper that, while in scope, collects the names of every table
+// accessed by subsequent sqlite3_prepare_v2 calls on this thread into
+// the supplied set.  Used by execute_sql to tell whether the user's
+// query reads from log-backed vtables.  Nested guards restore the
+// previous capture target on destruction.
+class sql_table_capture_guard {
+public:
+    explicit sql_table_capture_guard(std::set<std::string>& into);
+    ~sql_table_capture_guard();
+
+    sql_table_capture_guard(const sql_table_capture_guard&) = delete;
+    sql_table_capture_guard& operator=(const sql_table_capture_guard&) = delete;
+
+private:
+    std::set<std::string>* stcg_prev;
+};
+
+namespace lnav::sql {
+
+auto_mem<char, sqlite3_free> mprintf(const char* fmt, ...);
+
+}  // namespace lnav::sql
+
+namespace lnav::prql {
+
+Result<std::string, console::user_message> compile(const std::string& src);
+
+}
 
 #endif

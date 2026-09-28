@@ -65,7 +65,8 @@
     dst[off_inout] = ch; \
     off_inout += 1;
 
-#define ABR_TO_INT(a, b, c) (((a) << 24) | ((b) << 16) | ((c) << 8))
+#define ABR_TO_INT(a, b, c)     (((a) << 24) | ((b) << 16) | ((c) << 8))
+#define ABR_TO_INT4(a, b, c, d) (((a) << 24) | ((b) << 16) | ((c) << 8) | ((d)))
 
 inline bool
 ptime_upto(char ch, const char* str, off_t& off_inout, ssize_t len)
@@ -87,72 +88,245 @@ ptime_upto_end(const char* str, off_t& off_inout, ssize_t len)
     return true;
 }
 
+/**
+ * The most bytes a weekday name is allowed to occupy.  Going by the system
+ * locales, an abbreviated name reaches sixteen bytes and a full one reaches
+ * twenty-four.
+ */
+static constexpr off_t PTIME_A_MAX_WIDTH = 24;
+
+/**
+ * Scan up to the delimiter that follows a weekday name.  The name itself is
+ * thrown away, since ftime_a() writes one back from tm_wday, so this only has
+ * to be loose enough for every locale to get through: letters, the period that
+ * most abbreviations end with, and the hyphen a few full names use.  Anything
+ * else in front of the delimiter means this is not a weekday, which lets the
+ * scanner give up on the whole group of formats that start with one.
+ */
+inline bool
+ptime_a_upto(char ch, const char* str, off_t& off_inout, ssize_t len)
+{
+    auto limit = off_inout + PTIME_A_MAX_WIDTH;
+
+    if (limit > len) {
+        limit = len;
+    }
+    for (auto scan = off_inout; scan < limit; scan++) {
+        const auto name_ch = (unsigned char) str[scan];
+
+        if (name_ch == (unsigned char) ch) {
+            if (scan == off_inout) {
+                // the delimiter is the whole of the name
+                return false;
+            }
+            off_inout = scan;
+            return true;
+        }
+        // A byte at or above 0x80 is part of a multibyte name, so only the
+        // ASCII range says anything about what this is.
+        if (ch == ' ' && name_ch < 0x80
+            && !(name_ch >= 'A' && name_ch <= 'Z')
+            && !(name_ch >= 'a' && name_ch <= 'z') && name_ch != '.'
+            && name_ch != '-')
+        {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * The most bytes a month name is allowed to occupy.  Going by the system
+ * locales, an abbreviated name reaches twenty-three bytes and a full one
+ * reaches thirty-eight.
+ */
+static constexpr off_t PTIME_B_MAX_WIDTH = 40;
+
+/**
+ * The fewest bytes a month name can occupy.  The shortest the locales offer is
+ * a two byte abbreviation.
+ */
+static constexpr off_t PTIME_B_MIN_WIDTH = 2;
+
 bool ptime_b_slow(struct exttm* dst,
                   const char* str,
                   off_t& off_inout,
                   ssize_t len);
 
-inline bool
-ptime_b(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
-{
-    if (off_inout + 3 < len) {
-        auto month_start = (unsigned char*) &str[off_inout];
-        uint32_t month_int = ABR_TO_INT(month_start[0] & ~0x20UL,
-                                        month_start[1] & ~0x20UL,
-                                        month_start[2] & ~0x20UL);
-        int val;
+bool ptime_b_bounded(struct exttm* dst,
+                     const char* str,
+                     off_t start,
+                     off_t end);
 
-        switch (month_int) {
-            case ABR_TO_INT('J', 'A', 'N'):
-                val = 0;
-                break;
-            case ABR_TO_INT('F', 'E', 'B'):
-                val = 1;
-                break;
-            case ABR_TO_INT('M', 'A', 'R'):
-                val = 2;
-                break;
-            case ABR_TO_INT('A', 'P', 'R'):
-                val = 3;
-                break;
-            case ABR_TO_INT('M', 'A', 'Y'):
-                val = 4;
-                break;
-            case ABR_TO_INT('J', 'U', 'N'):
-                val = 5;
-                break;
-            case ABR_TO_INT('J', 'U', 'L'):
-                val = 6;
-                break;
-            case ABR_TO_INT('A', 'U', 'G'):
-                val = 7;
-                break;
-            case ABR_TO_INT('S', 'E', 'P'):
-                val = 8;
-                break;
-            case ABR_TO_INT('O', 'C', 'T'):
-                val = 9;
-                break;
-            case ABR_TO_INT('N', 'O', 'V'):
-                val = 10;
-                break;
-            case ABR_TO_INT('D', 'E', 'C'):
-                val = 11;
-                break;
-            default:
-                val = -1;
-                break;
-        }
-        if (val >= 0) {
+inline bool
+ptime_b_int(struct exttm* dst, const char* str, off_t off)
+{
+    auto month_start = (unsigned char*) &str[off];
+    uint32_t month_int = ABR_TO_INT(month_start[0] & ~0x20UL,
+                                    month_start[1] & ~0x20UL,
+                                    month_start[2] & ~0x20UL);
+    int val;
+
+    switch (month_int) {
+        case ABR_TO_INT('J', 'A', 'N'):
+            val = 0;
+            break;
+        case ABR_TO_INT('F', 'E', 'B'):
+            val = 1;
+            break;
+        case ABR_TO_INT('M', 'A', 'R'):
+            val = 2;
+            break;
+        case ABR_TO_INT('A', 'P', 'R'):
+            val = 3;
+            break;
+        case ABR_TO_INT('M', 'A', 'Y'):
+            val = 4;
+            break;
+        case ABR_TO_INT('J', 'U', 'N'):
+            val = 5;
+            break;
+        case ABR_TO_INT('J', 'U', 'L'):
+            val = 6;
+            break;
+        case ABR_TO_INT('A', 'U', 'G'):
+            val = 7;
+            break;
+        case ABR_TO_INT('S', 'E', 'P'):
+            val = 8;
+            break;
+        case ABR_TO_INT('O', 'C', 'T'):
+            val = 9;
+            break;
+        case ABR_TO_INT('N', 'O', 'V'):
+            val = 10;
+            break;
+        case ABR_TO_INT('D', 'E', 'C'):
+            val = 11;
+            break;
+        default:
+            val = -1;
+            break;
+    }
+    if (val >= 0) {
+        dst->et_tm.tm_mon = val;
+        dst->et_flags |= ETF_MONTH_SET;
+        return true;
+    }
+
+    return false;
+}
+
+#define PTIME_CHECK_b(dst, str, off, fmt_index) \
+    if (str[off + 3] == '.' || isalpha(str[off + 3]) \
+        || !ptime_b_int(dst, str, off)) \
+    { \
+        off_t tmp_off = off; \
+        if (!ptime_b_slow(dst, str, tmp_off, len)) { \
+            off_inout = off; \
+            return fmt_index; \
+        } \
+        auto diff = tmp_off - (off + 3); \
+        off_inout += diff; \
+    }
+
+inline bool
+ptime_b(exttm* dst, const char* str, off_t& off_inout, ssize_t len)
+{
+    // fast path to detect english abbreviated months
+    //
+    // only detect english abbreviated months if they end at a word
+    // boundary. if the abbreviated month in the current locale is longer
+    // than 3 letters, and starts with the same letters as an english locale
+    // month abbreviation, then the computation of off_inout is incorrect.
+    //
+    // Ex: in fr_FR november is `nov.`. Parsing `nov. 29` as `%b %d` fails
+    // if this fast path is taken as later we will attempt to parse `. 29`
+    // as ` %d`.
+    if (off_inout + 3 < len && str[off_inout + 3] != '.'
+        && !isalpha(str[off_inout + 3]))
+    {
+        if (ptime_b_int(dst, str, off_inout)) {
             off_inout += 3;
-            dst->et_tm.tm_mon = val;
-            dst->et_flags |= ETF_MONTH_SET;
             return true;
         }
     }
 
     return ptime_b_slow(dst, str, off_inout, len);
 }
+
+/**
+ * Find the extent of a "%b" that is followed by the literal `delim` in the
+ * format string.  On success, [b_start, b_end) covers the month name.
+ *
+ * A three byte name is decoded here, since that is only an integer compare,
+ * and b_start is set to -1 to record that there is nothing left to do.
+ * Anything longer is left to ptime_b_finish() to decode after the rest of the
+ * format has matched, which keeps the expensive strptime() call away from the
+ * lines that were never going to match.
+ */
+inline bool
+ptime_b_locate(struct exttm* dst,
+               const char* str,
+               off_t start,
+               ssize_t len,
+               char delim,
+               off_t& b_start,
+               off_t& b_end)
+{
+    auto limit = start + PTIME_B_MAX_WIDTH;
+
+    if (limit > len) {
+        limit = len;
+    }
+    for (auto scan = start; scan < limit; scan++) {
+        if (str[scan] != delim) {
+            continue;
+        }
+
+        if (scan - start < PTIME_B_MIN_WIDTH) {
+            // the delimiter arrived before a name could fit, so starting the
+            // scan past it would only fold it into the name
+            return false;
+        }
+        b_end = scan;
+        if (scan - start == 3 && ptime_b_int(dst, str, start)) {
+            b_start = -1;
+        } else {
+            b_start = start;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+inline bool
+ptime_b_finish(struct exttm* dst, const char* str, off_t b_start, off_t b_end)
+{
+    if (b_start < 0) {
+        return true;
+    }
+
+    return ptime_b_bounded(dst, str, b_start, b_end);
+}
+
+#define PTIME_LOCATE_b(dst, str, off, delim, b_start, b_end, fmt_index) \
+    { \
+        const off_t b_off = (off); \
+        if (!ptime_b_locate(dst, str, b_off, len, delim, b_start, b_end)) { \
+            off_inout = b_off; \
+            return fmt_index; \
+        } \
+        off_inout += (b_end - b_off) - 3; \
+    }
+
+#define PTIME_FINISH_b(dst, str, b_start, b_end, fmt_index) \
+    if (!ptime_b_finish(dst, str, b_start, b_end)) { \
+        off_inout = b_start; \
+        return fmt_index; \
+    }
 
 inline void
 ftime_a(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
@@ -199,11 +373,6 @@ ftime_a(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
             PTIME_APPEND('X');
             break;
     }
-}
-
-inline void
-ftime_Z(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
-{
 }
 
 inline void
@@ -278,19 +447,20 @@ ftime_b(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
     }
 }
 
-inline bool
-ptime_S(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
-{
-    PTIME_CONSUME(2, {
-        if (str[off_inout + 1] > '9') {
-            return false;
-        }
-        dst->et_tm.tm_sec
-            = (str[off_inout] - '0') * 10 + (str[off_inout + 1] - '0');
-        dst->et_flags |= ETF_SECOND_SET;
-    });
+#define PTIME_CHECK_S(dst, str, off, fmt_index) \
+    dst->et_tm.tm_sec = (str[off] - '0') * 10 + (str[off + 1] - '0'); \
+    if (dst->et_tm.tm_sec < 0 || dst->et_tm.tm_sec >= 60) { \
+        off_inout = off; \
+        return fmt_index; \
+    } \
+    dst->et_flags |= ETF_SECOND_SET;
 
-    return (dst->et_tm.tm_sec >= 0 && dst->et_tm.tm_sec <= 59);
+inline bool
+ptime_S(exttm* dst, const char* str, off_t& off_inout, ssize_t len)
+{
+    PTIME_CONSUME(2, { PTIME_CHECK_S(dst, str, off_inout, false); });
+
+    return true;
 }
 
 inline void
@@ -323,9 +493,9 @@ ptime_s(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
     secs2tm(epoch, &dst->et_tm);
     dst->et_flags = ETF_DAY_SET | ETF_MONTH_SET | ETF_YEAR_SET | ETF_HOUR_SET
         | ETF_MINUTE_SET | ETF_SECOND_SET | ETF_MACHINE_ORIENTED
-        | ETF_EPOCH_TIME;
+        | ETF_EPOCH_TIME | ETF_ZONE_SET;
 
-    return (epoch > 0);
+    return off_inout > off_start;
 }
 
 inline void
@@ -381,9 +551,9 @@ ptime_q(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
     secs2tm(epoch, &dst->et_tm);
     dst->et_flags = ETF_DAY_SET | ETF_MONTH_SET | ETF_YEAR_SET | ETF_HOUR_SET
         | ETF_MINUTE_SET | ETF_SECOND_SET | ETF_MACHINE_ORIENTED
-        | ETF_EPOCH_TIME;
+        | ETF_EPOCH_TIME | ETF_ZONE_SET;
 
-    return (epoch > 0);
+    return off_inout > off_start;
 }
 
 inline void
@@ -398,20 +568,42 @@ ftime_q(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
 inline bool
 ptime_L(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 {
+    auto avail = len - off_inout;
     int ms = 0;
 
-    PTIME_CONSUME(3, {
-        char c0 = str[off_inout];
-        char c1 = str[off_inout + 1];
-        char c2 = str[off_inout + 2];
-        if (!isdigit(c0) || !isdigit(c1) || !isdigit(c2)) {
-            return false;
-        }
-        ms = ((str[off_inout] - '0') * 100 + (str[off_inout + 1] - '0') * 10
-              + (str[off_inout + 2] - '0'));
-    });
+    if (avail >= 3 && isdigit(str[off_inout + 2])) {
+        PTIME_CONSUME(3, {
+            char c0 = str[off_inout];
+            char c1 = str[off_inout + 1];
+            char c2 = str[off_inout + 2];
+            if (!isdigit(c0) || !isdigit(c1) || !isdigit(c2)) {
+                return false;
+            }
+            ms = ((str[off_inout] - '0') * 100 + (str[off_inout + 1] - '0') * 10
+                  + (str[off_inout + 2] - '0'));
+        });
+    } else if (avail >= 2 && isdigit(str[off_inout + 1])) {
+        PTIME_CONSUME(2, {
+            char c0 = str[off_inout];
+            char c1 = str[off_inout + 1];
+            if (!isdigit(c0) || !isdigit(c1)) {
+                return false;
+            }
+            ms = ((str[off_inout] - '0') * 100
+                  + (str[off_inout + 1] - '0') * 10);
+        });
+    } else {
+        PTIME_CONSUME(1, {
+            char c0 = str[off_inout];
+            if (!isdigit(c0)) {
+                return false;
+            }
+            ms = (str[off_inout] - '0') * 100;
+        });
+    }
 
     if ((ms >= 0 && ms <= 999)) {
+        dst->et_flags |= ETF_MILLIS_SET;
         dst->et_nsec = ms * 1000000;
         return true;
     }
@@ -428,19 +620,20 @@ ftime_L(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
     PTIME_APPEND('0' + ((millis / 1) % 10));
 }
 
-inline bool
-ptime_M(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
-{
-    PTIME_CONSUME(2, {
-        if (str[off_inout + 1] > '9') {
-            return false;
-        }
-        dst->et_tm.tm_min
-            = (str[off_inout] - '0') * 10 + (str[off_inout + 1] - '0');
-        dst->et_flags |= ETF_MINUTE_SET;
-    });
+#define PTIME_CHECK_M(dst, str, off, fmt_index) \
+    dst->et_tm.tm_min = (str[off] - '0') * 10 + (str[off + 1] - '0'); \
+    if (dst->et_tm.tm_min < 0 || dst->et_tm.tm_min >= 60) { \
+        off_inout = off; \
+        return fmt_index; \
+    } \
+    dst->et_flags |= ETF_MINUTE_SET;
 
-    return (dst->et_tm.tm_min >= 0 && dst->et_tm.tm_min <= 59);
+inline bool
+ptime_M(exttm* dst, const char* str, off_t& off_inout, ssize_t len)
+{
+    PTIME_CONSUME(2, { PTIME_CHECK_M(dst, str, off_inout, false); });
+
+    return true;
 }
 
 inline void
@@ -450,19 +643,25 @@ ftime_M(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
     PTIME_APPEND('0' + ((tm.et_tm.tm_min / 1) % 10));
 }
 
+#define PTIME_CHECK_H(dst, str, off, fmt_index) \
+    if (str[off] == ' ') { \
+        dst->et_tm.tm_hour = 0; \
+    } else { \
+        dst->et_tm.tm_hour = (str[off] - '0') * 10; \
+    } \
+    dst->et_tm.tm_hour += (str[off + 1] - '0'); \
+    if (dst->et_tm.tm_hour < 0 || dst->et_tm.tm_hour > 23) { \
+        off_inout = off; \
+        return fmt_index; \
+    } \
+    dst->et_flags |= ETF_HOUR_SET;
+
 inline bool
 ptime_H(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 {
-    PTIME_CONSUME(2, {
-        if (str[off_inout + 1] > '9') {
-            return false;
-        }
-        dst->et_tm.tm_hour
-            = (str[off_inout] - '0') * 10 + (str[off_inout + 1] - '0');
-        dst->et_flags |= ETF_HOUR_SET;
-    });
+    PTIME_CONSUME(2, { PTIME_CHECK_H(dst, str, off_inout, false); });
 
-    return (dst->et_tm.tm_hour >= 0 && dst->et_tm.tm_hour <= 23);
+    return true;
 }
 
 inline void
@@ -475,6 +674,7 @@ ftime_H(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
 inline bool
 ptime_i(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 {
+    off_t off_start = off_inout;
     uint64_t epoch_ms = 0;
     lnav::time64_t epoch;
 
@@ -493,16 +693,17 @@ ptime_i(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 
     secs2tm(epoch, &dst->et_tm);
     dst->et_flags = ETF_DAY_SET | ETF_MONTH_SET | ETF_YEAR_SET | ETF_HOUR_SET
-        | ETF_MINUTE_SET | ETF_SECOND_SET | ETF_MACHINE_ORIENTED
-        | ETF_EPOCH_TIME;
+        | ETF_MINUTE_SET | ETF_SECOND_SET | ETF_MILLIS_SET
+        | ETF_MACHINE_ORIENTED | ETF_EPOCH_TIME | ETF_ZONE_SET
+        | ETF_SUB_NOT_IN_FORMAT;
 
-    return (epoch_ms > 0);
+    return off_inout > off_start;
 }
 
 inline void
 ftime_i(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
 {
-    int64_t t = tm2sec(&tm.et_tm);
+    int64_t t = tm2sec(&tm.et_tm) * 1000LL;
 
     t += tm.et_nsec / 1000000;
     snprintf(&dst[off_inout], len - off_inout, "%" PRId64, t);
@@ -512,6 +713,7 @@ ftime_i(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
 inline bool
 ptime_6(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 {
+    off_t off_start = off_inout;
     uint64_t epoch_us = 0;
     lnav::time64_t epoch;
 
@@ -530,19 +732,120 @@ ptime_6(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 
     secs2tm(epoch, &dst->et_tm);
     dst->et_flags = ETF_DAY_SET | ETF_MONTH_SET | ETF_YEAR_SET | ETF_HOUR_SET
-        | ETF_MINUTE_SET | ETF_SECOND_SET | ETF_MACHINE_ORIENTED
-        | ETF_EPOCH_TIME;
+        | ETF_MINUTE_SET | ETF_SECOND_SET | ETF_MICROS_SET
+        | ETF_MACHINE_ORIENTED | ETF_EPOCH_TIME | ETF_ZONE_SET
+        | ETF_SUB_NOT_IN_FORMAT | ETF_Z_FOR_UTC;
 
-    return (epoch_us > 0);
+    return off_inout > off_start;
 }
 
 inline void
 ftime_6(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
 {
-    int64_t t = tm2sec(&tm.et_tm);
+    int64_t t = tm2sec(&tm.et_tm) * 1000000LL;
 
     t += tm.et_nsec / 1000;
     snprintf(&dst[off_inout], len - off_inout, "%" PRId64, t);
+    off_inout = strlen(dst);
+}
+
+inline bool
+ptime_9(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
+{
+    off_t off_start = off_inout;
+    uint64_t epoch_ns = 0;
+    lnav::time64_t epoch;
+
+    while (off_inout < len && isdigit(str[off_inout])) {
+        epoch_ns *= 10;
+        epoch_ns += str[off_inout] - '0';
+        off_inout += 1;
+    }
+
+    dst->et_nsec = epoch_ns % 1000000000ULL;
+    epoch = (epoch_ns / 1000000000ULL);
+
+    if (epoch >= MAX_TIME_T) {
+        return false;
+    }
+
+    secs2tm(epoch, &dst->et_tm);
+    dst->et_flags = ETF_DAY_SET | ETF_MONTH_SET | ETF_YEAR_SET | ETF_HOUR_SET
+        | ETF_MINUTE_SET | ETF_SECOND_SET | ETF_NANOS_SET | ETF_MACHINE_ORIENTED
+        | ETF_EPOCH_TIME | ETF_ZONE_SET | ETF_SUB_NOT_IN_FORMAT | ETF_Z_FOR_UTC;
+
+    return off_inout > off_start;
+}
+
+inline void
+ftime_9(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
+{
+    int64_t t = tm2sec(&tm.et_tm) * 1000000000LL;
+
+    t += tm.et_nsec;
+    snprintf(&dst[off_inout], len - off_inout, "%" PRId64, t);
+    off_inout = strlen(dst);
+}
+
+/**
+ * Picoseconds from the epoch.  The value can exceed what fits in 64 bits, so
+ * the last twelve digits are taken as the fraction of a second and the rest
+ * as the seconds.
+ */
+inline bool
+ptime_2(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
+{
+    static constexpr int PS_DIGITS = 12;
+    const off_t off_start = off_inout;
+
+    while (off_inout < len && isdigit(str[off_inout])) {
+        off_inout += 1;
+    }
+
+    const auto digits = static_cast<int>(off_inout - off_start);
+    if (digits == 0) {
+        return false;
+    }
+
+    lnav::time64_t epoch = 0;
+    uint64_t sub_ps = 0;
+    for (int lpc = 0; lpc < digits; lpc++) {
+        const auto val = str[off_start + lpc] - '0';
+
+        if (lpc < digits - PS_DIGITS) {
+            epoch = epoch * 10 + val;
+            if (epoch >= MAX_TIME_T) {
+                return false;
+            }
+        } else {
+            sub_ps = sub_ps * 10 + val;
+        }
+    }
+
+    secs2tm(epoch, &dst->et_tm);
+    dst->et_nsec = sub_ps / 1000ULL;
+    dst->et_flags = ETF_DAY_SET | ETF_MONTH_SET | ETF_YEAR_SET | ETF_HOUR_SET
+        | ETF_MINUTE_SET | ETF_SECOND_SET | ETF_NANOS_SET | ETF_MACHINE_ORIENTED
+        | ETF_EPOCH_TIME | ETF_ZONE_SET | ETF_SUB_NOT_IN_FORMAT | ETF_Z_FOR_UTC;
+
+    return true;
+}
+
+inline void
+ftime_2(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
+{
+    const int64_t t = tm2sec(&tm.et_tm);
+    const int64_t sub_ps = static_cast<int64_t>(tm.et_nsec) * 1000LL;
+
+    if (t > 0) {
+        snprintf(&dst[off_inout],
+                 len - off_inout,
+                 "%" PRId64 "%012" PRId64,
+                 t,
+                 sub_ps);
+    } else {
+        snprintf(&dst[off_inout], len - off_inout, "%" PRId64, sub_ps);
+    }
     off_inout = strlen(dst);
 }
 
@@ -553,8 +856,14 @@ ptime_I(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
         if (str[off_inout + 1] > '9') {
             return false;
         }
-        dst->et_tm.tm_hour
-            = (str[off_inout] - '0') * 10 + (str[off_inout + 1] - '0');
+        if (isdigit(str[off_inout])) {
+            dst->et_tm.tm_hour = (str[off_inout] - '0') * 10;
+        } else if (str[off_inout] == ' ') {
+            dst->et_tm.tm_hour = 0;
+        } else {
+            return false;
+        }
+        dst->et_tm.tm_hour += (str[off_inout + 1] - '0');
 
         if (dst->et_tm.tm_hour < 1 || dst->et_tm.tm_hour > 12) {
             return false;
@@ -581,26 +890,27 @@ ftime_I(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
     PTIME_APPEND('0' + ((hour / 1) % 10));
 }
 
+#define PTIME_CHECK_d(dst, str, off, fmt_index) \
+    dst->et_tm.tm_yday = -1; \
+    if (str[off] == ' ') { \
+        dst->et_tm.tm_mday = 0; \
+    } else { \
+        dst->et_tm.tm_mday = (str[off] - '0') * 10; \
+    } \
+    dst->et_tm.tm_mday += (str[off + 1] - '0'); \
+    if (dst->et_tm.tm_mday >= 1 && dst->et_tm.tm_mday <= 31) { \
+        dst->et_flags |= ETF_DAY_SET; \
+    } else { \
+        off_inout = off; \
+        return fmt_index; \
+    }
+
 inline bool
 ptime_d(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 {
-    PTIME_CONSUME(2, {
-        if (str[off_inout] == ' ') {
-            dst->et_tm.tm_mday = 0;
-        } else {
-            dst->et_tm.tm_mday = (str[off_inout] - '0') * 10;
-        }
-        if (str[off_inout + 1] > '9') {
-            return false;
-        }
-        dst->et_tm.tm_mday += (str[off_inout + 1] - '0');
-    });
+    PTIME_CONSUME(2, { PTIME_CHECK_d(dst, str, off_inout, false); });
 
-    if (dst->et_tm.tm_mday >= 1 && dst->et_tm.tm_mday <= 31) {
-        dst->et_flags |= ETF_DAY_SET;
-        return true;
-    }
-    return false;
+    return true;
 }
 
 inline void
@@ -613,12 +923,16 @@ ftime_d(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
 inline bool
 ptime_e(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 {
+    dst->et_tm.tm_yday = -1;
     dst->et_tm.tm_mday = 0;
     PTIME_CONSUME(1, {
-        if (str[off_inout] < '0' || str[off_inout] > '9') {
+        if (str[off_inout] == ' ') {
+            dst->et_tm.tm_mday = 0;
+        } else if (str[off_inout] < '0' || str[off_inout] > '9') {
             return false;
+        } else {
+            dst->et_tm.tm_mday = str[off_inout] - '0';
         }
-        dst->et_tm.tm_mday = str[off_inout] - '0';
     });
     if (off_inout < len) {
         if (str[off_inout] >= '0' && str[off_inout] <= '9') {
@@ -647,29 +961,72 @@ ftime_e(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
 }
 
 inline bool
-ptime_m(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
+ptime_j(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 {
-    off_t orig_off = off_inout;
-
-    dst->et_tm.tm_mon = 0;
+    dst->et_tm.tm_yday = -1;
     PTIME_CONSUME(1, {
         if (str[off_inout] < '0' || str[off_inout] > '9') {
             return false;
         }
-        dst->et_tm.tm_mon = str[off_inout] - '0';
+        dst->et_tm.tm_yday = str[off_inout] - '0';
     });
     if (off_inout < len) {
         if (str[off_inout] >= '0' && str[off_inout] <= '9') {
-            dst->et_tm.tm_mon *= 10;
-            dst->et_tm.tm_mon += str[off_inout] - '0';
+            dst->et_tm.tm_yday *= 10;
+            dst->et_tm.tm_yday += str[off_inout] - '0';
+            off_inout += 1;
+        }
+    }
+    if (off_inout < len) {
+        if (str[off_inout] >= '0' && str[off_inout] <= '9') {
+            dst->et_tm.tm_yday *= 10;
+            dst->et_tm.tm_yday += str[off_inout] - '0';
             off_inout += 1;
         }
     }
 
-    dst->et_tm.tm_mon -= 1;
+    if (dst->et_tm.tm_yday >= 1 && dst->et_tm.tm_yday <= 366) {
+        dst->et_tm.tm_yday -= 1;
+        dst->et_flags |= ETF_YDAY_SET;
+        return true;
+    }
+    dst->et_tm.tm_yday = -1;
+    return false;
+}
 
-    if (dst->et_tm.tm_mon >= 0 && dst->et_tm.tm_mon <= 11) {
+inline void
+ftime_j(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
+{
+    PTIME_APPEND('0' + (((tm.et_tm.tm_yday + 1) / 100) % 100));
+    PTIME_APPEND('0' + (((tm.et_tm.tm_yday + 1) / 10) % 10));
+    PTIME_APPEND('0' + (((tm.et_tm.tm_yday + 1) / 1) % 10));
+}
+
+inline bool
+ptime_m(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
+{
+    off_t orig_off = off_inout;
+    int val = 0;
+
+    PTIME_CONSUME(1, {
+        if (str[off_inout] < '0' || str[off_inout] > '9') {
+            return false;
+        }
+        val = str[off_inout] - '0';
+    });
+    if (off_inout < len) {
+        if (str[off_inout] >= '0' && str[off_inout] <= '9') {
+            val *= 10;
+            val += str[off_inout] - '0';
+            off_inout += 1;
+        }
+    }
+
+    val -= 1;
+
+    if (val >= 0 && val <= 11) {
         dst->et_flags |= ETF_MONTH_SET;
+        dst->et_tm.tm_mon = val;
         return true;
     }
 
@@ -725,7 +1082,7 @@ ptime_l(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 
     dst->et_tm.tm_hour = 0;
 
-    if ((off_inout + 1) > len) {
+    if ((off_inout + 1) >= len) {
         return false;
     }
 
@@ -734,7 +1091,7 @@ ptime_l(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
         off_inout += 1;
     }
 
-    if ((off_inout + 1) > len) {
+    if ((off_inout + 1) >= len) {
         off_inout = orig_off;
         return false;
     }
@@ -747,7 +1104,13 @@ ptime_l(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
     dst->et_tm.tm_hour = str[off_inout] - '0';
     off_inout += 1;
 
+    if (!consumed_space && (off_inout + 1) >= len) {
+        off_inout = orig_off;
+        return false;
+    }
+
     if (consumed_space || str[off_inout] < '0' || str[off_inout] > '9') {
+        dst->et_flags |= ETF_HOUR_SET;
         return true;
     }
 
@@ -756,10 +1119,9 @@ ptime_l(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
     off_inout += 1;
 
     if (dst->et_tm.tm_hour >= 0 && dst->et_tm.tm_hour <= 23) {
+        dst->et_flags |= ETF_HOUR_SET;
         return true;
     }
-
-    dst->et_flags |= ETF_HOUR_SET;
 
     off_inout = orig_off;
     return false;
@@ -820,22 +1182,21 @@ ftime_p(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
     PTIME_APPEND('M');
 }
 
+#define PTIME_CHECK_Y(dst, str, off, fmt_index) \
+    dst->et_tm.tm_year \
+        = ((str[off + 0] - '0') * 1000 + (str[off + 1] - '0') * 100 \
+           + (str[off + 2] - '0') * 10 + (str[off + 3] - '0') * 1) \
+        - 1900; \
+    if (dst->et_tm.tm_year < 0 || dst->et_tm.tm_year > 1100) { \
+        off_inout = off; \
+        return fmt_index; \
+    } \
+    dst->et_flags |= ETF_YEAR_SET;
+
 inline bool
 ptime_Y(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 {
-    PTIME_CONSUME(4, {
-        dst->et_tm.tm_year = ((str[off_inout + 0] - '0') * 1000
-                              + (str[off_inout + 1] - '0') * 100
-                              + (str[off_inout + 2] - '0') * 10
-                              + (str[off_inout + 3] - '0') * 1)
-            - 1900;
-
-        if (dst->et_tm.tm_year < 0 || dst->et_tm.tm_year > 1100) {
-            return false;
-        }
-
-        dst->et_flags |= ETF_YEAR_SET;
-    });
+    PTIME_CONSUME(4, { PTIME_CHECK_Y(dst, str, off_inout, false); });
 
     return true;
 }
@@ -879,9 +1240,51 @@ ftime_y(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
     PTIME_APPEND('0' + ((year / 1) % 10));
 }
 
+bool ptime_Z_to_gmtoff(exttm* dst,
+                       const char* str,
+                       off_t& off_inout,
+                       ssize_t len);
+
+inline bool
+ptime_Z_upto(struct exttm* dst,
+             const char* str,
+             off_t& off_inout,
+             ssize_t len,
+             char term)
+{
+    if (!ptime_Z_to_gmtoff(dst, str, off_inout, len)) {
+        return false;
+    }
+
+    return ptime_upto(term, str, off_inout, len);
+}
+
+inline bool
+ptime_Z_upto_end(struct exttm* dst,
+                 const char* str,
+                 off_t& off_inout,
+                 ssize_t len)
+{
+    if (!ptime_Z_to_gmtoff(dst, str, off_inout, len)) {
+        return false;
+    }
+
+    return ptime_upto_end(str, off_inout, len);
+}
+
 inline bool
 ptime_z(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 {
+    if (off_inout + 1 <= len && str[off_inout] == 'Z') {
+        off_inout += 1;
+        dst->et_flags |= ETF_ZONE_SET | ETF_Z_FOR_UTC;
+#ifdef HAVE_STRUCT_TM_TM_ZONE
+        dst->et_tm.tm_gmtoff = 0;
+#endif
+        dst->et_gmtoff = 0;
+        return true;
+    }
+
     int consume_amount = 5;
 
     if ((off_inout + 6) <= len && str[off_inout + 3] == ':') {
@@ -907,6 +1310,10 @@ ptime_z(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
         mins = ((str[off_inout + skip_colon + 3] - '0') * 10
                 + (str[off_inout + skip_colon + 4] - '0') * 1)
             * 60;
+        if (skip_colon) {
+            dst->et_flags |= ETF_Z_COLON;
+        }
+        dst->et_flags |= ETF_ZONE_SET;
         dst->et_gmtoff = sign * (hours + mins);
 #ifdef HAVE_STRUCT_TM_TM_ZONE
         dst->et_tm.tm_gmtoff = sign * (hours + mins);
@@ -919,6 +1326,15 @@ ptime_z(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 inline void
 ftime_z(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
 {
+    if (!(tm.et_flags & ETF_ZONE_SET)) {
+        return;
+    }
+
+    if (tm.et_gmtoff == 0 && tm.et_flags & ETF_Z_FOR_UTC) {
+        PTIME_APPEND('Z');
+        return;
+    }
+
     long gmtoff = std::abs(tm.et_gmtoff) / 60;
 
     if (tm.et_gmtoff < 0) {
@@ -932,42 +1348,100 @@ ftime_z(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
 
     PTIME_APPEND('0' + ((hours / 10) % 10));
     PTIME_APPEND('0' + ((hours / 1) % 10));
+    if (tm.et_flags & ETF_Z_COLON) {
+        PTIME_APPEND(':');
+    }
     PTIME_APPEND('0' + ((mins / 10) % 10));
     PTIME_APPEND('0' + ((mins / 1) % 10));
 }
 
-inline bool
-ptime_f(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
+inline void
+ftime_Z(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
 {
-    PTIME_CONSUME(6, {
-        for (int lpc = 0; lpc < 6; lpc++) {
-            if (str[off_inout + lpc] < '0' || str[off_inout + lpc] > '9') {
-                return false;
-            }
+    if (tm.et_gmtoff == 0 && tm.et_flags & ETF_Z_IS_UTC) {
+        PTIME_APPEND('U');
+        PTIME_APPEND('T');
+        PTIME_APPEND('C');
+    } else if (tm.et_gmtoff == 0 && tm.et_flags & ETF_Z_IS_GMT) {
+        PTIME_APPEND('G');
+        PTIME_APPEND('M');
+        PTIME_APPEND('T');
+    } else if (tm.et_flags & ETF_ZONE_SET) {
+        ftime_z(dst, off_inout, len, tm);
+    }
+}
+
+inline bool
+ptime_f(exttm* dst, const char* str, off_t& off_inout, ssize_t len)
+{
+    auto avail = len - off_inout;
+    auto index = size_t{0};
+    int32_t mult = 100'000'000;
+    int32_t nsec = 0;
+
+    for (; index < 10 && index < avail; index++) {
+        if (!isdigit(str[off_inout + index])) {
+            break;
         }
-        dst->et_nsec = ((str[off_inout + 0] - '0') * 100000
-                        + (str[off_inout + 1] - '0') * 10000
-                        + (str[off_inout + 2] - '0') * 1000
-                        + (str[off_inout + 3] - '0') * 100
-                        + (str[off_inout + 4] - '0') * 10
-                        + (str[off_inout + 5] - '0') * 1)
-            * 1000;
-    });
+
+        nsec += (str[off_inout + index] - '0') * mult;
+        mult /= 10;
+    }
+
+    // After "%i" or "%6", the digits are a fraction of a millisecond or a
+    // microsecond, so they add to what that conversion found.  After "%9"
+    // or "%2", they are below the nanosecond resolution and are dropped.
+    if (dst->et_flags & ETF_EPOCH_TIME
+        && dst->et_flags & (ETF_MILLIS_SET | ETF_MICROS_SET | ETF_NANOS_SET))
+    {
+        auto unit_digits = size_t{9};
+        if (dst->et_flags & ETF_MILLIS_SET) {
+            unit_digits = 3;
+            dst->et_nsec += nsec / 1'000;
+        } else if (dst->et_flags & ETF_MICROS_SET) {
+            unit_digits = 6;
+            dst->et_nsec += nsec / 1'000'000;
+        }
+        dst->et_flags &= ~(ETF_MILLIS_SET | ETF_MICROS_SET | ETF_NANOS_SET);
+        if (unit_digits + index <= 6) {
+            dst->et_flags |= ETF_MICROS_SET;
+        } else {
+            dst->et_flags |= ETF_NANOS_SET;
+        }
+        off_inout += index;
+
+        return true;
+    }
+
+    if (index < 4) {
+        dst->et_flags |= ETF_MILLIS_SET;
+    } else if (index < 7) {
+        dst->et_flags |= ETF_MICROS_SET;
+    } else {
+        dst->et_flags |= ETF_NANOS_SET;
+    }
+    dst->et_nsec = nsec;
+    off_inout += index;
 
     return true;
 }
 
 inline void
-ftime_f(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
+ftime_f(char* dst, off_t& off_inout, ssize_t len, const exttm& tm)
 {
-    uint32_t micros = tm.et_nsec / 1000;
+    uint32_t divisor = 100'000'000;
+    const auto value = tm.et_nsec;
+    auto out_len = size_t{3};
 
-    PTIME_APPEND('0' + ((micros / 100000) % 10));
-    PTIME_APPEND('0' + ((micros / 10000) % 10));
-    PTIME_APPEND('0' + ((micros / 1000) % 10));
-    PTIME_APPEND('0' + ((micros / 100) % 10));
-    PTIME_APPEND('0' + ((micros / 10) % 10));
-    PTIME_APPEND('0' + ((micros / 1) % 10));
+    if (tm.et_flags & ETF_MICROS_SET) {
+        out_len = 6;
+    } else if (tm.et_flags & ETF_NANOS_SET) {
+        out_len = 9;
+    }
+    for (auto lpc = 0; lpc < out_len; lpc++) {
+        PTIME_APPEND('0' + ((value / divisor) % 10));
+        divisor /= 10;
+    }
 }
 
 inline bool
@@ -979,6 +1453,7 @@ ptime_N(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
                 return false;
             }
         }
+        dst->et_flags |= ETF_NANOS_SET;
         dst->et_nsec = ((str[off_inout + 0] - '0') * 100000000
                         + (str[off_inout + 1] - '0') * 10000000
                         + (str[off_inout + 2] - '0') * 1000000
@@ -1009,14 +1484,62 @@ ftime_N(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
     PTIME_APPEND('0' + ((nano / 1) % 10));
 }
 
+#define PTIME_CHECK_CHAR(expected, actual, fmt_index) \
+    if (expected != actual) { \
+        return fmt_index; \
+    }
+
+/**
+ * The width of the space character that 'str' starts with, or zero if it does
+ * not start with one.  CLDR, which is where Apple and ICU get their date
+ * formats, separates the time from the AM/PM marker with a NARROW NO-BREAK
+ * SPACE rather than an ASCII one, and uses the other spaces here in the same
+ * kind of place, so a space in a format needs to accept them as well.
+ */
+inline ssize_t
+ptime_space_width(const char* str, off_t off, ssize_t len)
+{
+    if (off >= len) {
+        return 0;
+    }
+    if (str[off] == ' ') {
+        return 1;
+    }
+    // U+00A0 NO-BREAK SPACE
+    if ((off + 1) < len && (unsigned char) str[off] == 0xc2
+        && (unsigned char) str[off + 1] == 0xa0)
+    {
+        return 2;
+    }
+    if ((off + 2) < len && (unsigned char) str[off] == 0xe2
+        && (unsigned char) str[off + 1] == 0x80)
+    {
+        switch ((unsigned char) str[off + 2]) {
+            case 0x87:  // U+2007 FIGURE SPACE
+            case 0x89:  // U+2009 THIN SPACE
+            case 0xaf:  // U+202F NARROW NO-BREAK SPACE
+                return 3;
+            default:
+                break;
+        }
+    }
+    return 0;
+}
+
 inline bool
 ptime_char(char val, const char* str, off_t& off_inout, ssize_t len)
 {
-    PTIME_CONSUME(1, {
-        if (str[off_inout] != val) {
+    if (val == ' ') {
+        auto width = ptime_space_width(str, off_inout, len);
+
+        if (width == 0) {
             return false;
         }
-    });
+        off_inout += width;
+        return true;
+    }
+
+    PTIME_CONSUME(1, { PTIME_CHECK_CHAR(val, str[off_inout], false); });
 
     return true;
 }
@@ -1028,7 +1551,7 @@ ftime_char(char* dst, off_t& off_inout, ssize_t len, char ch)
 }
 
 template<typename T>
-inline bool
+bool
 ptime_hex_to_quad(T& value_inout, const char quad)
 {
     value_inout <<= 4;
@@ -1062,7 +1585,7 @@ ptime_at(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
 
         lnav::time64_t small_secs = secs - 4611686018427387914ULL;
 
-        if (small_secs >= MAX_TIME_T) {
+        if (small_secs < 0 || small_secs >= MAX_TIME_T) {
             return false;
         }
 
@@ -1079,11 +1602,15 @@ ptime_at(struct exttm* dst, const char* str, off_t& off_inout, ssize_t len)
                 }
             }
         });
+
+        if (dst->et_nsec < 0) {
+            return false;
+        }
     }
 
     dst->et_flags |= ETF_DAY_SET | ETF_MONTH_SET | ETF_YEAR_SET | ETF_HOUR_SET
-        | ETF_MINUTE_SET | ETF_SECOND_SET | ETF_MACHINE_ORIENTED
-        | ETF_EPOCH_TIME;
+        | ETF_MINUTE_SET | ETF_SECOND_SET | ETF_NANOS_SET | ETF_MACHINE_ORIENTED
+        | ETF_EPOCH_TIME | ETF_ZONE_SET;
 
     return true;
 }
@@ -1093,7 +1620,15 @@ ftime_at(char* dst, off_t& off_inout, ssize_t len, const struct exttm& tm)
 {
 }
 
-using ptime_func = bool (*)(struct exttm*, const char*, off_t&, ssize_t);
+constexpr int32_t PTIME_MATCHED = -1;
+constexpr int32_t PTIME_TOO_SHORT = -2;
+
+/**
+ * A ptime_func returns PTIME_MATCHED on success, PTIME_TOO_SHORT if the input
+ * is shorter than the minimum width of the format, and otherwise the index in
+ * the format string of the element that failed to match.
+ */
+using ptime_func = int32_t (*)(struct exttm*, const char*, off_t&, ssize_t);
 using ftime_func = void (*)(char*, off_t&, size_t, const struct exttm&);
 
 bool ptime_fmt(const char* fmt,
@@ -1110,10 +1645,19 @@ struct ptime_fmt {
     const char* pf_fmt;
     ptime_func pf_func;
     ftime_func pf_ffunc;
+    char pf_leading_conversion;
+    /**
+     * The index of the first format with a different leading conversion.  The
+     * formats are grouped by that conversion, so a conversion that fails at
+     * index zero rules out everything up to this point.
+     */
+    size_t pf_next_group;
 };
 
 extern struct ptime_fmt PTIMEC_FORMATS[];
 
 extern const char* PTIMEC_FORMAT_STR[];
+
+extern size_t PTIMEC_DEFAULT_FMT_INDEX;
 
 #endif

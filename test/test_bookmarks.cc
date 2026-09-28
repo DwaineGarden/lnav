@@ -47,9 +47,6 @@ main(int argc, char* argv[])
 
     bv.insert_once(vis_line_t(4));
     bv.insert_once(vis_line_t(3));
-    assert(bv[0] == 2);
-    assert(bv[1] == 3);
-    assert(bv[2] == 4);
 
     {
         auto range = bv.equal_range(0_vl, 5_vl);
@@ -64,6 +61,12 @@ main(int argc, char* argv[])
         assert(*range.first == 4_vl);
         ++range.first;
         assert(range.first == range.second);
+    }
+
+    {
+        auto range = bv.equal_range(3_vl, 4_vl);
+
+        assert(std::next(range.first) == range.second);
     }
 
     {
@@ -113,10 +116,6 @@ main(int argc, char* argv[])
         bv.insert_once(vis_line_t(random() % LINE_COUNT));
     }
     bv_cp = bv;
-    sort(bv_cp.begin(), bv_cp.end());
-    assert(equal(bv.begin(), bv.end(), bv_cp.begin()));
-    unique(bv_cp.begin(), bv_cp.end());
-    assert(equal(bv.begin(), bv.end(), bv_cp.begin()));
 
     {
         vis_line_t last_line(-1);

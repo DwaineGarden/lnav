@@ -32,9 +32,11 @@
 #ifndef lnav_auto_mem_hh
 #define lnav_auto_mem_hh
 
-#include <exception>
 #include <iterator>
+#include <memory>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <utility>
 
 #include <assert.h>
@@ -42,7 +44,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "base/result.h"
+#include "fmt/format.h"
 
 using free_func_t = void (*)(void*);
 
@@ -64,6 +66,16 @@ public:
         retval = ptr;
 
         return retval;
+    }
+
+    static auto_mem calloc(size_t count)
+    {
+        return auto_mem(static_cast<T*>(::calloc(count, sizeof(T))));
+    }
+
+    static auto_mem malloc(size_t sz)
+    {
+        return auto_mem(static_cast<T*>(::malloc(sz)));
     }
 
     explicit auto_mem(T* ptr = nullptr)
@@ -98,6 +110,7 @@ public:
         return *this;
     }
 
+    auto_mem& operator=(const auto_mem&) = delete;
     auto_mem& operator=(auto_mem&) = delete;
 
     auto_mem& operator=(auto_mem&& am) noexcept
@@ -213,7 +226,7 @@ public:
         this->ab_capacity = 0;
     }
 
-    auto_buffer& operator=(auto_buffer&) = delete;
+    auto_buffer& operator=(const auto_buffer&) = delete;
 
     auto_buffer& operator=(auto_buffer&& other) noexcept
     {
@@ -231,6 +244,11 @@ public:
         std::swap(this->ab_capacity, other.ab_capacity);
     }
 
+    unsigned char* u_in()
+    {
+        return reinterpret_cast<unsigned char*>(this->ab_buffer);
+    }
+
     char* in() { return this->ab_buffer; }
 
     char* at(size_t offset) { return &this->ab_buffer[offset]; }
@@ -241,6 +259,34 @@ public:
 
     const char* begin() const { return this->ab_buffer; }
 
+    char* data() { return this->ab_buffer; }
+
+    const char* data() const { return this->ab_buffer; }
+
+    char& operator[](size_t index) { return this->ab_buffer[index]; }
+
+    const char& operator[](size_t index) const
+    {
+        return this->ab_buffer[index];
+    }
+
+    char back() const { return this->ab_buffer[this->ab_size - 1]; }
+
+    char* next_available() { return &this->ab_buffer[this->ab_size]; }
+
+    void consume(ssize_t amount)
+    {
+        if (amount <= 0) {
+            return;
+        }
+        assert(amount <= (ssize_t) this->ab_size);
+        auto remaining = this->ab_size - amount;
+        if (remaining > 0) {
+            memmove(this->ab_buffer, &this->ab_buffer[amount], remaining);
+        }
+        this->ab_size = remaining;
+    }
+
     auto_buffer& push_back(char ch)
     {
         if (this->ab_size == this->ab_capacity) {
@@ -249,6 +295,16 @@ public:
         this->ab_buffer[this->ab_size] = ch;
         this->ab_size += 1;
 
+        return *this;
+    }
+
+    auto_buffer& append(std::string_view sv)
+    {
+        if (this->ab_size + sv.length() > this->ab_capacity) {
+            this->expand_by(sv.length() + 1024);
+        }
+        memcpy(&this->ab_buffer[this->ab_size], sv.data(), sv.length());
+        this->ab_size += sv.length();
         return *this;
     }
 
@@ -312,6 +368,14 @@ public:
         return retval;
     }
 
+    std::unique_ptr<const unsigned char[]> to_unique() const
+    {
+        auto retval = std::make_unique<unsigned char[]>(this->ab_size);
+
+        memcpy(retval.get(), this->ab_buffer, this->ab_size);
+        return retval;
+    }
+
     size_t size() const { return this->ab_size; }
 
     size_t bitmap_size() const { return this->ab_size * 8; }
@@ -321,6 +385,19 @@ public:
     bool full() const { return this->ab_size == this->ab_capacity; }
 
     size_t capacity() const { return this->ab_capacity; }
+
+    template<typename T>
+    std::enable_if_t<std::is_integral_v<T>, bool> has_capacity_for(
+        T amount) const
+    {
+        if constexpr (std::is_signed_v<T>) {
+            assert(amount >= 0);
+
+            return amount <= static_cast<ssize_t>(this->ab_capacity);
+        } else {
+            return amount <= this->ab_capacity;
+        }
+    }
 
     size_t available() const { return this->ab_capacity - this->ab_size; }
 
@@ -397,6 +474,16 @@ struct text_auto_buffer {
 
 struct blob_auto_buffer {
     auto_buffer inner;
+};
+
+template<>
+struct fmt::formatter<auto_buffer> : formatter<string_view> {
+    template<typename FormatContext>
+    auto format(const auto_buffer& buf, FormatContext& ctx) const
+    {
+        return formatter<string_view>::format(
+            string_view{buf.begin(), buf.size()}, ctx);
+    }
 };
 
 #endif

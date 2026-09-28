@@ -32,6 +32,8 @@
 #include "base/snippet_highlighters.hh"
 #include "config.h"
 
+using namespace lnav::roles::literals;
+
 bottom_status_source::bottom_status_source()
 {
     this->bss_fields[BSF_LINE_NUMBER].set_min_width(10);
@@ -45,7 +47,8 @@ bottom_status_source::bottom_status_source()
     this->bss_fields[BSF_LOADING].set_width(13);
     this->bss_fields[BSF_LOADING].right_justify(true);
     this->bss_fields[BSF_HELP].set_width(14);
-    this->bss_fields[BSF_HELP].set_value("?:View Help");
+    auto help_al = attr_line_t(" ").append("?"_hotkey).append(":View Help ");
+    this->bss_fields[BSF_HELP].set_value(help_al);
     this->bss_fields[BSF_HELP].right_justify(true);
     this->bss_prompt.set_left_pad(1);
     this->bss_prompt.set_min_width(35);
@@ -61,24 +64,42 @@ bottom_status_source::bottom_status_source()
 void
 bottom_status_source::update_line_number(listview_curses* lc)
 {
-    status_field& sf = this->bss_fields[BSF_LINE_NUMBER];
+    auto& sf = this->bss_fields[BSF_LINE_NUMBER];
+    auto sel = lc->get_selection();
 
     if (lc->get_inner_height() == 0) {
-        sf.set_value(" L0");
+        sf.set_value(" L0"_frag);
+    } else if (sel) {
+        sf.set_value(" L%'d", (int) sel.value());
     } else {
-        sf.set_value(" L%'d", (int) lc->get_selection());
+        sf.set_value(" L-"_frag);
     }
 
     this->bss_line_error.set_value(
         lc->map_top_row([](const attr_line_t& top_row)
-                            -> nonstd::optional<std::string> {
+                            -> std::optional<std::string> {
               const auto& sa = top_row.get_attrs();
               auto error_wrapper = get_string_attr(sa, SA_ERROR);
               if (error_wrapper) {
                   return error_wrapper.value().get();
               }
-              return nonstd::nullopt;
+              return std::nullopt;
           }).value_or(""));
+}
+
+bottom_status_source::search_report_t
+bottom_status_source::search_report_for(textview_curses& tc)
+{
+    if (tc.get_focused_search_slot()) {
+        return search_report_t::focused;
+    }
+    // With no named search in play, n/N covers the interactive search and
+    // nothing else, so there is no distinction to draw.
+    if (tc.get_named_searches().empty()) {
+        return search_report_t::interactive;
+    }
+
+    return search_report_t::all;
 }
 
 void
@@ -87,7 +108,41 @@ bottom_status_source::update_search_term(textview_curses& tc)
     auto& sf = this->bss_fields[BSF_SEARCH_TERM];
     auto search_term = tc.get_current_search();
 
+    this->bss_focused_search_slot = tc.get_focused_search_slot();
+    this->bss_search_report = search_report_for(tc);
     sf.clear();
+    switch (this->bss_search_report) {
+        case search_report_t::all: {
+            // n/N is moving through more than one pattern, so there is no
+            // single term to put here.
+            sf.get_value().append("all searches"_variable);
+            search_term.clear();
+            break;
+        }
+        case search_report_t::focused: {
+            auto focused_name = tc.get_focused_search_name();
+
+            if (focused_name) {
+                const auto* ns = tc.find_named_search(focused_name.value());
+                // The name wears the background that its matches wear in the
+                // view, so the field and the highlighting read as the same
+                // search.
+                auto name_attrs = text_attrs{};
+
+                name_attrs.ta_bg_color
+                    = view_colors::singleton().color_for_ident(
+                        string_fragment::from_str(focused_name.value()));
+                sf.get_value()
+                    .append(" ")
+                    .append(focused_name.value(), VC_STYLE.value(name_attrs))
+                    .append(" ");
+                search_term = ns == nullptr ? std::string() : ns->ns_pattern;
+            }
+            break;
+        }
+        case search_report_t::interactive:
+            break;
+    }
     if (!search_term.empty()) {
         auto search_term_al = attr_line_t(search_term);
 
@@ -122,39 +177,71 @@ bottom_status_source::update_percent(listview_curses* lc)
     sf.set_value("%3d%% ", (int) percent);
 }
 
-void
+bool
 bottom_status_source::update_marks(listview_curses* lc)
 {
     auto* tc = static_cast<textview_curses*>(lc);
-    vis_bookmarks& bm = tc->get_bookmarks();
     status_field& sf = this->bss_fields[BSF_HITS];
+    auto retval = false;
 
-    if (bm.find(&textview_curses::BM_SEARCH) != bm.end()) {
-        bookmark_vector<vis_line_t>& bv = bm[&textview_curses::BM_SEARCH];
+    // The count has to cover the same hits that n/N moves through, since the
+    // term it is labelled with names them.
+    auto focused_slot = tc->get_focused_search_slot();
 
-        if (!bv.empty() || !tc->get_current_search().empty()) {
-            bookmark_vector<vis_line_t>::iterator lb;
-
-            lb = std::lower_bound(bv.begin(), bv.end(), tc->get_top());
-            if (lb != bv.end() && *lb == tc->get_top()) {
-                sf.set_value("  Hit %'d of %'d for ",
-                             std::distance(bv.begin(), lb) + 1,
-                             tc->get_match_count());
-            } else {
-                sf.set_value("  %'d hits for ", tc->get_match_count());
-            }
-        } else {
-            sf.clear();
-        }
-    } else {
-        sf.clear();
+    if (focused_slot != this->bss_focused_search_slot
+        || search_report_for(*tc) != this->bss_search_report)
+    {
+        this->update_search_term(*tc);
     }
+
+
+    auto report = search_report_for(*tc);
+    using bv_t = bookmark_vector<vis_line_t>;
+    const auto& bv = [tc, report, focused_slot]() -> const bv_t& {
+        switch (report) {
+            case search_report_t::focused:
+                return tc->search_matches_for_slot(focused_slot.value());
+            case search_report_t::all:
+                return tc->get_bookmarks()[&textview_curses::BM_SEARCH];
+            case search_report_t::interactive:
+                break;
+        }
+        return tc->get_interactive_matches();
+    }();
+
+    // A focused search and the "all searches" label always name something, so
+    // they get a count even when it is zero.  The interactive search on its
+    // own leaves the field empty until there is a pattern to count.
+    if (!bv.empty() || report != search_report_t::interactive
+        || !tc->get_current_search().empty())
+    {
+        auto vl = tc->get_selection();
+        if (vl) {
+            auto lb = bv.bv_tree.find(vl.value());
+            if (lb != bv.bv_tree.end()) {
+                retval = sf.set_value("  Hit %'d of %'d for ",
+                                      (lb - bv.bv_tree.begin()) + 1,
+                                      bv.size());
+            } else {
+                retval = sf.set_value("  %'d hits for ", bv.size());
+            }
+        }
+    } else if (tc->is_searching()) {
+        // A search that this field is not counting -- a named search, say --
+        // is running, so update_hits() has the cylon going.  Say what is
+        // happening instead of animating an empty field.
+        retval = sf.set_value("  Searching...  "_frag);
+    } else {
+        retval = sf.clear();
+    }
+    return retval;
 }
 
-void
+bool
 bottom_status_source::update_hits(textview_curses* tc)
 {
-    status_field& sf = this->bss_fields[BSF_HITS];
+    auto& sf = this->bss_fields[BSF_HITS];
+    bool retval = false;
     role_t new_role;
 
     if (tc->is_searching()) {
@@ -164,34 +251,44 @@ bottom_status_source::update_hits(textview_curses* tc)
         } else {
             new_role = role_t::VCR_ACTIVE_STATUS2;
         }
-        sf.set_cylon(true);
+        if (!sf.is_cylon()) {
+            sf.set_cylon(true);
+        }
+        retval = true;
     } else {
         new_role = role_t::VCR_STATUS;
-        sf.set_cylon(false);
+        if (sf.is_cylon()) {
+            sf.set_cylon(false);
+            sf.clear();  // clear cylon style attribute
+            retval = true;
+        }
     }
     // this->bss_error.clear();
     sf.set_role(new_role);
-    this->update_marks(tc);
+    retval = this->update_marks(tc) || retval;
+    return retval;
 }
 
 void
-bottom_status_source::update_loading(file_off_t off, file_ssize_t total)
+bottom_status_source::update_loading(file_off_t off,
+                                     file_ssize_t total,
+                                     const char* term)
 {
     auto& sf = this->bss_fields[BSF_LOADING];
 
-    require(off >= 0);
-    require(off <= total);
+    require_ge(off, 0);
+    require_ge(total, off);
 
     if (total == 0) {
         sf.set_cylon(false);
         sf.set_role(role_t::VCR_STATUS);
         if (this->bss_paused) {
-            sf.set_value("\xE2\x80\x96 Paused");
+            sf.set_value("\xE2\x80\x96 Paused"_frag);
         } else {
             sf.clear();
         }
     } else if (off == total) {
-        static const std::vector<std::string> DOTS = {
+        static const char* const DOTS[] = {
             "   ",
             ".  ",
             ".. ",
@@ -199,12 +296,12 @@ bottom_status_source::update_loading(file_off_t off, file_ssize_t total)
             ".. ",
             ".  ",
         };
+        static auto DOTS_LEN = std::distance(std::begin(DOTS), std::end(DOTS));
 
         this->bss_load_percent += 1;
         sf.set_cylon(true);
         sf.set_role(role_t::VCR_ACTIVE_STATUS2);
-        sf.set_value(" Working%s  ",
-                     DOTS[this->bss_load_percent % DOTS.size()].c_str());
+        sf.set_value(" Working%s  ", DOTS[this->bss_load_percent % DOTS_LEN]);
     } else {
         int pct = (int) (((double) off / (double) total) * 100.0);
 
@@ -213,7 +310,7 @@ bottom_status_source::update_loading(file_off_t off, file_ssize_t total)
 
             sf.set_cylon(true);
             sf.set_role(role_t::VCR_ACTIVE_STATUS2);
-            sf.set_value(" Loading %2d%% ", pct);
+            sf.set_value(" %s %2d%% ", term, pct);
         }
     }
 }
@@ -226,7 +323,7 @@ bottom_status_source::statusview_fields()
     if (this->bss_prompt.empty() && this->bss_error.empty()
         && this->bss_line_error.empty())
     {
-        retval = BSF__MAX;
+        retval = BSF__MAX - 1;
     } else {
         retval = 1;
     }
@@ -245,6 +342,12 @@ bottom_status_source::statusview_value_for_field(int field)
     }
     if (!this->bss_line_error.empty()) {
         return this->bss_line_error;
+    }
+    if (field == 4) {
+        if (this->bss_fields[BSF_LOADING].empty()) {
+            return this->bss_fields[BSF_HELP];
+        }
+        return this->bss_fields[BSF_LOADING];
     }
     return this->get_field((field_t) field);
 }

@@ -1,55 +1,107 @@
 
 TIME_FORMATS = \
     "@%@" \
-    "%Y-%m-%d %H:%M:%S" \
+    "%Y-%m-%d %H:%M:%S.%f%z" \
+    "%Y-%m-%d %H:%M:%S,%f%z" \
+    "%Y-%m-%d %H:%M:%S.%f %Z" \
+    "%Y-%m-%d %H:%M:%S,%f %Z" \
+    "%Y-%m-%d %H:%M:%S,%L%z" \
+    "%Y-%m-%d %H:%M:%S,%L %z" \
+    "%Y-%m-%d %H:%M:%S.%L%z" \
+    "%Y-%m-%d %H:%M:%S.%f %z" \
+    "%Y-%m-%d %H:%M:%S.%f %Z" \
+    "%Y-%m-%d %H:%M:%S:%f %z" \
+    "%Y-%m-%d %H:%M:%S.%f" \
+    "%Y-%m-%d %H:%M:%S,%L" \
+    "%Y-%m-%d %H:%M:%S.%L" \
+    "%Y-%m-%d %H:%M:%S%Z" \
     "%Y-%m-%d %H:%M:%S%z" \
+    "%Y-%m-%d %H:%M:%S %Z" \
     "%Y-%m-%d %H:%M:%S %z" \
+    "%Y-%m-%d %H:%M:%S:%L" \
+    "%Y-%m-%d %H:%M:%S" \
     "%Y-%m-%d %H:%M" \
+    "%Y-%jT%H:%M:%S %p %Z" \
+    "%Y-%m-%dT%H:%M:%S %p %Z" \
+    "%Y-%jT%H:%M:%S.%f%z" \
+    "%Y-%m-%dT%H:%M:%S.%f%Z" \
     "%Y-%m-%dT%H:%M:%S.%f%z" \
+    "%y-%m-%dT%H:%M:%S.%f%Z" \
     "%y-%m-%dT%H:%M:%S.%f%z" \
-    "%Y-%m-%dT%H:%M:%SZ" \
+    "%Y-%jT%H:%M:%S.%L%z" \
+    "%Y-%jT%H:%M:%S,%L%z" \
+    "%Y-%m-%dT%H:%M:%S,%L%z" \
+    "%y-%m-%dT%H:%M:%S,%L%z" \
+    "%Y-%jT%H:%M:%S.%L%Z" \
+    "%Y-%m-%dT%H:%M:%S.%L%Z" \
+    "%y-%m-%dT%H:%M:%S.%L%Z" \
+    "%Y-%m-%dT%H:%M:%S%Z" \
     "%Y-%m-%dT%H:%M:%S%z" \
+    "%Y-%jT%H:%M:%S" \
     "%Y-%m-%dT%H:%M:%S" \
-    "%Y-%m-%dT%H:%M:%S%z" \
     "%Y-%m-%dT%H:%M" \
-    "%Y/%m/%d %H:%M:%S" \
     "%Y/%m/%d %H:%M:%S %z" \
     "%Y/%m/%d %H:%M:%S%z" \
+    "%Y/%m/%d %H:%M:%S.%f%z" \
+    "%Y/%m/%d %H:%M:%S.%f%Z" \
+    "%Y/%m/%d %H:%M:%S.%f %z" \
+    "%Y/%m/%d %H:%M:%S.%f %Z" \
+    "%Y/%m/%d %H:%M:%S.%f" \
+    "%Y/%m/%d %H:%M:%S.%L" \
+    "%Y/%m/%d %H:%M:%S" \
     "%Y/%m/%d %H:%M" \
     "%Y %b %d %a %H:%M:%S.%L" \
     "%Y %b %d %H:%M:%S.%L" \
     "%Y %b %d %H:%M:%S" \
-    "%a %b %d %H:%M:%S %Y" \
-    "%a %b %d %H:%M:%S.%f %Y" \
-    "%a %b %d %H:%M:%S %Z %Y" \
-    "%a %b %d %H:%M:%S " \
-    "%a %b %d %H:%M:%S.%L " \
-    "%a %b %d %H:%M " \
-    "%a %b %e %H:%M:%S %Z %Y" \
-    "%d/%b/%Y:%H:%M:%S +0000" \
-    "%d/%b/%Y:%H:%M:%S %z" \
-    "%d-%b-%Y %H:%M:%S %z" \
-    "%d-%b-%Y %H:%M:%S %Z" \
-    "%d %b %Y %H:%M:%S" \
-    "%d %b %Y %H:%M:%S.%L" \
-    "%d %b %Y %H:%M:%S,%L" \
-    "%d %b %Y %H:%M" \
+    "%b-%d %H:%M:%S" \
     "%b %d %H:%M:%S" \
     "%b %d %k:%M:%S" \
     "%b %d %l:%M:%S" \
     "%b %d %l:%M" \
     "%b %e, %Y %l:%M:%S %p" \
     "%b %d, %Y %l:%M:%S %p" \
-    "%m/%d/%y %H:%M:%S" \
+    "%b %e, %Y at %l:%M:%S %p" \
+    "%b %d, %Y at %I:%M:%S %p" \
+    "%a %b %e %H:%M:%S %Y" \
+    "%a %b %e %H:%M:%S.%f %Y" \
+    "%a %b %e %H:%M:%S:%f %Y" \
+    "%a %b %e %H:%M:%S %Z %Y" \
+    "%a %b %e %I:%M:%S %p %Z %Y" \
+    "%a %b %e %H:%M:%S " \
+    "%a %b %e %H:%M:%S.%L " \
+    "%a %b %e %H:%M " \
+    "%a %b %e %H:%M:%S %Z %Y" \
+    "%d.%m.%Y %H:%M:%S.%f" \
+    "%d/%m/%y %H:%M:%S" \
+    "%d/%b/%Y:%H:%M:%S %z" \
+    "%d-%b-%Y %H:%M:%S %z" \
+    "%d-%b-%Y %H:%M:%S %Z" \
+    "%d %b %Y %H:%M:%S" \
+    "%d %b %Y %H:%M:%S.%L%z" \
+    "%d %b %Y %H:%M:%S,%L%z" \
+    "%d %b %Y %H:%M:%S.%L" \
+    "%d %b %Y %H:%M:%S,%L" \
+    "%d %b %Y %H:%M" \
     "%m/%d/%Y %I:%M:%S:%L %p %Z" \
     "%m/%d/%Y %I:%M:%S %p %Z" \
     "%m/%d/%Y %l:%M:%S %p %Z" \
+    "%m/%d/%Y %I:%M:%S %p%z" \
+    "%m/%d/%Y %l:%M:%S %p%z" \
+    "%m/%e/%Y %l:%M:%S %p%z" \
+    "%m/%e/%Y %l:%M:%S %p %z" \
     "%m/%e/%Y %I:%M:%S %p" \
     "%m/%e/%Y %l:%M:%S %p" \
+    "%m/%e/%Y %l:%M:%S%p" \
+    "%m/%d/%y %H:%M:%S" \
     "%m/%d/%Y %H:%M:%S" \
+    "%d/%b/%Y %H:%M:%S" \
     "%d/%b/%y %H:%M:%S" \
+    "%m.%d %H:%M:%S" \
     "%m%d %H:%M:%S" \
     "%Y%m%d %H:%M:%S" \
+    "%y%m%d %H%M%S" \
+    "%y%m%d %H:%M:%S" \
+    "%Y%m%d %H%M%S" \
     "%Y%m%d.%H%M%S" \
     "%H:%M:%S" \
     "%H:%M:%S.%f" \
@@ -59,5 +111,5 @@ TIME_FORMATS = \
     "%Y-%m" \
     "%Y/%m/%d" \
     "%Y/%m" \
-    "%s.%f" \
+    "%b %d" \
     $()

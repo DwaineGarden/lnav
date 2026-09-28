@@ -32,18 +32,49 @@
 #ifndef lnav_file_format_hh
 #define lnav_file_format_hh
 
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "base/intern_string.hh"
+#include "base/lnav.console.hh"
 #include "fmt/format.h"
-#include "ghc/filesystem.hpp"
 
 enum class file_format_t : int {
     UNKNOWN,
     SQLITE_DB,
+    UNSUPPORTED,
     ARCHIVE,
-    PCAP,
+    MULTIPLEXED,
     REMOTE,
 };
 
-file_format_t detect_file_format(const ghc::filesystem::path& filename);
+struct external_file_format {
+    std::string eff_format_name;
+    std::string eff_converter;
+    std::filesystem::path eff_source_path;
+};
+
+struct detect_file_format_result {
+    file_format_t dffr_file_format{file_format_t::UNKNOWN};
+    std::vector<lnav::console::user_message> dffr_details;
+    /** The leading bytes of the file, if they were read. */
+    std::vector<uint8_t> dffr_header;
+};
+
+detect_file_format_result detect_file_format(
+    const std::filesystem::path& filename);
+
+/**
+ * Detect the format of the file open on the given descriptor.  The
+ * descriptor is not closed and its offset is left at an unspecified position.
+ */
+detect_file_format_result detect_file_format(
+    const std::filesystem::path& filename, int fd);
+
+std::optional<external_file_format> detect_mime_type(
+    const std::filesystem::path& filename, string_fragment header);
 
 namespace fmt {
 template<>
@@ -56,11 +87,14 @@ struct formatter<file_format_t> : formatter<string_view> {
             case file_format_t::SQLITE_DB:
                 name = "\U0001F5C2  SQLite DB";
                 break;
+            case file_format_t::UNSUPPORTED:
+                name = "\U0001F6AB Unsupported";
+                break;
             case file_format_t::ARCHIVE:
                 name = "\U0001F5C4  Archive";
                 break;
-            case file_format_t::PCAP:
-                name = "\U0001F5A5  Pcap";
+            case file_format_t::MULTIPLEXED:
+                name = "\u22fa  Multiplexed";
                 break;
             case file_format_t::REMOTE:
                 name = "\U0001F5A5  Remote";

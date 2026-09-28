@@ -29,6 +29,9 @@
  * @file archive_manager.cc
  */
 
+#include <future>
+#include <vector>
+
 #include <unistd.h>
 
 #include "config.h"
@@ -48,9 +51,9 @@
 #include "base/lnav_log.hh"
 #include "base/paths.hh"
 #include "fmt/format.h"
-#include "lnav_util.hh"
+#include "hasher.hh"
 
-namespace fs = ghc::filesystem;
+namespace fs = std::filesystem;
 
 namespace archive_manager {
 
@@ -72,10 +75,27 @@ enable_desired_archive_formats(archive* arc)
 }
 #endif
 
-bool
-is_archive(const fs::path& filename)
+Result<describe_result, std::string>
+describe(const fs::path& filename)
+{
+    auto fd = TRY(lnav::filesystem::open_file(filename, O_RDONLY | O_CLOEXEC));
+
+    return describe(filename, fd.get());
+}
+
+Result<describe_result, std::string>
+describe(const fs::path& filename, int fd)
 {
 #if HAVE_ARCHIVE_H
+    static constexpr auto RAW_FORMAT_NAME = "raw"_frag;
+    static constexpr auto GZ_FILTER_NAME = "gzip"_frag;
+
+    if (lseek(fd, 0, SEEK_SET) == -1) {
+        return Err(fmt::format(FMT_STRING("unable to seek file: {} -- {}"),
+                               filename,
+                               strerror(errno)));
+    }
+
     auto_mem<archive> arc(archive_read_free);
 
     arc = archive_read_new();
@@ -84,9 +104,9 @@ is_archive(const fs::path& filename)
     enable_desired_archive_formats(arc);
     archive_read_support_format_raw(arc);
     log_debug("read open %s", filename.c_str());
-    auto r = archive_read_open_filename(arc, filename.c_str(), 128 * 1024);
+    auto r = archive_read_open_fd(arc, fd, 128 * 1024);
     if (r == ARCHIVE_OK) {
-        struct archive_entry* entry = nullptr;
+        archive_entry* entry = nullptr;
 
         const auto* format_name = archive_format_name(arc);
 
@@ -94,39 +114,60 @@ is_archive(const fs::path& filename)
         if (archive_read_next_header(arc, &entry) == ARCHIVE_OK) {
             log_debug("read next done %s", filename.c_str());
 
-            static const auto RAW_FORMAT_NAME = string_fragment("raw");
-            static const auto GZ_FILTER_NAME = string_fragment("gzip");
-
             format_name = archive_format_name(arc);
-
             if (RAW_FORMAT_NAME == format_name) {
                 auto filter_count = archive_filter_count(arc);
 
                 if (filter_count == 1) {
-                    return false;
+                    return Ok(describe_result{unknown_file{}});
                 }
 
                 const auto* first_filter_name = archive_filter_name(arc, 0);
                 if (filter_count == 2 && GZ_FILTER_NAME == first_filter_name) {
-                    return false;
+                    return Ok(describe_result{unknown_file{}});
                 }
             }
             log_info(
                 "detected archive: %s -- %s", filename.c_str(), format_name);
-            return true;
+            auto ai = archive_info{
+                format_name,
+            };
+
+            do {
+                const auto* entry_path = archive_entry_pathname_utf8(entry);
+
+                if (entry_path != nullptr) {
+                    ai.ai_entries.emplace_back(archive_info::entry{
+                        entry_path,
+                        archive_entry_strmode(entry),
+                        archive_entry_mtime(entry),
+                        archive_entry_size_is_set(entry)
+                            ? std::make_optional(archive_entry_size(entry))
+                            : std::nullopt,
+                    });
+                }
+            } while (archive_read_next_header(arc, &entry) == ARCHIVE_OK);
+
+            return Ok(describe_result{ai});
         }
 
-        log_info("archive read header failed: %s -- %s",
-                 filename.c_str(),
-                 archive_error_string(arc));
+        const auto* errstr = archive_error_string(arc);
+        log_info(
+            "archive read header failed: %s -- %s", filename.c_str(), errstr);
+        return Err(
+            fmt::format(FMT_STRING("unable to read archive header: {} -- {}"),
+                        filename,
+                        errstr ? errstr : "not an archive"));
     } else {
-        log_info("archive open failed: %s -- %s",
-                 filename.c_str(),
-                 archive_error_string(arc));
+        const auto* errstr = archive_error_string(arc);
+        log_info("archive open failed: %s -- %s", filename.c_str(), errstr);
+        return Err(fmt::format(FMT_STRING("unable to open file: {} -- {}"),
+                               filename,
+                               errstr ? errstr : "unknown"));
     }
 #endif
 
-    return false;
+    return Ok(describe_result{unknown_file{}});
 }
 
 static fs::path
@@ -143,7 +184,7 @@ filename_to_tmp_path(const std::string& filename)
     hasher h;
 
     h.update(basename);
-    auto fd = auto_fd(lnav::filesystem::openp(filename, O_RDONLY));
+    auto fd = auto_fd(lnav::filesystem::openp(filename, O_RDONLY | O_CLOEXEC));
     if (fd != -1) {
         char buffer[1024];
         int rc;
@@ -189,7 +230,7 @@ copy_data(const std::string& filename,
                     entry_path.filename().string(),
                     entry_path.parent_path().string()));
             }
-            next_space_check += 1024 * 1024;
+            next_space_check += 10 * 1024 * 1024;
         }
 
         r = archive_read_data_block(ar, &buff, &size, &offset);
@@ -226,9 +267,10 @@ extract(const std::string& filename, const extract_cb& cb)
 
     fs::create_directories(tmp_path.parent_path(), ec);
     if (ec) {
-        return Err(fmt::format("unable to create directory: {} -- {}",
-                               tmp_path.parent_path().string(),
-                               ec.message()));
+        return Err(
+            fmt::format(FMT_STRING("unable to create directory: {} -- {}"),
+                        tmp_path.parent_path().string(),
+                        ec.message()));
     }
 
     auto arc_lock = lnav::filesystem::file_lock(tmp_path);
@@ -240,13 +282,14 @@ extract(const std::string& filename, const extract_cb& cb)
     if (fs::exists(done_path)) {
         size_t file_count = 0;
         if (fs::is_directory(tmp_path)) {
-            for (const auto& entry : fs::directory_iterator(tmp_path)) {
+            for (const auto& entry : fs::directory_iterator(tmp_path, ec)) {
                 (void) entry;
                 file_count += 1;
             }
         }
         if (file_count > 0) {
-            fs::last_write_time(done_path, std::chrono::system_clock::now());
+            auto now = fs::file_time_type::clock::now();
+            fs::last_write_time(done_path, now);
             log_info("%s: archive has already been extracted!",
                      done_path.c_str());
             return Ok();
@@ -273,6 +316,7 @@ extract(const std::string& filename, const extract_cb& cb)
                                filename,
                                archive_error_string(arc)));
     }
+    auto tmp_base = tmp_path.lexically_normal();
 
     log_info("extracting %s to %s", filename.c_str(), tmp_path.c_str());
     while (true) {
@@ -292,13 +336,23 @@ extract(const std::string& filename, const extract_cb& cb)
         const auto* format_name = archive_format_name(arc);
         auto filter_count = archive_filter_count(arc);
 
+        const auto* entry_path_str = archive_entry_pathname_utf8(entry);
+        if (entry_path_str == nullptr) {
+            continue;
+        }
+
         auto_mem<archive_entry> wentry(archive_entry_free);
         wentry = archive_entry_clone(entry);
-        auto desired_pathname = fs::path(archive_entry_pathname(entry));
+        auto desired_pathname = fs::path(entry_path_str).relative_path();
         if (strcmp(format_name, "raw") == 0 && filter_count >= 2) {
             desired_pathname = fs::path(filename).filename();
         }
-        auto entry_path = tmp_path / desired_pathname;
+        auto entry_path = (tmp_path / desired_pathname).lexically_normal();
+        auto rel = entry_path.lexically_relative(tmp_base);
+        if (rel.empty() || lnav::filesystem::contains_dotdot(rel)) {
+            log_warning("ignoring naughty path: %s", entry_path_str);
+            continue;
+        }
         auto* prog = cb(
             entry_path,
             archive_entry_size_is_set(entry) ? archive_entry_size(entry) : -1);
@@ -307,6 +361,44 @@ extract(const std::string& filename, const extract_cb& cb)
 
         archive_entry_set_perm(
             wentry, S_IRUSR | (S_ISDIR(entry_mode) ? S_IXUSR | S_IWUSR : 0));
+        if (S_ISLNK(entry_mode)) {
+            auto* target_path_str = archive_entry_symlink(wentry);
+            if (target_path_str == nullptr) {
+                log_warning("symlink is null: %s", entry_path_str);
+                continue;
+            }
+            auto link_target = fs::path(target_path_str);
+            if (link_target.is_absolute()) {
+                // Confine to tmp_path: strip root, rejoin under tmp_path,
+                // then express as relative from the symlink's own directory.
+                auto confined = (tmp_path / link_target.relative_path())
+                                    .lexically_normal();
+                auto rewritten
+                    = confined.lexically_relative(entry_path.parent_path());
+                if (rewritten.empty()) {
+                    log_warning(
+                        "ignoring symlink with unrepresentable target: %s",
+                        entry_path_str);
+                    continue;
+                }
+                archive_entry_set_symlink(wentry, rewritten.c_str());
+            } else {
+                // Relative target: verify it lands inside tmp_base, but leave
+                // the literal target alone so kernel resolution matches.
+                auto resolved = (entry_path.parent_path() / link_target)
+                                    .lexically_normal();
+                auto target_rel = resolved.lexically_relative(tmp_base);
+                if (target_rel.empty()
+                    || lnav::filesystem::contains_dotdot(target_rel))
+                {
+                    log_warning(
+                        "ignoring naughty symlink '%s' with target '%s'",
+                        entry_path_str,
+                        target_path_str);
+                    continue;
+                }
+            }
+        }
         r = archive_write_header(ext, wentry);
         if (r < ARCHIVE_OK) {
             return Err(
@@ -352,12 +444,18 @@ walk_archive_files(
         return result;
     }
 
-    for (const auto& entry : fs::recursive_directory_iterator(tmp_path)) {
+    std::error_code ec;
+    for (const auto& entry : fs::recursive_directory_iterator(tmp_path, ec)) {
         if (!entry.is_regular_file()) {
             continue;
         }
 
         callback(tmp_path, entry);
+    }
+    if (ec) {
+        return Err(fmt::format(FMT_STRING("failed to walk temp dir: {} -- {}"),
+                               tmp_path.string(),
+                               ec.message()));
     }
 
     return Ok();
@@ -366,41 +464,43 @@ walk_archive_files(
 #endif
 }
 
-void
+std::future<void>
 cleanup_cache()
 {
-    (void) std::async(std::launch::async, []() {
-        auto now = std::chrono::system_clock::now();
-        auto cache_path = archive_cache_path();
-        const auto& cfg = injector::get<const config&>();
-        std::vector<fs::path> to_remove;
+    return std::async(
+        std::launch::async, +[]() {
+            auto now = std::filesystem::file_time_type::clock::now();
+            auto cache_path = archive_cache_path();
+            const auto& cfg = injector::get<const config&>();
+            std::vector<fs::path> to_remove;
+            std::error_code ec;
 
-        log_debug("cache-ttl %d", cfg.amc_cache_ttl.count());
-        for (const auto& entry : fs::directory_iterator(cache_path)) {
-            if (entry.path().extension() != ".done") {
-                continue;
+            log_debug("cache-ttl %lld", cfg.amc_cache_ttl.count());
+            for (const auto& entry : fs::directory_iterator(cache_path, ec)) {
+                if (entry.path().extension() != ".done") {
+                    continue;
+                }
+
+                auto mtime = fs::last_write_time(entry.path());
+                auto exp_time = mtime + cfg.amc_cache_ttl;
+                if (now < exp_time) {
+                    continue;
+                }
+
+                to_remove.emplace_back(entry.path());
             }
 
-            auto mtime = fs::last_write_time(entry.path());
-            auto exp_time = mtime + cfg.amc_cache_ttl;
-            if (now < exp_time) {
-                continue;
+            for (auto& entry : to_remove) {
+                log_debug("removing cached archive: %s", entry.c_str());
+                fs::remove(entry);
+
+                entry.replace_extension(".lck");
+                fs::remove(entry);
+
+                entry.replace_extension();
+                fs::remove_all(entry);
             }
-
-            to_remove.emplace_back(entry.path());
-        }
-
-        for (auto& entry : to_remove) {
-            log_debug("removing cached archive: %s", entry.c_str());
-            fs::remove(entry);
-
-            entry.replace_extension(".lck");
-            fs::remove(entry);
-
-            entry.replace_extension();
-            fs::remove_all(entry);
-        }
-    });
+        });
 }
 
 }  // namespace archive_manager

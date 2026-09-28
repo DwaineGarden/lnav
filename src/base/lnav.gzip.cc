@@ -33,11 +33,11 @@
 
 #include <zlib.h>
 
+#include "base/lnav_log.hh"
 #include "config.h"
 #include "fmt/format.h"
 
-namespace lnav {
-namespace gzip {
+namespace lnav::gzip {
 
 bool
 is_gzipped(const char* buffer, size_t len)
@@ -50,15 +50,11 @@ compress(const void* input, size_t len)
 {
     auto retval = auto_buffer::alloc(len + 4096);
 
-    z_stream zs;
-    zs.zalloc = Z_NULL;
-    zs.zfree = Z_NULL;
-    zs.opaque = Z_NULL;
+    z_stream zs = {};
     zs.avail_in = (uInt) len;
     zs.next_in = (Bytef*) input;
     zs.avail_out = (uInt) retval.capacity();
     zs.next_out = (Bytef*) retval.in();
-    zs.total_out = 0;
 
     auto rc = deflateInit2(
         &zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 | 16, 8, Z_DEFAULT_STRATEGY);
@@ -68,6 +64,7 @@ compress(const void* input, size_t len)
     }
     rc = deflate(&zs, Z_FINISH);
     if (rc != Z_STREAM_END) {
+        deflateEnd(&zs);
         return Err(fmt::format(FMT_STRING("unable to compress data -- {}"),
                                zError(rc)));
     }
@@ -83,16 +80,11 @@ Result<auto_buffer, std::string>
 uncompress(const std::string& src, const void* buffer, size_t size)
 {
     auto uncomp = auto_buffer::alloc(size * 2);
-    z_stream strm;
+    z_stream strm = {};
     int err;
 
     strm.next_in = (Bytef*) buffer;
-    strm.msg = Z_NULL;
     strm.avail_in = size;
-    strm.total_in = 0;
-    strm.total_out = 0;
-    strm.zalloc = Z_NULL;
-    strm.zfree = Z_NULL;
 
     if ((err = inflateInit2(&strm, (16 + MAX_WBITS))) != Z_OK) {
         return Err(fmt::format(FMT_STRING("invalid gzip data: {} -- {}"),
@@ -122,14 +114,97 @@ uncompress(const std::string& src, const void* buffer, size_t size)
         }
     }
 
-    if (inflateEnd(&strm) != Z_OK) {
-        return Err(fmt::format(FMT_STRING("unable to uncompress: {} -- {}"),
-                               src,
-                               strm.msg ? strm.msg : zError(err)));
+    err = inflateEnd(&strm);
+    if (err != Z_OK) {
+        return Err(fmt::format(
+            FMT_STRING("unable to uncompress: {} -- {}"), src, zError(err)));
     }
 
     return Ok(std::move(uncomp.resize(strm.total_out)));
 }
 
-}  // namespace gzip
-}  // namespace lnav
+struct gunzip_producer : string_fragment_producer {
+    explicit gunzip_producer(const string_fragment& src,
+                             size_t uncompressed_size)
+        : gp_src(src.to_string()), gp_uncompressed_size(uncompressed_size)
+    {
+    }
+
+    gunzip_producer(const gunzip_producer&) = delete;
+    gunzip_producer& operator=(const gunzip_producer&) = delete;
+
+    ~gunzip_producer() override
+    {
+        if (this->strm.next_in) {
+            inflateEnd(&this->strm);
+        }
+    }
+
+    size_t estimated_size() const override
+    {
+        return this->gp_uncompressed_size;
+    }
+
+    next_result next() override
+    {
+        if (this->strm.next_in == nullptr) {
+            return eof{};
+        }
+
+        this->strm.next_out = (Bytef*) this->gp_buff;
+        this->strm.avail_out = sizeof(this->gp_buff);
+
+        const auto err = inflate(&this->strm, Z_SYNC_FLUSH);
+        if (err == Z_STREAM_END) {
+            auto used = sizeof(this->gp_buff) - this->strm.avail_out;
+            this->strm.next_in = nullptr;
+            if (inflateEnd(&strm) != Z_OK) {
+                return error{
+                    fmt::format(FMT_STRING("unable to uncompress: {} -- {}"),
+                                this->gp_src,
+                                this->strm.msg ? this->strm.msg : zError(err))};
+            }
+            return string_fragment::from_bytes(this->gp_buff, used);
+        }
+
+        if (err == Z_OK) {
+            auto used = sizeof(this->gp_buff) - this->strm.avail_out;
+            return string_fragment::from_bytes(this->gp_buff, used);
+        }
+
+        this->strm.next_in = nullptr;
+        inflateEnd(&this->strm);
+        return error{
+            fmt::format(FMT_STRING("unable to uncompress: {} -- {}"),
+                        this->gp_src,
+                        this->strm.msg ? this->strm.msg : zError(err))};
+    }
+
+    std::string gp_src;
+    z_stream strm = {};
+    unsigned char gp_buff[2048];
+    size_t gp_uncompressed_size;
+};
+
+Result<std::unique_ptr<string_fragment_producer>, std::string>
+uncompress_stream(const string_fragment& src,
+                  const unsigned char* buffer,
+                  size_t compressed_size,
+                  size_t uncompressed_size)
+{
+    int err;
+    auto gp = std::make_unique<gunzip_producer>(src, uncompressed_size);
+    gp->strm.next_in = (Bytef*) buffer;
+    gp->strm.avail_in = compressed_size;
+
+    if ((err = inflateInit(&gp->strm)) != Z_OK) {
+        return Err(fmt::format(FMT_STRING("invalid gzip data: {} -- {}"),
+                               src,
+                               gp->strm.msg ? gp->strm.msg : zError(err)));
+    }
+
+    std::unique_ptr<string_fragment_producer> retval = std::move(gp);
+    return Ok(std::move(retval));
+}
+
+}  // namespace lnav::gzip

@@ -32,51 +32,116 @@
 #ifndef bookmarks_hh
 #define bookmarks_hh
 
-#include <algorithm>
 #include <map>
-#include <unordered_set>
+#include <memory>
 #include <string>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include "base/distributed_slice.hh"
+#include "base/intern_string.hh"
 #include "base/lnav_log.hh"
+#include "tlx/container/btree_set.hpp"
+
+struct logmsg_annotations {
+    std::map<std::string, std::string> la_pairs;
+};
 
 struct bookmark_metadata {
     static std::unordered_set<std::string> KNOWN_TAGS;
 
-    std::string bm_name;
-    std::string bm_comment;
-    std::vector<std::string> bm_tags;
+    enum class categories : int {
+        any = 0,
+        partition = 0x01,
+        notes = 0x02,
+        opid = 0x04,
+        session = 0x08,
+    };
 
-    void add_tag(const std::string& tag);
+    bool has(categories props) const
+    {
+        if (props == categories::any) {
+            return true;
+        }
+
+        if (props == categories::partition && !this->bm_name.empty()) {
+            return true;
+        }
+
+        if (props == categories::notes
+            && (!this->bm_comment.empty()
+                || !this->bm_annotations.la_pairs.empty()
+                || !this->bm_tags.empty()))
+        {
+            return true;
+        }
+
+        if (props == categories::opid && !this->bm_opid.empty()) {
+            return true;
+        }
+
+        return false;
+    }
+
+    enum class meta_source {
+        user,
+        format,
+    };
+
+    std::string bm_name;
+    meta_source bm_name_source{meta_source::user};
+    std::string bm_opid;
+    std::string bm_comment;
+    logmsg_annotations bm_annotations;
+
+    struct tag_entry {
+        std::string te_tag;
+        meta_source te_source{meta_source::user};
+
+        bool operator==(const std::string& rhs) const
+        {
+            return this->te_tag == rhs;
+        }
+    };
+
+    std::vector<tag_entry> bm_tags;
+
+    void add_tag(const std::string& tag, meta_source src = meta_source::user);
 
     bool remove_tag(const std::string& tag);
 
-    bool empty() const;
+    size_t user_tag_count() const;
+
+    bool empty(categories props) const;
 
     void clear();
 };
 
 /**
- * Extension of the STL vector that is used to store bookmarks for
- * files being viewed, where a bookmark is just a particular line in
- * the file(s).  The value-added over the standard vector are some
- * methods for doing content-wise iteration.  In other words, given a
- * value that may or may not be in the vector, find the next or
- * previous value that is in the vector.
- *
  * @param LineType The type used to store line numbers.  (e.g.
  *   vis_line_t or content_line_t)
  *
  * @note The vector is expected to be sorted.
  */
 template<typename LineType>
-class bookmark_vector : public std::vector<LineType> {
-    using base_vector = std::vector<LineType>;
-
+class bookmark_vector {
 public:
-    using size_type = typename base_vector::size_type;
-    using iterator = typename base_vector::iterator;
-    using const_iterator = typename base_vector::const_iterator;
+    using iterator = typename tlx::btree_set<LineType>::iterator;
+    using const_iterator = typename tlx::btree_set<LineType>::const_iterator;
+
+    tlx::btree_set<LineType> bv_tree;
+    size_t bv_generation{0};
+
+    std::size_t size() const { return this->bv_tree.size(); }
+
+    void clear()
+    {
+        this->bv_tree.clear();
+        this->bv_generation += 1;
+    }
+
+    bool empty() const { return this->bv_tree.empty(); }
 
     /**
      * Insert a bookmark into this vector, but only if it is not already in the
@@ -84,34 +149,50 @@ public:
      *
      * @param vl The line to bookmark.
      */
-    iterator insert_once(LineType vl)
+    std::pair<iterator, bool> insert_once(LineType vl)
     {
-        iterator retval;
-
-        require(vl >= 0);
-
-        auto lb = std::lower_bound(this->begin(), this->end(), vl);
-        if (lb == this->end() || *lb != vl) {
-            this->insert(lb, vl);
-            retval = this->end();
-        } else {
-            retval = lb;
+        auto retval = this->bv_tree.insert(vl);
+        if (retval.second) {
+            this->bv_generation += 1;
         }
-
         return retval;
     }
 
-    std::pair<iterator, iterator> equal_range(LineType start, LineType stop)
+    bool contains(LineType vl)
     {
-        auto lb = std::lower_bound(this->begin(), this->end(), start);
+        return this->bv_tree.find(vl) != this->bv_tree.end();
+    }
+
+    std::pair<const_iterator, const_iterator> equal_range(LineType start,
+                                                          LineType stop) const
+    {
+        auto lb = this->bv_tree.lower_bound(start);
 
         if (stop == LineType(-1)) {
-            return std::make_pair(lb, this->end());
+            return std::make_pair(lb, this->bv_tree.end());
         }
 
-        auto up = std::upper_bound(this->begin(), this->end(), stop);
+        auto up = this->bv_tree.lower_bound(stop);
 
         return std::make_pair(lb, up);
+    }
+
+    size_t erase(LineType vl)
+    {
+        auto retval = this->bv_tree.erase(vl);
+        if (retval > 0) {
+            this->bv_generation += 1;
+        }
+        return retval;
+    }
+
+    void apply(LineType vl, bool added)
+    {
+        if (added) {
+            this->insert_once(vl);
+        } else {
+            this->erase(vl);
+        }
     }
 
     /**
@@ -121,7 +202,7 @@ public:
      * the next bookmark is returned.  If the 'start' value is not a
      * bookmark, the next highest value in the vector is returned.
      */
-    nonstd::optional<LineType> next(LineType start) const;
+    std::optional<LineType> next(LineType start) const;
 
     /**
      * @param start The value to start the search for the previous
@@ -130,7 +211,7 @@ public:
      * are no more prior bookmarks.
      * @see next
      */
-    nonstd::optional<LineType> prev(LineType start) const;
+    std::optional<LineType> prev(LineType start) const;
 };
 
 /**
@@ -139,38 +220,45 @@ public:
  */
 class bookmark_type_t {
 public:
-    using type_iterator = std::vector<bookmark_type_t*>::iterator;
+    using type_container = dist_slice_container<bookmark_type_t>;
 
-    static type_iterator type_begin() { return get_all_types().begin(); }
+    static const type_container& get_all_types();
 
-    static type_iterator type_end() { return get_all_types().end(); }
+    static std::optional<const bookmark_type_t*> find_type(
+        const string_fragment& name);
 
-    static nonstd::optional<bookmark_type_t*> find_type(
-        const std::string& name);
+    static std::vector<string_fragment> get_type_names();
 
-    static std::vector<bookmark_type_t*>& get_all_types();
-
-    explicit bookmark_type_t(std::string name) : bt_name(std::move(name))
+    template<typename T, std::size_t N>
+    constexpr explicit bookmark_type_t(const T (&name)[N])
+        : bt_name(string_fragment::from_const(name))
     {
-        get_all_types().push_back(this);
     }
 
-    const std::string& get_name() const { return this->bt_name; }
+    ~bookmark_type_t() = default;
+
+    bookmark_type_t(const bookmark_type_t&) = delete;
+    bookmark_type_t(bookmark_type_t&&) = delete;
+
+    bookmark_type_t& operator=(const bookmark_type_t&) = delete;
+    bookmark_type_t& operator=(bookmark_type_t&&) = delete;
+
+    const string_fragment& get_name() const { return this->bt_name; }
 
 private:
-    const std::string bt_name;
+    const string_fragment bt_name;
 };
 
 template<typename LineType>
-nonstd::optional<LineType>
+std::optional<LineType>
 bookmark_vector<LineType>::next(LineType start) const
 {
-    nonstd::optional<LineType> retval;
+    std::optional<LineType> retval;
 
     require(start >= -1);
 
-    auto ub = std::upper_bound(this->cbegin(), this->cend(), start);
-    if (ub != this->cend()) {
+    auto ub = this->bv_tree.upper_bound(start);
+    if (ub != this->bv_tree.end()) {
         retval = *ub;
     }
 
@@ -180,16 +268,16 @@ bookmark_vector<LineType>::next(LineType start) const
 }
 
 template<typename LineType>
-nonstd::optional<LineType>
+std::optional<LineType>
 bookmark_vector<LineType>::prev(LineType start) const
 {
-    nonstd::optional<LineType> retval;
+    std::optional<LineType> retval;
 
     require(start >= 0);
 
-    auto lb = std::lower_bound(this->cbegin(), this->cend(), start);
-    if (lb != this->cbegin()) {
-        lb -= 1;
+    auto lb = this->bv_tree.lower_bound(start);
+    if (lb != this->bv_tree.begin()) {
+        --lb;
         retval = *lb;
     }
 
@@ -203,7 +291,14 @@ bookmark_vector<LineType>::prev(LineType start) const
  */
 template<typename LineType>
 struct bookmarks {
-    using type = std::map<const bookmark_type_t*, bookmark_vector<LineType>>;
+    using type = bookmark_type_t::type_container::slice_indexed_array<
+        bookmark_vector<LineType>>;
+
+    static type create_array()
+    {
+        return bookmark_type_t::get_all_types()
+            .create_array_indexed_by<bookmark_vector<LineType>>();
+    }
 };
 
 #endif

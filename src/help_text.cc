@@ -31,6 +31,15 @@
 
 #include "config.h"
 
+help_text::help_text(const char* name, const char* summary) noexcept
+    : ht_name(name), ht_summary(summary)
+{
+    if (name[0] == ':') {
+        this->ht_context = help_context_t::HC_COMMAND;
+        this->ht_name = &name[1];
+    }
+}
+
 help_text&
 help_text::with_parameters(
     const std::initializer_list<help_text>& params) noexcept
@@ -73,9 +82,25 @@ help_text::with_example(const help_example& example) noexcept
     return *this;
 }
 
+bool
+help_text::is_trailing_arg() const
+{
+    switch (this->ht_format) {
+        case help_parameter_format_t::HPF_TEXT:
+        case help_parameter_format_t::HPF_TIME_FILTER_POINT:
+        case help_parameter_format_t::HPF_MULTILINE_TEXT:
+        case help_parameter_format_t::HPF_REGEX:
+        case help_parameter_format_t::HPF_SQL:
+        case help_parameter_format_t::HPF_SQL_EXPR:
+            return true;
+        default:
+            return false;
+    }
+}
+
 help_text&
 help_text::with_enum_values(
-    const std::initializer_list<const char*>& enum_values) noexcept
+    const std::initializer_list<string_fragment>& enum_values) noexcept
 {
     this->ht_enum_values = enum_values;
     return *this;
@@ -96,10 +121,26 @@ help_text::with_opposites(
     return *this;
 }
 
+help_text&
+help_text::with_prql_path(
+    const std::initializer_list<const char*>& prql) noexcept
+{
+    this->ht_prql_path = prql;
+    return *this;
+}
+
+std::multimap<std::string, help_text*>&
+help_text::tag_map()
+{
+    static std::multimap<std::string, help_text*> retval;
+
+    return retval;
+}
+
 void
 help_text::index_tags()
 {
     for (const auto& tag : this->ht_tags) {
-        TAGGED.insert(std::make_pair(tag, this));
+        tag_map().insert(std::make_pair(tag, this));
     }
 }

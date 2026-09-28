@@ -34,16 +34,14 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
-#include <sqlite3.h>
-
-#include "base/lnav_log.hh"
 #include "column_namer.hh"
 #include "data_parser.hh"
 #include "logfile_sub_source.hh"
-#include "sql_util.hh"
-#include "xml_util.hh"
+#include "src_ref.hh"
 #include "yajlpp/json_ptr.hh"
 
 class log_data_helper {
@@ -52,12 +50,14 @@ public:
 
     void clear();
 
-    bool parse_line(vis_line_t line, bool allow_middle = false)
+    bool load_line(vis_line_t line, bool allow_middle = false)
     {
-        return this->parse_line(this->ldh_log_source.at(line), allow_middle);
+        return this->load_line(this->ldh_log_source.at(line), allow_middle);
     }
 
-    bool parse_line(content_line_t line, bool allow_middle = false);
+    bool load_line(content_line_t line, bool allow_middle = false);
+
+    void parse_body();
 
     int get_line_bounds(size_t& line_index_out,
                         size_t& line_end_index_out) const;
@@ -81,12 +81,17 @@ public:
     std::unique_ptr<data_scanner> ldh_scanner;
     std::unique_ptr<data_parser> ldh_parser;
     std::unique_ptr<column_namer> ldh_namer;
-    string_attrs_t ldh_line_attrs;
+    std::optional<lnav::src_ref> ldh_src_ref;
+    std::vector<std::pair<std::string, std::string>> ldh_src_vars;
+    attr_line_t ldh_attr_line;
     logline_value_vector ldh_line_values;
-    std::map<const intern_string_t, json_ptr_walk::walk_list_t> ldh_json_pairs;
+    std::map<const intern_string_t, std::pair<intern_string_t, std::string>>
+        ldh_extra_json;
+    std::map<const intern_string_t, json_walk_collector> ldh_json_pairs;
     std::map<std::pair<const intern_string_t, std::string>, std::string>
         ldh_xml_pairs;
     std::string ldh_msg_format;
+    shared_buffer ldh_share_manager;
 };
 
 #endif

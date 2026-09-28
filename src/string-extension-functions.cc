@@ -7,17 +7,17 @@
  * commercial or non-commercial, and by any means.
  */
 
-#ifdef __CYGWIN__
-#    include <alloca.h>
-#endif
-
+#include <cmath>
+#include <optional>
 #include <unordered_map>
 
 #include <sqlite3.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "base/fts_fuzzy_match.hh"
 #include "base/humanize.hh"
+#include "base/is_utf8.hh"
 #include "base/lnav.gzip.hh"
 #include "base/string_util.hh"
 #include "column_namer.hh"
@@ -25,16 +25,20 @@
 #include "data_parser.hh"
 #include "data_scanner.hh"
 #include "elem_to_json.hh"
+#include "fmt/format.h"
 #include "formats/logfmt/logfmt.parser.hh"
+#include "hasher.hh"
 #include "libbase64.h"
 #include "mapbox/variant.hpp"
-#include "optional.hpp"
+#include "md4cpp.hh"
 #include "pcrepp/pcre2pp.hh"
+#include "pretty_printer.hh"
 #include "safe/safe.h"
-#include "scn/scn.h"
-#include "spookyhash/SpookyV2.h"
+#include "scn/scan.h"
 #include "sqlite-extension-func.hh"
 #include "text_anonymizer.hh"
+#include "view_curses.hh"
+#include "curl_looper.hh"
 #include "vtab_module.hh"
 #include "vtab_module_json.hh"
 #include "yajl/api/yajl_gen.h"
@@ -46,7 +50,38 @@
 #    include <curl/curl.h>
 #endif
 
-using namespace mapbox;
+enum class encode_algo {
+    base64,
+    hex,
+    uri,
+    html,
+};
+
+template<>
+struct from_sqlite<encode_algo> {
+    encode_algo operator()(int argc, sqlite3_value** val, int argi)
+    {
+        const char* algo_name = (const char*) sqlite3_value_text(val[argi]);
+
+        if (strcasecmp(algo_name, "base64") == 0) {
+            return encode_algo::base64;
+        }
+        if (strcasecmp(algo_name, "hex") == 0) {
+            return encode_algo::hex;
+        }
+        if (strcasecmp(algo_name, "uri") == 0) {
+            return encode_algo::uri;
+        }
+        if (strcasecmp(algo_name, "html") == 0) {
+            return encode_algo::html;
+        }
+
+        throw from_sqlite_conversion_error(
+            "value of 'base64', 'hex', 'uri', or 'html'", argi);
+    }
+};
+
+namespace {
 
 struct cache_entry {
     std::shared_ptr<lnav::pcre2pp::code> re2;
@@ -54,12 +89,12 @@ struct cache_entry {
         std::make_shared<column_namer>(column_namer::language::JSON)};
 };
 
-static cache_entry*
+cache_entry*
 find_re(string_fragment re)
 {
     using re_cache_t
         = std::unordered_map<string_fragment, cache_entry, frag_hasher>;
-    static thread_local re_cache_t cache;
+    thread_local re_cache_t cache;
 
     auto iter = cache.find(re);
     if (iter == cache.end()) {
@@ -76,7 +111,7 @@ find_re(string_fragment re)
         auto pair = cache.insert(
             std::make_pair(string_fragment::from_str(c.re2->get_pattern()), c));
 
-        for (int lpc = 0; lpc < c.re2->get_capture_count(); lpc++) {
+        for (size_t lpc = 0; lpc < c.re2->get_capture_count(); lpc++) {
             c.cn->add_column(string_fragment::from_c_str(
                 c.re2->get_name_for_capture(lpc + 1)));
         }
@@ -87,7 +122,30 @@ find_re(string_fragment re)
     return &iter->second;
 }
 
-static bool
+/**
+ * @return The capture as an integer, or as a finite real, when all of it
+ * parses as one.
+ */
+std::optional<mapbox::util::variant<int64_t, double>>
+capture_to_number(string_fragment cap)
+{
+    const auto sv = cap.to_string_view();
+
+    auto scan_int_res = scn::scan_value<int64_t>(sv);
+    if (scan_int_res && scan_int_res->range().empty()) {
+        return scan_int_res->value();
+    }
+    auto scan_float_res = scn::scan_value<double>(sv);
+    if (scan_float_res && scan_float_res->range().empty()
+        && std::isfinite(scan_float_res->value()))
+    {
+        return scan_float_res->value();
+    }
+
+    return std::nullopt;
+}
+
+bool
 regexp(string_fragment re, string_fragment str)
 {
     auto* reobj = find_re(re);
@@ -95,8 +153,9 @@ regexp(string_fragment re, string_fragment str)
     return reobj->re2->find_in(str).ignore_error().has_value();
 }
 
-static util::variant<int64_t, double, const char*, string_fragment, json_string>
-regexp_match(string_fragment re, string_fragment str)
+mapbox::util::
+    variant<int64_t, double, const char*, string_fragment, json_string>
+    regexp_match(string_fragment re, string_fragment str)
 {
     auto* reobj = find_re(re);
     auto& extractor = *reobj->re2;
@@ -117,9 +176,6 @@ regexp_match(string_fragment re, string_fragment str)
         throw std::runtime_error(err.get_message());
     }
 
-    yajlpp_gen gen;
-    yajl_gen_config(gen, yajl_gen_beautify, false);
-
     if (extractor.get_capture_count() == 1) {
         auto cap = md[1];
 
@@ -127,21 +183,34 @@ regexp_match(string_fragment re, string_fragment str)
             return static_cast<const char*>(nullptr);
         }
 
-        auto scan_int_res = scn::scan_value<int64_t>(cap->to_string_view());
-        if (scan_int_res && scan_int_res.empty()) {
-            return scan_int_res.value();
-        }
-
-        auto scan_float_res = scn::scan_value<double>(cap->to_string_view());
-        if (scan_float_res && scan_float_res.empty()) {
-            return scan_float_res.value();
+        auto num = capture_to_number(cap.value());
+        if (num) {
+            return num->match(
+                [](int64_t iv) -> mapbox::util::variant<int64_t,
+                                                        double,
+                                                        const char*,
+                                                        string_fragment,
+                                                        json_string> {
+                    return iv;
+                },
+                [](double dv) -> mapbox::util::variant<int64_t,
+                                                       double,
+                                                       const char*,
+                                                       string_fragment,
+                                                       json_string> {
+                    return dv;
+                });
         }
 
         return cap.value();
-    } else {
+    }
+
+    yajlpp_gen gen;
+    yajl_gen_config(gen, yajl_gen_beautify, false);
+    {
         yajlpp_map root_map(gen);
 
-        for (int lpc = 0; lpc < extractor.get_capture_count(); lpc++) {
+        for (size_t lpc = 0; lpc < extractor.get_capture_count(); lpc++) {
             const auto& colname = reobj->cn->cn_names[lpc];
             const auto cap = md[lpc + 1];
 
@@ -150,18 +219,23 @@ regexp_match(string_fragment re, string_fragment str)
             if (!cap) {
                 yajl_gen_null(gen);
             } else {
-                auto scan_int_res
-                    = scn::scan_value<int64_t>(cap->to_string_view());
-                if (scan_int_res && scan_int_res.empty()) {
-                    yajl_gen_integer(gen, scan_int_res.value());
+                static const auto JSON_NUMBER_RE
+                    = lnav::pcre2pp::code::from_const(
+                        R"(\A-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z)");
+
+                auto num = capture_to_number(cap.value());
+                if (!num) {
+                    yajl_gen_pstring(gen, cap->data(), cap->length());
+                } else if (num->is<int64_t>()) {
+                    yajl_gen_integer(gen, num->get<int64_t>());
+                } else if (JSON_NUMBER_RE.find_in(cap.value())
+                               .ignore_error()
+                               .has_value())
+                {
+                    // Keep the text as written when it is already valid JSON.
+                    yajl_gen_number(gen, cap->data(), cap->length());
                 } else {
-                    auto scan_float_res
-                        = scn::scan_value<double>(cap->to_string_view());
-                    if (scan_float_res && scan_float_res.empty()) {
-                        yajl_gen_number(gen, cap->data(), cap->length());
-                    } else {
-                        yajl_gen_pstring(gen, cap->data(), cap->length());
-                    }
+                    yajl_gen_double(gen, num->get<double>());
                 }
             }
         }
@@ -176,30 +250,13 @@ regexp_match(string_fragment re, string_fragment str)
 #endif
 }
 
-json_string
-extract(const char* str)
-{
-    data_scanner ds(str);
-    data_parser dp(&ds);
-
-    dp.parse();
-    // dp.print(stderr, dp.dp_pairs);
-
-    yajlpp_gen gen;
-    yajl_gen_config(gen, yajl_gen_beautify, false);
-
-    elements_to_json(gen, dp, &dp.dp_pairs);
-
-    return json_string(gen);
-}
-
-json_string
+static json_string
 logfmt2json(string_fragment line)
 {
+    std::vector<string_fragment> unbound;
     logfmt::parser p(line);
     yajlpp_gen gen;
     yajl_gen_config(gen, yajl_gen_beautify, false);
-
     {
         yajlpp_map root(gen);
         bool done = false;
@@ -209,6 +266,10 @@ logfmt2json(string_fragment line)
 
             done = pair.match(
                 [](const logfmt::parser::end_of_input& eoi) { return true; },
+                [&unbound](const string_fragment& sf) {
+                    unbound.emplace_back(sf);
+                    return false;
+                },
                 [&root, &gen](const logfmt::parser::kvpair& kvp) {
                     root.gen(kvp.first);
 
@@ -254,12 +315,20 @@ logfmt2json(string_fragment line)
                     throw sqlite_func_error("Invalid logfmt: {}", e.e_msg);
                 });
         }
+
+        if (!unbound.empty()) {
+            root.gen("__unbound__");
+            yajlpp_array unbound_array(gen);
+            for (const auto& sf : unbound) {
+                unbound_array.gen(sf);
+            }
+        }
     }
 
     return json_string(gen);
 }
 
-static std::string
+std::string
 regexp_replace(string_fragment str, string_fragment re, const char* repl)
 {
     auto* reobj = find_re(re);
@@ -267,28 +336,47 @@ regexp_replace(string_fragment str, string_fragment re, const char* repl)
     return reobj->re2->replace(str, repl);
 }
 
-static std::string
+std::optional<int64_t>
+sql_fuzzy_match(const char* pat, const char* str)
+{
+    if (pat == nullptr) {
+        return std::nullopt;
+    }
+
+    if (pat[0] == '\0') {
+        return 1;
+    }
+
+    int score = 0;
+
+    if (!fts::fuzzy_match(pat, str, score)) {
+        return std::nullopt;
+    }
+
+    return score;
+}
+
+string_fragment
 spooky_hash(const std::vector<const char*>& args)
 {
-    byte_array<2, uint64> hash;
-    SpookyHash context;
+    thread_local char hash_str_buf[hasher::STRING_SIZE];
 
-    context.Init(0, 0);
+    hasher context;
     for (const auto* const arg : args) {
         int64_t len = arg != nullptr ? strlen(arg) : 0;
 
-        context.Update(&len, sizeof(len));
+        context.update((const char*) &len, sizeof(len));
         if (arg == nullptr) {
             continue;
         }
-        context.Update(arg, len);
+        context.update(arg, len);
     }
-    context.Final(hash.out(0), hash.out(1));
+    context.to_string(hash_str_buf);
 
-    return hash.to_string();
+    return string_fragment::from_bytes(hash_str_buf, sizeof(hash_str_buf) - 1);
 }
 
-static void
+void
 sql_spooky_hash_step(sqlite3_context* context, int argc, sqlite3_value** argv)
 {
     auto* hasher
@@ -306,7 +394,7 @@ sql_spooky_hash_step(sqlite3_context* context, int argc, sqlite3_value** argv)
     }
 }
 
-static void
+void
 sql_spooky_hash_final(sqlite3_context* context)
 {
     auto* hasher
@@ -328,10 +416,12 @@ sql_spooky_hash_final(sqlite3_context* context)
 struct sparkline_context {
     bool sc_initialized{true};
     double sc_max_value{0.0};
+    std::optional<double> sc_bound_a;
+    std::optional<double> sc_bound_b;
     std::vector<double> sc_values;
 };
 
-static void
+void
 sparkline_step(sqlite3_context* context, int argc, sqlite3_value** argv)
 {
     auto* sc = (sparkline_context*) sqlite3_aggregate_context(
@@ -348,13 +438,15 @@ sparkline_step(sqlite3_context* context, int argc, sqlite3_value** argv)
     sc->sc_values.push_back(sqlite3_value_double(argv[0]));
     sc->sc_max_value = std::max(sc->sc_max_value, sc->sc_values.back());
 
-    if (argc >= 2) {
-        sc->sc_max_value
-            = std::max(sc->sc_max_value, sqlite3_value_double(argv[1]));
+    if (argc >= 2 && sqlite3_value_type(argv[1]) != SQLITE_NULL) {
+        sc->sc_bound_a = sqlite3_value_double(argv[1]);
+    }
+    if (argc >= 3 && sqlite3_value_type(argv[2]) != SQLITE_NULL) {
+        sc->sc_bound_b = sqlite3_value_double(argv[2]);
     }
 }
 
-static void
+void
 sparkline_final(sqlite3_context* context)
 {
     auto* sc = (sparkline_context*) sqlite3_aggregate_context(
@@ -365,23 +457,26 @@ sparkline_final(sqlite3_context* context)
         return;
     }
 
-    auto* retval = (char*) malloc(sc->sc_values.size() * 3 + 1);
-    auto* start = retval;
+    auto retval = auto_mem<char>::malloc(sc->sc_values.size() * 3 + 1);
+    auto* start = retval.in();
 
+    // Without a bound, the largest input is the ceiling.  The bounds are
+    // otherwise treated like humanize::sparkline() does.
+    const auto bound_a = sc->sc_bound_a.value_or(sc->sc_max_value);
     for (const auto& value : sc->sc_values) {
-        auto bar = humanize::sparkline(value, sc->sc_max_value);
+        auto bar = humanize::sparkline(value, bound_a, sc->sc_bound_b);
 
         strcpy(start, bar.c_str());
         start += bar.length();
     }
     *start = '\0';
 
-    sqlite3_result_text(context, retval, -1, free);
+    to_sqlite(context, std::move(retval));
 
     sc->~sparkline_context();
 }
 
-nonstd::optional<util::variant<blob_auto_buffer, sqlite3_int64, double>>
+std::optional<mapbox::util::variant<blob_auto_buffer, sqlite3_int64, double>>
 sql_gunzip(sqlite3_value* val)
 {
     switch (sqlite3_value_type(val)) {
@@ -410,10 +505,10 @@ sql_gunzip(sqlite3_value* val)
             return sqlite3_value_double(val);
     }
 
-    return nonstd::nullopt;
+    return std::nullopt;
 }
 
-nonstd::optional<blob_auto_buffer>
+std::optional<blob_auto_buffer>
 sql_gzip(sqlite3_value* val)
 {
     switch (sqlite3_value_type(val)) {
@@ -445,42 +540,19 @@ sql_gzip(sqlite3_value* val)
         }
     }
 
-    return nonstd::nullopt;
+    return std::nullopt;
 }
-
-enum class encode_algo {
-    base64,
-    hex,
-    uri,
-};
-
-template<>
-struct from_sqlite<encode_algo> {
-    inline encode_algo operator()(int argc, sqlite3_value** val, int argi)
-    {
-        const char* algo_name = (const char*) sqlite3_value_text(val[argi]);
-
-        if (strcasecmp(algo_name, "base64") == 0) {
-            return encode_algo::base64;
-        }
-        if (strcasecmp(algo_name, "hex") == 0) {
-            return encode_algo::hex;
-        }
-        if (strcasecmp(algo_name, "uri") == 0) {
-            return encode_algo::uri;
-        }
-
-        throw from_sqlite_conversion_error("value of 'base64', 'hex', or 'uri'",
-                                           argi);
-    }
-};
 
 #if defined(HAVE_LIBCURL)
 static CURL*
 get_curl_easy()
 {
     static struct curl_wrapper {
-        curl_wrapper() { this->cw_value = curl_easy_init(); }
+        curl_wrapper()
+        {
+            ensure_curl_global_init();
+            this->cw_value = curl_easy_init();
+        }
 
         auto_mem<CURL> cw_value{curl_easy_cleanup};
     } retval;
@@ -489,7 +561,7 @@ get_curl_easy()
 }
 #endif
 
-static mapbox::util::variant<text_auto_buffer, auto_mem<char>, null_value_t>
+mapbox::util::variant<text_auto_buffer, auto_mem<char>, null_value_t>
 sql_encode(sqlite3_value* value, encode_algo algo)
 {
     switch (sqlite3_value_type(value)) {
@@ -503,7 +575,7 @@ sql_encode(sqlite3_value* value, encode_algo algo)
 
             switch (algo) {
                 case encode_algo::base64: {
-                    auto buf = auto_buffer::alloc((blob_len * 5) / 3);
+                    auto buf = auto_buffer::alloc(4 * ((blob_len + 2) / 3));
                     auto outlen = buf.capacity();
 
                     base64_encode(blob, blob_len, buf.in(), &outlen, 0);
@@ -515,7 +587,7 @@ sql_encode(sqlite3_value* value, encode_algo algo)
 
                     for (int lpc = 0; lpc < blob_len; lpc++) {
                         fmt::format_to(std::back_inserter(buf),
-                                       FMT_STRING("{:x}"),
+                                       FMT_STRING("{:02x}"),
                                        blob[lpc]);
                     }
 
@@ -529,6 +601,10 @@ sql_encode(sqlite3_value* value, encode_algo algo)
                     return std::move(retval);
                 }
 #endif
+                case encode_algo::html: {
+                    return md4cpp::escape_html(
+                        string_fragment::from_bytes(blob, blob_len));
+                }
             }
         }
         default: {
@@ -537,7 +613,7 @@ sql_encode(sqlite3_value* value, encode_algo algo)
 
             switch (algo) {
                 case encode_algo::base64: {
-                    auto buf = auto_buffer::alloc((text_len * 5) / 3);
+                    auto buf = auto_buffer::alloc(4 * ((text_len + 2) / 3));
                     size_t outlen = buf.capacity();
 
                     base64_encode(text, text_len, buf.in(), &outlen, 0);
@@ -549,7 +625,7 @@ sql_encode(sqlite3_value* value, encode_algo algo)
 
                     for (int lpc = 0; lpc < text_len; lpc++) {
                         fmt::format_to(std::back_inserter(buf),
-                                       FMT_STRING("{:x}"),
+                                       FMT_STRING("{:02x}"),
                                        text[lpc]);
                     }
 
@@ -563,20 +639,28 @@ sql_encode(sqlite3_value* value, encode_algo algo)
                     return std::move(retval);
                 }
 #endif
+                case encode_algo::html: {
+                    return md4cpp::escape_html(
+                        string_fragment::from_bytes(text, text_len));
+                }
             }
         }
     }
     ensure(false);
 }
 
-static mapbox::util::variant<blob_auto_buffer, auto_mem<char>>
+mapbox::util::variant<blob_auto_buffer, text_auto_buffer, auto_mem<char>>
 sql_decode(string_fragment str, encode_algo algo)
 {
     switch (algo) {
         case encode_algo::base64: {
             auto buf = auto_buffer::alloc(str.length());
             auto outlen = buf.capacity();
-            base64_decode(str.data(), str.length(), buf.in(), &outlen, 0);
+            if (base64_decode(str.data(), str.length(), buf.in(), &outlen, 0)
+                != 1)
+            {
+                throw sqlite_func_error("invalid base64 input");
+            }
             buf.resize(outlen);
 
             return blob_auto_buffer{std::move(buf)};
@@ -585,16 +669,20 @@ sql_decode(string_fragment str, encode_algo algo)
             auto buf = auto_buffer::alloc(str.length() / 2);
             auto sv = str.to_string_view();
 
-            while (!sv.empty()) {
-                int32_t value;
-                auto scan_res = scn::scan(sv, "{:2x}", value);
+            if (sv.size() % 2 != 0) {
+                throw sqlite_func_error(
+                    "hex input is not a multiple of two characters");
+            }
+            while (sv.size() >= 2) {
+                auto scan_res = scn::scan<uint8_t>(sv.substr(0, 2), "{:2x}");
                 if (!scan_res) {
                     throw sqlite_func_error(
                         "invalid hex input at: {}",
                         std::distance(str.begin(), sv.begin()));
                 }
+                auto value = scan_res->value();
                 buf.push_back((char) (value & 0xff));
-                sv = scan_res.range_as_string_view();
+                sv = sv.substr(2);
             }
 
             return blob_auto_buffer{std::move(buf)};
@@ -609,6 +697,41 @@ sql_decode(string_fragment str, encode_algo algo)
             return std::move(retval);
         }
 #endif
+        case encode_algo::html: {
+            static const auto ENTITY_RE = lnav::pcre2pp::code::from_const(
+                R"(&(?:([a-z0-9]+)|#([0-9]{1,6})|#x([0-9a-fA-F]{1,6}));)",
+                PCRE2_CASELESS);
+            static const auto& ENTITIES = md4cpp::get_xml_entity_map();
+
+            auto buf = auto_buffer::alloc(str.length());
+            auto res = ENTITY_RE.capture_from(str).for_each(
+                [&buf](const auto& match) {
+                    buf.append(match.leading().to_string_view());
+                    auto named = match[1];
+                    if (named) {
+                        auto iter
+                            = ENTITIES.xem_entities.find(match[0]->to_string());
+                        if (iter != ENTITIES.xem_entities.end()) {
+                            buf.append(iter->second.xe_chars);
+                        } else {
+                            buf.append(match[0]->to_string_view());
+                        }
+                        return;
+                    }
+                    auto decoded
+                        = md4cpp::decode_numeric_entity(match[0].value());
+                    if (decoded) {
+                        buf.append(decoded.value());
+                    } else {
+                        buf.append(match[0]->to_string_view());
+                    }
+                });
+            if (res.isOk()) {
+                auto remaining = res.unwrap();
+                buf.append(remaining.to_string_view());
+            }
+            return text_auto_buffer{std::move(buf)};
+        }
     }
     ensure(false);
 }
@@ -619,7 +742,7 @@ sql_humanize_file_size(file_ssize_t value)
     return humanize::file_size(value, humanize::alignment::columnar);
 }
 
-static std::string
+std::string
 sql_anonymize(string_fragment frag)
 {
     static safe::Safe<lnav::text_anonymizer> ta;
@@ -634,19 +757,32 @@ const char* curl_url_strerror(CURLUcode error);
 }
 #endif
 
-static json_string
-sql_parse_url(string_fragment url_frag)
+json_string
+sql_parse_url(std::string url)
 {
     static auto* CURL_HANDLE = get_curl_easy();
 
     auto_mem<CURLU> cu(curl_url_cleanup);
     cu = curl_url();
 
-    auto rc = curl_url_set(cu, CURLUPART_URL, url_frag.data(), 0);
+    auto rc = curl_url_set(
+        cu, CURLUPART_URL, url.c_str(), CURLU_NON_SUPPORT_SCHEME);
     if (rc != CURLUE_OK) {
-        throw lnav::console::user_message::error(
-            attr_line_t("invalid URL: ").append_quoted(url_frag.to_string()))
-            .with_reason(curl_url_strerror(rc));
+        auto_mem<char> url_part(curl_free);
+        yajlpp_gen gen;
+        yajl_gen_config(gen, yajl_gen_beautify, false);
+
+        {
+            yajlpp_map root(gen);
+            root.gen("error");
+            root.gen("invalid-url");
+            root.gen("url");
+            root.gen(url);
+            root.gen("reason");
+            root.gen(curl_url_strerror(rc));
+        }
+
+        return json_string(gen);
     }
 
     auto_mem<char> url_part(curl_free);
@@ -663,7 +799,7 @@ sql_parse_url(string_fragment url_frag)
         } else {
             root.gen();
         }
-        root.gen("user");
+        root.gen("username");
         rc = curl_url_get(cu, CURLUPART_USER, url_part.out(), CURLU_URLDECODE);
         if (rc == CURLUE_OK) {
             root.gen(string_fragment::from_c_str(url_part.in()));
@@ -695,7 +831,18 @@ sql_parse_url(string_fragment url_frag)
         root.gen("path");
         rc = curl_url_get(cu, CURLUPART_PATH, url_part.out(), CURLU_URLDECODE);
         if (rc == CURLUE_OK) {
-            root.gen(string_fragment::from_c_str(url_part.in()));
+            auto path_frag = string_fragment::from_c_str(url_part.in());
+            auto path_utf_res = is_utf8(path_frag);
+            if (path_utf_res.is_valid()) {
+                root.gen(path_frag);
+            } else {
+                rc = curl_url_get(cu, CURLUPART_PATH, url_part.out(), 0);
+                if (rc == CURLUE_OK) {
+                    root.gen(string_fragment::from_c_str(url_part.in()));
+                } else {
+                    root.gen();
+                }
+            }
         } else {
             root.gen();
         }
@@ -708,53 +855,62 @@ sql_parse_url(string_fragment url_frag)
             robin_hood::unordered_set<std::string> seen_keys;
             yajlpp_map query_map(gen);
 
+            for (size_t lpc = 0; url_part.in()[lpc]; lpc++) {
+                if (url_part.in()[lpc] == '+') {
+                    url_part.in()[lpc] = ' ';
+                }
+            }
             auto query_frag = string_fragment::from_c_str(url_part.in());
             auto remaining = query_frag;
+            auto unescape = [](string_fragment sf, auto_mem<char>& buf) {
+                // curl treats a zero length as "use strlen()".
+                if (sf.empty()) {
+                    return string_fragment::from_const("");
+                }
+
+                int out_len = 0;
+
+                buf = curl_easy_unescape(
+                    CURL_HANDLE, sf.data(), sf.length(), &out_len);
+                return string_fragment::from_bytes(buf.in(), out_len);
+            };
 
             while (true) {
                 auto split_res
                     = remaining.split_when(string_fragment::tag1{'&'});
+                auto kv_pair_encoded = split_res.first;
+                // Split before decoding so an encoded '=' stays in the key
+                // or value it belongs to.
+                auto eq_split = kv_pair_encoded.split_pair(
+                    string_fragment::tag1{'='});
+                auto key_encoded
+                    = eq_split ? eq_split->first : kv_pair_encoded;
+                auto_mem<char> key_buf(curl_free);
+                auto key_sf = unescape(key_encoded, key_buf);
 
-                if (!split_res) {
-                    break;
-                }
-
-                auto_mem<char> kv_pair(curl_free);
-                auto kv_pair_encoded = split_res->first;
-                int out_len = 0;
-
-                kv_pair = curl_easy_unescape(CURL_HANDLE,
-                                             kv_pair_encoded.data(),
-                                             kv_pair_encoded.length(),
-                                             &out_len);
-                auto kv_pair_frag
-                    = string_fragment::from_bytes(kv_pair.in(), out_len);
-                auto eq_index_opt = kv_pair_frag.find('=');
-                if (eq_index_opt) {
-                    auto key = kv_pair_frag.sub_range(0, eq_index_opt.value());
-                    auto val = kv_pair_frag.substr(eq_index_opt.value() + 1);
-                    auto key_str = key.to_string();
-
-                    if (seen_keys.count(key_str) == 0) {
-                        seen_keys.emplace(key_str);
-                        query_map.gen(key);
-                        query_map.gen(val);
-                    }
-                } else {
-                    auto val_str = split_res->first.to_string();
-
-                    if (seen_keys.count(val_str) == 0) {
-                        seen_keys.insert(val_str);
-                        query_map.gen(split_res->first);
+                if (is_utf8(key_sf).is_valid()
+                    && seen_keys.emplace(key_sf.to_string()).second)
+                {
+                    query_map.gen(key_sf);
+                    if (!eq_split) {
                         query_map.gen();
+                    } else {
+                        auto_mem<char> val_buf(curl_free);
+                        auto val_sf = unescape(eq_split->second, val_buf);
+
+                        if (is_utf8(val_sf).is_valid()) {
+                            query_map.gen(val_sf);
+                        } else {
+                            query_map.gen(eq_split->second);
+                        }
                     }
                 }
 
-                if (split_res->second.empty()) {
+                if (split_res.second.empty()) {
                     break;
                 }
 
-                remaining = split_res->second;
+                remaining = split_res.second;
             }
         } else {
             root.gen("query");
@@ -776,43 +932,50 @@ sql_parse_url(string_fragment url_frag)
 }
 
 struct url_parts {
-    nonstd::optional<std::string> up_scheme;
-    nonstd::optional<std::string> up_username;
-    nonstd::optional<std::string> up_password;
-    nonstd::optional<std::string> up_host;
-    nonstd::optional<std::string> up_port;
-    nonstd::optional<std::string> up_path;
-    nonstd::optional<std::string> up_query;
-    std::map<std::string, nonstd::optional<std::string>> up_parameters;
-    nonstd::optional<std::string> up_fragment;
+    std::optional<std::string> up_scheme;
+    std::optional<std::string> up_username;
+    std::optional<std::string> up_password;
+    std::optional<std::string> up_host;
+    std::optional<std::string> up_port;
+    std::optional<std::string> up_path;
+    std::optional<std::string> up_query;
+    std::map<std::string, std::optional<std::string>> up_parameters;
+    std::optional<std::string> up_fragment;
 };
 
-static const json_path_container url_params_handlers = {
-    yajlpp::pattern_property_handler("(?<param>.+)")
-        .for_field(&url_parts::up_parameters),
-};
+const typed_json_path_container<url_parts>&
+get_url_parts_handlers()
+{
+    static const json_path_container url_params_handlers = {
+        yajlpp::pattern_property_handler("(?<param>.*)")
+            .for_field(&url_parts::up_parameters),
+    };
 
-static const typed_json_path_container<url_parts> url_parts_handlers = {
-    yajlpp::property_handler("scheme").for_field(&url_parts::up_scheme),
-    yajlpp::property_handler("username").for_field(&url_parts::up_username),
-    yajlpp::property_handler("password").for_field(&url_parts::up_password),
-    yajlpp::property_handler("host").for_field(&url_parts::up_host),
-    yajlpp::property_handler("port").for_field(&url_parts::up_port),
-    yajlpp::property_handler("path").for_field(&url_parts::up_path),
-    yajlpp::property_handler("query").for_field(&url_parts::up_query),
-    yajlpp::property_handler("parameters").with_children(url_params_handlers),
-    yajlpp::property_handler("fragment").for_field(&url_parts::up_fragment),
-};
+    static const typed_json_path_container<url_parts> retval = {
+        yajlpp::property_handler("scheme").for_field(&url_parts::up_scheme),
+        yajlpp::property_handler("username").for_field(&url_parts::up_username),
+        yajlpp::property_handler("password").for_field(&url_parts::up_password),
+        yajlpp::property_handler("host").for_field(&url_parts::up_host),
+        yajlpp::property_handler("port").for_field(&url_parts::up_port),
+        yajlpp::property_handler("path").for_field(&url_parts::up_path),
+        yajlpp::property_handler("query").for_field(&url_parts::up_query),
+        yajlpp::property_handler("parameters")
+            .with_children(url_params_handlers),
+        yajlpp::property_handler("fragment").for_field(&url_parts::up_fragment),
+    };
 
-static auto_mem<char>
+    return retval;
+}
+
+auto_mem<char>
 sql_unparse_url(string_fragment in)
 {
     static auto* CURL_HANDLE = get_curl_easy();
-    static intern_string_t SRC = intern_string::lookup("arg");
+    static const intern_string_t SRC = intern_string::lookup("arg");
 
-    auto parse_res = url_parts_handlers.parser_for(SRC).of(in);
+    auto parse_res = get_url_parts_handlers().parser_for(SRC).of(in);
     if (parse_res.isErr()) {
-        throw parse_res.unwrapErr();
+        throw parse_res.unwrapErr()[0];
     }
 
     auto up = parse_res.unwrap();
@@ -873,6 +1036,49 @@ sql_unparse_url(string_fragment in)
     return retval;
 }
 
+}  // namespace
+
+json_string
+extract(const char* str)
+{
+    data_scanner ds(str);
+    data_parser dp(&ds);
+
+    dp.parse();
+    // dp.print(stderr, dp.dp_pairs);
+
+    yajlpp_gen gen;
+    yajl_gen_config(gen, yajl_gen_beautify, false);
+
+    elements_to_json(gen, dp, &dp.dp_pairs);
+
+    return json_string(gen);
+}
+
+static std::string
+sql_humanize_id(string_fragment id)
+{
+    auto& vc = view_colors::singleton();
+    auto attrs = vc.attrs_for_ident(id.data(), id.length());
+
+    return fmt::format(FMT_STRING("\x1b[38;5;{}m{}\x1b[0m"),
+                       // XXX attrs.ta_fg_color.value_or(COLOR_CYAN),
+                       (int8_t) ansi_color::cyan,
+                       id);
+}
+
+static std::string
+sql_pretty_print(string_fragment in)
+{
+    data_scanner ds(in);
+    pretty_printer pp(&ds, {});
+    attr_line_t retval;
+
+    pp.append_to(retval);
+
+    return std::move(retval.get_string());
+}
+
 int
 string_extension_functions(struct FuncDef** basic_funcs,
                            struct FuncDefAgg** agg_funcs)
@@ -892,6 +1098,7 @@ string_extension_functions(struct FuncDef** basic_funcs,
                       "Match a string against a regular expression and return "
                       "the capture groups as JSON.")
                 .sql_function()
+                .with_prql_path({"text", "regexp_match"})
                 .with_parameter({"re", "The regular expression to use"})
                 .with_parameter({
                     "str",
@@ -912,13 +1119,15 @@ string_extension_functions(struct FuncDef** basic_funcs,
                     "named properties 'num' and 'str'",
                     "SELECT regexp_match('(?<num>\\d+) (?<str>\\w+)', '123 "
                     "four')",
-                })),
+                }))
+            .with_result_subtype(),
 
         sqlite_func_adapter<decltype(&regexp_replace), regexp_replace>::builder(
             help_text("regexp_replace",
                       "Replace the parts of a string that match a regular "
                       "expression.")
                 .sql_function()
+                .with_prql_path({"text", "regexp_replace"})
                 .with_parameter(
                     {"str", "The string to perform replacements on"})
                 .with_parameter({"re", "The regular expression to match"})
@@ -947,6 +1156,7 @@ string_extension_functions(struct FuncDef** basic_funcs,
                         "humanize_file_size",
                         "Format the given file size as a human-friendly string")
                         .sql_function()
+                        .with_prql_path({"humanize", "file_size"})
                         .with_parameter({"value", "The file size to format"})
                         .with_tags({"string"})
                         .with_example({
@@ -954,41 +1164,23 @@ string_extension_functions(struct FuncDef** basic_funcs,
                             "SELECT humanize_file_size(10 * 1024 * 1024)",
                         })),
 
-        sqlite_func_adapter<decltype(&humanize::sparkline),
-                            humanize::sparkline>::
-            builder(
-                help_text("sparkline",
-                          "Function used to generate a sparkline bar chart.  "
-                          "The non-aggregate version converts a single numeric "
-                          "value on a range to a bar chart character.  The "
-                          "aggregate version returns a string with a bar "
-                          "character for every numeric input")
-                    .sql_function()
-                    .with_parameter({"value", "The numeric value to convert"})
-                    .with_parameter(help_text("upper",
-                                              "The upper bound of the numeric "
-                                              "range.  The non-aggregate "
-                                              "version defaults to 100.  The "
-                                              "aggregate version uses the "
-                                              "largest value in the inputs.")
-                                        .optional())
-                    .with_tags({"string"})
-                    .with_example({
-                        "To get the unicode block element for the "
-                        "value 32 in the "
-                        "range of 0-128",
-                        "SELECT sparkline(32, 128)",
-                    })
-                    .with_example({
-                        "To chart the values in a JSON array",
-                        "SELECT sparkline(value) FROM json_each('[0, 1, 2, 3, "
-                        "4, 5, 6, 7, 8]')",
-                    })),
+        sqlite_func_adapter<decltype(&sql_humanize_id), sql_humanize_id>::
+            builder(help_text("humanize_id",
+                              "Colorize the given ID using ANSI escape codes.")
+                        .sql_function()
+                        .with_prql_path({"humanize", "id"})
+                        .with_parameter({"id", "The identifier to color"})
+                        .with_tags({"string"})
+                        .with_example({
+                            "To colorize the ID 'cluster1'",
+                            "SELECT humanize_id('cluster1')",
+                        })),
 
         sqlite_func_adapter<decltype(&sql_anonymize), sql_anonymize>::builder(
             help_text("anonymize",
                       "Replace identifying information with random values.")
                 .sql_function()
+                .with_prql_path({"text", "anonymize"})
                 .with_parameter({"value", "The text to anonymize"})
                 .with_tags({"string"})
                 .with_example({
@@ -1000,6 +1192,7 @@ string_extension_functions(struct FuncDef** basic_funcs,
             help_text("extract",
                       "Automatically Parse and extract data from a string")
                 .sql_function()
+                .with_prql_path({"text", "discover"})
                 .with_parameter({"str", "The string to parse"})
                 .with_tags({"string"})
                 .with_example({
@@ -1009,18 +1202,21 @@ string_extension_functions(struct FuncDef** basic_funcs,
                 .with_example({
                     "To extract columnar data from a string",
                     "SELECT extract('1.0 abc 2.0')",
-                })),
+                }))
+            .with_result_subtype(),
 
         sqlite_func_adapter<decltype(&logfmt2json), logfmt2json>::builder(
             help_text("logfmt2json",
                       "Convert a logfmt-encoded string into JSON")
                 .sql_function()
+                .with_prql_path({"logfmt", "to_json"})
                 .with_parameter({"str", "The logfmt message to parse"})
                 .with_tags({"string"})
                 .with_example({
                     "To extract key/value pairs from a log message",
                     "SELECT logfmt2json('foo=1 bar=2 name=\"Rolo Tomassi\"')",
-                })),
+                }))
+            .with_result_subtype(),
 
         sqlite_func_adapter<
             decltype(static_cast<bool (*)(const char*, const char*)>(
@@ -1061,6 +1257,23 @@ string_extension_functions(struct FuncDef** basic_funcs,
                         "To test if the string 'notbad.png' starts with '.jpg'",
                         "SELECT endswith('notbad.png', '.jpg')",
                     })),
+
+        sqlite_func_adapter<decltype(&sql_fuzzy_match), sql_fuzzy_match>::
+            builder(help_text(
+                        "fuzzy_match",
+                        "Perform a fuzzy match of a pattern against a "
+                        "string and return a score or NULL if the pattern was "
+                        "not matched")
+                        .sql_function()
+                        .with_parameter(help_text(
+                            "pattern", "The pattern to look for in the string"))
+                        .with_parameter(
+                            help_text("str", "The string to match against"))
+                        .with_tags({"string"})
+                        .with_example({
+                            "To match the pattern 'fo' against 'filter-out'",
+                            "SELECT fuzzy_match('fo', 'filter-out')",
+                        })),
 
         sqlite_func_adapter<decltype(&spooky_hash), spooky_hash>::builder(
             help_text("spooky_hash",
@@ -1108,7 +1321,7 @@ string_extension_functions(struct FuncDef** basic_funcs,
                 .with_parameter(help_text("value", "The value to encode"))
                 .with_parameter(help_text("algorithm",
                                           "One of the following encoding "
-                                          "algorithms: base64, hex, uri"))
+                                          "algorithms: base64, hex, uri, html"))
                 .with_tags({"string"})
                 .with_example({
                     "To base64-encode 'Hello, World!'",
@@ -1191,7 +1404,8 @@ string_extension_functions(struct FuncDef** basic_funcs,
                     "'https://alice@[fe80::14ff:4ee5:1215:2fb2]'",
                     "SELECT "
                     "parse_url('https://alice@[fe80::14ff:4ee5:1215:2fb2]')",
-                })),
+                }))
+            .with_result_subtype(),
 
         sqlite_func_adapter<decltype(&sql_unparse_url), sql_unparse_url>::
             builder(
@@ -1210,6 +1424,21 @@ string_extension_functions(struct FuncDef** basic_funcs,
                         "\"example.com\"}')",
                     })),
 
+        sqlite_func_adapter<decltype(&sql_pretty_print), sql_pretty_print>::
+            builder(
+                help_text("pretty_print", "Pretty-print the given string")
+                    .sql_function()
+                    .with_prql_path({"text", "pretty"})
+                    .with_parameter(help_text("str", "The string to format"))
+                    .with_tags({"string"})
+                    .with_example({
+                        "To pretty-print the string "
+                        "'{\"scheme\": \"https\", \"host\": \"example.com\"}'",
+                        "SELECT "
+                        "pretty_print('{\"scheme\": \"https\", \"host\": "
+                        "\"example.com\"}')",
+                    })),
+
         {nullptr},
     };
 
@@ -1217,6 +1446,7 @@ string_extension_functions(struct FuncDef** basic_funcs,
         {
             "group_spooky_hash",
             -1,
+            SQLITE_UTF8,
             0,
             sql_spooky_hash_step,
             sql_spooky_hash_final,
@@ -1236,9 +1466,38 @@ string_extension_functions(struct FuncDef** basic_funcs,
         {
             "sparkline",
             -1,
+            SQLITE_UTF8,
             0,
             sparkline_step,
             sparkline_final,
+            help_text("sparkline",
+                      "Aggregate function that returns a sparkline bar chart "
+                      "with a bar character for every numeric input")
+                .sql_agg_function()
+                .with_prql_path({"text", "sparkline"})
+                .with_parameter({"value", "The numeric value to chart"})
+                .with_parameter(help_text("bound_a",
+                                          "One bound of the numeric range.  "
+                                          "Order does not matter: the smaller "
+                                          "of bound_a and bound_b is the "
+                                          "floor, the larger is the ceiling.  "
+                                          "Defaults to the largest input.")
+                                    .optional())
+                .with_parameter(help_text("bound_b",
+                                          "The other bound of the numeric "
+                                          "range.  Defaults to 0.")
+                                    .optional())
+                .with_tags({"string"})
+                .with_example({
+                    "To chart the values in a JSON array",
+                    "SELECT sparkline(value) FROM json_each('[0, 1, 2, 3, 4, "
+                    "5, 6, 7, 8]')",
+                })
+                .with_example({
+                    "To chart the values on a range of 0-100",
+                    "SELECT sparkline(value, 0, 100) FROM json_each('[10, 50, "
+                    "90]')",
+                }),
         },
 
         {nullptr},

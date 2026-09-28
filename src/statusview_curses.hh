@@ -42,6 +42,8 @@
  */
 class status_field {
 public:
+    using action = std::function<void(status_field&)>;
+
     /**
      * @param width The maximum width of the field in characters.
      * @param role The color role for this field, defaults to VCR_STATUS.
@@ -54,7 +56,9 @@ public:
     virtual ~status_field() = default;
 
     /** @param value The new value for this field. */
-    void set_value(std::string value);
+    bool set_value(std::string value);
+
+    bool set_value(const string_fragment& value);
 
     /**
      * Set the new value for this field using a formatted string.
@@ -62,18 +66,9 @@ public:
      * @param fmt The format string.
      * @param ... Arguments for the format.
      */
-    status_field& set_value(const char* fmt, ...)
-    {
-        char buffer[256];
-        va_list args;
+    bool set_value(const char* fmt, ...);
 
-        va_start(args, fmt);
-        vsnprintf(buffer, sizeof(buffer), fmt, args);
-        this->set_value(std::string(buffer));
-        va_end(args);
-
-        return *this;
-    }
+    bool set_value(const attr_line_t& value);
 
     void set_stitch_value(role_t left, role_t right);
 
@@ -100,7 +95,14 @@ public:
     /** @return True if this field's value is an empty string. */
     bool empty() const { return this->sf_value.get_string().empty(); }
 
-    void clear() { this->sf_value.clear(); }
+    bool clear()
+    {
+        if (!this->sf_value.empty()) {
+            this->sf_value.clear();
+            return true;
+        }
+        return false;
+    }
 
     /** @param role The color role for this field. */
     void set_role(role_t role) { this->sf_role = role; }
@@ -120,6 +122,10 @@ public:
     void set_share(int share) { this->sf_share = share; }
 
     int get_share() const { return this->sf_share; }
+
+    static void no_op_action(status_field&);
+
+    action on_click{no_op_action};
 
 protected:
     ssize_t sf_width; /*< The maximum display width, in chars. */
@@ -152,6 +158,8 @@ public:
      * @return A reference to the field at the given index.
      */
     virtual status_field& statusview_value_for_field(int field) = 0;
+
+    std::function<void(mouse_event&)> on_drag;
 };
 
 /**
@@ -159,31 +167,42 @@ public:
  */
 class statusview_curses : public view_curses {
 public:
+    statusview_curses() { this->vc_default_role = role_t::VCR_STATUS; }
+
     void set_data_source(status_data_source* src) { this->sc_source = src; }
     status_data_source* get_data_source() { return this->sc_source; }
 
-    void set_top(int top) { this->sc_top = top; }
-    int get_top() const { return this->sc_top; }
-
-    void set_window(WINDOW* win) { this->sc_window = win; }
-    WINDOW* get_window() { return this->sc_window; }
-
-    void set_enabled(bool value) { this->sc_enabled = value; }
+    void set_enabled(bool value)
+    {
+        if (this->sc_enabled != value) {
+            this->sc_enabled = value;
+            this->set_needs_update();
+        }
+    }
     bool get_enabled() const { return this->sc_enabled; }
-
-    void set_default_role(role_t role) { this->sc_default_role = role; }
-    role_t get_default_role() const { return this->sc_default_role; }
 
     void window_change();
 
-    void do_update() override;
+    bool do_update() override;
 
+    bool handle_mouse(mouse_event& me) override;
+
+    bool sc_disable_styles{true};
 private:
     status_data_source* sc_source{nullptr};
-    WINDOW* sc_window{nullptr};
-    int sc_top{0};
     bool sc_enabled{true};
-    role_t sc_default_role{role_t::VCR_STATUS};
+
+    struct displayed_field {
+        displayed_field(line_range lr, size_t field_index)
+            : df_range(lr), df_field_index(field_index)
+        {
+        }
+
+        line_range df_range;
+        size_t df_field_index;
+    };
+
+    std::vector<displayed_field> sc_displayed_fields;
 };
 
 #endif

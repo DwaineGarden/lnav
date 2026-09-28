@@ -33,6 +33,40 @@
 #include "doctest/doctest.h"
 #include "pcre2pp.hh"
 
+TEST_CASE("marks")
+{
+    auto code
+        = lnav::pcre2pp::code::from_const("^(?:/abc(*MARK:0)|/def(*MARK:1))$");
+    auto md = lnav::pcre2pp::match_data::unitialized();
+
+    {
+        const auto abc = string_fragment::from_const("/abc");
+        auto match_res = code.capture_from(abc)
+                             .into(md)
+                             .matches(PCRE2_NO_UTF_CHECK)
+                             .ignore_error();
+        CHECK(match_res.has_value());
+        CHECK(md.get_mark() == "0");
+    }
+    {
+        const auto def = string_fragment::from_const("/def");
+        auto match_res = code.capture_from(def)
+                             .into(md)
+                             .matches(PCRE2_NO_UTF_CHECK)
+                             .ignore_error();
+        CHECK(match_res.has_value());
+        CHECK(md.get_mark() == "1");
+    }
+    {
+        const auto ghi = string_fragment::from_const("/ghi");
+        auto match_res = code.capture_from(ghi)
+                             .into(md)
+                             .matches(PCRE2_NO_UTF_CHECK)
+                             .ignore_error();
+        CHECK(!match_res.has_value());
+    }
+}
+
 TEST_CASE("bad pattern")
 {
     auto compile_res
@@ -84,11 +118,29 @@ TEST_CASE("match")
 
 TEST_CASE("partial")
 {
-    static const char INPUT[] = "key1=1234";
-
     auto co = lnav::pcre2pp::code::from_const(R"([a-z]+=.*)");
-    auto matched = co.match_partial(string_fragment::from_const(INPUT));
-    CHECK(matched == 3);
+
+    {
+        static const char INPUT[] = "key1=1234";
+
+        auto matched = co.match_partial(string_fragment::from_const(INPUT));
+        CHECK(matched == 3);
+    }
+
+    {
+        static const char INPUT[] = "key";
+
+        auto matched = co.match_partial(string_fragment::from_const(INPUT));
+        CHECK(matched == 3);
+    }
+
+    {
+        // Large input that doesn't match -- should return promptly
+        // due to the input cap, not loop for millions of iterations.
+        std::string big_input(32768, 'Z');
+        auto matched = co.match_partial(string_fragment::from_str(big_input));
+        CHECK(matched == 0);
+    }
 }
 
 TEST_CASE("capture_name")
@@ -196,6 +248,79 @@ TEST_CASE("get_captures-nested")
     CHECK(re.get_captures()[0].length() == 14);
 }
 
+TEST_CASE("get_captures-branch-reset")
+{
+    // Each alternative of a branch reset group numbers its captures from the
+    // same start, and the text kept is from the first one to use the number.
+    {
+        auto re = lnav::pcre2pp::code::from_const("(?|(GET)|(POST))");
+
+        CHECK(re.get_capture_count() == 1);
+        const auto caps = re.get_captures();
+        REQUIRE(caps.size() == 1);
+        CHECK(caps[0].to_string() == "(GET)");
+    }
+    {
+        // Numbering after the group carries on from the alternative with the
+        // most captures.
+        auto re = lnav::pcre2pp::code::from_const("(?|(a)|(b)(c))(d)");
+
+        CHECK(re.get_capture_count() == 3);
+        const auto caps = re.get_captures();
+        REQUIRE(caps.size() == 3);
+        CHECK(caps[0].to_string() == "(a)");
+        CHECK(caps[1].to_string() == "(c)");
+        CHECK(caps[2].to_string() == "(d)");
+    }
+    {
+        // An alternative in a group nested in the branch reset does not reset
+        // the numbering.
+        auto re = lnav::pcre2pp::code::from_const("(?|(a(?:x|y))|(b))(c)");
+
+        CHECK(re.get_capture_count() == 2);
+        const auto caps = re.get_captures();
+        REQUIRE(caps.size() == 2);
+        CHECK(caps[0].to_string() == "(a(?:x|y))");
+        CHECK(caps[1].to_string() == "(c)");
+    }
+}
+
+TEST_CASE("get_captures-nested-order")
+{
+    // Captures are numbered by where they open, so an outer group comes
+    // before the groups inside of it.
+    auto re = lnav::pcre2pp::code::from_const(R"(((\d+)x)(y))");
+
+    CHECK(re.get_capture_count() == 3);
+    const auto caps = re.get_captures();
+    REQUIRE(caps.size() == 3);
+    CHECK(caps[0].to_string() == R"(((\d+)x))");
+    CHECK(caps[1].to_string() == R"((\d+))");
+    CHECK(caps[2].to_string() == "(y)");
+}
+
+TEST_CASE("get_captures-comment")
+{
+    // A comment ends at the first ")", so the parens in it are not groups.
+    auto re = lnav::pcre2pp::code::from_const("(?#see (a)(b)");
+
+    CHECK(re.get_capture_count() == 1);
+    const auto caps = re.get_captures();
+    REQUIRE(caps.size() == 1);
+    CHECK(caps[0].to_string() == "(b)");
+}
+
+TEST_CASE("get_captures-conditional")
+{
+    // The reference in a condition is not a capture.
+    auto re = lnav::pcre2pp::code::from_const("(a)?(?(1)b|c)");
+
+    CHECK(re.get_capture_count() == 1);
+    const auto caps = re.get_captures();
+    REQUIRE(caps.size() == 1);
+    CHECK(caps[0].to_string() == "(a)");
+}
+
 TEST_CASE("get_captures-basic")
 {
     auto re = lnav::pcre2pp::code::from_const("(a)(b)(c)");
@@ -243,6 +368,21 @@ TEST_CASE("get_captures-namedq")
     CHECK(re.get_captures().size() == 1);
     CHECK(re.get_captures()[0].sf_begin == 0);
     CHECK(re.get_captures()[0].sf_end == 11);
+}
+
+TEST_CASE("get_captures-empty")
+{
+    auto re
+        = lnav::pcre2pp::code::from_const("(?<size>[]+), free (?<free>[^)]+)");
+
+    CHECK(re.get_captures().size() == 1);
+    CHECK(re.get_captures()[0].sf_begin == 0);
+    CHECK(re.get_captures()[0].sf_end == 33);
+
+    auto re2
+        = lnav::pcre2pp::code::from_const("(?<size>[^]+), free (?<free>[^)]+)");
+
+    CHECK(re2.get_captures().size() == 1);
 }
 
 TEST_CASE("anchored")

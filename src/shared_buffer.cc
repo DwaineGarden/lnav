@@ -32,6 +32,10 @@
 #include "config.h"
 
 #ifdef HAVE_EXECINFO_H
+// clang-format off
+#    include <sys/types.h>
+// clang-format on
+
 #    include <execinfo.h>
 #endif
 
@@ -40,19 +44,15 @@
 #include "base/ansi_scrubber.hh"
 #include "shared_buffer.hh"
 
-static const bool DEBUG_TRACE = false;
-
 void
 shared_buffer_ref::share(shared_buffer& sb, const char* data, size_t len)
 {
-#ifdef HAVE_EXECINFO_H
-    if (DEBUG_TRACE) {
-        void* frames[128];
-        int rc;
+#if SHARED_BUFFER_TRACE
+    void* frames[128];
+    int rc;
 
-        rc = backtrace(frames, 128);
-        this->sb_backtrace.reset(backtrace_symbols(frames, rc));
-    }
+    rc = backtrace(frames, 128);
+    this->sb_backtrace.reset(backtrace_symbols(frames, rc));
 #endif
 
     this->disown();
@@ -88,15 +88,16 @@ shared_buffer_ref::subset(shared_buffer_ref& other, off_t offset, size_t len)
     return true;
 }
 
-shared_buffer_ref::shared_buffer_ref(shared_buffer_ref&& other) noexcept
+shared_buffer_ref::
+shared_buffer_ref(shared_buffer_ref&& other) noexcept
 {
     if (other.sb_data == nullptr) {
         this->sb_owner = nullptr;
         this->sb_data = nullptr;
         this->sb_length = 0;
     } else if (other.sb_owner != nullptr) {
-        auto owner_ref_iter = std::find(other.sb_owner->sb_refs.begin(),
-                                        other.sb_owner->sb_refs.end(),
+        auto owner_ref_iter = std::find(other.sb_owner->sb_refs.rbegin(),
+                                        other.sb_owner->sb_refs.rend(),
                                         &other);
         *owner_ref_iter = this;
         this->sb_owner = std::exchange(other.sb_owner, nullptr);
@@ -109,6 +110,38 @@ shared_buffer_ref::shared_buffer_ref(shared_buffer_ref&& other) noexcept
         other.sb_data = nullptr;
         other.sb_length = 0;
     }
+    this->sb_metadata = other.sb_metadata;
+    other.sb_metadata = {};
+}
+
+shared_buffer_ref&
+shared_buffer_ref::operator=(shared_buffer_ref&& other) noexcept
+{
+    this->disown();
+
+    if (other.sb_data == nullptr) {
+        this->sb_owner = nullptr;
+        this->sb_data = nullptr;
+        this->sb_length = 0;
+    } else if (other.sb_owner != nullptr) {
+        auto owner_ref_iter = std::find(other.sb_owner->sb_refs.rbegin(),
+                                        other.sb_owner->sb_refs.rend(),
+                                        &other);
+        *owner_ref_iter = this;
+        this->sb_owner = std::exchange(other.sb_owner, nullptr);
+        this->sb_data = std::exchange(other.sb_data, nullptr);
+        this->sb_length = std::exchange(other.sb_length, 0);
+    } else {
+        this->sb_owner = nullptr;
+        this->sb_data = other.sb_data;
+        this->sb_length = other.sb_length;
+        other.sb_data = nullptr;
+        other.sb_length = 0;
+    }
+    this->sb_metadata = other.sb_metadata;
+    other.sb_metadata = {};
+
+    return *this;
 }
 
 bool
@@ -148,6 +181,7 @@ shared_buffer_ref::disown()
     this->sb_owner = nullptr;
     this->sb_data = nullptr;
     this->sb_length = 0;
+    this->sb_metadata = {};
 }
 
 void
@@ -187,7 +221,7 @@ shared_buffer_ref::widen(narrow_result old_data_length)
 void
 shared_buffer_ref::erase_ansi()
 {
-    if (!this->sb_metadata.m_has_ansi) {
+    if (!this->sb_metadata.m_valid_utf || !this->sb_metadata.m_has_ansi) {
         return;
     }
 

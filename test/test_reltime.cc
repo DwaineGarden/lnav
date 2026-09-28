@@ -33,8 +33,8 @@
 #include "fmt/format.h"
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "base/relative_time.hh"
 #include "doctest/doctest.h"
-#include "relative_time.hh"
 
 using namespace std;
 
@@ -44,6 +44,7 @@ static struct {
     const char* expected_negate{nullptr};
 } TEST_DATA[] = {
     // { "10 minutes after the next hour", "next 0:10" },
+    {"next 10 minutes after the hour", "next 0:10", "last 0:10"},
     {"0s", "0s", "0s"},
     {"next day", "next day 0:00", "last day 0:00"},
     {"next month", "next month day 0 0:00", "last month day 0 0:00"},
@@ -51,7 +52,6 @@ static struct {
      "next year month 0 day 0 0:00",
      "last year month 0 day 0 0:00"},
     {"previous hour", "last 0:00", "next 0:00"},
-    {"next 10 minutes after the hour", "next 0:10", "last 0:10"},
     {"1h50m", "1h50m", "-1h-50m"},
     {"next hour", "next 0:00", "last 0:00"},
     {"a minute ago", "0:-1", "0:-1"},
@@ -91,6 +91,68 @@ static struct {
 
 TEST_CASE("reltime")
 {
+    setenv("TZ", "UTC", 1);
+
+    {
+        auto parse_res = relative_time::from_str("30m here"_frag);
+        CHECK(parse_res.isErr());
+    }
+
+    {
+        auto rt = relative_time::from_str("30m before here"_frag).unwrap();
+        CHECK(rt.rt_field[relative_time::RTF_MINUTES].value == -30);
+        CHECK(rt.is_negative() == true);
+    }
+
+    {
+        auto rt = relative_time::from_str("30m after here"_frag).unwrap();
+        CHECK(rt.rt_field[relative_time::RTF_MINUTES].value == 30);
+        CHECK(rt.is_negative() == false);
+    }
+
+    {
+        auto rt_res = relative_time::from_str("1:47 today"_frag);
+
+        if (rt_res.isErr()) {
+            auto err = rt_res.unwrapErr();
+            fprintf(stderr, "error %s\n", err.pe_msg.c_str());
+        }
+
+        CHECK(rt_res.isOk());
+        auto rt = rt_res.unwrap();
+        CHECK(rt.rt_field[relative_time::RTF_HOURS].value == 1);
+        CHECK(rt.rt_field[relative_time::RTF_MINUTES].value == 47);
+    }
+
+    {
+        auto rt_res = relative_time::from_str("an hour before now"_frag);
+
+        if (rt_res.isErr()) {
+            auto err = rt_res.unwrapErr();
+            fprintf(stderr, "error %s\n", err.pe_msg.c_str());
+        }
+
+        CHECK(rt_res.isOk());
+        auto rt = rt_res.unwrap();
+
+        auto now_tv = current_timeval();
+        auto ago_tv = rt.to_timeval();
+        auto diff = now_tv - ago_tv;
+        CHECK(diff.tv_sec == (60 * 60));
+    }
+
+    {
+        auto tv = timeval{1690440588, 0};
+        auto parse_res
+            = relative_time::from_str("next 10 minutes after the hour"_frag);
+        auto rt = parse_res.unwrap();
+        auto adj_tm = rt.adjust(tv);
+
+        CHECK(adj_tm.et_nsec == 0);
+        CHECK(adj_tm.et_tm.tm_sec == 0);
+        CHECK(adj_tm.et_tm.tm_min == 10);
+    }
+
     time_t base_time = 1317913200;
     struct exttm base_tm;
     base_tm.et_tm = *gmtime(&base_time);
@@ -99,8 +161,7 @@ TEST_CASE("reltime")
     time_t new_time;
 
     {
-        auto rt_res = relative_time::from_str(
-            string_fragment::from_const("before 2014"));
+        auto rt_res = relative_time::from_str("before 2014"_frag);
 
         CHECK(rt_res.isOk());
         auto rt = rt_res.unwrap();
@@ -113,8 +174,7 @@ TEST_CASE("reltime")
     }
 
     {
-        auto rt_res = relative_time::from_str(
-            string_fragment::from_const("after 2014"));
+        auto rt_res = relative_time::from_str("after 2014"_frag);
 
         CHECK(rt_res.isOk());
         auto rt = rt_res.unwrap();
@@ -127,8 +187,7 @@ TEST_CASE("reltime")
     }
 
     {
-        auto rt_res
-            = relative_time::from_str(string_fragment::from_const("after fri"));
+        auto rt_res = relative_time::from_str("after fri"_frag);
 
         CHECK(rt_res.isOk());
         auto rt = rt_res.unwrap();
@@ -141,8 +200,7 @@ TEST_CASE("reltime")
     }
 
     {
-        auto rt_res = relative_time::from_str(
-            string_fragment::from_const("before fri"));
+        auto rt_res = relative_time::from_str("before fri"_frag);
 
         CHECK(rt_res.isOk());
         auto rt = rt_res.unwrap();
@@ -155,8 +213,7 @@ TEST_CASE("reltime")
     }
 
     {
-        auto rt_res = relative_time::from_str(
-            string_fragment::from_const("before 12pm"));
+        auto rt_res = relative_time::from_str("before 12pm"_frag);
 
         CHECK(rt_res.isOk());
         auto rt = rt_res.unwrap();
@@ -169,8 +226,7 @@ TEST_CASE("reltime")
     }
 
     {
-        auto rt_res = relative_time::from_str(
-            string_fragment::from_const("sun after 1pm"));
+        auto rt_res = relative_time::from_str("sun after 1pm"_frag);
 
         CHECK(rt_res.isOk());
         auto rt = rt_res.unwrap();
@@ -189,8 +245,7 @@ TEST_CASE("reltime")
     }
 
     {
-        auto rt_res
-            = relative_time::from_str(string_fragment::from_const("0:05"));
+        auto rt_res = relative_time::from_str("0:05"_frag);
 
         CHECK(rt_res.isOk());
         auto rt = rt_res.unwrap();
@@ -212,8 +267,7 @@ TEST_CASE("reltime")
     }
 
     {
-        auto rt_res
-            = relative_time::from_str(string_fragment::from_const("mon"));
+        auto rt_res = relative_time::from_str("mon "_frag);
 
         CHECK(rt_res.isOk());
         auto rt = rt_res.unwrap();
@@ -232,18 +286,18 @@ TEST_CASE("reltime")
     }
 
     {
-        auto rt_res
-            = relative_time::from_str(string_fragment::from_const("tue"));
+        auto rt_res = relative_time::from_str("tue"_frag);
 
         CHECK(rt_res.isOk());
         auto rt = rt_res.unwrap();
-        CHECK(rt.rt_included_days
-              == std::set<relative_time::token_t>{relative_time::RTT_TUESDAY});
+        CHECK(rt.rt_included_days.keys()
+              == lnav::set::small<
+                     relative_time::token_t>{relative_time::RTT_TUESDAY}
+                     .keys());
     }
 
     {
-        auto rt_res
-            = relative_time::from_str(string_fragment::from_const("1m"));
+        auto rt_res = relative_time::from_str("1m"_frag);
 
         CHECK(rt_res.isOk());
         auto rt = rt_res.unwrap();
@@ -286,44 +340,36 @@ TEST_CASE("reltime")
               == string(BAD_TEST_DATA[lpc].expected_error));
     }
 
-    rt = relative_time::from_str(string_fragment::from_const("")).unwrap();
+    rt = relative_time::from_str(""_frag).unwrap();
     CHECK(rt.empty());
 
-    rt = relative_time::from_str(string_fragment::from_const("a minute ago"))
-             .unwrap();
+    rt = relative_time::from_str("a minute ago"_frag).unwrap();
     CHECK(rt.rt_field[relative_time::RTF_MINUTES].value == -1);
     CHECK(rt.is_negative() == true);
 
-    rt = relative_time::from_str(string_fragment::from_const("5 milliseconds"))
-             .unwrap();
+    rt = relative_time::from_str("5 milliseconds"_frag).unwrap();
     CHECK(rt.rt_field[relative_time::RTF_MICROSECONDS].value == 5 * 1000);
 
-    rt = relative_time::from_str(string_fragment::from_const("5000 ms ago"))
-             .unwrap();
+    rt = relative_time::from_str("5000 ms ago"_frag).unwrap();
     CHECK(rt.rt_field[relative_time::RTF_SECONDS].value == -5);
 
-    rt = relative_time::from_str(
-             string_fragment::from_const("5 hours 20 minutes ago"))
-             .unwrap();
+    rt = relative_time::from_str("5 hours 20 minutes ago"_frag).unwrap();
 
     CHECK(rt.rt_field[relative_time::RTF_HOURS].value == -5);
     CHECK(rt.rt_field[relative_time::RTF_MINUTES].value == -20);
 
-    rt = relative_time::from_str(
-             string_fragment::from_const("5 hours and 20 minutes ago"))
-             .unwrap();
+    rt = relative_time::from_str("5 hours and 20 minutes ago"_frag).unwrap();
 
     CHECK(rt.rt_field[relative_time::RTF_HOURS].value == -5);
     CHECK(rt.rt_field[relative_time::RTF_MINUTES].value == -20);
 
-    rt = relative_time::from_str(string_fragment::from_const("1:23")).unwrap();
+    rt = relative_time::from_str("1:23"_frag).unwrap();
 
     CHECK(rt.rt_field[relative_time::RTF_HOURS].value == 1);
     CHECK(rt.rt_field[relative_time::RTF_MINUTES].value == 23);
     CHECK(rt.is_absolute());
 
-    rt = relative_time::from_str(string_fragment::from_const("1:23:45"))
-             .unwrap();
+    rt = relative_time::from_str("1:23:45"_frag).unwrap();
 
     CHECK(rt.rt_field[relative_time::RTF_HOURS].value == 1);
     CHECK(rt.rt_field[relative_time::RTF_MINUTES].value == 23);
@@ -338,8 +384,7 @@ TEST_CASE("reltime")
     CHECK(tm.et_tm.tm_hour == 1);
     CHECK(tm.et_tm.tm_min == 23);
 
-    rt = relative_time::from_str(string_fragment::from_const("5 minutes ago"))
-             .unwrap();
+    rt = relative_time::from_str("5 minutes ago"_frag).unwrap();
 
     tm = base_tm;
     tm = rt.adjust(tm);
@@ -348,8 +393,7 @@ TEST_CASE("reltime")
 
     CHECK(new_time == (base_time - (5 * 60)));
 
-    rt = relative_time::from_str(string_fragment::from_const("today at 4pm"))
-             .unwrap();
+    rt = relative_time::from_str("today at 4pm"_frag).unwrap();
     memset(&tm, 0, sizeof(tm));
     memset(&tm2, 0, sizeof(tm2));
     gettimeofday(&tv, nullptr);
@@ -374,9 +418,7 @@ TEST_CASE("reltime")
     CHECK(tm.et_tm.tm_min == tm2.et_tm.tm_min);
     CHECK(tm.et_tm.tm_sec == tm2.et_tm.tm_sec);
 
-    rt = relative_time::from_str(
-             string_fragment::from_const("yesterday at 4pm"))
-             .unwrap();
+    rt = relative_time::from_str("yesterday at 4pm"_frag).unwrap();
     gettimeofday(&tv, nullptr);
     localtime_r(&tv.tv_sec, &tm.et_tm);
     localtime_r(&tv.tv_sec, &tm2.et_tm);
@@ -400,8 +442,7 @@ TEST_CASE("reltime")
     CHECK(tm.et_tm.tm_min == tm2.et_tm.tm_min);
     CHECK(tm.et_tm.tm_sec == tm2.et_tm.tm_sec);
 
-    rt = relative_time::from_str(string_fragment::from_const("2 days ago"))
-             .unwrap();
+    rt = relative_time::from_str("2 days ago"_frag).unwrap();
     gettimeofday(&tv, nullptr);
     localtime_r(&tv.tv_sec, &tm.et_tm);
     localtime_r(&tv.tv_sec, &tm2.et_tm);

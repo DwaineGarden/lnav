@@ -29,37 +29,609 @@
  * @file sql_util.cc
  */
 
-#include <algorithm>
+#include <array>
 #include <regex>
 #include <vector>
 
 #include "sql_util.hh"
 
 #include <ctype.h>
-#include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 
 #include "base/auto_mem.hh"
+#include "base/from_trait.hh"
 #include "base/injector.hh"
 #include "base/lnav_log.hh"
 #include "base/string_util.hh"
-#include "base/time_util.hh"
 #include "bound_tags.hh"
 #include "config.h"
 #include "lnav_util.hh"
 #include "pcrepp/pcre2pp.hh"
-#include "readline_context.hh"
+#include "prql-modules.h"
+#include "lnav.commands.hh"
 #include "readline_highlighters.hh"
-#include "shlex.resolver.hh"
+#include "sql_execute.hh"
 #include "sql_help.hh"
-#include "sqlite-extension-func.hh"
+#include "sqlitepp.hh"
+
+#ifdef HAVE_RUST_DEPS
+#    include "lnav_rs_ext.cxx.hh"
+#endif
 
 using namespace lnav::roles::literals;
+
+constexpr std::array<const char*, 564> pg_sql_keywords = {
+    "ABORT",
+    "ABS",
+    "ACCESSIBLE",
+    "ACTION",
+    "ADD",
+    "ADMIN",
+    "AFTER",
+    "AGGREGATE",
+    "ALIAS",
+    "ALL",
+    "ALLOCATE",
+    "ALTER",
+    "ALWAYS",
+    "ANALYSE",
+    "ANALYZE",
+    "AND",
+    "ANY",
+    "ARE",
+    "ARRAY",
+    "AS",
+    "ASC",
+    "ASENSITIVE",
+    "ASSERTION",
+    "ASSIGNMENT",
+    "ASYMMETRIC",
+    "AT",
+    "ATOMIC",
+    "ATTRIBUTE",
+    "ATTRIBUTES",
+    "AUDIT",
+    "AUTHORIZATION",
+    "AVG",
+    "BEFORE",
+    "BEGIN",
+    "BERNOULLI",
+    "BETWEEN",
+    "BIGINT",
+    "BINARY",
+    "BIT",
+    "BLOB",
+    "BOOLEAN",
+    "BOTH",
+    "BREADTH",
+    "BY",
+    "CALL",
+    "CALLED",
+    "CARDINALITY",
+    "CASCADE",
+    "CASCADED",
+    "CASE",
+    "CAST",
+    "CATALOG",
+    "CATALOG_NAME",
+    "CEIL",
+    "CEILING",
+    "CHAR",
+    "CHARACTER",
+    "CHARACTER_LENGTH",
+    "CHARACTER_SET_CATALOG",
+    "CHARACTER_SET_NAME",
+    "CHARACTER_SET_SCHEMA",
+    "CHAR_LENGTH",
+    "CHECK",
+    "CLASS",
+    "CLASS_ORIGIN",
+    "CLOB",
+    "CLOSE",
+    "COALESCE",
+    "COLLATE",
+    "COLLATION",
+    "COLLATION_CATALOG",
+    "COLLATION_NAME",
+    "COLLATION_SCHEMA",
+    "COLLECT",
+    "COLUMN",
+    "COLUMN_NAME",
+    "COMMAND_FUNCTION",
+    "COMMAND_FUNCTION_CODE",
+    "COMMIT",
+    "COMMITTED",
+    "CONDITION",
+    "CONDITION_NUMBER",
+    "CONNECT",
+    "CONNECTION",
+    "CONNECTION_NAME",
+    "CONSTRAINT",
+    "CONSTRAINT_CATALOG",
+    "CONSTRAINT_NAME",
+    "CONSTRAINT_SCHEMA",
+    "CONSTRUCTORS",
+    "CONTAINS",
+    "CONTINUE",
+    "CONVERT",
+    "CORR",
+    "CORRESPONDING",
+    "COUNT",
+    "COVAR_POP",
+    "COVAR_SAMP",
+    "CREATE",
+    "CROSS",
+    "CUBE",
+    "CUME_DIST",
+    "CURRENT",
+    "CURRENT_CATALOG",
+    "CURRENT_DATE",
+    "CURRENT_DEFAULT_TRANSFORM_GROUP",
+    "CURRENT_PATH",
+    "CURRENT_ROLE",
+    "CURRENT_ROW",
+    "CURRENT_SCHEMA",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "CURRENT_TRANSFORM_GROUP_FOR_TYPE",
+    "CURRENT_USER",
+    "CURSOR",
+    "CURSOR_NAME",
+    "CYCLE",
+    "DATA",
+    "DATABASE",
+    "DATE",
+    "DATETIME_INTERVAL_CODE",
+    "DATETIME_INTERVAL_PRECISION",
+    "DAY",
+    "DEALLOCATE",
+    "DEC",
+    "DECIMAL",
+    "DECLARE",
+    "DEFAULT",
+    "DEFAULTS",
+    "DEFERRABLE",
+    "DEFERRED",
+    "DEFINED",
+    "DEFINER",
+    "DEGREE",
+    "DELETE",
+    "DENSE_RANK",
+    "DEPTH",
+    "DEREF",
+    "DESC",
+    "DESCRIBE",
+    "DESCRIPTOR",
+    "DETERMINISTIC",
+    "DIAGNOSTICS",
+    "DISCONNECT",
+    "DISPATCH",
+    "DISTINCT",
+    "DO",
+    "DOMAIN",
+    "DOUBLE",
+    "DROP",
+    "DYNAMIC",
+    "DYNAMIC_FUNCTION",
+    "DYNAMIC_FUNCTION_CODE",
+    "EACH",
+    "ELEMENT",
+    "ELSE",
+    "END",
+    "END_FRAME",
+    "END_OF_CHAIN",
+    "EQUALS",
+    "ESCAPE",
+    "EVERY",
+    "EXCEPT",
+    "EXCEPTION",
+    "EXCLUDE",
+    "EXCLUDING",
+    "EXEC",
+    "EXECUTE",
+    "EXISTS",
+    "EXP",
+    "EXPLAIN",
+    "EXTEND",
+    "EXTERNAL",
+    "EXTRACT",
+    "FALSE",
+    "FAMILY",
+    "FETCH",
+    "FILE",
+    "FINAL",
+    "FIRST",
+    "FIRST_VALUE",
+    "FLAG",
+    "FLOAT",
+    "FLOOR",
+    "FOLLOWING",
+    "FOR",
+    "FOREIGN",
+    "FORTRAN",
+    "FOUND",
+    "FRAME_ROW",
+    "FREE",
+    "FREEZE",
+    "FROM",
+    "FULL",
+    "FUNCTION",
+    "FUSION",
+    "GENERAL",
+    "GENERATED",
+    "GET",
+    "GLOBAL",
+    "GO",
+    "GOTO",
+    "GRANT",
+    "GRANTED",
+    "GROUP",
+    "GROUPING",
+    "GROUPS",
+    "HAVING",
+    "HOLD",
+    "HOUR",
+    "IDENTITY",
+    "IF",
+    "IGNORE",
+    "ILIKE",
+    "IMMEDIATE",
+    "IMMEDIATELY",
+    "IMPLEMENTATION",
+    "IMPLICIT",
+    "IN",
+    "INCLUDING",
+    "INCREMENT",
+    "INDICATOR",
+    "INHERIT",
+    "INITIALLY",
+    "INNER",
+    "INOUT",
+    "INPUT",
+    "INSENSITIVE",
+    "INSERT",
+    "INSTANCE",
+    "INSTANTIABLE",
+    "INT",
+    "INTEGER",
+    "INTEGRITY",
+    "INTERSECT",
+    "INTERVAL",
+    "INTO",
+    "INVOKER",
+    "IS",
+    "ISNULL",
+    "ISOLATION",
+    "JAVA",
+    "JOIN",
+    "KEY",
+    "KEY_MEMBER",
+    "KEY_TYPE",
+    "LAG",
+    "LANGUAGE",
+    "LARGE",
+    "LAST",
+    "LAST_VALUE",
+    "LATERAL",
+    "LEAD",
+    "LEADING",
+    "LEFT",
+    "LENGTH",
+    "LEVEL",
+    "LIKE",
+    "LIKE_REGEX",
+    "LIMIT",
+    "LN",
+    "LOCAL",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    "LOCATOR",
+    "LOWER",
+    "MAP",
+    "MATCH",
+    "MATCHED",
+    "MAX",
+    "MAX_CARDINALITY",
+    "MEMBER",
+    "MERGE",
+    "MESSAGE_LENGTH",
+    "MESSAGE_OCTET_LENGTH",
+    "MESSAGE_TEXT",
+    "METHOD",
+    "MIN",
+    "MINUTE",
+    "MOD",
+    "MODIFIES",
+    "MODULE",
+    "MONTH",
+    "MULTISET",
+    "NAME",
+    "NAMES",
+    "NATIONAL",
+    "NATURAL",
+    "NCHAR",
+    "NCLOB",
+    "NEW",
+    "NEXT",
+    "NO",
+    "NONE",
+    "NORMALIZE",
+    "NORMALIZED",
+    "NOT",
+    "NOTNULL",
+    "NTH_VALUE",
+    "NULL",
+    "NULLABLE",
+    "NULLIF",
+    "NULLS",
+    "NUMBER",
+    "NUMERIC",
+    "OBJECT",
+    "OCTET_LENGTH",
+    "OF",
+    "OFF",
+    "OFFSET",
+    "OLD",
+    "ON",
+    "ONLY",
+    "OPEN",
+    "OPERATION",
+    "OPTION",
+    "ORDINALITY",
+    "ORDER",
+    "ORDERING",
+    "ORIENTATION",
+    "ORIGIN",
+    "OUT",
+    "OUTER",
+    "OUTPUT",
+    "OVER",
+    "OVERLAPS",
+    "OVERLAY",
+    "PAD",
+    "PARAMETER",
+    "PARAMETER_MODE",
+    "PARAMETER_NAME",
+    "PARAMETER_ORDINAL_POSITION",
+    "PARAMETER_SPECIFIC_CATALOG",
+    "PARAMETER_SPECIFIC_NAME",
+    "PARAMETER_SPECIFIC_SCHEMA",
+    "PARTIAL",
+    "PARTITION",
+    "PASCAL",
+    "PATH",
+    "PERCENT_RANK",
+    "PERCENTILE_CONT",
+    "PERCENTILE_DISC",
+    "PERIOD",
+    "PG_CATALOG",
+    "PG_CLIENT",
+    "PG_EXTENSION",
+    "PG_GET_KEYWORDS",
+    "PG_IS_TEMP_SCHEMA",
+    "PG_IS_TEMP_SCHE",
+    "PG_LAST_WAL_RECEIVE_LOCATION",
+    "PG_LAST_WAL_REPLAY_LOCATION",
+    "PG_LISTEN",
+    "PG_NOTIFY",
+    "PG_RELATION_SIZE",
+    "PG_SLEEP",
+    "PG_TABLE_SIZE",
+    "PG_TRY_ADVISORY_LOCK",
+    "PG_TRY_ADVISORY_UNLOCK",
+    "PG_TYPEOF",
+    "PG_UNLISTEN",
+    "PG_WAL_LSN_DIFF",
+    "PG_WAL_REPLAY_PAUSED",
+    "PG_XLOG_LOCATION_DIFF",
+    "PG_XLOG_REPLAY_PAUSED",
+    "PG_XLOG_REPLAY_WAIT",
+    "PLACING",
+    "PLI",
+    "PORTION",
+    "POSITION",
+    "POWER",
+    "PRECEDES",
+    "PRECISION",
+    "PREPARE",
+    "PRESERVE",
+    "PRIMARY",
+    "PRIOR",
+    "PRIVILEGES",
+    "PROCEDURE",
+    "PUBLIC",
+    "RANGE",
+    "RANK",
+    "READ",
+    "READS",
+    "REAL",
+    "RECURSIVE",
+    "REF",
+    "REFERENCES",
+    "REFERENCING",
+    "REGR_AVGX",
+    "REGR_AVGY",
+    "REGR_COUNT",
+    "REGR_INTERCEPT",
+    "REGR_R2",
+    "REGR_SLOPE",
+    "REGR_SXX",
+    "REGR_SXY",
+    "REGR_SYY",
+    "RELATIVE",
+    "RELEASE",
+    "REPEATABLE",
+    "REPLACE",
+    "RESPECT",
+    "RESTART",
+    "RESTRICT",
+    "RETURN",
+    "RETURNED_CARDINALITY",
+    "RETURNED_LENGTH",
+    "RETURNED_OCTET_LENGTH",
+    "RETURNED_SQLSTATE",
+    "RETURNING",
+    "REVOKE",
+    "RIGHT",
+    "ROLLBACK",
+    "ROLLUP",
+    "ROUTINE",
+    "ROUTINE_CATALOG",
+    "ROUTINE_NAME",
+    "ROUTINE_SCHEMA",
+    "ROW",
+    "ROW_COUNT",
+    "ROW_NUMBER",
+    "ROWS",
+    "SAVEPOINT",
+    "SCHEMA",
+    "SCHEMA_NAME",
+    "SCOPE",
+    "SCOPE_CATALOG",
+    "SCOPE_NAME",
+    "SCOPE_SCHEMA",
+    "SCROLL",
+    "SEARCH",
+    "SECOND",
+    "SECTION",
+    "SECURITY",
+    "SELECT",
+    "SELF",
+    "SENSITIVE",
+    "SEQUENCE",
+    "SERIALIZABLE",
+    "SERVER_NAME",
+    "SESSION",
+    "SESSION_USER",
+    "SET",
+    "SETS",
+    "SIMILAR",
+    "SIZE",
+    "SMALLINT",
+    "SOME",
+    "SPACE",
+    "SPECIFIC",
+    "SPECIFIC_NAME",
+    "SPECIFIC_SCHEMA",
+    "SPECIFICTYPE",
+    "SQL",
+    "SQLCODE",
+    "SQLERROR",
+    "SQLEXCEPTION",
+    "SQLSTATE",
+    "SQLWARNING",
+    "SQRT",
+    "START",
+    "STATE",
+    "STATEMENT",
+    "STATIC",
+    "STDDEV_POP",
+    "STDDEV_SAMP",
+    "STRUCTURE",
+    "STYLE",
+    "SUBCLASS_ORIGIN",
+    "SUBMULTISET",
+    "SUBSTRING",
+    "SUM",
+    "SYMMETRIC",
+    "SYSTEM",
+    "SYSTEM_USER",
+    "TABLE",
+    "TABLE_NAME",
+    "TABLESAMPLE",
+    "TEMPORARY",
+    "THEN",
+    "TIES",
+    "TIME",
+    "TIMESTAMP",
+    "TIMESTAMPADD",
+    "TIMESTAMPDIFF",
+    "TIMEZONE_HOUR",
+    "TIMEZONE_MINUTE",
+    "TO",
+    "TOP",
+    "TRAILING",
+    "TRANSACTION",
+    "TRANSACTIONS_COMMITTED",
+    "TRANSACTIONS_ROLLED_BACK",
+    "TRANSACTION_ACTIVE",
+    "TRANSFORM",
+    "TRANSFORMS",
+    "TRANSLATE",
+    "TRANSLATION",
+    "TREAT",
+    "TRIGGER",
+    "TRIGGER_CATALOG",
+    "TRIGGER_NAME",
+    "TRIGGER_SCHEMA",
+    "TRIM",
+    "TRUE",
+    "TRUNCATE",
+    "UNBOUNDED",
+    "UNCOMMITTED",
+    "UNDER",
+    "UNION",
+    "UNIQUE",
+    "UNKNOWN",
+    "UNLISTEN",
+    "UNNAMED",
+    "UNNEST",
+    "UNTIL",
+    "UPDATE",
+    "UPPER",
+    "USAGE",
+    "USER",
+    "USER_DEFINED_TYPE_CATALOG",
+    "USER_DEFINED_TYPE_CODE",
+    "USER_DEFINED_TYPE_NAME",
+    "USER_DEFINED_TYPE_SCHEMA",
+    "USING",
+    "VACUUM",
+    "VALID",
+    "VALUE",
+    "VALUES",
+    "VAR_POP",
+    "VAR_SAMP",
+    "VARCHAR",
+    "VARYING",
+    "VERBOSE",
+    "VERSION",
+    "VIEW",
+    "WHEN",
+    "WHENEVER",
+    "WHERE",
+    "WIDTH_BUCKET",
+    "WINDOW",
+    "WITH",
+    "WITHIN",
+    "WITHOUT",
+    "WORK",
+    "WRITE",
+    "XML",
+    "XMLAGG",
+    "XMLATTRIBUTES",
+    "XMLCONCAT",
+    "XMLELEMENT",
+    "XMLEXISTS",
+    "XMLFOREST",
+    "XMLPARSE",
+    "XMLPI",
+    "XMLQUERY",
+    "XMLROOT",
+    "XMLSERIALIZE",
+    "XMLTABLE",
+    "XMLTEXT",
+    "XMLVALIDATE",
+    "YEAR",
+    "YES",
+    "ZONE",
+};
 
 /**
  * Copied from -- http://www.sqlite.org/lang_keywords.html
  */
-const char* sql_keywords[] = {
+constexpr std::array<const char*, 145> sqlite_keywords = {
     "ABORT",
     "ACTION",
     "ADD",
@@ -287,14 +859,15 @@ const std::unordered_map<unsigned char, const char*> sql_constraint_names = {
 #endif
 };
 
-std::multimap<std::string, help_text*> sqlite_function_help;
+std::multimap<std::string, const help_text*> sqlite_function_help;
+
+const char* const LNAV_ATTACH_DB
+    = "ATTACH DATABASE 'file:lnav_db?mode=memory&cache=shared' AS lnav_db";
 
 static int
 handle_db_list(void* ptr, int ncols, char** colvalues, char** colnames)
 {
-    struct sqlite_metadata_callbacks* smc;
-
-    smc = (struct sqlite_metadata_callbacks*) ptr;
+    auto* smc = (struct sqlite_metadata_callbacks*) ptr;
 
     smc->smc_db_list[colvalues[1]] = std::vector<std::string>();
     if (!smc->smc_database_list) {
@@ -305,14 +878,14 @@ handle_db_list(void* ptr, int ncols, char** colvalues, char** colnames)
 }
 
 struct table_list_data {
-    struct sqlite_metadata_callbacks* tld_callbacks;
+    sqlite_metadata_callbacks* tld_callbacks;
     db_table_map_t::iterator* tld_iter;
 };
 
 static int
 handle_table_list(void* ptr, int ncols, char** colvalues, char** colnames)
 {
-    struct table_list_data* tld = (struct table_list_data*) ptr;
+    auto* tld = (struct table_list_data*) ptr;
 
     (*tld->tld_iter)->second.emplace_back(colvalues[0]);
     if (!tld->tld_callbacks->smc_table_list) {
@@ -324,7 +897,7 @@ handle_table_list(void* ptr, int ncols, char** colvalues, char** colnames)
 }
 
 int
-walk_sqlite_metadata(sqlite3* db, struct sqlite_metadata_callbacks& smc)
+walk_sqlite_metadata(sqlite3* db, sqlite_metadata_callbacks& smc)
 {
     auto_mem<char, sqlite3_free> errmsg;
     int retval;
@@ -351,7 +924,7 @@ walk_sqlite_metadata(sqlite3* db, struct sqlite_metadata_callbacks& smc)
     for (auto iter = smc.smc_db_list.begin(); iter != smc.smc_db_list.end();
          ++iter)
     {
-        struct table_list_data tld = {&smc, &iter};
+        table_list_data tld = {&smc, &iter};
         auto_mem<char, sqlite3_free> query;
 
         query = sqlite3_mprintf(
@@ -370,11 +943,11 @@ walk_sqlite_metadata(sqlite3* db, struct sqlite_metadata_callbacks& smc)
              ++table_iter)
         {
             auto_mem<char, sqlite3_free> table_query;
-            std::string& table_name = *table_iter;
+            smc.smc_table_name = *table_iter;
 
             table_query = sqlite3_mprintf("pragma %Q.table_xinfo(%Q)",
                                           iter->first.c_str(),
-                                          table_name.c_str());
+                                          smc.smc_table_name.c_str());
             if (table_query == nullptr) {
                 return SQLITE_NOMEM;
             }
@@ -390,7 +963,7 @@ walk_sqlite_metadata(sqlite3* db, struct sqlite_metadata_callbacks& smc)
 
             table_query = sqlite3_mprintf("pragma %Q.foreign_key_list(%Q)",
                                           iter->first.c_str(),
-                                          table_name.c_str());
+                                          smc.smc_table_name.c_str());
             if (table_query == nullptr) {
                 return SQLITE_NOMEM;
             }
@@ -422,8 +995,8 @@ schema_collation_list(void* ptr, int ncols, char** colvalues, char** colnames)
 static int
 schema_db_list(void* ptr, int ncols, char** colvalues, char** colnames)
 {
-    struct sqlite_metadata_callbacks* smc = (sqlite_metadata_callbacks*) ptr;
-    std::string& schema_out = *((std::string*) smc->smc_userdata);
+    auto* smc = (sqlite_metadata_callbacks*) ptr;
+    auto& schema_out = *((std::string*) smc->smc_userdata);
     auto_mem<char, sqlite3_free> attach_sql;
 
     attach_sql = sqlite3_mprintf(
@@ -437,8 +1010,8 @@ schema_db_list(void* ptr, int ncols, char** colvalues, char** colnames)
 static int
 schema_table_list(void* ptr, int ncols, char** colvalues, char** colnames)
 {
-    struct sqlite_metadata_callbacks* smc = (sqlite_metadata_callbacks*) ptr;
-    std::string& schema_out = *((std::string*) smc->smc_userdata);
+    auto smc = (sqlite_metadata_callbacks*) ptr;
+    auto& schema_out = *((std::string*) smc->smc_userdata);
     auto_mem<char, sqlite3_free> create_sql;
 
     create_sql = sqlite3_mprintf("%s;\n", colvalues[1]);
@@ -463,14 +1036,15 @@ schema_foreign_key_list(void* ptr, int ncols, char** colvalues, char** colnames)
 void
 dump_sqlite_schema(sqlite3* db, std::string& schema_out)
 {
-    struct sqlite_metadata_callbacks schema_sql_meta_callbacks
-        = {schema_collation_list,
-           schema_db_list,
-           schema_table_list,
-           schema_table_info,
-           schema_foreign_key_list,
-           &schema_out,
-           {}};
+    sqlite_metadata_callbacks schema_sql_meta_callbacks = {
+        schema_collation_list,
+        schema_db_list,
+        schema_table_list,
+        schema_table_info,
+        schema_foreign_key_list,
+        &schema_out,
+        {},
+    };
 
     walk_sqlite_metadata(db, schema_sql_meta_callbacks);
 }
@@ -575,12 +1149,19 @@ sql_ident_needs_quote(const char* ident)
     return false;
 }
 
-char*
+std::string
+sql_quote_text(const std::string& str)
+{
+    auto quoted_token = lnav::sql::mprintf("%Q", str.c_str());
+    return {quoted_token};
+}
+
+auto_mem<char, sqlite3_free>
 sql_quote_ident(const char* ident)
 {
     bool needs_quote = false;
     size_t quote_count = 0, alloc_size;
-    char* retval;
+    auto_mem<char, sqlite3_free> retval;
 
     for (int lpc = 0; ident[lpc]; lpc++) {
         if ((lpc == 0 && isdigit(ident[lpc]))
@@ -594,8 +1175,8 @@ sql_quote_ident(const char* ident)
     }
 
     alloc_size = strlen(ident) + quote_count * 2 + (needs_quote ? 2 : 0) + 1;
-    if ((retval = (char*) sqlite3_malloc(alloc_size)) == NULL) {
-        retval = NULL;
+    if ((retval = (char*) sqlite3_malloc(alloc_size)) == nullptr) {
+        retval = nullptr;
     } else {
         char* curr = retval;
 
@@ -671,11 +1252,12 @@ annotate_sql_with_error(sqlite3* db, const char* sql, const char* tail)
         retval.append("\n");
     }
     retval.with_attr_for_all(VC_ROLE.value(role_t::VCR_QUOTED_CODE));
-    readline_sqlite_highlighter(retval, retval.length());
+    readline_sql_highlighter(
+        retval, lnav::sql::dialect::sqlite, retval.length());
 
     if (erroff != -1) {
         auto line_with_error
-            = string_fragment(retval.get_string())
+            = string_fragment::from_str(retval.get_string())
                   .find_boundaries_around(erroff, string_fragment::tag1{'\n'});
         auto erroff_in_line = erroff - line_with_error.sf_begin;
 
@@ -745,24 +1327,23 @@ sql_execute_script(sqlite3* db,
 
                 for (int lpc = 0; lpc < ncols; lpc++) {
                     const char* name = sqlite3_column_name(stmt, lpc);
-                    auto* raw_value = sqlite3_column_value(stmt, lpc);
-                    auto value_type = sqlite3_value_type(raw_value);
+                    auto value_type = sqlite3_column_type(stmt, lpc);
                     scoped_value_t value;
 
                     switch (value_type) {
                         case SQLITE_INTEGER:
-                            value = (int64_t) sqlite3_value_int64(raw_value);
+                            value = (int64_t) sqlite3_column_int64(stmt, lpc);
                             break;
                         case SQLITE_FLOAT:
-                            value = sqlite3_value_double(raw_value);
+                            value = sqlite3_column_double(stmt, lpc);
                             break;
                         case SQLITE_NULL:
                             value = null_value_t{};
                             break;
                         default:
                             value = string_fragment::from_bytes(
-                                sqlite3_value_text(raw_value),
-                                sqlite3_value_bytes(raw_value));
+                                sqlite3_column_text(stmt, lpc),
+                                sqlite3_column_bytes(stmt, lpc));
                             break;
                     }
                     lvars[name] = value;
@@ -817,17 +1398,23 @@ sql_compile_script(sqlite3* db,
         retcode = sqlite3_prepare_v2(db, script, -1, stmt.out(), &tail);
         log_debug("retcode %d  %p %p", retcode, script, tail);
         if (retcode != SQLITE_OK) {
-            const auto* errmsg = sqlite3_errmsg(db);
+            const auto errmsg = string_fragment::from_c_str(sqlite3_errmsg(db));
             auto sql_content = annotate_sql_with_error(db, script, tail);
-
-            errors.emplace_back(
-                lnav::console::user_message::error(
-                    "failed to compile SQL statement")
-                    .with_reason(errmsg)
-                    .with_snippet(
-                        lnav::console::snippet::from(
-                            intern_string::lookup(src_name), sql_content)
-                            .with_line(line_number)));
+            auto um = lnav::console::user_message::error(
+                          "failed to compile SQL statement")
+                          .with_reason(errmsg.to_string())
+                          .with_snippet(
+                              lnav::console::snippet::from(
+                                  intern_string::lookup(src_name), sql_content)
+                                  .with_line(line_number));
+            if (errmsg.startswith("no such table: main.lnav")) {
+                um.with_help(
+                    attr_line_t("The lnav tables have been moved to the ")
+                        .append_quoted("lnav_db"_symbol)
+                        .append(" database.  Try prefixing the name with ")
+                        .append("lnav_db."_quoted_code));
+            }
+            errors.emplace_back(um);
             break;
         }
         if (script == tail) {
@@ -852,22 +1439,31 @@ sql_execute_script(sqlite3* db,
     sql_compile_script(db, global_vars, src_name, script, errors);
 }
 
-static struct {
+static const struct {
     int sqlite_type;
     const char* collator;
     const char* sample;
 } TYPE_TEST_VALUE[] = {
     {SQLITE3_TEXT, "", "foobar"},
-    {SQLITE_INTEGER, "", "123"},
     {SQLITE_FLOAT, "", "123.0"},
+    {SQLITE_INTEGER, "", "123"},
     {SQLITE_TEXT, "ipaddress", "127.0.0.1"},
+    {SQLITE_TEXT, "measure_with_units", "123ms"},
+    {SQLITE_TEXT, "measure_with_units", "123 ms"},
+    {SQLITE_TEXT, "measure_with_units", "123KB"},
+    {SQLITE_TEXT, "measure_with_units", "123 KB"},
+    {SQLITE_TEXT, "measure_with_units", "123Kbps"},
+    {SQLITE_TEXT, "measure_with_units", "123.0 Kbps"},
+    {SQLITE_TEXT, "measure_with_units", "123.0KB"},
+    {SQLITE_TEXT, "measure_with_units", "123.0 KB"},
+    {SQLITE_TEXT, "measure_with_units", "123.0Kbps"},
+    {SQLITE_TEXT, "measure_with_units", "123.0 Kbps"},
 };
 
 int
 guess_type_from_pcre(const std::string& pattern, std::string& collator)
 {
-    static const std::vector<int> number_matches = {1, 2};
-
+    log_info("guessing SQL type from pattern: %s", pattern.c_str());
     auto compile_res = lnav::pcre2pp::code::from(pattern);
     if (compile_res.isErr()) {
         return SQLITE3_TEXT;
@@ -880,14 +1476,22 @@ guess_type_from_pcre(const std::string& pattern, std::string& collator)
 
     collator.clear();
     for (const auto& test_value : TYPE_TEST_VALUE) {
-        auto find_res
+        log_info("  testing sample: %s", test_value.sample);
+        const auto find_res
             = re.find_in(string_fragment::from_c_str(test_value.sample),
                          PCRE2_ANCHORED)
                   .ignore_error();
         if (find_res && find_res->f_all.sf_begin == 0
             && find_res->f_remaining.empty())
         {
+            log_info("    matched!");
             matches.push_back(index);
+            break;
+        }
+        if (!find_res) {
+            log_info("    mismatch");
+        } else if (!find_res->f_remaining.empty()) {
+            log_info("    incomplete match");
         }
 
         index += 1;
@@ -896,9 +1500,6 @@ guess_type_from_pcre(const std::string& pattern, std::string& collator)
     if (matches.size() == 1) {
         retval = TYPE_TEST_VALUE[matches.front()].sqlite_type;
         collator = TYPE_TEST_VALUE[matches.front()].collator;
-    } else if (matches == number_matches) {
-        retval = SQLITE_FLOAT;
-        collator = "";
     }
 
     return retval;
@@ -920,7 +1521,7 @@ sqlite3_type_to_string(int type)
             return "BLOB";
     }
 
-    ensure("Invalid sqlite type");
+    ensure(!!!"Invalid sqlite type");
 
     return nullptr;
 }
@@ -932,6 +1533,9 @@ sqlite_close_wrapper(void* mem)
     sqlite3_close_v2((sqlite3*) mem);
 }
 
+static thread_local std::set<std::string>* tl_authorizer_table_capture
+    = nullptr;
+
 int
 sqlite_authorizer(void* pUserData,
                   int action_code,
@@ -940,10 +1544,83 @@ sqlite_authorizer(void* pUserData,
                   const char* detail3,
                   const char* detail4)
 {
-    if (action_code == SQLITE_ATTACH) {
+    static auto& lnflags = injector::get<lnav_flags_storage&>();
+
+    if (lnflags.is_set<lnav_flags::secure_mode>()
+        && action_code == SQLITE_ATTACH)
+    {
         return SQLITE_DENY;
     }
+    if (action_code == SQLITE_READ && tl_authorizer_table_capture != nullptr
+        && detail1 != nullptr)
+    {
+        tl_authorizer_table_capture->emplace(detail1);
+    }
     return SQLITE_OK;
+}
+
+sql_table_capture_guard::sql_table_capture_guard(std::set<std::string>& into)
+    : stcg_prev(tl_authorizer_table_capture)
+{
+    tl_authorizer_table_capture = &into;
+}
+
+sql_table_capture_guard::~sql_table_capture_guard()
+{
+    tl_authorizer_table_capture = this->stcg_prev;
+}
+
+#if HAVE_RUST_DEPS
+extern rust::Vec<lnav_rs_ext::SourceTreeElement> sqlite_extension_prql;
+#endif
+
+Result<std::string, lnav::console::user_message>
+lnav::prql::compile(const std::string& src)
+{
+#if HAVE_RUST_DEPS
+    auto opts = lnav_rs_ext::Options{true, "sql.sqlite", true};
+
+    auto tree = sqlite_extension_prql;
+    for (const auto& mod : lnav_prql_modules) {
+        auto name = mod.get_name().to_string();
+        log_debug("lnav_rs_ext adding mod %s", name.c_str());
+        tree.emplace_back(lnav_rs_ext::SourceTreeElement{
+            name.c_str(),
+            mod.to_string_fragment_producer()->to_string(),
+        });
+    }
+    tree.emplace_back(lnav_rs_ext::SourceTreeElement{"", src});
+    log_debug("BEGIN compiling tree");
+    auto cr = lnav_rs_ext::compile_tree(tree, opts);
+    log_debug("END compiling tree");
+
+    for (const auto& msg : cr.messages) {
+        if (msg.kind != lnav_rs_ext::MessageKind::Error) {
+            continue;
+        }
+
+        auto stmt_al = attr_line_t(src);
+        readline_sql_highlighter(stmt_al, lnav::sql::dialect::prql, 0);
+        auto um = lnav::console::user_message::error(
+                      attr_line_t("unable to compile PRQL: ").append(stmt_al))
+                      .with_reason(
+                          attr_line_t::from_ansi_str((std::string) msg.reason));
+        if (!msg.display.empty()) {
+            um.with_note(attr_line_t::from_ansi_str((std::string) msg.display));
+        }
+        for (const auto& hint : msg.hints) {
+            um.with_help(attr_line_t::from_ansi_str((std::string) hint));
+            break;
+        }
+        return Err(um);
+    }
+    log_debug("done!");
+    return Ok((std::string) cr.output);
+#else
+    auto um = lnav::console::user_message::error(
+        attr_line_t("PRQL is not supported in this build"));
+    return Err(um);
+#endif
 }
 
 attr_line_t
@@ -964,48 +1641,73 @@ sqlite3_errmsg_to_attr_line(sqlite3* db)
     return attr_line_t(errmsg);
 }
 
-std::string
-sql_keyword_re()
+static void
+append_kw(std::string& retval, bool& first, const char* kw)
+{
+    if (!first) {
+        retval.append("|");
+    } else {
+        first = false;
+    }
+    retval.append("\\b");
+    retval.append(kw);
+    retval.append("\\b");
+}
+
+static std::string
+sql_keyword_re(lnav::sql::dialect dia)
 {
     std::string retval = "(?:";
-    bool first = true;
+    auto first = true;
 
-    for (const char* kw : sql_keywords) {
-        if (!first) {
-            retval.append("|");
-        } else {
-            first = false;
-        }
-        retval.append("\\b");
-        retval.append(kw);
-        retval.append("\\b");
+    switch (dia) {
+        case lnav::sql::dialect::sqlite:
+            for (const char* kw : sqlite_keywords) {
+                append_kw(retval, first, kw);
+            }
+            break;
+        default:
+            for (const char* kw : pg_sql_keywords) {
+                append_kw(retval, first, kw);
+            }
+            break;
     }
+
     retval += ")";
 
     return retval;
 }
 
-string_attr_type<void> SQL_COMMAND_ATTR("sql_command");
-string_attr_type<void> SQL_KEYWORD_ATTR("sql_keyword");
-string_attr_type<void> SQL_IDENTIFIER_ATTR("sql_ident");
-string_attr_type<void> SQL_FUNCTION_ATTR("sql_func");
-string_attr_type<void> SQL_STRING_ATTR("sql_string");
-string_attr_type<void> SQL_NUMBER_ATTR("sql_number");
-string_attr_type<void> SQL_UNTERMINATED_STRING_ATTR("sql_unstring");
-string_attr_type<void> SQL_OPERATOR_ATTR("sql_oper");
-string_attr_type<void> SQL_PAREN_ATTR("sql_paren");
-string_attr_type<void> SQL_COMMA_ATTR("sql_comma");
-string_attr_type<void> SQL_GARBAGE_ATTR("sql_garbage");
-string_attr_type<void> SQL_COMMENT_ATTR("sql_comment");
+constexpr string_attr_type<void> SQL_COMMAND_ATTR("sql_command");
+constexpr string_attr_type<void> SQL_KEYWORD_ATTR("sql_keyword");
+constexpr string_attr_type<void> SQL_IDENTIFIER_ATTR("sql_ident");
+constexpr string_attr_type<std::string> SQL_FUNCTION_ATTR("sql_func");
+constexpr string_attr_type<void> SQL_STRING_ATTR("sql_string");
+constexpr string_attr_type<void> SQL_HEX_LIT_ATTR("sql_hex_lit");
+constexpr string_attr_type<void> SQL_NUMBER_ATTR("sql_number");
+constexpr string_attr_type<void> SQL_OPERATOR_ATTR("sql_oper");
+constexpr string_attr_type<void> SQL_PAREN_ATTR("sql_paren");
+constexpr string_attr_type<void> SQL_COMMA_ATTR("sql_comma");
+constexpr string_attr_type<void> SQL_GARBAGE_ATTR("sql_garbage");
+constexpr string_attr_type<void> SQL_COMMENT_ATTR("sql_comment");
 
 void
-annotate_sql_statement(attr_line_t& al)
+annotate_sql_statement(attr_line_t& al, lnav::sql::dialect dia)
 {
-    static const std::string keyword_re_str = R"(\A)" + sql_keyword_re();
+    static const std::string sqlite_keyword_re_str
+        = R"(\A)" + sql_keyword_re(lnav::sql::dialect::sqlite);
+    static const auto sqlite_keyword_re
+        = lnav::pcre2pp::code::from(sqlite_keyword_re_str, PCRE2_CASELESS)
+              .unwrap();
+    static const std::string sql_keyword_re_str
+        = R"(\A)" + sql_keyword_re(lnav::sql::dialect::sql);
+    static const auto sql_keyword_re
+        = lnav::pcre2pp::code::from(sql_keyword_re_str, PCRE2_CASELESS)
+              .unwrap();
 
     static const struct {
         lnav::pcre2pp::code re;
-        string_attr_type<void>* type;
+        const string_attr_type<void>* type;
     } PATTERNS[] = {
         {
             lnav::pcre2pp::code::from_const(R"(\A,)"),
@@ -1016,16 +1718,21 @@ annotate_sql_statement(attr_line_t& al)
             &SQL_PAREN_ATTR,
         },
         {
-            lnav::pcre2pp::code::from(keyword_re_str, PCRE2_CASELESS).unwrap(),
-            &SQL_KEYWORD_ATTR,
+            lnav::pcre2pp::code::from_const(
+                R"(\A(?:x|X)'(?:(?:[0-9a-fA-F]{2})+'|[0-9a-fA-F]*$))"),
+            &SQL_HEX_LIT_ATTR,
         },
         {
             lnav::pcre2pp::code::from_const(R"(\A'[^']*('(?:'[^']*')*|$))"),
             &SQL_STRING_ATTR,
         },
         {
+            lnav::pcre2pp::code::from_const(R"(\A0x[0-9a-fA-F]+)"),
+            &SQL_NUMBER_ATTR,
+        },
+        {
             lnav::pcre2pp::code::from_const(
-                R"(\A-?\d+(?:\.\d*(?:[eE][\-\+]?\d+)?)?|0x[0-9a-fA-F]+$)"),
+                R"(\A-?\d+(?:\.\d+)?(?:[eE][\-\+]?\d+)?\b)"),
             &SQL_NUMBER_ATTR,
         },
         {
@@ -1039,8 +1746,13 @@ annotate_sql_statement(attr_line_t& al)
             &SQL_COMMENT_ATTR,
         },
         {
-            lnav::pcre2pp::code::from_const(R"(\A(\*|<|>|=|!|\-|\+|\|\|))"),
+            lnav::pcre2pp::code::from_const(
+                R"(\A(~|%|\*|\->{1,2}|<=|>=|<<|>>|<>|<|>|={1,2}|!=?|\-|\+|\|\|{1,2}|&|::))"),
             &SQL_OPERATOR_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from_const(R"(\A[0-9][a-zA-Z0-9\-\._]+)"),
+            &SQL_GARBAGE_ATTR,
         },
         {
             lnav::pcre2pp::code::from_const(R"(\A.)"),
@@ -1049,11 +1761,16 @@ annotate_sql_statement(attr_line_t& al)
     };
 
     static const auto cmd_pattern
-        = lnav::pcre2pp::code::from_const(R"(^(\.\w+))");
+        = lnav::pcre2pp::code::from_const(R"(^;?(\.\w+))");
     static const auto ws_pattern = lnav::pcre2pp::code::from_const(R"(\A\s+)");
 
-    auto& line = al.get_string();
+    const auto& line = al.get_string();
     auto& sa = al.get_attrs();
+
+    if (lnav::sql::is_prql(line)) {
+        lnav::sql::annotate_prql_statement(al);
+        return;
+    }
 
     auto cmd_find_res
         = cmd_pattern.find_in(line, PCRE2_ANCHORED).ignore_error();
@@ -1069,6 +1786,16 @@ annotate_sql_statement(attr_line_t& al)
         auto ws_find_res = ws_pattern.find_in(remaining).ignore_error();
         if (ws_find_res) {
             remaining = ws_find_res->f_remaining;
+            continue;
+        }
+        const auto& kw_pat = dia == lnav::sql::dialect::sqlite
+            ? sqlite_keyword_re
+            : sql_keyword_re;
+        auto kw_pat_find_res = kw_pat.find_in(remaining).ignore_error();
+        if (kw_pat_find_res) {
+            sa.emplace_back(to_line_range(kw_pat_find_res->f_all),
+                            SQL_KEYWORD_ATTR.value());
+            remaining = kw_pat_find_res->f_remaining;
             continue;
         }
         for (const auto& pat : PATTERNS) {
@@ -1089,22 +1816,10 @@ annotate_sql_statement(attr_line_t& al)
            != sa.end())
     {
         string_attrs_t::const_iterator piter;
-        bool found_open = false;
-        ssize_t lpc;
 
         start = iter->sa_range.lr_end;
-        for (lpc = iter->sa_range.lr_end; lpc < (int) line.length(); lpc++) {
-            if (line[lpc] == '(') {
-                found_open = true;
-                break;
-            }
-            if (!isspace(line[lpc])) {
-                break;
-            }
-        }
-
-        if (found_open) {
-            ssize_t pstart = lpc + 1;
+        if (start < (ssize_t) line.length() && line[start] == '(') {
+            ssize_t pstart = start + 1;
             int depth = 1;
 
             while (depth > 0
@@ -1123,19 +1838,25 @@ annotate_sql_statement(attr_line_t& al)
             if (piter == sa.end()) {
                 func_range.lr_end = line.length();
             } else {
-                func_range.lr_end = piter->sa_range.lr_end - 1;
+                func_range.lr_end = piter->sa_range.lr_end;
             }
-            sa.emplace_back(func_range, SQL_FUNCTION_ATTR.value());
+            auto func_name = al.to_string_fragment(iter);
+            sa.emplace_back(
+                func_range,
+                SQL_FUNCTION_ATTR.value(tolower(func_name.to_string())));
         }
     }
 
-    remove_string_attr(sa, &SQL_PAREN_ATTR);
+    // remove_string_attr(sa, &SQL_PAREN_ATTR);
     stable_sort(sa.begin(), sa.end());
 }
 
 std::vector<const help_text*>
 find_sql_help_for_line(const attr_line_t& al, size_t x)
 {
+    static const auto* sql_cmd_map
+        = injector::get<lnav::commands::command_map_t*, sql_cmd_map_tag>();
+
     std::vector<const help_text*> retval;
     const auto& sa = al.get_attrs();
     std::string name;
@@ -1144,16 +1865,43 @@ find_sql_help_for_line(const attr_line_t& al, size_t x)
 
     {
         auto sa_opt = get_string_attr(al.get_attrs(), &SQL_COMMAND_ATTR);
-
         if (sa_opt) {
-            auto* sql_cmd_map = injector::get<readline_context::command_map_t*,
-                                              sql_cmd_map_tag>();
             auto cmd_name = al.get_substring((*sa_opt)->sa_range);
             auto cmd_iter = sql_cmd_map->find(cmd_name);
 
             if (cmd_iter != sql_cmd_map->end()) {
                 return {&cmd_iter->second->c_help};
             }
+        }
+
+        auto prql_trans_iter = find_string_attr_containing(
+            al.get_attrs(), &lnav::sql::PRQL_TRANSFORM_ATTR, x);
+        if (prql_trans_iter != al.get_attrs().end()) {
+            auto cmd_name = al.get_substring(prql_trans_iter->sa_range);
+            auto cmd_iter = sql_cmd_map->find(cmd_name);
+
+            if (cmd_iter != sql_cmd_map->end()) {
+                return {&cmd_iter->second->c_help};
+            }
+        }
+    }
+
+    auto prql_fqid_iter = find_string_attr_containing(
+        al.get_attrs(), &lnav::sql ::PRQL_FQID_ATTR, x);
+    if (prql_fqid_iter != al.get_attrs().end()) {
+        auto fqid = al.get_substring(prql_fqid_iter->sa_range);
+        auto cmd_iter = sql_cmd_map->find(fqid);
+        if (cmd_iter != sql_cmd_map->end()) {
+            return {&cmd_iter->second->c_help};
+        }
+
+        auto func_pair = lnav::sql::prql_functions.equal_range(fqid);
+
+        for (auto func_iter = func_pair.first; func_iter != func_pair.second;
+             ++func_iter)
+        {
+            retval.emplace_back(func_iter->second);
+            return retval;
         }
     }
 
@@ -1164,9 +1912,8 @@ find_sql_help_for_line(const attr_line_t& al, size_t x)
             return false;
         }
 
-        const std::string& str = al.get_string();
-        const line_range& lr = sa.sa_range;
-        int lpc;
+        const auto& str = al.get_string();
+        const auto& lr = sa.sa_range;
 
         if (sa.sa_type == &SQL_FUNCTION_ATTR) {
             if (!sa.sa_range.contains(x)) {
@@ -1174,7 +1921,8 @@ find_sql_help_for_line(const attr_line_t& al, size_t x)
             }
         }
 
-        for (lpc = lr.lr_start; lpc < lr.lr_end; lpc++) {
+        auto lpc = lr.lr_start;
+        for (; lpc < lr.lr_end; lpc++) {
             if (!isalnum(str[lpc]) && str[lpc] != '_') {
                 break;
             }
@@ -1218,3 +1966,361 @@ find_sql_help_for_line(const attr_line_t& al, size_t x)
 
     return retval;
 }
+
+template<>
+Result<lnav::sql::dialect, std::string>
+from(string_fragment sf)
+{
+    if (sf == "sql"_frag) {
+        return Ok(lnav::sql::dialect::sql);
+    }
+    if (sf == "sqlite"_frag) {
+        return Ok(lnav::sql::dialect::sqlite);
+    }
+    if (sf == "plpgsql"_frag) {
+        return Ok(lnav::sql::dialect::plpgsql);
+    }
+    if (sf == "prql"_frag) {
+        return Ok(lnav::sql::dialect::prql);
+    }
+    return Err(fmt::format(FMT_STRING("unknown SQL dialect: {}"), sf));
+}
+
+namespace lnav {
+namespace sql {
+
+auto_mem<char, sqlite3_free>
+mprintf(const char* fmt, ...)
+{
+    auto_mem<char, sqlite3_free> retval;
+    va_list args;
+
+    va_start(args, fmt);
+    retval = sqlite3_vmprintf(fmt, args);
+    va_end(args);
+
+    return retval;
+}
+
+bool
+is_prql(const string_fragment& sf)
+{
+    auto trimmed = sf.trim().skip(string_fragment::tag1{';'});
+
+    return trimmed == "let"_frag || trimmed.startswith("let ")
+        || trimmed.startswith("from");
+}
+
+static const char* const prql_transforms[] = {
+    "aggregate",
+    "append",
+    "derive",
+    "filter",
+    "from",
+    "group",
+    "join",
+    "loop",
+    "select",
+    "sort",
+    "take",
+    "window",
+
+    nullptr,
+};
+
+const char* const prql_keywords[] = {
+    "average", "avg", "case", "count", "count_distinct", "false", "func",
+    "into",    "let", "max",  "min",   "module",         "null",  "prql",
+    "stddev",  "sum", "true", "type",
+
+    nullptr,
+};
+
+std::string
+prql_keyword_re()
+{
+    std::string retval = "(?:";
+    bool first = true;
+
+    for (const char* kw : prql_keywords) {
+        if (kw == nullptr) {
+            break;
+        }
+        if (!first) {
+            retval.append("|");
+        } else {
+            first = false;
+        }
+        retval.append("\\b");
+        retval.append(kw);
+        retval.append("\\b");
+    }
+    retval += ")";
+
+    return retval;
+}
+
+std::string
+prql_transform_re()
+{
+    std::string retval = "(?:";
+    bool first = true;
+
+    for (const char* kw : prql_transforms) {
+        if (kw == nullptr) {
+            break;
+        }
+        if (!first) {
+            retval.append("|");
+        } else {
+            first = false;
+        }
+        retval.append("\\b");
+        retval.append(kw);
+        retval.append("\\b");
+    }
+    retval += ")";
+
+    return retval;
+}
+
+constexpr string_attr_type<void> PRQL_STAGE_ATTR("prql_stage");
+constexpr string_attr_type<void> PRQL_TRANSFORM_ATTR("prql_transform");
+constexpr string_attr_type<void> PRQL_KEYWORD_ATTR("prql_keyword");
+constexpr string_attr_type<void> PRQL_IDENTIFIER_ATTR("prql_ident");
+constexpr string_attr_type<void> PRQL_FQID_ATTR("prql_fqid");
+constexpr string_attr_type<void> PRQL_DOT_ATTR("prql_dot");
+constexpr string_attr_type<void> PRQL_PIPE_ATTR("prql_pipe");
+constexpr string_attr_type<void> PRQL_STRING_ATTR("prql_string");
+constexpr string_attr_type<void> PRQL_NUMBER_ATTR("prql_number");
+constexpr string_attr_type<void> PRQL_OPERATOR_ATTR("prql_oper");
+constexpr string_attr_type<void> PRQL_PAREN_ATTR("prql_paren");
+constexpr string_attr_type<void> PRQL_UNTERMINATED_PAREN_ATTR(
+    "prql_unterminated_paren");
+constexpr string_attr_type<void> PRQL_GARBAGE_ATTR("prql_garbage");
+constexpr string_attr_type<void> PRQL_COMMENT_ATTR("prql_comment");
+
+void
+annotate_prql_statement(attr_line_t& al)
+{
+    static const std::string keyword_re_str = R"(\A)" + prql_keyword_re();
+    static const std::string transform_re_str = R"(\A)" + prql_transform_re();
+
+    static const struct {
+        lnav::pcre2pp::code re;
+        const string_attr_type<void>* type;
+    } PATTERNS[] = {
+        {
+            lnav::pcre2pp::code::from_const(R"(\A(?:\[|\]|\{|\}|\(|\)))"),
+            &PRQL_PAREN_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from(transform_re_str).unwrap(),
+            &PRQL_TRANSFORM_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from(keyword_re_str).unwrap(),
+            &PRQL_KEYWORD_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from_const(R"(\A(?:f|r|s)?'([^']|\\.)*')"),
+            &PRQL_STRING_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from_const(R"(\A(?:f|r|s)?"([^\"]|\\.)*")"),
+            &PRQL_STRING_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from_const(R"(\A0x[0-9a-fA-F]+)"),
+            &PRQL_NUMBER_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from_const(
+                R"(\A-?\d+(?:\.\d+)?(?:[eE][\-\+]?\d+)?)"),
+            &PRQL_NUMBER_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from_const(
+                R"(\A(?:(?:(?:\$)?\b[a-z_]\w*)|`([^`]+)`))", PCRE2_CASELESS),
+            &PRQL_IDENTIFIER_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from_const(R"(\A#.*)"),
+            &PRQL_COMMENT_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from_const(
+                R"(\A(\*|\->{1,2}|<|>|=>|={1,2}|\|\||&&|!|\-|\+|~=|\.\.|,|\?\?))"),
+            &PRQL_OPERATOR_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from_const(R"(\A(?:\||\n))"),
+            &PRQL_PIPE_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from_const(R"(\A\.)"),
+            &PRQL_DOT_ATTR,
+        },
+        {
+            lnav::pcre2pp::code::from_const(R"(\A.)"),
+            &PRQL_GARBAGE_ATTR,
+        },
+    };
+
+    static const auto ws_pattern
+        = lnav::pcre2pp::code::from_const(R"(\A[ \t\r]+)");
+
+    const auto& line = al.get_string();
+    auto& sa = al.get_attrs();
+    auto remaining = string_fragment::from_str(line);
+    while (!remaining.empty()) {
+        auto ws_find_res = ws_pattern.find_in(remaining).ignore_error();
+        if (ws_find_res) {
+            remaining = ws_find_res->f_remaining;
+            continue;
+        }
+        for (const auto& pat : PATTERNS) {
+            auto pat_find_res = pat.re.find_in(remaining).ignore_error();
+            if (pat_find_res) {
+                sa.emplace_back(to_line_range(pat_find_res->f_all),
+                                pat.type->value());
+                if (sa.back().sa_type == &PRQL_PIPE_ATTR
+                    && pat_find_res->f_all == "\n"_frag)
+                {
+                    sa.back().sa_range.lr_start += 1;
+                }
+                remaining = pat_find_res->f_remaining;
+                break;
+            }
+        }
+    }
+
+    auto stages = std::vector<int>{};
+    std::vector<std::pair<char, int>> groups;
+    std::vector<line_range> fqids;
+    std::optional<line_range> id_start;
+    const string_attr_type_base* last_attr_type = nullptr;
+    bool saw_id_dot = false;
+    for (const auto& attr : sa) {
+        if (attr.sa_type == &PRQL_PIPE_ATTR && groups.size() == 1
+            && groups.front().first == 'l')
+        {
+            groups.pop_back();
+            last_attr_type = nullptr;
+            continue;
+        }
+        if (groups.empty() && attr.sa_type == &PRQL_PIPE_ATTR
+            && last_attr_type != &PRQL_PIPE_ATTR)
+        {
+            stages.push_back(attr.sa_range.lr_start);
+        }
+        last_attr_type = attr.sa_type;
+        if (!id_start) {
+            if (attr.sa_type == &PRQL_IDENTIFIER_ATTR) {
+                id_start = attr.sa_range;
+                saw_id_dot = false;
+            }
+        } else if (!saw_id_dot) {
+            if (attr.sa_type == &PRQL_DOT_ATTR) {
+                saw_id_dot = true;
+            } else {
+                fqids.emplace_back(id_start.value());
+                if (attr.sa_type == &PRQL_IDENTIFIER_ATTR) {
+                    id_start = attr.sa_range;
+                } else {
+                    id_start = std::nullopt;
+                }
+                saw_id_dot = false;
+            }
+        } else {
+            if (attr.sa_type == &PRQL_IDENTIFIER_ATTR) {
+                id_start = line_range{
+                    id_start.value().lr_start,
+                    attr.sa_range.lr_end,
+                };
+            } else {
+                id_start = std::nullopt;
+            }
+            saw_id_dot = false;
+        }
+        if (attr.sa_type == &PRQL_KEYWORD_ATTR
+            && al.to_string_fragment(attr) == "let"_frag)
+        {
+            groups.emplace_back('l', attr.sa_range.lr_start);
+        }
+        if (attr.sa_type != &PRQL_PAREN_ATTR) {
+            continue;
+        }
+
+        auto ch = line[attr.sa_range.lr_start];
+        switch (ch) {
+            case '(':
+            case '{':
+            case '[':
+                groups.emplace_back(ch, attr.sa_range.lr_start);
+                break;
+            case ')':
+                if (!groups.empty() && groups.back().first == '(') {
+                    groups.pop_back();
+                }
+                break;
+            case '}':
+                if (!groups.empty() && groups.back().first == '{') {
+                    groups.pop_back();
+                }
+                break;
+            case ']':
+                if (!groups.empty() && groups.back().first == '[') {
+                    groups.pop_back();
+                }
+                break;
+        }
+    }
+    if (id_start) {
+        fqids.emplace_back(id_start.value());
+    }
+    int prev_stage_index = 0;
+    for (auto stage_index : stages) {
+        sa.emplace_back(line_range{prev_stage_index, stage_index},
+                        PRQL_STAGE_ATTR.value());
+        prev_stage_index = stage_index;
+    }
+    sa.emplace_back(
+        line_range{prev_stage_index, (int) al.get_string().length()},
+        PRQL_STAGE_ATTR.value());
+    for (const auto& group : groups) {
+        sa.emplace_back(line_range{group.second, group.second + 1},
+                        PRQL_UNTERMINATED_PAREN_ATTR.value());
+    }
+    for (const auto& fqid_range : fqids) {
+        sa.emplace_back(fqid_range, PRQL_FQID_ATTR.value());
+    }
+    remove_string_attr(sa, &PRQL_IDENTIFIER_ATTR);
+    remove_string_attr(sa, &PRQL_DOT_ATTR);
+
+    stable_sort(sa.begin(), sa.end());
+}
+
+}  // namespace sql
+
+namespace prql {
+
+std::string
+quote_ident(std::string id)
+{
+    static const auto PLAIN_NAME
+        = pcre2pp::code::from_const("^[a-zA-Z_][a-zA-Z_0-9]*$");
+
+    if (PLAIN_NAME.find_in(id).ignore_error()) {
+        return id;
+    }
+
+    auto buf = auto_buffer::alloc(id.length() + 8);
+    quote_content(buf, id, '`');
+
+    return fmt::format(FMT_STRING("`{}`"), buf.in());
+}
+
+}  // namespace prql
+
+}  // namespace lnav

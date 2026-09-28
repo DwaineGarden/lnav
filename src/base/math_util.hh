@@ -30,9 +30,12 @@
 #ifndef lnav_math_util_hh
 #define lnav_math_util_hh
 
+#include <cmath>
+
 #include <sys/types.h>
 
 #undef rounddown
+#undef roundup
 
 /**
  * Round down a number based on a given granularity.
@@ -41,10 +44,21 @@
  * @param step The granularity.
  */
 template<typename Size, typename Step>
-inline int
+auto
 rounddown(Size size, Step step)
 {
     return size - (size % step);
+}
+
+template<typename Size, typename Step>
+auto
+roundup(Size size, Step step)
+{
+    auto retval = size + (step - Step{1});
+
+    retval -= (retval % step);
+
+    return retval;
 }
 
 inline int
@@ -53,10 +67,11 @@ rounddown_offset(size_t size, int step, int offset)
     return size - ((size - offset) % step);
 }
 
-inline size_t
-roundup_size(size_t size, int step)
+template<typename Size, typename Step>
+auto
+roundup_size(Size size, Step step)
 {
-    size_t retval = size + step;
+    auto retval = size + step;
 
     retval -= (retval % step);
 
@@ -69,5 +84,100 @@ abs_diff(T a, T b)
 {
     return a > b ? a - b : b - a;
 }
+
+template<typename T>
+class clamped {
+public:
+    static clamped from(T value, T min, T max) { return {value, min, max}; }
+
+    clamped& operator+=(T rhs)
+    {
+        if (rhs < 0) {
+            return this->operator-=(-rhs);
+        }
+
+        if (this->c_value + rhs < this->c_max) {
+            this->c_value += rhs;
+        } else {
+            this->c_value = this->c_max;
+        }
+
+        return *this;
+    }
+
+    clamped& operator-=(T rhs)
+    {
+        if (rhs < 0) {
+            return this->operator+=(-rhs);
+        }
+
+        if (this->c_value - rhs > this->c_min) {
+            this->c_value -= rhs;
+        } else {
+            this->c_value = this->c_min;
+        }
+
+        return *this;
+    }
+
+    bool available_to_consume(T rhs) const
+    {
+        return (this->c_value - rhs > this->c_min);
+    }
+
+    bool try_consume(T rhs)
+    {
+        if (rhs == 0) {
+            return false;
+        }
+
+        if (this->c_value - rhs > this->c_min) {
+            this->c_value -= rhs;
+            return true;
+        }
+
+        return false;
+    }
+
+    operator T() const { return this->c_value; }
+
+    bool is_min() const { return this->c_value == this->c_min; }
+
+    T get_min() const { return this->c_min; }
+
+    T get_max() const { return this->c_max; }
+
+private:
+    clamped(T value, T min, T max) : c_value(value), c_min(min), c_max(max) {}
+
+    T c_value;
+    T c_min;
+    T c_max;
+};
+
+template<typename T>
+std::enable_if_t<std::is_integral_v<T>, size_t>
+count_digits(T n)
+{
+    return n == 0 ? 1 : 1 + std::floor(std::log10(std::abs(n)));
+}
+
+namespace lnav::math {
+
+template<typename T>
+T
+vmax(T a, T b)
+{
+    return (a > b) ? a : b;
+}
+
+template<typename T, typename... Args>
+T
+vmax(T a, T b, Args... args)
+{
+    return vmax(vmax(a, b), args...);
+}
+
+}  // namespace lnav::math
 
 #endif

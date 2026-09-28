@@ -29,24 +29,21 @@
 
 #include "top_status_source.hh"
 
-#include "base/injector.hh"
 #include "config.h"
 #include "lnav.hh"
 #include "md2attr_line.hh"
 #include "md4cpp.hh"
 #include "shlex.hh"
-#include "shlex.resolver.hh"
-#include "sql_util.hh"
 #include "sqlitepp.client.hh"
 #include "top_status_source.cfg.hh"
 
-static const char* MSG_QUERY = R"(
+static const char* const MSG_QUERY = R"(
 SELECT message FROM lnav_user_notifications
   WHERE message IS NOT NULL AND
         (expiration IS NULL OR expiration > datetime('now')) AND
         (views IS NULL OR
          json_contains(views, (SELECT name FROM lnav_top_view)))
-  ORDER BY priority DESC
+  ORDER BY priority DESC, expiration ASC
   LIMIT 1
 )";
 
@@ -55,41 +52,49 @@ top_status_source::top_status_source(auto_sqlite3& db,
     : tss_config(cfg),
       tss_user_msgs_stmt(prepare_stmt(db.in(), MSG_QUERY).unwrap())
 {
+    this->tss_fields[TSF_EXT_ACCESS].set_width(0);
+    this->tss_fields[TSF_EXT_ACCESS].right_justify(true);
     this->tss_fields[TSF_TIME].set_width(28);
-    this->tss_fields[TSF_TIME].set_role(role_t::VCR_STATUS_INFO);
     this->tss_fields[TSF_USER_MSG].set_share(1);
     this->tss_fields[TSF_USER_MSG].right_justify(true);
-    this->tss_fields[TSF_USER_MSG].set_role(role_t::VCR_STATUS_INFO);
+
+    for (auto& sf : this->tss_fields) {
+        sf.set_role(role_t::VCR_INACTIVE_STATUS);
+    }
 }
 
-void
+bool
 top_status_source::update_time(const timeval& current_time)
 {
-    auto& sf = this->tss_fields[TSF_TIME];
     char buffer[32];
+    tm current_tm;
 
     buffer[0] = ' ';
     strftime(&buffer[1],
              sizeof(buffer) - 1,
              this->tss_config.tssc_clock_format.c_str(),
-             localtime(&current_time.tv_sec));
-    sf.set_value(buffer);
+             localtime_r(&current_time.tv_sec, &current_tm));
+    auto& sf = this->tss_fields[TSF_TIME];
+    if (sf.get_value().al_string != buffer) {
+        sf.set_value(buffer);
+        return true;
+    }
+    return false;
 }
 
 void
 top_status_source::update_time()
 {
-    struct timeval tv;
+    timeval tv;
 
     gettimeofday(&tv, nullptr);
     this->update_time(tv);
 }
 
-void
+bool
 top_status_source::update_user_msg()
 {
-    auto& al = this->tss_fields[TSF_USER_MSG].get_value();
-    al.clear();
+    auto al = attr_line_t();
 
     this->tss_user_msgs_stmt.reset();
     auto fetch_res = this->tss_user_msgs_stmt.fetch_row<std::string>();
@@ -99,7 +104,8 @@ top_status_source::update_user_msg()
             std::string user_note;
 
             lexer.with_ignore_quotes(true).eval(
-                user_note, lnav_data.ld_exec_context.ec_global_vars);
+                user_note,
+                scoped_resolver{&lnav_data.ld_exec_context.ec_global_vars});
 
             md2attr_line mdal;
             auto parse_res = md4cpp::parse(user_note, mdal);
@@ -119,4 +125,13 @@ top_status_source::update_user_msg()
             log_error("failed to execute user-message expression: %s",
                       fe.fe_msg.c_str());
         });
+    this->tss_user_msgs_stmt.reset();
+
+    auto& curr_msg = this->tss_fields[TSF_USER_MSG].get_value();
+    if (al.al_string != curr_msg.al_string) {
+        curr_msg = al;
+        return true;
+    }
+
+    return false;
 }

@@ -33,17 +33,27 @@
 
 #include "ansi_scrubber.hh"
 
+#include "ansi_vars.hh"
+#include "base/lnav_log.hh"
 #include "base/opt_util.hh"
 #include "config.h"
 #include "pcrepp/pcre2pp.hh"
-#include "scn/scn.h"
-#include "view_curses.hh"
+#include "scn/scan.h"
+
+using std::string_literals::operator""s;
 
 static const lnav::pcre2pp::code&
 ansi_regex()
 {
     static const auto retval = lnav::pcre2pp::code::from_const(
-        "\x1b\\[([\\d=;\\?]*)([a-zA-Z])|(?:\\X\x08\\X)+");
+        R"(
+            \x00                                      # NUL
+          | \x1b \[ ([\d=;:\?]*) ([a-zA-Z])           # CSI: ESC [ <params> <final>
+          | \x1b \] (\d+) ; (.*?) (?:\x07 | \x1b\\)   # OSC: ESC ] <code> ; <payload> (BEL|ST)
+          | (?: \X \x08 \X )+                         # Overstrike: glyph BS glyph
+          | (\x16+)                                   # SYN run
+        )",
+        PCRE2_EXTENDED);
 
     return retval;
 }
@@ -51,10 +61,10 @@ ansi_regex()
 size_t
 erase_ansi_escapes(string_fragment input)
 {
-    static thread_local auto md = lnav::pcre2pp::match_data::unitialized();
+    thread_local auto md = lnav::pcre2pp::match_data::unitialized();
 
     const auto& regex = ansi_regex();
-    nonstd::optional<int> move_start;
+    std::optional<int> move_start;
     size_t fill_index = 0;
 
     auto matcher = regex.capture_from(input).into(md);
@@ -70,6 +80,14 @@ erase_ansi_escapes(string_fragment input)
         }
 
         auto sf = md[0].value();
+
+        if (sf == "\x00"_frag) {
+            *input.writable_data(fill_index) = ' ';
+            move_start = sf.sf_end;
+            fill_index += 1;
+            continue;
+        }
+
         auto bs_index_res = sf.codepoint_to_byte_index(1);
 
         if (move_start) {
@@ -119,12 +137,21 @@ erase_ansi_escapes(string_fragment input)
 void
 scrub_ansi_string(std::string& str, string_attrs_t* sa)
 {
-    static thread_local auto md = lnav::pcre2pp::match_data::unitialized();
-    const auto& regex = ansi_regex();
-    int64_t origin_offset = 0;
-    int last_origin_offset_end = 0;
+    thread_local auto md = lnav::pcre2pp::match_data::unitialized();
+    static constexpr auto semi_pred = string_fragment::tag1{';'};
+    static constexpr auto colon_pred
+        = [](char ch) { return ch == ';' || ch == ':'; };
 
-    replace(str.begin(), str.end(), '\0', ' ');
+    const auto& regex = ansi_regex();
+    std::optional<std::string> href;
+    size_t href_start = 0;
+    string_attrs_t tmp_sa;
+    size_t cp_dst = std::string::npos;
+    size_t cp_start = std::string::npos;
+    int last_origin_end = 0;
+    int erased = 0;
+    size_t tmp_sa_open = 0;
+
     auto matcher = regex.capture_from(str).into(md);
     while (true) {
         auto match_res = matcher.matches(PCRE2_NO_UTF_CHECK);
@@ -140,10 +167,25 @@ scrub_ansi_string(std::string& str, string_attrs_t* sa)
         const auto sf = md[0].value();
         auto bs_index_res = sf.codepoint_to_byte_index(1);
 
+        if (cp_dst != std::string::npos) {
+            auto cp_len = sf.sf_begin - cp_start;
+            memmove(&str[cp_dst], &str[cp_start], cp_len);
+            cp_dst += cp_len;
+        } else {
+            cp_dst = sf.sf_begin;
+        }
+
+        if (sf == "\x00"_frag) {
+            str[cp_dst] = ' ';
+            cp_start = sf.sf_end;
+            cp_dst += 1;
+            continue;
+        }
+
         if (sf.length() >= 3 && bs_index_res.isOk()
             && sf[bs_index_res.unwrap()] == '\b')
         {
-            ssize_t fill_index = sf.sf_begin;
+            ssize_t fill_index = cp_dst;
             line_range bold_range;
             line_range ul_range;
             auto sub_sf = sf;
@@ -164,12 +206,14 @@ scrub_ansi_string(std::string& str, string_attrs_t* sa)
                     return;
                 }
                 auto rhs_pair = rhs_opt.value();
-                sub_sf = rhs_pair.second;
 
                 if (lhs_pair.first == '_' || rhs_pair.first == '_') {
                     if (sa != nullptr && bold_range.is_valid()) {
-                        sa->emplace_back(bold_range,
-                                         VC_STYLE.value(text_attrs{A_BOLD}));
+                        shift_string_attrs(
+                            *sa, bold_range.lr_start, -bold_range.length() * 2);
+                        tmp_sa.emplace_back(
+                            bold_range,
+                            VC_STYLE.value(text_attrs::with_bold()));
                         bold_range.clear();
                     }
                     if (ul_range.is_valid()) {
@@ -183,10 +227,15 @@ scrub_ansi_string(std::string& str, string_attrs_t* sa)
                     ww898::utf::utf8::write(cp, [&str, &fill_index](auto ch) {
                         str[fill_index++] = ch;
                     });
-                } else {
+                } else if (lhs_pair.first == rhs_pair.first
+                           && !fmt::v10::detail::needs_escape(lhs_pair.first))
+                {
                     if (sa != nullptr && ul_range.is_valid()) {
-                        sa->emplace_back(
-                            ul_range, VC_STYLE.value(text_attrs{A_UNDERLINE}));
+                        shift_string_attrs(
+                            *sa, ul_range.lr_start, -ul_range.length() * 2);
+                        tmp_sa.emplace_back(
+                            ul_range,
+                            VC_STYLE.value(text_attrs::with_underline()));
                         ul_range.clear();
                     }
                     if (bold_range.is_valid()) {
@@ -204,185 +253,335 @@ scrub_ansi_string(std::string& str, string_attrs_t* sa)
                         log_error("invalid UTF-8 at %d", sf.sf_begin);
                         return;
                     }
+                } else {
+                    break;
                 }
+                sub_sf = rhs_pair.second;
             }
 
-            auto output_size = fill_index - sf.sf_begin;
-            auto erased_size = sf.length() - output_size;
-
-            if (sa != nullptr) {
-#if 0
-                shift_string_attrs(
-                    *sa, caps->c_begin + sf.length() / 3, -erased_size);
-#endif
-                sa->emplace_back(line_range{last_origin_offset_end,
-                                            sf.sf_begin + (int) output_size},
-                                 SA_ORIGIN_OFFSET.value(origin_offset));
-            }
-
+            auto output_size = fill_index - cp_dst;
             if (sa != nullptr && ul_range.is_valid()) {
-                sa->emplace_back(ul_range,
-                                 VC_STYLE.value(text_attrs{A_UNDERLINE}));
+                shift_string_attrs(
+                    *sa, ul_range.lr_start, -ul_range.length() * 2);
+                tmp_sa.emplace_back(
+                    ul_range, VC_STYLE.value(text_attrs::with_underline()));
                 ul_range.clear();
             }
             if (sa != nullptr && bold_range.is_valid()) {
-                sa->emplace_back(bold_range,
-                                 VC_STYLE.value(text_attrs{A_BOLD}));
+                shift_string_attrs(
+                    *sa, bold_range.lr_start, -bold_range.length() * 2);
+                tmp_sa.emplace_back(bold_range,
+                                    VC_STYLE.value(text_attrs::with_bold()));
                 bold_range.clear();
             }
-
-            str.erase(str.begin() + fill_index, str.begin() + sf.sf_end);
-            last_origin_offset_end = sf.sf_begin + output_size;
-            origin_offset += erased_size;
-            matcher.reload_input(str, last_origin_offset_end);
+            if (sa != nullptr && output_size > 0 && cp_dst > 0) {
+                tmp_sa.emplace_back(
+                    line_range{
+                        (int) last_origin_end,
+                        (int) cp_dst + (int) output_size,
+                    },
+                    SA_ORIGIN_OFFSET.value(erased));
+            }
+            last_origin_end = cp_dst + output_size;
+            cp_dst = fill_index;
+            cp_start = sub_sf.sf_begin;
+            erased += sf.length() - output_size;
             continue;
         }
 
-        auto seq = md[1].value();
-        auto terminator = md[2].value();
-        struct line_range lr;
-        bool has_attrs = false;
+        line_range lr;
         text_attrs attrs;
-        auto role = nonstd::optional<role_t>();
-        size_t lpc;
+        bool has_attrs = false;
+        std::optional<role_t> role;
 
-        switch (terminator[0]) {
-            case 'm':
-                for (lpc = seq.sf_begin;
-                     lpc != std::string::npos && lpc < (size_t) seq.sf_end;)
-                {
-                    auto ansi_code_res = scn::scan_value<int>(
-                        scn::string_view{&str[lpc], &str[seq.sf_end]});
+        if (md[3]) {
+            auto osc_id = scn::scan_value<int32_t>(md[3]->to_string_view());
 
-                    if (ansi_code_res) {
-                        auto ansi_code = ansi_code_res.value();
+            if (osc_id) {
+                switch (osc_id->value()) {
+                    case 8: {
+                        auto split_res = md[4]->split_pair(semi_pred);
+                        if (split_res) {
+                            // auto params = split_res->first;
+                            auto uri = split_res->second;
+
+                            if (href) {
+                                if (sa != nullptr) {
+                                    tmp_sa.emplace_back(
+                                        line_range{
+                                            (int) href_start,
+                                            (int) cp_dst,
+                                        },
+                                        VC_HYPERLINK.value(href.value()));
+                                }
+                                href = std::nullopt;
+                            }
+                            if (!uri.empty()) {
+                                href = uri.to_string();
+                                href_start = cp_dst;
+                            }
+                        }
+                        break;
+                    }
+                    default: {
+                        if (sa != nullptr) {
+                            lr.lr_start = cp_dst;
+                            lr.lr_end = cp_dst;
+                            tmp_sa.emplace_back(
+                                lr,
+                                SAT_UNSUPPORTED.value(fmt::format(
+                                    FMT_STRING("ANSI sequence: OSC {} {}"),
+                                    md[3],
+                                    md[4])));
+                        }
+                        break;
+                    }
+                }
+            }
+        } else if (md[1]) {
+            auto seq = md[1].value();
+            auto terminator = md[2].value();
+
+            switch (terminator[0]) {
+                case 'm':
+                    while (!seq.empty()) {
+                        auto ansi_code_res
+                            = scn::scan_value<uint8_t>(seq.to_string_view());
+
+                        if (!ansi_code_res) {
+                            break;
+                        }
+                        auto ansi_code = ansi_code_res->value();
                         if (90 <= ansi_code && ansi_code <= 97) {
                             ansi_code -= 60;
-                            attrs.ta_attrs |= A_STANDOUT;
+                            // XXX attrs.ta_attrs |= A_STANDOUT;
                         }
                         if (30 <= ansi_code && ansi_code <= 37) {
-                            attrs.ta_fg_color = ansi_code - 30;
+                            attrs.ta_fg_color = palette_color{
+                                static_cast<uint8_t>(ansi_code - 30)};
                         }
                         if (40 <= ansi_code && ansi_code <= 47) {
-                            attrs.ta_bg_color = ansi_code - 40;
+                            attrs.ta_bg_color = palette_color{
+                                static_cast<uint8_t>(ansi_code - 40)};
+                        }
+                        if (ansi_code == 38 || ansi_code == 48) {
+                            auto color_code_pair
+                                = seq.split_when(colon_pred)
+                                      .second.split_pair(colon_pred);
+                            if (!color_code_pair) {
+                                break;
+                            }
+                            auto color_type = scn::scan_value<int>(
+                                color_code_pair->first.to_string_view());
+                            if (!color_type.has_value()) {
+                                break;
+                            }
+                            if (color_type->value() == 2) {
+                                auto scan_res = scn::
+                                    scan<uint8_t, char, uint8_t, char, uint8_t>(
+                                        color_code_pair->second
+                                            .to_string_view(),
+                                        "{}{}{}{}{}");
+                                if (scan_res) {
+                                    auto [r, sep1, g, sep2, b]
+                                        = scan_res->values();
+                                    if ((sep1 == ';' && sep2 == ';')
+                                        || (sep1 == ':' && sep2 == ':'))
+                                    {
+                                        if (ansi_code == 38) {
+                                            attrs.ta_fg_color
+                                                = rgb_color{r, g, b};
+                                        } else {
+                                            attrs.ta_bg_color
+                                                = rgb_color{r, g, b};
+                                        }
+                                        seq = color_code_pair->second;
+                                    }
+                                }
+                            } else if (color_type->value() == 5) {
+                                auto color_index_pair
+                                    = color_code_pair->second.split_when(
+                                        colon_pred);
+                                auto color_index = scn::scan_value<short>(
+                                    color_index_pair.first.to_string_view());
+                                if (!color_index.has_value()
+                                    || color_index->value() < 0
+                                    || color_index->value() > 255)
+                                {
+                                    break;
+                                }
+                                if (ansi_code == 38) {
+                                    attrs.ta_fg_color = palette_color{
+                                        (uint8_t) color_index->value()};
+                                } else {
+                                    attrs.ta_bg_color = palette_color{
+                                        (uint8_t) color_index->value()};
+                                }
+                                seq = color_index_pair.second;
+                            }
                         }
                         switch (ansi_code) {
                             case 1:
-                                attrs.ta_attrs |= A_BOLD;
+                                attrs |= text_attrs::style::bold;
                                 break;
 
                             case 2:
-                                attrs.ta_attrs |= A_DIM;
+                                // XXX attrs.ta_attrs |= A_DIM;
+                                break;
+
+                            case 3:
+                                attrs |= text_attrs::style::italic;
                                 break;
 
                             case 4:
-                                attrs.ta_attrs |= A_UNDERLINE;
+                                attrs |= text_attrs::style::underline;
                                 break;
 
                             case 7:
-                                attrs.ta_attrs |= A_REVERSE;
+                                attrs |= text_attrs::style::reverse;
                                 break;
                         }
+                        auto split_pair = seq.split_when(semi_pred);
+                        seq = split_pair.second;
                     }
-                    lpc = str.find(';', lpc);
-                    if (lpc != std::string::npos) {
-                        lpc += 1;
-                    }
-                }
-                has_attrs = true;
-                break;
+                    has_attrs = true;
+                    break;
 
-            case 'C': {
-                auto spaces_res
-                    = scn::scan_value<unsigned int>(seq.to_string_view());
+#if 0
+                case 'C': {
+                    auto spaces_res
+                        = scn::scan_value<unsigned int>(seq.to_string_view());
 
-                if (spaces_res && spaces_res.value() > 0) {
-                    str.insert((std::string::size_type) sf.sf_end,
-                               spaces_res.value(),
-                               ' ');
-                }
-                break;
-            }
-
-            case 'H': {
-                unsigned int row = 0, spaces = 0;
-
-                if (scn::scan(seq.to_string_view(), "{};{}", row, spaces)
-                    && spaces > 1)
-                {
-                    int ispaces = spaces - 1;
-                    if (ispaces > sf.sf_begin) {
-                        str.insert((unsigned long) sf.sf_end,
-                                   ispaces - sf.sf_begin,
+                    if (spaces_res && spaces_res.value() > 0) {
+                        str.insert((std::string::size_type) sf.sf_end,
+                                   spaces_res.value(),
                                    ' ');
                     }
+                    break;
                 }
-                break;
-            }
 
-            case 'O': {
-                auto role_res = scn::scan_value<int>(seq.to_string_view());
+                case 'H': {
+                    unsigned int row = 0, spaces = 0;
 
-                if (role_res) {
-                    role_t role_tmp = (role_t) role_res.value();
-                    if (role_tmp > role_t::VCR_NONE
-                        && role_tmp < role_t::VCR__MAX)
+                    if (scn::scan(seq.to_string_view(), "{};{}", row, spaces)
+                        && spaces > 1)
                     {
-                        role = role_tmp;
-                        has_attrs = true;
+                        int ispaces = spaces - 1;
+                        if (ispaces > sf.sf_begin) {
+                            str.insert((unsigned long) sf.sf_end,
+                                       ispaces - sf.sf_begin,
+                                       ' ');
+                        }
                     }
+                    break;
                 }
-                break;
+#endif
+
+                case 'O': {
+                    auto role_res = scn::scan_value<int>(seq.to_string_view());
+
+                    if (role_res) {
+                        role_t role_tmp = (role_t) role_res->value();
+                        if (role_tmp > role_t::VCR_NONE
+                            && role_tmp < role_t::VCR__MAX)
+                        {
+                            role = role_tmp;
+                            has_attrs = true;
+                        }
+                    }
+                    break;
+                }
+                default: {
+                    if (sa != nullptr) {
+                        lr.lr_start = cp_dst;
+                        lr.lr_end = cp_dst;
+                        tmp_sa.emplace_back(
+                            lr,
+                            SAT_UNSUPPORTED.value(fmt::format(
+                                FMT_STRING("ANSI sequence: ESC [ {} {}"),
+                                seq,
+                                terminator)));
+                    }
+                    break;
+                }
             }
         }
-        str.erase(str.begin() + sf.sf_begin, str.begin() + sf.sf_end);
-        if (sa != nullptr) {
-            shift_string_attrs(*sa, sf.sf_begin, -sf.length());
-
-            if (has_attrs) {
-                for (auto rit = sa->rbegin(); rit != sa->rend(); rit++) {
-                    if (rit->sa_range.lr_end != -1) {
-                        continue;
+        if (md[1] || md[3] || md[5]) {
+            if (sa != nullptr) {
+                shift_string_attrs(*sa, sf.sf_begin - erased, -sf.length());
+                if (has_attrs) {
+                    for (auto tmp_sa_curr = tmp_sa_open;
+                         tmp_sa_curr < tmp_sa.size();
+                         tmp_sa_curr++)
+                    {
+                        auto& sa = tmp_sa[tmp_sa_curr];
+                        if (sa.sa_range.lr_end != -1) {
+                            continue;
+                        }
+                        sa.sa_range.lr_end = cp_dst;
+                        if (sa.sa_range.empty()) {
+                            sa.sa_type = &SA_INVALID;
+                            sa.sa_value = "zero-length attribute"s;
+                        }
                     }
-                    rit->sa_range.lr_end = sf.sf_begin;
+                    if (sf.sf_end < str.size()) {
+                        lr.lr_start = cp_dst;
+                        lr.lr_end = -1;
+                        tmp_sa_open = tmp_sa.size();
+                        if (!attrs.empty()) {
+                            tmp_sa.emplace_back(lr, VC_STYLE.value(attrs));
+                        }
+                        role | [&lr, &tmp_sa](role_t r) {
+                            tmp_sa.emplace_back(lr, VC_ROLE.value(r));
+                        };
+                    }
                 }
-                lr.lr_start = sf.sf_begin;
-                lr.lr_end = -1;
-                if (attrs.ta_attrs || attrs.ta_fg_color || attrs.ta_bg_color) {
-                    sa->emplace_back(lr, VC_STYLE.value(attrs));
+                if (cp_dst > 0) {
+                    tmp_sa.emplace_back(
+                        line_range{
+                            (int) last_origin_end,
+                            (int) cp_dst,
+                        },
+                        SA_ORIGIN_OFFSET.value(erased));
                 }
-                role | [&lr, &sa](role_t r) {
-                    sa->emplace_back(lr, VC_ROLE.value(r));
-                };
+                last_origin_end = cp_dst;
             }
-            sa->emplace_back(line_range{last_origin_offset_end, sf.sf_begin},
-                             SA_ORIGIN_OFFSET.value(origin_offset));
-            last_origin_offset_end = sf.sf_begin;
-            origin_offset += sf.length();
+            erased += sf.length();
         }
-
-        matcher.reload_input(str, sf.sf_begin);
+        cp_start = sf.sf_end;
     }
 
-    if (sa != nullptr && last_origin_offset_end > 0) {
-        sa->emplace_back(line_range{last_origin_offset_end, (int) str.size()},
-                         SA_ORIGIN_OFFSET.value(origin_offset));
+    if (cp_dst != std::string::npos) {
+        auto cp_len = str.size() - cp_start;
+        memmove(&str[cp_dst], &str[cp_start], cp_len);
+        cp_dst += cp_len;
+        str.resize(cp_dst);
+    }
+    if (sa != nullptr && last_origin_end > 0
+        && last_origin_end != (ssize_t) str.size())
+    {
+        tmp_sa.emplace_back(line_range{(int) last_origin_end, (int) str.size()},
+                            SA_ORIGIN_OFFSET.value(erased));
+    }
+    if (sa != nullptr) {
+        sa->insert(sa->end(), tmp_sa.begin(), tmp_sa.end());
     }
 }
 
 void
 add_ansi_vars(std::map<std::string, scoped_value_t>& vars)
 {
-    vars["ansi_csi"] = ANSI_CSI;
-    vars["ansi_norm"] = ANSI_NORM;
-    vars["ansi_bold"] = ANSI_BOLD_START;
-    vars["ansi_underline"] = ANSI_UNDERLINE_START;
-    vars["ansi_black"] = ANSI_COLOR(COLOR_BLACK);
-    vars["ansi_red"] = ANSI_COLOR(COLOR_RED);
-    vars["ansi_green"] = ANSI_COLOR(COLOR_GREEN);
-    vars["ansi_yellow"] = ANSI_COLOR(COLOR_YELLOW);
-    vars["ansi_blue"] = ANSI_COLOR(COLOR_BLUE);
-    vars["ansi_magenta"] = ANSI_COLOR(COLOR_MAGENTA);
-    vars["ansi_cyan"] = ANSI_COLOR(COLOR_CYAN);
-    vars["ansi_white"] = ANSI_COLOR(COLOR_WHITE);
+    vars["ansi_csi"] = string_fragment::from_const(ANSI_CSI);
+    vars["ansi_norm"] = string_fragment::from_const(ANSI_NORM);
+    vars["ansi_bold"] = string_fragment::from_const(ANSI_BOLD_START);
+    vars["ansi_underline"] = string_fragment::from_const(ANSI_UNDERLINE_START);
+    vars["ansi_black"] = string_fragment::from_const(ANSI_COLOR(COLOR_BLACK));
+    vars["ansi_red"] = string_fragment::from_const(ANSI_COLOR(COLOR_RED));
+    vars["ansi_green"] = string_fragment::from_const(ANSI_COLOR(COLOR_GREEN));
+    vars["ansi_yellow"] = string_fragment::from_const(ANSI_COLOR(COLOR_YELLOW));
+    vars["ansi_blue"] = string_fragment::from_const(ANSI_COLOR(COLOR_BLUE));
+    vars["ansi_magenta"]
+        = string_fragment::from_const(ANSI_COLOR(COLOR_MAGENTA));
+    vars["ansi_cyan"] = string_fragment::from_const(ANSI_COLOR(COLOR_CYAN));
+    vars["ansi_white"] = string_fragment::from_const(ANSI_COLOR(COLOR_WHITE));
 }

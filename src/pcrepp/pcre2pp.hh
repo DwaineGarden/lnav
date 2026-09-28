@@ -33,6 +33,7 @@
 #define PCRE2_CODE_UNIT_WIDTH 8
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -43,20 +44,33 @@
 #include "base/result.h"
 #include "mapbox/variant.hpp"
 
-namespace lnav {
-namespace pcre2pp {
-
-std::string quote(const char* unquoted);
-
-inline std::string
-quote(const std::string& unquoted)
-{
-    return quote(unquoted.c_str());
-}
+namespace lnav::pcre2pp {
 
 class code;
 struct capture_builder;
 class matcher;
+
+/**
+ * Note that this process is a fork of the one that compiled the patterns it
+ * inherited.
+ *
+ * The JIT'd form of a pattern lives in a mapping that the kernel will not
+ * fault back in for a forked child on some platforms (arm64 macOS raises
+ * SIGBUS as soon as one of those pages is no longer resident).  A pattern
+ * that was compiled before the fork is therefore rebuilt, in place, the first
+ * time this process matches with it, so that the form being run belongs here.
+ *
+ * Matching with the interpreter instead would be the other way out, and is
+ * deliberately not taken: it is a large, silent slowdown on the paths that
+ * care most about matching speed.  A rebuild that fails is fatal.
+ */
+void jit_after_fork();
+
+/**
+ * @return The number of forks this process has been through, which is what
+ * decides whether a pattern's JIT'd form was built by this process.
+ */
+uint32_t current_jit_epoch();
 
 struct input {
     string_fragment i_string;
@@ -86,27 +100,61 @@ public:
             this->md_input.i_string.sf_end);
     }
 
-    nonstd::optional<string_fragment> operator[](size_t index) const
+    size_t capture_size(size_t index) const
+    {
+        const auto start = this->md_ovector[(index * 2)];
+        const auto stop = this->md_ovector[(index * 2) + 1];
+
+        return stop - start;
+    }
+
+    std::optional<string_fragment> operator[](size_t index) const
     {
         if (index >= this->md_capture_end) {
-            return nonstd::nullopt;
+            return std::nullopt;
         }
 
         auto start = this->md_ovector[(index * 2)];
         auto stop = this->md_ovector[(index * 2) + 1];
         if (start == PCRE2_UNSET || stop == PCRE2_UNSET) {
-            return nonstd::nullopt;
+            return std::nullopt;
         }
 
         return this->md_input.i_string.sub_range(start, stop);
     }
 
     template<typename T, std::size_t N>
-    nonstd::optional<string_fragment> operator[](const T (&name)[N]) const;
+    std::optional<string_fragment> operator[](const T (&name)[N]) const;
 
-    int get_count() const { return this->md_capture_end; }
+    /**
+     * Copy the offsets of capture "src" into capture "dst" if "dst" did
+     * not match and "src" did.  Used to make a group name that appears more
+     * than once (see PCRE2_DUPNAMES) resolve through a single index.  The
+     * "dst" index must be lower than "src".
+     */
+    void coalesce(size_t dst, size_t src)
+    {
+        if (src >= this->md_capture_end
+            || this->md_ovector[dst * 2] != PCRE2_UNSET
+            || this->md_ovector[src * 2] == PCRE2_UNSET)
+        {
+            return;
+        }
+
+        this->md_ovector[dst * 2] = this->md_ovector[src * 2];
+        this->md_ovector[dst * 2 + 1] = this->md_ovector[src * 2 + 1];
+    }
+
+    size_t get_count() const { return this->md_capture_end; }
 
     uint32_t get_capacity() const { return this->md_ovector_count; }
+
+    string_fragment get_mark() const
+    {
+        return string_fragment::from_c_str(pcre2_get_mark(this->md_data.in()));
+    }
+
+    std::string to_string() const;
 
 private:
     friend matcher;
@@ -126,7 +174,7 @@ private:
     input md_input;
     PCRE2_SIZE* md_ovector{nullptr};
     uint32_t md_ovector_count{0};
-    int md_capture_end{0};
+    size_t md_capture_end{0};
 };
 
 class matcher {
@@ -147,15 +195,14 @@ public:
     public:
         using variant::variant;
 
-        nonstd::optional<found> ignore_error()
+        std::optional<found> ignore_error()
         {
-            return this->match(
-                [](found fo) { return nonstd::make_optional(fo); },
-                [](not_found) { return nonstd::nullopt; },
-                [](error err) {
-                    handle_error(err);
-                    return nonstd::nullopt;
-                });
+            return this->match([](found fo) { return std::make_optional(fo); },
+                               [](not_found) { return std::nullopt; },
+                               [](error err) {
+                                   handle_error(err);
+                                   return std::nullopt;
+                               });
         }
 
     private:
@@ -168,6 +215,8 @@ public:
 
         return *this;
     }
+
+    bool found_p(uint32_t options = 0);
 
     matches_result matches(uint32_t options = 0);
 
@@ -189,11 +238,18 @@ private:
 struct capture_builder {
     const code& mb_code;
     input mb_input;
+    uint32_t mb_options{0};
 
     capture_builder at(const string_fragment& remaining) &&
     {
         this->mb_input.i_offset = this->mb_input.i_next_offset
             = remaining.sf_begin;
+        return *this;
+    }
+
+    capture_builder with_options(uint32_t opts) &&
+    {
+        this->mb_options = opts;
         return *this;
     }
 
@@ -254,10 +310,12 @@ public:
     template<typename T, std::size_t N>
     static code from_const(const T (&str)[N], int options = 0)
     {
-        return from(string_fragment::from_const(str), options).unwrap();
+        return from_const(string_fragment::from_const(str), options);
     }
 
     const std::string& get_pattern() const { return this->p_pattern; }
+
+    std::string to_string() const { return this->p_pattern; }
 
     named_captures get_named_captures() const;
 
@@ -267,9 +325,15 @@ public:
 
     int name_index(const char* name) const;
 
+    /**
+     * @return The text of each capture group in the pattern, in the order
+     * of their capture numbers.  In a branch reset group, "(?|(a)|(b))",
+     * the text is from the first alternative that uses the number.
+     */
     std::vector<string_fragment> get_captures() const;
 
-    uint32_t get_match_data_capacity() const {
+    uint32_t get_match_data_capacity() const
+    {
         return this->p_match_proto.md_ovector_count;
     }
 
@@ -284,16 +348,7 @@ public:
     }
 
     matcher::matches_result find_in(string_fragment in,
-                                    uint32_t options = 0) const
-    {
-        static thread_local match_data md = this->create_match_data();
-
-        if (md.md_ovector_count < this->p_match_proto.md_ovector_count) {
-            md = this->create_match_data();
-        }
-
-        return this->capture_from(in).into(md).matches(options);
-    }
+                                    uint32_t options = 0) const;
 
     size_t match_partial(string_fragment in) const;
 
@@ -302,12 +357,15 @@ public:
     std::shared_ptr<code> to_shared() &&
     {
         return std::make_shared<code>(std::move(this->p_code),
-                                      std::move(this->p_pattern));
+                                      std::move(this->p_pattern),
+                                      this->p_jit_epoch);
     }
 
-    code(auto_mem<pcre2_code> code, std::string pattern)
+    code(auto_mem<pcre2_code> code,
+         std::string pattern,
+         uint32_t jit_epoch = current_jit_epoch())
         : p_code(std::move(code)), p_pattern(std::move(pattern)),
-          p_match_proto(this->create_match_data())
+          p_jit_epoch(jit_epoch), p_match_proto(this->create_match_data())
     {
     }
 
@@ -315,13 +373,41 @@ private:
     friend matcher;
     friend match_data;
 
-    auto_mem<pcre2_code> p_code;
+    static code from_const(string_fragment sf, int options);
+
+    /**
+     * Compile this pattern again, with the same options, so that the result
+     * belongs to this process.
+     */
+    Result<code, compile_error> recompile() const;
+
+    /**
+     * Rebuild this pattern if its JIT'd form was built by another process, so
+     * that what pcre2_match() is about to run belongs here.  Aborts if the
+     * rebuild fails, since neither of the alternatives is acceptable: the
+     * inherited JIT would fault, and the interpreter is the silent slowdown
+     * this exists to avoid.
+     *
+     * Must be called as a statement of its own before pcre2_match(), never
+     * from within its argument list -- this swaps p_code, and the arguments
+     * of a call are unsequenced, so the pointer could otherwise be read
+     * before the swap.
+     */
+    void ensure_local_jit() const;
+
+    /**
+     * Swapped in place by ensure_local_jit(), which is why these are mutable;
+     * every matching entry point is const.
+     */
+    mutable auto_mem<pcre2_code> p_code;
     std::string p_pattern;
+    /** The fork epoch this pattern was compiled in. */
+    mutable uint32_t p_jit_epoch;
     match_data p_match_proto;
 };
 
 template<typename T, std::size_t N>
-nonstd::optional<string_fragment>
+std::optional<string_fragment>
 match_data::operator[](const T (&name)[N]) const
 {
     auto index = pcre2_substring_number_from_name(
@@ -335,14 +421,18 @@ template<uint32_t Options, typename F>
 Result<string_fragment, matcher::error>
 capture_builder::for_each(F func) &&
 {
-    auto md = this->mb_code.create_match_data();
+    thread_local auto md = match_data::unitialized();
+
+    if (md.get_capacity() < this->mb_code.get_match_data_capacity()) {
+        md = this->mb_code.create_match_data();
+    }
     auto mat = matcher{this->mb_code, this->mb_input, md};
 
     bool done = false;
     matcher::error eret;
 
     while (!done) {
-        auto match_res = mat.matches(Options);
+        auto match_res = mat.matches(Options | this->mb_options);
         done = match_res.match(
             [mat, &func](matcher::found) {
                 func(mat.mb_match_data);
@@ -361,7 +451,6 @@ capture_builder::for_each(F func) &&
     return Err(eret);
 }
 
-}  // namespace pcre2pp
-}  // namespace lnav
+}  // namespace lnav::pcre2pp
 
 #endif

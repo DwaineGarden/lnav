@@ -1,5 +1,8 @@
 #! /bin/bash
 
+unset NO_COLOR
+unset XDG_CONFIG_HOME
+
 top_srcdir="@abssrcdir@"
 export top_srcdir
 
@@ -15,6 +18,15 @@ export top_builddir
 
 builddir=`pwd -P`
 export builddir
+
+top_builddir_abs=`dirname ${builddir}`
+export top_builddir_abs
+
+LNAV_VERSION=`${top_builddir}/src/lnav-test -V`
+export LNAV_VERSION
+
+prefix="@prefix@"
+export prefix
 
 test_dir="@abssrcdir@/test"
 export test_dir
@@ -35,15 +47,21 @@ export TSHARK_CMD
 LIBARCHIVE_LIBS="@LIBARCHIVE_LIBS@"
 export LIBARCHIVE_LIBS
 
-HOME="${top_builddir}/test"
-export HOME
-
 # The full path of the test case
 test_file=$1
 # The base name of the test case
 test_file_base=`basename $1`
+# lnav names its debug log after these when they are both set.
+LNAV_TEST_FILE_BASE="${test_file_base}"
+export LNAV_TEST_FILE_BASE
 # The current test number for shell based tests.
 test_num=0
+
+HOME="${top_builddir}/test/cfg/${test_file_base}"
+export HOME
+
+rm -rf "${top_builddir}/test/cfg/${test_file_base}"
+mkdir -p ${HOME}
 
 test_hash=""
 
@@ -65,13 +83,18 @@ export HAVE_SQLITE3_VALUE_SUBTYPE
 HAVE_SQLITE3_ERROR_OFFSET="@HAVE_SQLITE3_ERROR_OFFSET@"
 export HAVE_SQLITE3_ERROR_OFFSET
 
+export TERM=xterm-256color
+export NO_EXTERNAL_TERMINFO=1
+
 ## BEGIN Functions
 
 LAST_TEST=""
 
-LAST_CAP_TEST=()
+LAST_CAP_TEST=""
 
 has_errors=""
+
+ROOT_DIR=`realpath ~root`
 
 #
 # Run a test case and capture its standard out and standard err.
@@ -94,16 +117,27 @@ run_test() {
 
 run_cap_test() {
     LAST_CAP_TEST=("test: $@")
-    local full_cmd=$(echo "${LAST_CAP_TEST[@]}" | sed -e "s;${test_dir};{test_dir};g" -e "s;${top_srcdir};{top_srcdir};g")
+    local full_cmd=$(echo "${LAST_CAP_TEST[@]}" | LC_ALL=C sed -e "s;${test_dir};{test_dir};g" -e "s;${top_srcdir};{top_srcdir};g")
     export test_hash=$(echo "${full_cmd}" | shasum | cut -f 1 -d ' ')
+    LNAV_TEST_HASH="${test_hash}"
+    export LNAV_TEST_HASH
     echo "${full_cmd}" > ${test_file_base}_${test_hash}.cmd
-    "$@" > ${test_file_base}_${test_hash}.out 2> ${test_file_base}_${test_hash}.err
+    timeout ${LNAV_CAP_TIMEOUT:-15s} "$@" > ${test_file_base}_${test_hash}.out 2> ${test_file_base}_${test_hash}.err
+    printf "Exit code: $?"
 
     sed -ibak \
+        -e "s;${prefix}/etc;{prefix}/etc;g" \
+        -e 's;run-at\\":\\".*\\";;' \
+        -e "s;${LNAV_VERSION};{LNAV_VERSION};g" \
         -e "s;${test_dir};{test_dir};g" \
         -e "s;${builddir};{test_dir};g" \
+        -e "s;${ROOT_DIR};{root_dir};g" \
         -e "s;${top_srcdir};{top_srcdir};g" \
         -e "s;${top_srcdir_parent};{top_srcdir_parent};g" \
+        -e "s;${TMPDIR};{TMPDIR};g" \
+        -e "s;${top_builddir_abs};{buildir};g" \
+        -e "s;/tmp/;{TMPDIR};g" \
+        -e "s;lnav-user-${UID}-work;lnav-user-{uid}-work;g" \
         ${test_file_base}_${test_hash}.out
     echo
     printf "%s \033[0;35m=============================================================\033[0m\n" $(date -Iseconds)
@@ -128,9 +162,17 @@ run_cap_test() {
     fi
 
     sed -ibak -E \
+        -e "s;${prefix}/etc;{prefix}/etc;g" \
+        -e "s;${LNAV_VERSION};{LNAV_VERSION};g" \
+        -e "s;${top_builddir_abs}/src/lnav-test;{lnav-test};g" \
         -e "s;${test_dir};{test_dir};g" \
+        -e "s;${ROOT_DIR};{root_dir};g" \
         -e "s;${builddir};{builddir};g" \
         -e "s;${top_srcdir};{top_srcdir};g" \
+        -e "s;${TMPDIR};{TMPDIR};g" \
+        -e "s;/tmp/;{TMPDIR};g" \
+        -e "s;${top_builddir_abs};{buildir};g" \
+        -e "s;lnav-user-${UID}-work;lnav-user-{uid}-work;g" \
         -e 's;"errorId":".+";;g' \
         ${test_file_base}_${test_hash}.err
     printf '\033[0;31mBEGIN\033[0m %s\n' "${test_file_base}_${test_hash}.err"

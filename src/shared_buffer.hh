@@ -33,51 +33,46 @@
 #define shared_buffer_hh
 
 #include <string>
+#include <string_view>
 #include <vector>
 
-#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 
-#include "base/attr_line.hh"
 #include "base/auto_mem.hh"
 #include "base/file_range.hh"
 #include "base/intern_string.hh"
+#include "base/line_range.hh"
 #include "base/lnav_log.hh"
-#include "scn/util/string_view.h"
 
 class shared_buffer;
 
+#define SHARED_BUFFER_TRACE 0
+
 struct shared_buffer_ref {
-public:
-    shared_buffer_ref(char* data = nullptr, size_t len = 0)
+    shared_buffer_ref(const char* data = nullptr, size_t len = 0)
         : sb_owner(nullptr), sb_data(data), sb_length(len)
     {
     }
 
     ~shared_buffer_ref() { this->disown(); }
 
-    shared_buffer_ref(const shared_buffer_ref& other)
-    {
-        this->sb_owner = nullptr;
-        this->sb_data = nullptr;
-        this->sb_length = 0;
-        this->sb_metadata = file_range::metadata{};
-
-        this->copy_ref(other);
-    }
+    shared_buffer_ref(const shared_buffer_ref& other) = delete;
 
     shared_buffer_ref(shared_buffer_ref&& other) noexcept;
 
-    shared_buffer_ref& operator=(const shared_buffer_ref& other)
-    {
-        if (this != &other) {
-            this->disown();
-            this->copy_ref(other);
-        }
+    shared_buffer_ref& operator=(const shared_buffer_ref& other) = delete;
 
-        return *this;
+    shared_buffer_ref clone() const
+    {
+        shared_buffer_ref retval;
+
+        retval.copy_ref(*this);
+
+        return retval;
     }
+
+    shared_buffer_ref& operator=(shared_buffer_ref&& other) noexcept;
 
     bool empty() const
     {
@@ -110,6 +105,8 @@ public:
         return (this->sb_data <= ptr && ptr < buffer_end);
     }
 
+    const file_range::metadata& get_metadata() const { return this->sb_metadata; }
+
     file_range::metadata& get_metadata() { return this->sb_metadata; }
 
     char* get_writable_data(size_t length)
@@ -132,16 +129,33 @@ public:
             this->sb_data, (int) offset, (int) (offset + len)};
     }
 
+    string_fragment to_string_fragment(const line_range& lr) const
+    {
+        if (!lr.is_valid()) {
+            return string_fragment::invalid();
+        }
+
+        return this->to_string_fragment(lr.lr_start, lr.length());
+    }
+
     string_fragment to_string_fragment() const
     {
         return string_fragment::from_bytes(this->sb_data, this->length());
     }
 
-    scn::string_view to_string_view(const line_range& lr) const
+    std::string_view to_string_view(const line_range& lr) const
     {
-        return scn::string_view{
+        return std::string_view{
             this->get_data_at(lr.lr_start),
-            this->get_data_at(lr.lr_end),
+            static_cast<std::string_view::size_type>(lr.length()),
+        };
+    }
+
+    std::string_view to_string_view() const
+    {
+        return std::string_view{
+            this->sb_data,
+            this->sb_length,
         };
     }
 
@@ -165,7 +179,9 @@ public:
 private:
     void copy_ref(const shared_buffer_ref& other);
 
+#if SHARED_BUFFER_TRACE
     auto_mem<char*> sb_backtrace;
+#endif
     file_range::metadata sb_metadata;
     shared_buffer* sb_owner;
     const char* sb_data;
@@ -194,24 +210,16 @@ public:
     std::vector<shared_buffer_ref*> sb_refs;
 };
 
-struct tmp_shared_buffer {
-    explicit tmp_shared_buffer(const char* str, size_t len = -1)
-    {
-        if (len == (size_t) -1) {
-            len = strlen(str);
-        }
-
-        this->tsb_ref.share(this->tsb_manager, (char*) str, len);
-    };
-
-    shared_buffer tsb_manager;
-    shared_buffer_ref tsb_ref;
-};
-
 inline std::string
 to_string(const shared_buffer_ref& sbr)
 {
     return {sbr.get_data(), sbr.length()};
+}
+
+inline string_fragment
+to_string_fragment(const shared_buffer_ref& sbr)
+{
+    return sbr.to_string_fragment();
 }
 
 #endif

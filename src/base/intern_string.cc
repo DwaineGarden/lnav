@@ -30,16 +30,30 @@
  */
 
 #include <mutex>
+#include <new>
 
 #include "intern_string.hh"
 
 #include <string.h>
 
 #include "config.h"
+#include "fmt/ostream.h"
+#include "lnav_log.hh"
 #include "pcrepp/pcre2pp.hh"
+#include "phmap.h"
+#include "unictype.h"
+#include "uniwidth.h"
+#include "ww898/cp_utf8.hpp"
 #include "xxHash/xxhash.h"
 
-const static int TABLE_SIZE = 4095;
+/**
+ * Must be a power of two: the bucket is masked out of the hash rather than
+ * taken modulo.  Sized so the built-in formats, which intern about 4800
+ * strings before any file is opened, stay well under a full load.
+ */
+constexpr size_t TABLE_SIZE = 8192;
+static_assert((TABLE_SIZE & (TABLE_SIZE - 1)) == 0,
+              "TABLE_SIZE must be a power of two for the mask below");
 
 struct intern_string::intern_table {
     ~intern_table()
@@ -50,13 +64,17 @@ struct intern_string::intern_table {
             while (curr != nullptr) {
                 auto next = curr->is_next;
 
-                delete curr;
+                intern_string::destroy(curr);
                 curr = next;
             }
         }
     }
 
-    intern_string* it_table[TABLE_SIZE];
+    /** Chain heads, null until something hashes to the bucket. */
+    intern_string* it_table[TABLE_SIZE]{};
+
+    phmap::parallel_flat_hash_map<string_fragment, intern_string*, frag_hasher>
+        it_para_map;
 };
 
 intern_table_lifetime
@@ -73,6 +91,27 @@ hash_str(const char* str, size_t len)
     return XXH3_64bits(str, len);
 }
 
+intern_string*
+intern_string::create(const char* str, size_t len)
+{
+    // is_data already accounts for one byte, so this covers the characters
+    // and the terminator.
+    auto* mem = ::operator new(sizeof(intern_string) + len);
+    auto* retval = new (mem) intern_string(len);
+
+    memcpy(retval->is_data, str, len);
+    retval->is_data[len] = '\0';
+
+    return retval;
+}
+
+void
+intern_string::destroy(intern_string* is)
+{
+    is->~intern_string();
+    ::operator delete(is);
+}
+
 const intern_string*
 intern_string::lookup(const char* str, ssize_t len) noexcept
 {
@@ -82,7 +121,14 @@ intern_string::lookup(const char* str, ssize_t len) noexcept
     if (len == -1) {
         len = strlen(str);
     }
-    h = hash_str(str, len) % TABLE_SIZE;
+    if (len == 0) {
+        /* Interning this would produce a node that intern_string_t::empty()
+         * reports as non-empty, since that tests for the null node.
+         */
+        return nullptr;
+    }
+#if 0
+    h = hash_str(str, len) & (TABLE_SIZE - 1);
 
     {
         static std::mutex table_mutex;
@@ -92,20 +138,35 @@ intern_string::lookup(const char* str, ssize_t len) noexcept
 
         curr = tab->it_table[h];
         while (curr != nullptr) {
-            if (static_cast<ssize_t>(curr->is_str.size()) == len
-                && strncmp(curr->is_str.c_str(), str, len) == 0)
+            if (static_cast<ssize_t>(curr->is_len) == len
+                && memcmp(curr->is_data, str, len) == 0)
             {
                 return curr;
             }
             curr = curr->is_next;
         }
 
-        curr = new intern_string(str, len);
+        curr = intern_string::create(str, len);
         curr->is_next = tab->it_table[h];
         tab->it_table[h] = curr;
 
         return curr;
     }
+#else
+    auto sf = string_fragment::from_bytes(str, len);
+
+    auto& it_para_map = get_table_lifetime()->it_para_map;
+    auto iter = it_para_map.find(sf);
+    if (iter != it_para_map.end()) {
+        return iter->second;
+    }
+
+    curr = create(str, len);
+    sf = string_fragment::from_bytes(curr->is_data, curr->is_len);
+    auto [inserted_iter, _inserted] = it_para_map.try_emplace(sf, curr);
+
+    return inserted_iter->second;
+#endif
 }
 
 const intern_string*
@@ -123,7 +184,7 @@ intern_string::lookup(const std::string& str) noexcept
 bool
 intern_string::startswith(const char* prefix) const
 {
-    const char* curr = this->is_str.data();
+    const char* curr = this->is_data;
 
     while (*prefix != '\0' && *prefix == *curr) {
         prefix += 1;
@@ -178,11 +239,51 @@ string_fragment::trim() const
     return this->trim(" \t\r\n");
 }
 
-nonstd::optional<string_fragment>
+string_fragment
+string_fragment::rtrim(const char* tokens) const
+{
+    string_fragment retval = *this;
+
+    while (retval.sf_begin < retval.sf_end) {
+        bool found = false;
+
+        for (int lpc = 0; tokens[lpc] != '\0'; lpc++) {
+            if (retval.sf_string[retval.sf_end - 1] == tokens[lpc]) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            break;
+        }
+
+        retval.sf_end -= 1;
+    }
+
+    return retval;
+}
+
+std::optional<int>
+string_fragment::rfind(char ch) const
+{
+    if (this->empty()) {
+        return std::nullopt;
+    }
+
+    for (auto index = this->sf_end - 1; index >= this->sf_begin; index--) {
+        if (this->sf_string[index] == ch) {
+            return index;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<string_fragment>
 string_fragment::consume_n(int amount) const
 {
     if (amount > this->length()) {
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
     return string_fragment{
@@ -192,14 +293,12 @@ string_fragment::consume_n(int amount) const
     };
 }
 
-string_fragment::split_result
+string_fragment::split_n_result
 string_fragment::split_n(int amount) const
 {
-    if (amount > this->length()) {
-        return nonstd::nullopt;
-    }
+    amount = std::min(amount, this->length());
 
-    return std::make_pair(
+    return {
         string_fragment{
             this->sf_string,
             this->sf_begin,
@@ -209,7 +308,8 @@ string_fragment::split_n(int amount) const
             this->sf_string,
             this->sf_begin + amount,
             this->sf_end,
-        });
+        },
+    };
 }
 
 std::vector<string_fragment>
@@ -219,12 +319,14 @@ string_fragment::split_lines() const
     int start = this->sf_begin;
 
     for (auto index = start; index < this->sf_end; index++) {
-        if ((*this)[index] == '\n') {
+        if (this->sf_string[index] == '\n') {
             retval.emplace_back(this->sf_string, start, index + 1);
             start = index + 1;
         }
     }
-    retval.emplace_back(this->sf_string, start, this->sf_end);
+    if (retval.empty() || start < this->sf_end) {
+        retval.emplace_back(this->sf_string, start, this->sf_end);
+    }
 
     return retval;
 }
@@ -298,6 +400,582 @@ string_fragment::to_string_with_case_style(case_style style) const
             return this->to_string();
         }
     }
+
+    return retval;
+}
+
+uint64_t
+string_fragment::bloom_bits() const
+{
+    return bloom_bits_from_hash(this->hash());
+}
+
+uint64_t
+string_fragment::bloom_bits_from_hash(uint64_t a)
+{
+    auto b = a >> 8;
+    if ((b & 0x3f) == (a & 0x3f)) {
+        b = b >> 8;
+    }
+    auto c = b >> 8;
+    if ((c & 0x3f) == (a & 0x3f) || (c & 0x3f) == (b & 0x3f)) {
+        c = c >> 8;
+    }
+
+    uint64_t retval = 0;
+    retval |= 1ULL << (a % 56);
+    retval |= 1ULL << (b % 56);
+    retval |= 1ULL << (c % 56);
+
+    return retval;
+}
+
+std::string
+string_fragment::to_unquoted_string() const
+{
+    auto sub_sf = *this;
+
+    if (sub_sf.startswith("r") || sub_sf.startswith("u")) {
+        sub_sf = sub_sf.consume_n(1).value();
+    }
+    if (sub_sf.length() >= 2
+        && ((sub_sf.startswith("\"") && sub_sf.endswith("\""))
+            || (sub_sf.startswith("'") && sub_sf.endswith("'"))))
+    {
+        std::string retval;
+
+        sub_sf.sf_begin += 1;
+        sub_sf.sf_end -= 1;
+        retval.reserve(this->length());
+
+        auto in_escape = false;
+        for (auto ch : sub_sf) {
+            if (in_escape) {
+                switch (ch) {
+                    case 'n':
+                        retval.push_back('\n');
+                        break;
+                    case 't':
+                        retval.push_back('\t');
+                        break;
+                    case 'r':
+                        retval.push_back('\r');
+                        break;
+                    default:
+                        retval.push_back(ch);
+                        break;
+                }
+                in_escape = false;
+            } else if (ch == '\\') {
+                in_escape = true;
+            } else {
+                retval.push_back(ch);
+            }
+        }
+
+        return retval;
+    }
+
+    return this->to_string();
+}
+
+uint32_t
+string_fragment::front_codepoint() const
+{
+    size_t index = 0;
+    auto read_res = ww898::utf::utf8::read(
+        [this, &index]() { return this->data()[index++]; });
+    if (read_res.isErr()) {
+        return this->data()[0];
+    }
+    return read_res.unwrap();
+}
+
+Result<ssize_t, const char*>
+string_fragment::codepoint_to_byte_index(ssize_t cp_index) const
+{
+    ssize_t retval = 0;
+
+    while (cp_index > 0) {
+        if (retval >= this->length()) {
+            return Err("index is beyond the end of the string");
+        }
+        auto ch_len = TRY(ww898::utf::utf8::char_size([this, retval]() {
+            return std::make_pair(this->data()[retval],
+                                  this->length() - retval - 1);
+        }));
+
+        retval += ch_len;
+        cp_index -= 1;
+    }
+
+    return Ok(retval);
+}
+
+size_t
+string_fragment::start_of_codepoint(size_t byte_index) const
+{
+    // A sequence is at most four bytes, so a lead byte is at most three steps
+    // back.  Anything longer is a malformed run that no walk can repair.
+    static constexpr size_t MAX_CONTINUATIONS = 3;
+
+    auto retval = byte_index;
+    for (size_t attempt = 0; attempt <= MAX_CONTINUATIONS; attempt++) {
+        if (retval == 0 || retval >= (size_t) this->length()) {
+            return retval;
+        }
+        if ((((unsigned char) this->data()[retval]) & 0xc0) != 0x80) {
+            return retval;
+        }
+        retval -= 1;
+    }
+
+    return byte_index;
+}
+
+string_fragment
+string_fragment::sub_cell_range(int cell_start, int cell_end) const
+{
+    int byte_index = this->sf_begin;
+    std::optional<int> byte_start;
+    std::optional<int> byte_end;
+    int cell_index = 0;
+
+    while (byte_index < this->sf_end) {
+        if (cell_start == cell_index) {
+            byte_start = byte_index;
+        }
+        if (!byte_end && cell_index >= cell_end) {
+            byte_end = byte_index;
+            break;
+        }
+        auto read_res = ww898::utf::utf8::read(
+            [this, &byte_index]() { return this->sf_string[byte_index++]; });
+        if (read_res.isErr()) {
+            byte_index += 1;
+        } else {
+            auto ch = read_res.unwrap();
+
+            switch (ch) {
+                case '\t':
+                    do {
+                        cell_index += 1;
+                    } while (cell_index % 8);
+                    break;
+                default: {
+                    auto wcw_res = uc_width(read_res.unwrap(), "UTF-8");
+                    if (wcw_res < 0) {
+                        wcw_res = 1;
+                    }
+                    cell_index += wcw_res;
+                    break;
+                }
+            }
+        }
+    }
+    if (cell_start == cell_index) {
+        byte_start = byte_index;
+    }
+    if (!byte_end) {
+        byte_end = byte_index;
+    }
+
+    if (byte_start && byte_end) {
+        return this->sub_range(byte_start.value(), byte_end.value());
+    }
+
+    return string_fragment{};
+}
+
+size_t
+string_fragment::column_to_byte_index(const size_t col) const
+{
+    auto index = this->sf_begin;
+    size_t curr_col = 0;
+
+    while (curr_col < col && index < this->sf_end) {
+        auto read_res = ww898::utf::utf8::read(
+            [this, &index]() { return this->sf_string[index++]; });
+        if (read_res.isErr()) {
+            curr_col += 1;
+        } else {
+            auto ch = read_res.unwrap();
+
+            switch (ch) {
+                case '\t':
+                    do {
+                        curr_col += 1;
+                    } while (curr_col % 8);
+                    break;
+                default: {
+                    auto wcw_res = uc_width(read_res.unwrap(), "UTF-8");
+                    if (wcw_res < 0) {
+                        wcw_res = 1;
+                    }
+
+                    curr_col += wcw_res;
+                    break;
+                }
+            }
+        }
+    }
+
+    return index - this->sf_begin;
+}
+
+size_t
+string_fragment::byte_to_column_index(const size_t byte_index) const
+{
+    auto index = this->sf_begin;
+    size_t curr_col = 0;
+
+    while (index < this->sf_end && index < (ssize_t) byte_index) {
+        auto read_res = ww898::utf::utf8::read(
+            [this, &index]() { return this->sf_string[index++]; });
+        if (read_res.isErr()) {
+            curr_col += 1;
+        } else {
+            auto ch = read_res.unwrap();
+
+            switch (ch) {
+                case '\t':
+                    do {
+                        curr_col += 1;
+                    } while (curr_col % 8);
+                    break;
+                case '\n':
+                    // a column is relative to the start of the row that the
+                    // byte is rendered on
+                    curr_col = 0;
+                    break;
+                default: {
+                    auto wcw_res = uc_width(read_res.unwrap(), "UTF-8");
+                    if (wcw_res < 0) {
+                        wcw_res = 1;
+                    }
+
+                    curr_col += wcw_res;
+                    break;
+                }
+            }
+        }
+    }
+
+    return curr_col;
+}
+
+enum class word_char_class {
+    space,
+    word,
+    symbol,
+};
+
+static word_char_class
+classify_word_char(wchar_t wchar)
+{
+    if (uc_is_property_white_space(wchar)) {
+        return word_char_class::space;
+    }
+    static constexpr uint32_t word_mask
+        = UC_CATEGORY_MASK_L | UC_CATEGORY_MASK_N | UC_CATEGORY_MASK_Pc;
+    if (uc_is_general_category_withtable(wchar, word_mask)) {
+        return word_char_class::word;
+    }
+    return word_char_class::symbol;
+}
+
+static bool
+is_word_start(word_char_class curr_class, word_char_class prev_class)
+{
+    if (curr_class == word_char_class::word
+        && prev_class != word_char_class::word)
+    {
+        return true;
+    }
+    if (curr_class == word_char_class::symbol
+        && prev_class == word_char_class::space)
+    {
+        return true;
+    }
+    return false;
+}
+
+std::optional<int>
+string_fragment::next_word(const int start_col) const
+{
+    auto index = this->sf_begin;
+    int curr_col = 0;
+    auto prev_class = word_char_class::space;
+
+    while (index < this->sf_end) {
+        auto read_res = ww898::utf::utf8::read(
+            [this, &index]() { return this->sf_string[index++]; });
+        if (read_res.isErr()) {
+            curr_col += 1;
+            continue;
+        }
+        auto ch = read_res.unwrap();
+
+        if (ch == '\t') {
+            prev_class = word_char_class::space;
+            do {
+                curr_col += 1;
+            } while (curr_col % 8);
+            continue;
+        }
+
+        auto wcw_res = uc_width(ch, "UTF-8");
+        if (wcw_res < 0) {
+            wcw_res = 1;
+        }
+
+        auto curr_class = classify_word_char(ch);
+        if (curr_col > start_col && is_word_start(curr_class, prev_class)) {
+            return curr_col;
+        }
+        prev_class = curr_class;
+        curr_col += wcw_res;
+    }
+
+    return std::nullopt;
+}
+
+std::optional<int>
+string_fragment::prev_word(const int start_col) const
+{
+    auto index = this->sf_begin;
+    int curr_col = 0;
+    auto prev_class = word_char_class::space;
+    std::optional<int> last_word_col;
+
+    while (index < this->sf_end) {
+        auto read_res = ww898::utf::utf8::read(
+            [this, &index]() { return this->sf_string[index++]; });
+        if (read_res.isErr()) {
+            curr_col += 1;
+            continue;
+        }
+        auto ch = read_res.unwrap();
+
+        if (ch == '\t') {
+            if (curr_col >= start_col) {
+                return last_word_col;
+            }
+            prev_class = word_char_class::space;
+            do {
+                curr_col += 1;
+            } while (curr_col % 8);
+            continue;
+        }
+
+        if (curr_col >= start_col) {
+            return last_word_col;
+        }
+
+        auto wcw_res = uc_width(ch, "UTF-8");
+        if (wcw_res < 0) {
+            wcw_res = 1;
+        }
+
+        auto curr_class = classify_word_char(ch);
+        if (is_word_start(curr_class, prev_class)) {
+            last_word_col = curr_col;
+        }
+        prev_class = curr_class;
+        curr_col += wcw_res;
+    }
+
+    return last_word_col;
+}
+
+std::optional<int>
+string_fragment::curr_word(const int start_col) const
+{
+    auto index = this->sf_begin;
+    int curr_col = 0;
+    auto prev_class = word_char_class::space;
+    std::optional<int> last_word_col;
+
+    while (index < this->sf_end) {
+        auto read_res = ww898::utf::utf8::read(
+            [this, &index]() { return this->sf_string[index++]; });
+        if (read_res.isErr()) {
+            curr_col += 1;
+            continue;
+        }
+        auto ch = read_res.unwrap();
+
+        if (ch == '\t') {
+            if (curr_col >= start_col) {
+                return std::nullopt;
+            }
+            prev_class = word_char_class::space;
+            do {
+                curr_col += 1;
+            } while (curr_col % 8);
+            continue;
+        }
+
+        auto wcw_res = uc_width(ch, "UTF-8");
+        if (wcw_res < 0) {
+            wcw_res = 1;
+        }
+
+        auto curr_class = classify_word_char(ch);
+
+        if (start_col < curr_col + wcw_res) {
+            if (curr_class == word_char_class::space) {
+                return std::nullopt;
+            }
+            if (is_word_start(curr_class, prev_class)) {
+                return curr_col;
+            }
+            return last_word_col;
+        }
+
+        if (is_word_start(curr_class, prev_class)) {
+            last_word_col = curr_col;
+        }
+        prev_class = curr_class;
+        curr_col += wcw_res;
+    }
+
+    return std::nullopt;
+}
+
+std::string
+string_fragment::transform_codepoints(
+    const std::function<uint32_t(uint32_t)>& xform) const
+{
+    std::string out;
+    out.reserve(this->length());
+
+    auto index = this->sf_begin;
+    while (index < this->sf_end) {
+        auto byte_before = index;
+        auto read_res = ww898::utf::utf8::read(
+            [this, &index]() { return this->sf_string[index++]; });
+        if (read_res.isErr()) {
+            for (auto j = byte_before; j < index; ++j) {
+                out.push_back(this->sf_string[j]);
+            }
+            continue;
+        }
+        auto cp = read_res.unwrap();
+        auto new_cp = xform(cp);
+        ww898::utf::utf8::write(new_cp,
+                                [&out](const char b) { out.push_back(b); });
+    }
+    return out;
+}
+
+size_t
+string_fragment::column_width() const
+{
+    auto index = this->sf_begin;
+    size_t retval = 0;
+
+    while (index < this->sf_end) {
+        auto read_res = ww898::utf::utf8::read(
+            [this, &index]() { return this->sf_string[index++]; });
+        if (read_res.isErr()) {
+            retval += 1;
+        } else {
+            auto ch = read_res.unwrap();
+
+            switch (ch) {
+                case '\t':
+                    do {
+                        retval += 1;
+                    } while (retval % 8);
+                    break;
+                default: {
+                    auto wcw_res = uc_width(read_res.unwrap(), "UTF-8");
+                    if (wcw_res < 0) {
+                        wcw_res = 1;
+                    }
+                    retval += wcw_res;
+                    break;
+                }
+            }
+        }
+    }
+
+    return retval;
+}
+
+std::optional<uint32_t>
+string_fragment::cursor_impl::lookahead() const
+{
+    if (this->ci_next_index >= this->ci_end) {
+        return std::nullopt;
+    }
+
+    int32_t index = this->ci_next_index;
+    auto read_res = ww898::utf::utf8::read(
+        [this, &index]() { return this->ci_string[index++]; });
+    if (read_res.isErr()) {
+        return this->ci_string[this->ci_next_index];
+    }
+    return read_res.unwrap();
+}
+
+std::optional<uint32_t>
+string_fragment::cursor_impl::next()
+{
+    this->ci_lookbehind = this->ci_next_lookbehind;
+    if (this->ci_next_index >= this->ci_end) {
+        return std::nullopt;
+    }
+
+    int32_t index = this->ci_next_index;
+    auto read_res = ww898::utf::utf8::read(
+        [this, &index]() { return this->ci_string[index++]; });
+    uint32_t retval;
+    if (read_res.isErr()) {
+        retval = this->ci_string[this->ci_next_index];
+        this->ci_next_index += 1;
+    } else {
+        retval = read_res.unwrap();
+        this->ci_next_index = index;
+    }
+    this->ci_next_lookbehind = retval;
+    return retval;
+}
+
+struct single_producer : string_fragment_producer {
+    explicit single_producer(const string_fragment& sf) : sp_frag(sf) {}
+
+    next_result next() override
+    {
+        auto retval = std::exchange(this->sp_frag, std::nullopt);
+        if (retval) {
+            return retval.value();
+        }
+
+        return eof{};
+    }
+
+    std::optional<string_fragment> sp_frag;
+};
+
+std::unique_ptr<string_fragment_producer>
+string_fragment_producer::from(string_fragment sf)
+{
+    return std::make_unique<single_producer>(sf);
+}
+
+std::string
+string_fragment_producer::to_string()
+{
+    auto retval = std::string{};
+
+    retval.reserve(this->estimated_size());
+    auto for_res = this->for_each(
+        [&retval](string_fragment sf) -> Result<void, std::string> {
+            retval.append(sf.data(), sf.length());
+            return Ok();
+        });
 
     return retval;
 }

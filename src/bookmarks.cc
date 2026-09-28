@@ -32,15 +32,23 @@
 #include "bookmarks.hh"
 
 #include "base/itertools.hh"
+#include "bookmarks.json.hh"
 #include "config.h"
+#include "yajlpp/yajlpp_def.hh"
 
 std::unordered_set<std::string> bookmark_metadata::KNOWN_TAGS;
 
+typed_json_path_container<logmsg_annotations> logmsg_annotations_handlers = {
+    yajlpp::pattern_property_handler("(?<annotation_id>.*)")
+        .for_field(&logmsg_annotations::la_pairs),
+};
+
 void
-bookmark_metadata::add_tag(const std::string& tag)
+bookmark_metadata::add_tag(const std::string& tag, meta_source src)
 {
-    if (!(this->bm_tags | lnav::itertools::find(tag))) {
-        this->bm_tags.emplace_back(tag);
+    auto iter = std::find(this->bm_tags.begin(), this->bm_tags.end(), tag);
+    if (iter == this->bm_tags.end()) {
+        this->bm_tags.emplace_back(tag_entry{tag, src});
     }
 }
 
@@ -58,32 +66,78 @@ bookmark_metadata::remove_tag(const std::string& tag)
 }
 
 bool
-bookmark_metadata::empty() const
+bookmark_metadata::empty(bookmark_metadata::categories props) const
 {
-    return this->bm_name.empty() && this->bm_comment.empty()
-        && this->bm_tags.empty();
+    switch (props) {
+        case categories::any:
+            return this->bm_name.empty() && this->bm_opid.empty()
+                && this->bm_comment.empty() && this->bm_tags.empty()
+                && this->bm_annotations.la_pairs.empty();
+        case categories::session:
+            return (this->bm_name.empty()
+                    || this->bm_name_source == meta_source::format)
+                && this->bm_opid.empty() && this->bm_comment.empty()
+                && this->user_tag_count() == 0
+                && this->bm_annotations.la_pairs.empty();
+        case categories::partition:
+            return this->bm_name.empty();
+        case categories::notes:
+            return this->bm_comment.empty() && this->bm_tags.empty()
+                && this->bm_annotations.la_pairs.empty();
+        case categories::opid:
+            return this->bm_opid.empty();
+    }
+    ensure(false);
+}
+
+size_t
+bookmark_metadata::user_tag_count() const
+{
+    return std::count_if(
+        this->bm_tags.begin(), this->bm_tags.end(), [](const auto& tag) {
+            return tag.te_source == meta_source::user;
+        });
 }
 
 void
 bookmark_metadata::clear()
 {
+    this->bm_opid.clear();
     this->bm_comment.clear();
     this->bm_tags.clear();
+    this->bm_annotations.la_pairs.clear();
 }
 
-nonstd::optional<bookmark_type_t*>
-bookmark_type_t::find_type(const std::string& name)
-{
-    return get_all_types()
-        | lnav::itertools::find_if(
-               [&name](const auto& elem) { return elem->bt_name == name; })
-        | lnav::itertools::deref();
-}
-
-std::vector<bookmark_type_t*>&
+const bookmark_type_t::type_container&
 bookmark_type_t::get_all_types()
 {
-    static std::vector<bookmark_type_t*> all_types;
+    static auto retval = DIST_SLICE_CONTAINER(bookmark_type_t, bm_types);
 
-    return all_types;
+    return retval;
+}
+
+std::optional<const bookmark_type_t*>
+bookmark_type_t::find_type(const string_fragment& name)
+{
+    for (const auto& bmt : get_all_types()) {
+        if (bmt.get_name() == name) {
+            return &bmt;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::vector<string_fragment>
+bookmark_type_t::get_type_names()
+{
+    std::vector<string_fragment> retval;
+
+    for (const auto& bt : get_all_types()) {
+        retval.emplace_back(bt.get_name());
+    }
+    std::sort(retval.begin(),
+              retval.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs < rhs; });
+    return retval;
 }

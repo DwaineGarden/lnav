@@ -82,6 +82,17 @@ error: unable to open file: nonexistent-host: -- failed to ssh to host: ...
 EOF
 
 run_test ${lnav_test} -d /tmp/lnav.err -n \
+    nonexistent-host:${test_dir}/logfile_access_log.*
+
+sed -e "s|ssh:.*|...|g" `test_err_filename` | head -1 \
+    > test_remote.err
+
+mv test_remote.err `test_err_filename`
+check_error_output "no error for nonexistent-host?" <<EOF
+error: unable to open file: nonexistent-host: -- failed to ssh to host: ...
+EOF
+
+run_test ${lnav_test} -d /tmp/lnav.err -n \
     localhost:nonexistent-file
 
 cat remote/sshd.log
@@ -106,6 +117,17 @@ check_output "could not download remote file?" <<EOF
 192.168.202.254 - - [20/Jul/2009:22:59:29 +0000] "GET /vmw/vSphere/default/vmkboot.gz HTTP/1.0" 404 46210 "-" "gPXE/0.9.7"
 192.168.202.254 - - [20/Jul/2009:22:59:29 +0000] "GET /vmw/vSphere/default/vmkernel.gz HTTP/1.0" 200 78929 "-" "gPXE/0.9.7"
 10.112.81.15 - - [15/Feb/2013:06:00:31 +0000] "-" 400 0 "-" "-"
+EOF
+
+run_test ${lnav_test} -d /tmp/lnav.err -n \
+    localhost:${test_dir}/textfile_invalid_utf8.0
+
+check_output "remote file with invalid UTF-8 was not fully indexed?" <<EOF
+<tiptop>
+	<sample>
+		<node>???????????í¹¤??</node>
+	</sample>
+</tiptop>
 EOF
 
 run_test ${lnav_test} -d /tmp/lnav.err -n \

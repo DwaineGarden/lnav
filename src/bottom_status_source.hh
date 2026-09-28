@@ -65,6 +65,11 @@ public:
         this->bss_error.set_value(msg);
     }
 
+    void set_error(const attr_line_t& msg)
+    {
+        this->bss_error.set_value(msg);
+    }
+
     size_t statusview_fields() override;
 
     status_field& statusview_value_for_field(int field) override;
@@ -75,11 +80,13 @@ public:
 
     void update_percent(listview_curses* lc);
 
-    void update_marks(listview_curses* lc);
+    bool update_marks(listview_curses* lc);
 
-    void update_hits(textview_curses* tc);
+    bool update_hits(textview_curses* tc);
 
-    void update_loading(file_off_t off, file_ssize_t total);
+    void update_loading(file_off_t off,
+                        file_ssize_t total,
+                        const char* term = "Loading");
 
 private:
     status_field bss_prompt{1024, role_t::VCR_STATUS};
@@ -89,6 +96,31 @@ private:
     int bss_hit_spinner{0};
     int bss_load_percent{0};
     bool bss_paused{false};
+    /** Which search the hit count and the term beside it are reporting on. */
+    enum class search_report_t {
+        /** The interactive search, which is on its own in the view. */
+        interactive,
+        /** The search that has been focused, named or interactive. */
+        focused,
+        /** Every enabled search, which is what n/N walks by default. */
+        all,
+    };
+
+    /**
+     * Kept in one place so that the count and the term it is labelled with
+     * cannot end up describing different searches.
+     */
+    static search_report_t search_report_for(textview_curses& tc);
+
+    /**
+     * What the search term field was last rendered for.  Neither of these can
+     * be relied on to change through the commands that set them -- a search
+     * can be deleted from the filter panel, and creating the first named
+     * search widens what n/N covers without touching the focus -- so the
+     * field is re-rendered whenever either no longer matches the view.
+     */
+    search_report_t bss_search_report{search_report_t::interactive};
+    std::optional<size_t> bss_focused_search_slot;
 };
 
 #endif

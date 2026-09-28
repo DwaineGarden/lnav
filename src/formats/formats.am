@@ -2,32 +2,61 @@
 FORMAT_FILES = \
     $(srcdir)/%reldir%/access_log.json \
     $(srcdir)/%reldir%/alb_log.json \
+    $(srcdir)/%reldir%/asterisk_log.json \
     $(srcdir)/%reldir%/block_log.json \
+    $(srcdir)/%reldir%/bunyan_log.json \
+    $(srcdir)/%reldir%/caddy_log.json \
     $(srcdir)/%reldir%/candlepin_log.json \
     $(srcdir)/%reldir%/choose_repo_log.json \
+    $(srcdir)/%reldir%/cloudflare_log.json \
+    $(srcdir)/%reldir%/cloudvm_ram_log.json \
     $(srcdir)/%reldir%/cups_log.json \
     $(srcdir)/%reldir%/dpkg_log.json \
+    $(srcdir)/%reldir%/ecs_log.json \
     $(srcdir)/%reldir%/elb_log.json \
     $(srcdir)/%reldir%/engine_log.json \
+    $(srcdir)/%reldir%/env_logger_log.json \
     $(srcdir)/%reldir%/error_log.json \
     $(srcdir)/%reldir%/esx_syslog_log.json \
-    $(srcdir)/%reldir%/fsck_hfs_log.json \
+    $(srcdir)/%reldir%/fsck_log.json \
+    $(srcdir)/%reldir%/github_events_log.json \
     $(srcdir)/%reldir%/glog_log.json \
     $(srcdir)/%reldir%/haproxy_log.json \
+    $(srcdir)/%reldir%/idea_log.json \
     $(srcdir)/%reldir%/java_log.json \
     $(srcdir)/%reldir%/journald_json_log.json \
     $(srcdir)/%reldir%/katello_log.json \
+    $(srcdir)/%reldir%/laravel_log.json \
+    $(srcdir)/%reldir%/lnav_debug_log.json \
+    $(srcdir)/%reldir%/logcat_log.json \
+    $(srcdir)/%reldir%/macosuni_log.json \
+    $(srcdir)/%reldir%/mongodb_json_log.json \
+    $(srcdir)/%reldir%/mysql_error_log.json \
+    $(srcdir)/%reldir%/mysql_gen_log.json \
+    $(srcdir)/%reldir%/mysql_slow_log.json \
+    $(srcdir)/%reldir%/nextcloud_log.json \
+    $(srcdir)/%reldir%/nextflow_log.json \
     $(srcdir)/%reldir%/openam_log.json \
     $(srcdir)/%reldir%/openamdb_log.json \
     $(srcdir)/%reldir%/openstack_log.json \
+    $(srcdir)/%reldir%/otel_collector_log.json \
+    $(srcdir)/%reldir%/otlp_python_log.json \
     $(srcdir)/%reldir%/page_log.json \
-    $(srcdir)/%reldir%/papertrail_log.json \
     $(srcdir)/%reldir%/pcap_log.json \
+    $(srcdir)/%reldir%/pino_log.json \
+    $(srcdir)/%reldir%/postgres_json_log.json \
+    $(srcdir)/%reldir%/postgres_log.json \
     $(srcdir)/%reldir%/procstate_log.json \
+    $(srcdir)/%reldir%/proxifier_log.json \
+    $(srcdir)/%reldir%/rails_log.json \
+    $(srcdir)/%reldir%/redis_log.json \
+    $(srcdir)/%reldir%/robot_fwk_log.json \
+    $(srcdir)/%reldir%/rust_tracing_log.json \
+    $(srcdir)/%reldir%/simple_rs_log.json \
     $(srcdir)/%reldir%/snaplogic_log.json \
+    $(srcdir)/%reldir%/spdlog_log.json \
     $(srcdir)/%reldir%/sssd_log.json \
     $(srcdir)/%reldir%/strace_log.json \
-    $(srcdir)/%reldir%/sudo_log.json \
     $(srcdir)/%reldir%/syslog_log.json \
     $(srcdir)/%reldir%/s3_log.json \
     $(srcdir)/%reldir%/tcf_log.json \
@@ -39,5 +68,11 @@ FORMAT_FILES = \
     $(srcdir)/%reldir%/vmw_log.json \
     $(srcdir)/%reldir%/vmw_vc_svc_log.json \
     $(srcdir)/%reldir%/vmw_py_log.json \
+    $(srcdir)/%reldir%/vpostgres_log.json \
+    $(srcdir)/%reldir%/web_robot_log.json \
+    $(srcdir)/%reldir%/windows_event_log.json \
     $(srcdir)/%reldir%/xmlrpc_log.json \
+    $(srcdir)/%reldir%/zap_console_log.json \
+    $(srcdir)/%reldir%/zellij_log.json \
+    $(srcdir)/%reldir%/zookeeper_log.json \
     $()

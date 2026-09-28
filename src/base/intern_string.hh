@@ -32,8 +32,13 @@
 #ifndef intern_string_hh
 #define intern_string_hh
 
+#include <functional>
+#include <optional>
 #include <ostream>
 #include <string>
+#include <string_view>
+#include <system_error>
+#include <tuple>
 #include <vector>
 
 #include <assert.h>
@@ -41,20 +46,26 @@
 #include <sys/types.h>
 
 #include "fmt/format.h"
-#include "optional.hpp"
-#include "scn/util/string_view.h"
+#include "mapbox/variant.hpp"
+#include "result.h"
 #include "strnatcmp.h"
-#include "ww898/cp_utf8.hpp"
+
+unsigned long hash_str(const char* str, size_t len);
 
 struct string_fragment {
     using iterator = const char*;
 
-    static string_fragment invalid()
+    static constexpr string_fragment invalid()
     {
         string_fragment retval;
 
         retval.invalidate();
         return retval;
+    }
+
+    static string_fragment from_string_view(std::string_view str)
+    {
+        return string_fragment{str.data(), 0, (int) str.size()};
     }
 
     static string_fragment from_c_str(const char* str)
@@ -69,7 +80,7 @@ struct string_fragment {
     }
 
     template<typename T, std::size_t N>
-    static string_fragment from_const(const T (&str)[N])
+    static constexpr string_fragment from_const(const T (&str)[N])
     {
         return string_fragment{str, 0, (int) N - 1};
     }
@@ -116,8 +127,15 @@ struct string_fragment {
         return string_fragment{bytes, (int) begin, (int) end};
     }
 
-    explicit string_fragment(const char* str = "", int begin = 0, int end = -1)
-        : sf_string(str), sf_begin(begin), sf_end(end == -1 ? strlen(str) : end)
+    constexpr string_fragment() : sf_string(nullptr), sf_begin(0), sf_end(0) {}
+
+    explicit constexpr string_fragment(const char* str,
+                                       int begin = 0,
+                                       int end = -1)
+        : sf_string(str), sf_begin(begin),
+          sf_end(end == -1
+                     ? static_cast<int>(std::string::traits_type::length(str))
+                     : end)
     {
     }
 
@@ -134,16 +152,43 @@ struct string_fragment {
     {
     }
 
-    bool is_valid() const
+    constexpr bool is_valid() const
     {
         return this->sf_begin != -1 && this->sf_begin <= this->sf_end;
     }
 
-    int length() const { return this->sf_end - this->sf_begin; }
+    constexpr int length() const { return this->sf_end - this->sf_begin; }
 
     Result<ssize_t, const char*> utf8_length() const;
 
-    const char* data() const { return &this->sf_string[this->sf_begin]; }
+    size_t column_to_byte_index(size_t col) const;
+
+    /**
+     * Get the display column that the given byte is rendered at.  The column
+     * is relative to the start of the row that the byte falls on, so an
+     * embedded line feed resets it back to zero.
+     */
+    size_t byte_to_column_index(size_t byte_index) const;
+
+    /**
+     * Note that the returned pair is only meaningful when both bytes are on
+     * the same row, since a line feed between them restarts the count.
+     */
+    std::tuple<int, int> byte_to_column_index(size_t byte_start,
+                                              size_t byte_end) const
+    {
+        return {
+            this->byte_to_column_index(byte_start),
+            this->byte_to_column_index(byte_end),
+        };
+    }
+
+    size_t column_width() const;
+
+    constexpr const char* data() const
+    {
+        return &this->sf_string[this->sf_begin];
+    }
 
     const unsigned char* udata() const
     {
@@ -155,48 +200,45 @@ struct string_fragment {
         return (char*) &this->sf_string[this->sf_begin + offset];
     }
 
-    char front() const { return this->sf_string[this->sf_begin]; }
+    constexpr char front() const { return this->sf_string[this->sf_begin]; }
 
-    uint32_t front_codepoint() const
+    uint32_t front_codepoint() const;
+
+    constexpr char back() const { return this->sf_string[this->sf_end - 1]; }
+
+    constexpr void pop_back()
     {
-        size_t index = 0;
-        try {
-            return ww898::utf::utf8::read(
-                [this, &index]() { return this->data()[index++]; });
-        } catch (const std::runtime_error& e) {
-            return this->data()[0];
+        if (!this->empty()) {
+            this->sf_end -= 1;
         }
     }
-
-    char back() const { return this->sf_string[this->sf_end - 1]; }
 
     iterator begin() const { return &this->sf_string[this->sf_begin]; }
 
     iterator end() const { return &this->sf_string[this->sf_end]; }
 
-    bool empty() const { return !this->is_valid() || length() == 0; }
+    constexpr bool empty() const { return !this->is_valid() || length() == 0; }
 
-    Result<ssize_t, const char*> codepoint_to_byte_index(ssize_t cp_index) const
-    {
-        ssize_t retval = 0;
+    Result<ssize_t, const char*> codepoint_to_byte_index(
+        ssize_t cp_index) const;
 
-        while (cp_index > 0) {
-            if (retval >= this->length()) {
-                return Err("index is beyond the end of the string");
-            }
-            auto ch_len = TRY(ww898::utf::utf8::char_size([this, retval]() {
-                return std::make_pair(this->data()[retval],
-                                      this->length() - retval - 1);
-            }));
+    /**
+     * Move a byte index back to the start of the code point that contains it.
+     *
+     * Unlike the other UTF-8 helpers here, this repairs an index rather than
+     * asking a question of the content, so it cannot fail.  An index that
+     * lands on a continuation byte walks back to the lead byte; one that is
+     * already at a boundary is returned as-is.  Since a sequence is at most
+     * four bytes, the walk gives up after three: a longer run of continuation
+     * bytes is malformed, and leaving the index where it was lets the caller
+     * treat those bytes as the garbage they are instead of sliding an offset
+     * an unbounded distance.
+     */
+    size_t start_of_codepoint(size_t byte_index) const;
 
-            retval += ch_len;
-            cp_index -= 1;
-        }
+    string_fragment sub_cell_range(int cell_start, int cell_end) const;
 
-        return Ok(retval);
-    }
-
-    char operator[](int index) const
+    constexpr const char& operator[](size_t index) const
     {
         return this->sf_string[sf_begin + index];
     }
@@ -221,6 +263,22 @@ struct string_fragment {
         return memcmp(this->data(), sf.data(), sf.length()) == 0;
     }
 
+    bool operator!=(const string_fragment& rhs) const
+    {
+        return !(*this == rhs);
+    }
+
+    bool operator<(const string_fragment& rhs) const
+    {
+        auto rc = strncmp(
+            this->data(), rhs.data(), std::min(this->length(), rhs.length()));
+        if (rc < 0 || (rc == 0 && this->length() < rhs.length())) {
+            return true;
+        }
+
+        return false;
+    }
+
     bool iequal(const string_fragment& sf) const
     {
         if (this->length() != sf.length()) {
@@ -232,15 +290,20 @@ struct string_fragment {
             == 0;
     }
 
-    bool operator==(const char* str) const
+    template<std::size_t N>
+    bool operator==(const char (&str)[N]) const
     {
-        size_t len = strlen(str);
-
-        return len == (size_t) this->length()
-            && strncmp(this->data(), str, this->length()) == 0;
+        return (N - 1) == (size_t) this->length()
+            && strncmp(this->data(), str, N - 1) == 0;
     }
 
     bool operator!=(const char* str) const { return !(*this == str); }
+
+    template<typename... Args>
+    bool is_one_of(Args... args) const
+    {
+        return (this->operator==(args) || ...);
+    }
 
     bool startswith(const char* prefix) const
     {
@@ -271,7 +334,7 @@ struct string_fragment {
         return *suffix == '\0';
     }
 
-    string_fragment substr(int begin) const
+    constexpr string_fragment substr(int begin) const
     {
         return string_fragment{
             this->sf_string, this->sf_begin + begin, this->sf_end};
@@ -279,11 +342,24 @@ struct string_fragment {
 
     string_fragment sub_range(int begin, int end) const
     {
+        if (this->sf_begin + begin > this->sf_end) {
+            begin = this->sf_end - this->sf_begin;
+        }
+        if (this->sf_begin + end > this->sf_end) {
+            end = this->sf_end - this->sf_begin;
+        }
         return string_fragment{
             this->sf_string, this->sf_begin + begin, this->sf_begin + end};
     }
 
-    size_t count(char ch) const {
+    constexpr bool contains(const string_fragment& sf) const
+    {
+        return this->sf_string == sf.sf_string && this->sf_begin <= sf.sf_begin
+            && sf.sf_end <= this->sf_end;
+    }
+
+    constexpr size_t count(char ch) const
+    {
         size_t retval = 0;
 
         for (int lpc = this->sf_begin; lpc < this->sf_end; lpc++) {
@@ -295,7 +371,7 @@ struct string_fragment {
         return retval;
     }
 
-    nonstd::optional<size_t> find(char ch) const
+    std::optional<int> find(char ch) const
     {
         for (int lpc = this->sf_begin; lpc < this->sf_end; lpc++) {
             if (this->sf_string[lpc] == ch) {
@@ -303,20 +379,40 @@ struct string_fragment {
             }
         }
 
-        return nonstd::nullopt;
+        return std::nullopt;
     }
 
+    std::optional<int> rfind(char ch) const;
+
+    std::optional<int> next_word(int start_col) const;
+    std::optional<int> prev_word(int start_col) const;
+    std::optional<int> curr_word(int start_col) const;
+
+    std::string transform_codepoints(
+        const std::function<uint32_t(uint32_t)>& xform) const;
+
     template<typename P>
-    string_fragment find_left_boundary(size_t start, P&& predicate) const
+    string_fragment find_left_boundary(size_t start,
+                                       P&& predicate,
+                                       size_t count = 1) const
     {
         assert((int) start <= this->length());
 
-        if (start > 0 && start == this->length()) {
+        if (this->empty()) {
+            return *this;
+        }
+
+        if (start > 0 && start == static_cast<size_t>(this->length())) {
             start -= 1;
         }
-        while (start > 0) {
+        while (true) {
             if (predicate(this->data()[start])) {
-                start += 1;
+                count -= 1;
+                if (count == 0) {
+                    start += 1;
+                    break;
+                }
+            } else if (start == 0) {
                 break;
             }
             start -= 1;
@@ -324,17 +420,22 @@ struct string_fragment {
 
         return string_fragment{
             this->sf_string,
-            (int) start,
+            this->sf_begin + (int) start,
             this->sf_end,
         };
     }
 
     template<typename P>
-    string_fragment find_right_boundary(size_t start, P&& predicate) const
+    string_fragment find_right_boundary(size_t start,
+                                        P&& predicate,
+                                        size_t count = 1) const
     {
         while ((int) start < this->length()) {
             if (predicate(this->data()[start])) {
-                break;
+                count -= 1;
+                if (count == 0) {
+                    break;
+                }
             }
             start += 1;
         }
@@ -347,27 +448,31 @@ struct string_fragment {
     }
 
     template<typename P>
-    string_fragment find_boundaries_around(size_t start, P&& predicate) const
+    string_fragment find_boundaries_around(size_t start,
+                                           P&& predicate,
+                                           size_t count = 1) const
     {
-        return this->template find_left_boundary(start, predicate)
-            .find_right_boundary(0, predicate);
+        auto left = this->find_left_boundary(start, predicate, count);
+
+        return left.find_right_boundary(
+            start - left.sf_begin, predicate, count);
     }
 
-    nonstd::optional<std::pair<uint32_t, string_fragment>> consume_codepoint()
+    std::optional<std::pair<uint32_t, string_fragment>> consume_codepoint()
         const
     {
         auto cp = this->front_codepoint();
         auto index_res = this->codepoint_to_byte_index(1);
 
         if (index_res.isErr()) {
-            return nonstd::nullopt;
+            return std::nullopt;
         }
 
         return std::make_pair(cp, this->substr(index_res.unwrap()));
     }
 
     template<typename P>
-    nonstd::optional<string_fragment> consume(P predicate) const
+    std::optional<string_fragment> consume(P predicate) const
     {
         int consumed = 0;
         while (consumed < this->length()) {
@@ -379,7 +484,7 @@ struct string_fragment {
         }
 
         if (consumed == 0) {
-            return nonstd::nullopt;
+            return std::nullopt;
         }
 
         return string_fragment{
@@ -389,7 +494,7 @@ struct string_fragment {
         };
     }
 
-    nonstd::optional<string_fragment> consume_n(int amount) const;
+    std::optional<string_fragment> consume_n(int amount) const;
 
     template<typename P>
     string_fragment skip(P predicate) const
@@ -407,7 +512,7 @@ struct string_fragment {
     }
 
     using split_result
-        = nonstd::optional<std::pair<string_fragment, string_fragment>>;
+        = std::optional<std::pair<string_fragment, string_fragment>>;
 
     template<typename P>
     split_result split_while(P&& predicate) const
@@ -422,7 +527,7 @@ struct string_fragment {
         }
 
         if (consumed == 0) {
-            return nonstd::nullopt;
+            return std::nullopt;
         }
 
         return std::make_pair(
@@ -438,8 +543,10 @@ struct string_fragment {
             });
     }
 
+    using split_when_result = std::pair<string_fragment, string_fragment>;
+
     template<typename P>
-    split_result split_when(P&& predicate) const
+    split_when_result split_when(P&& predicate) const
     {
         int consumed = 0;
         while (consumed < this->length()) {
@@ -450,8 +557,34 @@ struct string_fragment {
             consumed += 1;
         }
 
-        if (consumed == 0) {
-            return nonstd::nullopt;
+        return std::make_pair(
+            string_fragment{
+                this->sf_string,
+                this->sf_begin,
+                this->sf_begin + consumed,
+            },
+            string_fragment{
+                this->sf_string,
+                this->sf_begin + consumed
+                    + ((consumed == this->length()) ? 0 : 1),
+                this->sf_end,
+            });
+    }
+
+    template<typename P>
+    split_result split_pair(P&& predicate) const
+    {
+        int consumed = 0;
+        while (consumed < this->length()) {
+            if (predicate(this->data()[consumed])) {
+                break;
+            }
+
+            consumed += 1;
+        }
+
+        if (consumed == this->length()) {
+            return std::nullopt;
         }
 
         return std::make_pair(
@@ -467,14 +600,76 @@ struct string_fragment {
             });
     }
 
-    split_result split_n(int amount) const;
+    template<typename P>
+    split_result rsplit_pair(P&& predicate) const
+    {
+        if (this->empty()) {
+            return std::nullopt;
+        }
+
+        auto curr = this->sf_end - 1;
+        while (curr >= this->sf_begin) {
+            if (predicate(this->sf_string[curr])) {
+                return std::make_pair(
+                    string_fragment{
+                        this->sf_string,
+                        this->sf_begin,
+                        curr,
+                    },
+                    string_fragment{
+                        this->sf_string,
+                        curr + 1,
+                        this->sf_end,
+                    });
+            }
+
+            curr -= 1;
+        }
+
+        return std::nullopt;
+    }
+
+    template<typename P>
+    split_when_result rsplit_when(P&& predicate) const
+    {
+        if (this->empty()) {
+            return std::make_pair(string_fragment{}, string_fragment{});
+        }
+
+        auto curr = this->sf_end - 1;
+        while (curr >= this->sf_begin) {
+            if (predicate(this->sf_string[curr])) {
+                return std::make_pair(
+                    string_fragment{
+                        this->sf_string,
+                        this->sf_begin,
+                        curr + 1,
+                    },
+                    string_fragment{
+                        this->sf_string,
+                        curr + 1,
+                        this->sf_end,
+                    });
+            }
+
+            curr -= 1;
+        }
+
+        return std::make_pair(string_fragment{}, *this);
+    }
+
+    using split_n_result = std::pair<string_fragment, string_fragment>;
+
+    split_n_result split_n(int amount) const;
 
     std::vector<string_fragment> split_lines() const;
 
     struct tag1 {
         const char t_value;
 
-        bool operator()(char ch) const { return this->t_value == ch; }
+        constexpr explicit tag1(const char value) : t_value(value) {}
+
+        constexpr bool operator()(char ch) const { return this->t_value == ch; }
     };
 
     struct quoted_string_body {
@@ -485,14 +680,15 @@ struct string_fragment {
             if (this->qs_in_escape) {
                 this->qs_in_escape = false;
                 return true;
-            } else if (ch == '\\') {
+            }
+            if (ch == '\\') {
                 this->qs_in_escape = true;
                 return true;
-            } else if (ch == '"') {
-                return false;
-            } else {
-                return true;
             }
+            if (ch == '"') {
+                return false;
+            }
+            return true;
         }
     };
 
@@ -506,8 +702,22 @@ struct string_fragment {
 
     std::string to_string() const
     {
+        if (!this->is_valid()) {
+            return "<invalid>";
+        }
+
         return {this->data(), (size_t) this->length()};
     }
+
+    template<typename OutputIt>
+    void to_hex_string(OutputIt out) const
+    {
+        for (const auto ch : *this) {
+            fmt::format_to(out, FMT_STRING("{:02x}"), ch);
+        }
+    }
+
+    std::string to_unquoted_string() const;
 
     void clear()
     {
@@ -515,13 +725,14 @@ struct string_fragment {
         this->sf_end = 0;
     }
 
-    void invalidate()
+    constexpr void invalidate()
     {
         this->sf_begin = -1;
         this->sf_end = -1;
     }
 
     string_fragment trim(const char* tokens) const;
+    string_fragment rtrim(const char* tokens) const;
     string_fragment trim() const;
 
     string_fragment prepend(const char* str, int amount) const
@@ -564,18 +775,20 @@ struct string_fragment {
     string_fragment to_owned(A allocator) const
     {
         return string_fragment{
-            this->template to_c_str(allocator),
+            this->to_c_str(allocator),
             0,
             this->length(),
         };
     }
 
-    scn::string_view to_string_view() const
+    std::string_view to_string_view() const
     {
-        return scn::string_view{this->begin(), this->end()};
+        return std::string_view{
+            this->data(),
+            static_cast<std::string_view::size_type>(this->length())};
     }
 
-    enum class case_style {
+    enum class case_style : uint8_t {
         lower,
         upper,
         camel,
@@ -586,9 +799,52 @@ struct string_fragment {
 
     std::string to_string_with_case_style(case_style style) const;
 
+    unsigned long hash() const
+    {
+        return hash_str(this->data(), this->length());
+    }
+
+    uint64_t bloom_bits() const;
+
+    /**
+     * The bloom bits for a fragment whose hash() is already known, so the
+     * data does not have to be hashed again.
+     */
+    static uint64_t bloom_bits_from_hash(uint64_t a);
+
+    class cursor_impl {
+    public:
+        std::optional<uint32_t> lookbehind() const
+        {
+            return this->ci_lookbehind;
+        }
+
+        std::optional<uint32_t> lookahead() const;
+
+        std::optional<uint32_t> next();
+
+    private:
+        friend string_fragment;
+
+        explicit cursor_impl(const string_fragment& parent)
+            : ci_string(parent.sf_string),
+              ci_end(parent.sf_end),
+              ci_next_index(parent.sf_begin)
+        {
+        }
+
+        const char* ci_string;
+        int32_t ci_end;
+        int32_t ci_next_index;
+        std::optional<uint32_t> ci_lookbehind;
+        std::optional<uint32_t> ci_next_lookbehind;
+    };
+
+    cursor_impl cursor() const { return cursor_impl(*this); }
+
     const char* sf_string;
-    int sf_begin;
-    int sf_end;
+    int32_t sf_begin;
+    int32_t sf_end;
 };
 
 inline bool
@@ -623,23 +879,78 @@ operator<<(std::ostream& os, const string_fragment& sf)
     return os;
 }
 
+class string_fragment_producer {
+public:
+    struct eof {};
+    struct error {
+        std::string what;
+    };
+    using next_result = mapbox::util::variant<eof, string_fragment, error>;
+    static std::unique_ptr<string_fragment_producer> from(string_fragment sf);
+
+    Result<void, std::string> for_each(
+        std::function<Result<void, std::string>(string_fragment)> cb)
+    {
+        while (true) {
+            auto next_res = this->next();
+            if (next_res.is<error>()) {
+                auto err = next_res.get<error>();
+
+                return Err(err.what);
+            }
+
+            if (next_res.is<eof>()) {
+                break;
+            }
+
+            const auto sf = next_res.get<string_fragment>();
+            auto cb_res = cb(sf);
+
+            if (cb_res.isErr()) {
+                return Err(cb_res.unwrapErr());
+            }
+        }
+
+        return Ok();
+    }
+
+    virtual ~string_fragment_producer() {}
+
+    virtual size_t estimated_size() const { return 1024; }
+
+    virtual next_result next() = 0;
+
+    std::string to_string();
+};
+
 class intern_string {
 public:
+    /**
+     * Find or create the entry for the given string.
+     *
+     * An empty string is not interned, the null entry is returned for it so
+     * that the intern_string_t built from it reports itself as empty.
+     */
     static const intern_string* lookup(const char* str, ssize_t len) noexcept;
 
     static const intern_string* lookup(const string_fragment& sf) noexcept;
 
     static const intern_string* lookup(const std::string& str) noexcept;
 
-    const char* get() const { return this->is_str.c_str(); };
+    const char* get() const { return this->is_data; };
 
-    size_t size() const { return this->is_str.size(); }
+    const char* data() const { return this->is_data; };
 
-    std::string to_string() const { return this->is_str; }
+    size_t size() const { return this->is_len; }
+
+    std::string to_string() const
+    {
+        return std::string(this->is_data, this->is_len);
+    }
 
     string_fragment to_string_fragment() const
     {
-        return string_fragment{this->is_str};
+        return string_fragment::from_bytes(this->is_data, this->is_len);
     }
 
     bool startswith(const char* prefix) const;
@@ -647,16 +958,35 @@ public:
     struct intern_table;
     static std::shared_ptr<intern_table> get_table_lifetime();
 
+    intern_string(const intern_string&) = delete;
+    intern_string& operator=(const intern_string&) = delete;
+
 private:
     friend intern_table;
 
-    intern_string(const char* str, ssize_t len)
-        : is_next(nullptr), is_str(str, (size_t) len)
+    /**
+     * Allocate one block holding the node and its characters, which are
+     * NUL-terminated so get() can be handed to anything wanting a C string.
+     *
+     * The characters never change and are freed with the node, so there is
+     * nothing for a separate string to buy here -- most interned strings run
+     * past the small-string limit, and each would otherwise carry a second
+     * allocation.
+     */
+    static intern_string* create(const char* str, size_t len);
+
+    /** Undoes create(); the table owns every node until it is destroyed. */
+    static void destroy(intern_string* is);
+
+    explicit intern_string(size_t len)
+        : is_next(nullptr), is_len(static_cast<uint32_t>(len))
     {
     }
 
     intern_string* is_next;
-    std::string is_str;
+    uint32_t is_len;
+    /** Over-allocated by create() to hold is_len characters and a NUL. */
+    char is_data[1];
 };
 
 using intern_table_lifetime = std::shared_ptr<intern_string::intern_table>;
@@ -684,6 +1014,8 @@ public:
     }
 
     const char* c_str() const { return this->get(); }
+
+    const char* data() const { return this->get(); }
 
     iterator begin() const { return this->get(); }
 
@@ -754,13 +1086,11 @@ private:
     const intern_string* ist_interned_string;
 };
 
-unsigned long hash_str(const char* str, size_t len);
-
 namespace fmt {
 template<>
 struct formatter<string_fragment> : formatter<string_view> {
     template<typename FormatContext>
-    auto format(const string_fragment& sf, FormatContext& ctx)
+    auto format(const string_fragment& sf, FormatContext& ctx) const
     {
         return formatter<string_view>::format(
             string_view{sf.data(), (size_t) sf.length()}, ctx);
@@ -772,16 +1102,39 @@ struct formatter<intern_string_t> : formatter<string_view> {
     template<typename FormatContext>
     auto format(const intern_string_t& is, FormatContext& ctx)
     {
-        return formatter<string_view>::format(
-            string_view{is.get(), (size_t) is.size()}, ctx);
+        return formatter<string_view>::format(string_view{is.get(), is.size()},
+                                              ctx);
     }
 };
+
+template<>
+struct formatter<std::error_code> : formatter<string_view> {
+    template<typename FormatContext>
+    auto format(const std::error_code& ec, FormatContext& ctx)
+    {
+        return formatter<string_view>::format(ec.message(), ctx);
+    }
+};
+
+template<typename I>
+struct formatter<std::optional<I>> : formatter<I> {
+    template<typename FormatContext>
+    auto format(const std::optional<I>& opt, FormatContext& ctx) const
+    {
+        if (!opt) {
+            return formatter<string_view>::format("\u2205", ctx);
+        }
+
+        return formatter<I>::format(opt.value(), ctx);
+    }
+};
+
 }  // namespace fmt
 
 namespace std {
 template<>
 struct hash<const intern_string_t> {
-    std::size_t operator()(const intern_string_t& ist) const
+    std::size_t operator()(const intern_string_t& ist) const noexcept
     {
         return ist.hash();
     }
@@ -809,10 +1162,28 @@ operator==(const intern_string_t& left, const string_fragment& sf)
 }
 
 inline bool
+operator<(const intern_string_t& left, const string_fragment& sf)
+{
+    return left.to_string_fragment() < sf;
+}
+
+inline bool
+operator<(const string_fragment& lhs, const intern_string_t& rhs)
+{
+    return lhs < rhs.to_string_fragment();
+}
+
+inline bool
 operator==(const string_fragment& left, const intern_string_t& right)
 {
     return (left.length() == (int) right.size())
         && (memcmp(left.data(), right.get(), left.length()) == 0);
+}
+
+constexpr string_fragment
+operator""_frag(const char* str, std::size_t len)
+{
+    return string_fragment{str, 0, (int) len};
 }
 
 namespace std {
@@ -847,11 +1218,90 @@ to_string_fragment(const std::string& s)
     return string_fragment(s.c_str(), 0, s.length());
 }
 
+inline string_fragment
+to_string_fragment(const std::string_view& sv)
+{
+    return string_fragment::from_bytes(sv.data(), sv.length());
+}
+
+template<typename A>
+std::optional<string_fragment>
+to_owned(std::optional<string_fragment> sf, A allocator)
+{
+    if (!sf) {
+        return sf;
+    }
+
+    return sf->to_owned(allocator);
+}
+
+/**
+ * A fragment along with its hash(), for a value that is used for more than
+ * one table lookup or for its bloom bits, so it is only hashed once.
+ */
+struct hashed_frag {
+    string_fragment hf_frag;
+    unsigned long hf_hash{0};
+
+    static hashed_frag from(const string_fragment& sf)
+    {
+        return {sf, sf.hash()};
+    }
+
+    uint64_t bloom_bits() const
+    {
+        return string_fragment::bloom_bits_from_hash(this->hf_hash);
+    }
+};
+
+/**
+ * Hashes fragments for unordered maps.  Together with frag_equal, a map
+ * can also be searched with a hashed_frag, which reuses its hash.
+ */
 struct frag_hasher {
+    using is_transparent = void;
+
     size_t operator()(const string_fragment& sf) const
     {
         return hash_str(sf.data(), sf.length());
     }
+
+    size_t operator()(const hashed_frag& hf) const { return hf.hf_hash; }
 };
+
+struct frag_equal {
+    using is_transparent = void;
+
+    bool operator()(const string_fragment& lhs,
+                    const string_fragment& rhs) const
+    {
+        return lhs == rhs;
+    }
+
+    bool operator()(const hashed_frag& lhs, const string_fragment& rhs) const
+    {
+        return lhs.hf_frag == rhs;
+    }
+
+    bool operator()(const string_fragment& lhs, const hashed_frag& rhs) const
+    {
+        return lhs == rhs.hf_frag;
+    }
+};
+
+struct intern_hasher {
+    size_t operator()(const intern_string_t& is) const
+    {
+        return hash_str(is.c_str(), is.size());
+    }
+};
+
+namespace lnav {
+inline std::error_code
+from_errno()
+{
+    return std::error_code{errno, std::generic_category()};
+}
+}  // namespace lnav
 
 #endif

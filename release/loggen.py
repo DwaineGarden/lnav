@@ -12,6 +12,16 @@ SYSLOG_DATE_FMT = "%b %d %H:%M:%S"
 ACCESS_LOG_DATE_FMT = "%d/%b/%Y:%H:%M:%S"
 GENERIC_DATE_FMT = "%Y-%m-%dT%H:%M:%S.%%s"
 
+try:
+    shutil.rmtree("/tmp/demo")
+except OSError:
+    pass
+
+try:
+    os.makedirs("/tmp/demo")
+except OSError:
+    pass
+
 TEST_ADDRESSES = (
         ["192.0.2.55"] * 20 +
         ["192.0.2.44"] * 20 +
@@ -131,7 +141,7 @@ TEST_AGENTS = [
     "Roku4640X/DVP-7.70 (297.70E04154A)",
 ]
 
-START_TIME = datetime.datetime.fromtimestamp(1641898727)
+START_TIME = datetime.datetime.fromtimestamp(1692700000)
 ACCESS_LOG_CURR_TIME = START_TIME
 SYSLOG_LOG_CURR_TIME = START_TIME
 
@@ -139,7 +149,7 @@ SYSLOG_LOG_CURR_TIME = START_TIME
 def access_log_msgs():
     global ACCESS_LOG_CURR_TIME
     while True:
-        ACCESS_LOG_CURR_TIME += datetime.timedelta(seconds=random.randrange(1, 3))
+        ACCESS_LOG_CURR_TIME += datetime.timedelta(seconds=random.randrange(1, 5))
         yield '%s - %s [%s +0000] "%s %s %s" %s %s "%s" "%s"\n' % (
             random.choice(TEST_ADDRESSES),
             random.choice(TEST_USERNAMES),
@@ -181,7 +191,7 @@ TEST_MSGS = [
 def syslog_msgs():
     global SYSLOG_LOG_CURR_TIME
     while True:
-        SYSLOG_LOG_CURR_TIME += datetime.timedelta(seconds=random.randrange(1, 3))
+        SYSLOG_LOG_CURR_TIME += datetime.timedelta(seconds=random.randrange(1, 5))
         yield '%s frontend3 %s: %s\n' % (
             SYSLOG_LOG_CURR_TIME.strftime(SYSLOG_DATE_FMT),
             random.choice(TEST_PROCS),
@@ -201,7 +211,7 @@ FILES = [
 ]
 
 COUNTER = 0
-while COUNTER < 5000:
+while COUNTER < 500000:
     loop_inc = datetime.timedelta(seconds=random.weibullvariate(1, 1.5) * 500)
     ACCESS_LOG_CURR_TIME += loop_inc
     SYSLOG_LOG_CURR_TIME += loop_inc
@@ -220,6 +230,6 @@ while COUNTER < 5000:
                     fp.write(next(gen))
                 # if random.uniform(0.0, 1.0) < 0.010:
                 #    fp.truncate(0)
-            # time.sleep(random.uniform(0.01, 0.02))
+            time.sleep(random.uniform(0.0001, 0.0002))
             # if random.uniform(0.0, 1.0) < 0.001:
             #    os.remove(fname)

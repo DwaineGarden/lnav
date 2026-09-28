@@ -1,6 +1,54 @@
 #! /bin/bash
 
+export TZ=UTC
 export YES_COLOR=1
+export DUMP_CRASH=1
+
+run_cap_test ${lnav_test} -n \
+    -c ":goto 1" \
+    -c ":goto 0s" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -nN \
+    -c ":goto -1"
+
+run_cap_test ${lnav_test} -nN \
+    -c ":goto -1%"
+
+run_cap_test ${lnav_test} -n \
+    -c ":goto 0" \
+    -c ":convert-time-to bad-zone" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":goto 0" \
+    -c ":convert-time-to America/Los_Angeles" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -nN \
+    -c ";SELECT ':echo Hello' || char(10) || ':echo World' AS cmds" \
+    -c ':eval ${cmds}'
+
+run_cap_test ${lnav_test} -nN \
+    -c ":cd /bad-dir"
+
+run_cap_test ${lnav_test} -nN \
+    -c ":cd ${test_dir}/logfile_access_log.0"
+
+run_cap_test ${lnav_test} -nN \
+    -c ":cd ${test_dir}" \
+    -c ":open logfile_access_log.0"
+
+run_cap_test ${lnav_test} -nN \
+    -c ":cd ${top_srcdir}" \
+    -c ";SELECT * FROM environ WHERE name = 'PWD'" \
+    -c ":write-json-to -"
+
+run_cap_test ${lnav_test} -nN \
+    -e "echo Hello, World!"
+
+run_cap_test ${lnav_test} -nN \
+    -e "echo Hello, World! > /dev/stderr"
 
 run_cap_test ${lnav_test} -n \
     -c ":switch-to-view help" \
@@ -19,6 +67,13 @@ run_cap_test ${lnav_test} -n \
     ${test_dir}/logfile_access_log.0
 
 run_cap_test ${lnav_test} -n \
+    -c ":goto 1" \
+    -c ":mark" \
+    -c ":hide-unmarked-lines" \
+    -c ":goto 0" \
+    ${test_dir}/logfile_multiline.0
+
+run_cap_test ${lnav_test} -n \
     -c ":unix-time" \
     "${test_dir}/logfile_access_log.*"
 
@@ -30,9 +85,18 @@ run_cap_test env TZ=UTC ${lnav_test} -n \
     -c ":unix-time 1612072409" \
     "${test_dir}/logfile_access_log.*"
 
+#run_cap_test env TZ=UTC ${lnav_test} -n \
+#    -c ":unix-time 16120724091612072409" \
+#    "${test_dir}/logfile_access_log.*"
+
 run_cap_test env TZ=UTC ${lnav_test} -n \
     -c ":current-time" \
     "${test_dir}/logfile_access_log.*"
+
+run_cap_test env TEST_COMMENT="unknown command with suggestions" \
+    ${lnav_test} -n \
+    -c ":writ-to" \
+    ${test_dir}/logfile_access_log.0
 
 run_cap_test ${lnav_test} -n -d /tmp/lnav.err \
     -c ":write-to" \
@@ -84,6 +148,23 @@ run_cap_test ${lnav_test} -n -d /tmp/lnav.err \
     "${test_dir}/logfile_access_log.*"
 
 run_cap_test ${lnav_test} -n -d /tmp/lnav.err \
+    -c ":filter-expr :sc_bytes > 2000" \
+    -c ":clear-filter-expr" \
+    -c ":goto 0" \
+    ${test_dir}/logfile_access_log.0
+
+# Each expression must replace the one before it.  Three of them, because a
+# filter is built before the one it replaces is released, so only the third
+# can be handed the address the first had; the last two are the same so that
+# the only way to get the first one's rows is to still be running it.
+run_cap_test ${lnav_test} -n -d /tmp/lnav.err \
+    -c ":filter-expr :log_body LIKE '%lookup%'" \
+    -c ":filter-expr :log_body LIKE '%attempting%'" \
+    -c ":filter-expr :log_body LIKE '%attempting%'" \
+    -c ":goto 0" \
+    ${test_dir}/logfile_syslog.0
+
+run_cap_test ${lnav_test} -n -d /tmp/lnav.err \
     -c ":filter-expr :sc_bytes # ff" \
     "${test_dir}/logfile_access_log.*"
 
@@ -119,6 +200,13 @@ run_cap_test ${lnav_test} -n -d /tmp/lnav.err \
 
 run_cap_test ${lnav_test} -n -d /tmp/lnav.err \
     -c ":filter-in vmk" \
+    -c ":disable-filter vmk" \
+    -c ":enable-filter vmk" \
+    -c ":goto 0" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n -d /tmp/lnav.err \
+    -c ":filter-in vmk" \
     -c ":rebuild" \
     -c ":reset-session" \
     -c ":rebuild" \
@@ -132,6 +220,14 @@ run_cap_test ${lnav_test} -n -d /tmp/lnav.err \
     ${test_dir}/logfile_access_log.0
 
 run_cap_test ${lnav_test} -n \
+    -c ":hide-fields log_time" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":hide-fields log_level" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
     -c ":hide-fields foobar" \
     ${test_dir}/logfile_access_log.0
 
@@ -142,6 +238,10 @@ run_cap_test ${lnav_test} -n \
 run_cap_test ${lnav_test} -n \
     -c ":hide-fields access_log.c_ip access_log.cs_uri_stem" \
     ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ':hide-fields log_time log_level' \
+    ${test_dir}/logfile_generic.0
 
 run_cap_test ${lnav_test} -f- -n < ${test_dir}/formats/scripts/multiline-echo.lnav
 
@@ -186,7 +286,7 @@ run_cap_test ${lnav_test} -n \
     ${test_dir}/logfile_access_log.0
 
 run_cap_test ${lnav_test} -n \
-    -c ':goto 17:00:01.' \
+    -c ':goto 17:00:01.N' \
     ${test_dir}/logfile_access_log.0
 
 run_cap_test ${lnav_test} -n \
@@ -284,6 +384,47 @@ run_cap_test ${lnav_test} -n \
     -c ":rebuild" \
     logfile_append.0
 
+cp ${test_dir}/logfile_multiline.0 logfile_append.0
+chmod ug+w logfile_append.0
+
+# Lines arriving after a search must not cost the search the hits it already
+# found.  Nothing here may disturb the filters or force a full rebuild, since
+# either one rescans everything and hides the problem.
+run_cap_test ${lnav_test} -n \
+    -c "/Goodbye" \
+    -c ":shexec echo '2009-07-20 22:59:31,000:INFO:and another' >> logfile_append.0" \
+    -c ":rebuild" \
+    -c ":goto 0" \
+    -c ":next-mark search" \
+    logfile_append.0
+
+cp ${test_dir}/logfile_multiline.0 logfile_append.0
+chmod ug+w logfile_append.0
+
+# The second round of new lines is where a stale idea of how far the search has
+# got shows up, so the only line that matches here is the last one to arrive.
+run_cap_test ${lnav_test} -n \
+    -c "/zzz" \
+    -c ":shexec echo '2009-07-20 22:59:31,000:INFO:nothing to see' >> logfile_append.0" \
+    -c ":rebuild" \
+    -c ":shexec echo '2009-07-20 22:59:32,000:INFO:zzz is here' >> logfile_append.0" \
+    -c ":rebuild" \
+    -c ":goto 0" \
+    -c ":next-mark search" \
+    logfile_append.0
+
+cp ${test_dir}/logfile_multiline.0 logfile_append.0
+chmod ug+w logfile_append.0
+
+# A search created after lines have arrived is still run over the lines that
+# were already there, not just the new ones.
+run_cap_test ${lnav_test} -n \
+    -c ":shexec echo '2009-07-20 22:59:31,000:INFO:Goodbye again' >> logfile_append.0" \
+    -c ":rebuild" \
+    -c ":create-named-search bye Goodbye" \
+    -c ";SELECT log_line, log_named_searches FROM generic_log" \
+    logfile_append.0
+
 run_cap_test ${lnav_test} -n \
     -c ":filter-in avahi" \
     -c ":delete-filter avahi" \
@@ -301,13 +442,13 @@ run_cap_test ${lnav_test} -n \
     -c ":filter-out World" \
     ${test_dir}/logfile_plain.0
 
-TOO_MANY_FILTERS=""
-for i in `seq 1 32`; do
-    TOO_MANY_FILTERS="$TOO_MANY_FILTERS -c ':filter-out $i'"
-done
-run_cap_test eval ${lnav_test} -d /tmp/lnav.err -n \
-    $TOO_MANY_FILTERS \
-    ${test_dir}/logfile_filter.0
+#TOO_MANY_FILTERS=""
+#for i in `seq 1 32`; do
+#    TOO_MANY_FILTERS="$TOO_MANY_FILTERS -c ':filter-out $i'"
+#done
+#run_cap_test ${lnav_test} -d /tmp/lnav.err -n \
+#    $TOO_MANY_FILTERS \
+#    ${test_dir}/logfile_filter.0
 
 run_cap_test ${lnav_test} -n \
     -c ":close" \
@@ -347,6 +488,43 @@ run_cap_test ${lnav_test} -n \
     -c ':write-jsonlines-to -' \
     ${test_dir}/logfile_access_log.0
 
+run_cap_test env TEST_COMMENT="write-jsonlines-to for marked log lines" \
+    ${lnav_test} -n \
+    -c ":goto 0" \
+    -c ":mark" \
+    -c ":goto 2" \
+    -c ":mark" \
+    -c ":write-jsonlines-to -" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test env TEST_COMMENT="write-jsonlines-to with comment and tag" \
+    ${lnav_test} -n \
+    -c ":goto 0" \
+    -c ":mark" \
+    -c ":comment this is a test comment" \
+    -c ":tag #test-tag" \
+    -c ":write-jsonlines-to -" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test env TEST_COMMENT="write-jsonlines-to for JSON log format" \
+    ${lnav_test} -n \
+    -c ":goto 0" \
+    -c ":mark" \
+    -c ":goto 3" \
+    -c ":mark" \
+    -c ":write-jsonlines-to -" \
+    ${test_dir}/logfile_bunyan.0
+
+run_cap_test env TEST_COMMENT="write-jsonlines-to --all" \
+    ${lnav_test} -n \
+    -c ":write-jsonlines-to --all -" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test env TEST_COMMENT="write-jsonlines-to with no marks errors" \
+    ${lnav_test} -n \
+    -c ":write-jsonlines-to -" \
+    ${test_dir}/logfile_access_log.0
+
 # By setting the LNAVSECURE mode before executing the command, we will disable
 # the access to the write-json-to command and the output would just be the
 # actual display of select query rather than json output.
@@ -371,12 +549,14 @@ run_cap_test ${lnav_test} -n \
 
 run_cap_test ${lnav_test} -n \
     -c ":goto 0" \
-    -c ":pipe-line-to echo \$cs_uri_stem \$sc_status" \
+    -c ":pipe-line-to xargs echo \$cs_uri_stem \$sc_status - " \
     ${test_dir}/logfile_access_log.0
 
 run_cap_test ${lnav_test} -n \
-    -c ":switch-to-view pretty" \
-    ${test_dir}/textfile_json_one_line.0
+    -I ${test_dir} \
+    -c ":goto 5" \
+    -c ":pipe-line-to xargs echo \$log_raw_text \$log_level \$user - " \
+    ${test_dir}/logfile_json.json
 
 run_cap_test ${lnav_test} -n \
     -c ":switch-to-view pretty" \
@@ -384,6 +564,11 @@ run_cap_test ${lnav_test} -n \
 
 run_cap_test ${lnav_test} -n \
     -c ":switch-to-view pretty" \
+    ${test_dir}/textfile_json_one_line.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":switch-to-view pretty" \
+    -c ":goto 0" \
     ${test_dir}/textfile_quoted_json.0
 
 run_cap_test ${lnav_test} -n \
@@ -405,8 +590,39 @@ run_cap_test ${lnav_test} -n \
     ${test_dir}/logfile_access_log.0
 
 run_cap_test ${lnav_test} -n \
+    -c ":highlight-field --underline sc_status ^4.*" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":highlight-field --underline sc_status ^4.*" \
+    -c ":highlight-field --bg-color=green sc_status ^2.*" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":highlight-field --underline sc_status ^4.*" \
+    -c ":highlight-field --bg-color=green sc_status ^2.*" \
+    -c ":clear-highlight-field sc_status" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":highlight-field --color=blah sc_status ^4.*" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":highlight-field sc_status ^(" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":highlight-field sc_status" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
     -c ":clear-highlight foobar" \
     ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":highlight-field --underline arg" \
+    ${test_dir}/logfile_grafana.0
 
 run_cap_test ${lnav_test} -n \
     -c ":zoom-to 4-hour" \
@@ -459,10 +675,48 @@ run_cap_test ${lnav_test} -n \
     ${test_dir}/logfile_access_log.0
 
 run_cap_test ${lnav_test} -n \
+    -c ":mark-expr :cs_uri_stem LIKE '%vmk%'" \
+    -c ":clear-mark-expr" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -I ${test_dir} \
+    -c ":mark-expr :log_body LIKE '%service%'" \
+    ${test_dir}/logfile_json2.json
+
+run_cap_test ${lnav_test} -n \
     -c ":goto 0" \
     -c ":mark" \
     -c ":switch-to-view histogram" \
     ${test_dir}/logfile_syslog.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":mark" \
+    -c "/vmw" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":goto 0" \
+    -c ":toggle-sticky-header" \
+    -c ":goto 4" \
+    ${test_dir}/logfile_filter.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":goto 0" \
+    -c ":toggle-sticky-header" \
+    -c ":goto 2" \
+    -c ":toggle-sticky-header" \
+    -c ":goto 6" \
+    ${test_dir}/logfile_filter.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":goto 0" \
+    -c ":toggle-sticky-header" \
+    -c ":goto 4" \
+    -c ":goto 0" \
+    -c ":toggle-sticky-header" \
+    -c ":goto 4" \
+    ${test_dir}/logfile_filter.0
 
 run_cap_test ${lnav_test} -n \
     -c ":zoom-to bad" \
@@ -474,6 +728,9 @@ run_cap_test ${lnav_test} -n \
 
 printf "Hello, World!" | run_cap_test env TEST_COMMENT="text view" ${lnav_test} -n \
   -c ":switch-to-view text"
+
+run_cap_test ${lnav_test} -Nnv \
+    -c ":hide-lines-before badbadbad"
 
 run_cap_test ${lnav_test} -Nnv \
     -c ":hide-lines-before 2009-07-20T22:59:29" \
@@ -517,3 +774,411 @@ run_cap_test ${lnav_test} -n \
 run_cap_test ${lnav_test} -n \
     -c ':echo Hello, $XYZ!' \
     ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -H \
+    -c ':filter-context 4'
+
+# Naming the active search adopts its hits and then clears it, so the
+# highlighted lines survive with the named search's own color.
+run_cap_test ${lnav_test} -n \
+    -c "/vmw" \
+    -c ":create-named-search vmw" \
+    -c ":goto 0" \
+    -c ":next-mark search" \
+    ${test_dir}/logfile_access_log.0
+
+# A pattern can be given directly, with no search active.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search cgi cgi" \
+    -c ":goto 2" \
+    -c ":prev-mark search" \
+    ${test_dir}/logfile_access_log.0
+
+# The pattern is taken from after the name, even when the name ends with the
+# same character that the pattern starts with.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search req q 500" \
+    -c ";SELECT name, pattern FROM lnav_view_searches" \
+    ${test_dir}/logfile_access_log.0
+
+# A pattern that will not compile is searched for literally, but the search is
+# still reported as it was typed rather than in its escaped form.
+run_cap_test ${lnav_test} -n \
+    -c "/foo[" \
+    -c ";SELECT search FROM lnav_views WHERE name = 'log'" \
+    ${test_dir}/logfile_access_log.0
+
+# Naming an escaped search keeps working, since what is stored has to compile
+# again on a session load.
+run_cap_test ${lnav_test} -n \
+    -c "/foo[" \
+    -c ":create-named-search bracket" \
+    -c ";SELECT name, pattern FROM lnav_view_searches" \
+    ${test_dir}/logfile_access_log.0
+
+# Leaving the pattern off hands the active search over to the named one, even
+# when the search had to be escaped to compile.  Only the last query is what
+# the view is showing, so this is a run of its own.
+run_cap_test ${lnav_test} -n \
+    -c "/foo[" \
+    -c ":create-named-search bracket" \
+    -c ";SELECT search FROM lnav_views WHERE name = 'log'" \
+    ${test_dir}/logfile_access_log.0
+
+# Spelling the pattern out keeps the active search, even when the two happen
+# to be the same.  Only leaving the pattern off hands the search over.
+run_cap_test ${lnav_test} -n \
+    -c "/vmw" \
+    -c ":create-named-search dup vmw" \
+    -c ";SELECT name, search FROM lnav_views WHERE name = 'log'" \
+    ${test_dir}/logfile_access_log.0
+
+# Two named searches are active at once and get distinct colors.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ":create-named-search one cgi" \
+    ${test_dir}/logfile_access_log.0
+
+# Deleting one search must not unmark a line that the other one still
+# matches -- line 0 matches both 'vmw' and 'cgi'.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ":create-named-search one cgi" \
+    -c ":delete-named-search one" \
+    -c ":goto 1" \
+    -c ":prev-mark search" \
+    ${test_dir}/logfile_access_log.0
+
+# ... but deleting the last search matching a line does unmark it.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search one cgi" \
+    -c ":delete-named-search one" \
+    -c ":goto 1" \
+    -c ":prev-mark search" \
+    ${test_dir}/logfile_access_log.0
+
+# Resetting the session deletes the named searches, so their marks go with
+# them.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ":create-named-search one cgi" \
+    -c ":reset-session" \
+    -c ":goto 0" \
+    -c ":next-mark search" \
+    ${test_dir}/logfile_access_log.0
+
+# ... and the names and slots are free to be used again.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ":reset-session" \
+    -c ":create-named-search every vmw" \
+    -c ";SELECT view_name, name, pattern FROM lnav_view_searches" \
+    -c ":write-csv-to -" \
+    ${test_dir}/logfile_access_log.0
+
+# The details panel names the searches that matched the message.  Line 0
+# matches both 'every' and 'one'...
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ":create-named-search one cgi" \
+    -c ";UPDATE lnav_views SET options = json_object('row-details', 'show') WHERE name = 'log'" \
+    -c ":goto 0" \
+    ${test_dir}/logfile_access_log.0
+
+# ... and line 1 matches neither, so the section is left out.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search one cgi" \
+    -c ";UPDATE lnav_views SET options = json_object('row-details', 'show') WHERE name = 'log'" \
+    -c ":goto 1" \
+    ${test_dir}/logfile_access_log.0
+
+# Several hits in one message are listed as the distinct strings that
+# matched.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search gwords g[a-z]+" \
+    -c ";UPDATE lnav_views SET options = json_object('row-details', 'show') WHERE name = 'log'" \
+    -c ":goto 0" \
+    ${test_dir}/logfile_access_log.0
+
+# The hit is on the second line of the message, but the details panel for
+# the message still finds it.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search greeting today" \
+    -c ";UPDATE lnav_views SET options = json_object('row-details', 'show') WHERE name = 'log'" \
+    -c ":goto 0" \
+    ${test_dir}/logfile_multiline.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search dup vmw" \
+    -c ":create-named-search dup cgi" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":delete-named-search nonexistent" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search noname" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search bad (unclosed" \
+    ${test_dir}/logfile_access_log.0
+
+# The name is taken verbatim, so quoting it would only smuggle the quotes and
+# the rest of the words into the name.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search 'my search' vmw" \
+    ${test_dir}/logfile_access_log.0
+
+# A disabled search stops highlighting and gives up its marks, but line 0 is
+# still marked by the search that is left enabled.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ":create-named-search one cgi" \
+    -c ":disable-named-search one" \
+    -c ":goto 1" \
+    -c ":prev-mark search" \
+    ${test_dir}/logfile_access_log.0
+
+# ... and with nothing else matching the line, the mark goes away.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search one cgi" \
+    -c ":disable-named-search one" \
+    -c ":goto 1" \
+    -c ":prev-mark search" \
+    ${test_dir}/logfile_access_log.0
+
+# Re-enabling puts the highlighting and the marks back without another scan.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search one cgi" \
+    -c ":disable-named-search one" \
+    -c ":enable-named-search one" \
+    -c ":goto 1" \
+    -c ":prev-mark search" \
+    ${test_dir}/logfile_access_log.0
+
+# A disabled search is left out of the log_named_searches column.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ":create-named-search one cgi" \
+    -c ":disable-named-search one" \
+    -c ";SELECT log_line, log_named_searches FROM access_log" \
+    ${test_dir}/logfile_access_log.0
+
+# Marking a line rescans it for the metadata searches, which must not cost it
+# the hits that were already found in its text.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search every vmw" \
+    -c ":goto 0" \
+    -c ":mark" \
+    -c ";SELECT log_line, log_named_searches FROM access_log" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search one cgi" \
+    -c ":disable-named-search one" \
+    -c ":disable-named-search one" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":disable-named-search nonexistent" \
+    ${test_dir}/logfile_access_log.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":enable-named-search nonexistent" \
+    ${test_dir}/logfile_access_log.0
+
+# Reopening a view builds a new source for it, so the searches have to be run
+# again over the text that just arrived.  The search bookmark is what proves
+# it, so the failure shows up on stderr as a jump that could not be made.
+run_cap_test ${lnav_test} -n \
+    -c ":toggle-view schema" \
+    -c "/lnav_view_searches" \
+    -c ":toggle-view schema" \
+    -c ":toggle-view schema" \
+    -c ":goto 0" \
+    -c ":next-mark search" \
+    -c ":switch-to-view log" \
+    ${test_dir}/logfile_access_log.0
+
+# The pretty view asks for rewritten lines, which replace the buffer that the
+# shared ref for the line is a slice of.
+run_cap_test ${lnav_test} -n \
+    -c ":toggle-view pretty" \
+    -c "/vmkboot" \
+    -c ":goto 0" \
+    -c ":next-mark search" \
+    ${test_dir}/logfile_access_log.0
+
+# The same reopen check as the schema view above -- the pretty view builds a new
+# source every time it is opened, so the searches have to be run again over the
+# text that just arrived.
+run_cap_test ${lnav_test} -n \
+    -c ":toggle-view pretty" \
+    -c "/vmkboot" \
+    -c ":toggle-view pretty" \
+    -c ":toggle-view pretty" \
+    -c ":goto 0" \
+    -c ":next-mark search" \
+    ${test_dir}/logfile_access_log.0
+
+# logfile_glog.0 has 'log_if' on line 3 and 'array' on lines 4 and 5, so the
+# two searches can be told apart by where a jump lands.  A focused search
+# narrows the jump to its own hits, passing over the other search's line.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":focus-search arr" \
+    -c ":goto 0" \
+    -c ":next-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+# ... and with nothing focused the same jump stops on the nearer line,
+# whichever search found it.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":goto 0" \
+    -c ":next-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+# A name given to the jump narrows it without touching the focus.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":goto 0" \
+    -c ":next-search-hit arr" \
+    ${test_dir}/logfile_glog.0
+
+# Going backwards is narrowed the same way.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":focus-search warn" \
+    -c ":goto 6" \
+    -c ":prev-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+# The focused search is named when there are no more of its hits that way.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":focus-search warn" \
+    -c ":goto 4" \
+    -c ":next-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+# :focus-search with no name goes back to moving through all of the searches.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":focus-search arr" \
+    -c ":focus-search" \
+    -c ":goto 0" \
+    -c ":next-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+# From the last line no search has a hit ahead, so the message names whichever
+# search the cycle has landed on.  The first stop is the first named search,
+# since there is no active search to come before it.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":focus-next-search" \
+    -c ":goto 6" \
+    -c ":next-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":focus-next-search" \
+    -c ":focus-next-search" \
+    -c ":goto 6" \
+    -c ":next-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+# ... and the cycle comes back around to all of them, which have no name.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":focus-next-search" \
+    -c ":focus-next-search" \
+    -c ":focus-next-search" \
+    -c ":goto 6" \
+    -c ":next-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+# An active search is a stop of its own, ahead of the named searches, so the
+# jump follows it rather than the named search's earlier line.
+run_cap_test ${lnav_test} -n \
+    -c "/array" \
+    -c ":create-named-search warn log_if" \
+    -c ":focus-next-search" \
+    -c ":goto 0" \
+    -c ":next-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+# Cycling backwards from nothing focused lands on the last search.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":focus-prev-search" \
+    -c ":goto 6" \
+    -c ":next-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+# A disabled search is not a stop in the cycle, so the first stop is the one
+# that is still enabled.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":disable-named-search warn" \
+    -c ":focus-next-search" \
+    -c ":goto 6" \
+    -c ":next-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+# Disabling the focused search drops the focus, so the jump moves through what
+# is left instead of a slot that is no longer highlighted.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":focus-search arr" \
+    -c ":disable-named-search arr" \
+    -c ":goto 0" \
+    -c ":next-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+# Deleting the focused search drops the focus as well; its slot can be handed
+# to another search.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search warn log_if" \
+    -c ":create-named-search arr array" \
+    -c ":focus-search arr" \
+    -c ":delete-named-search arr" \
+    -c ":goto 0" \
+    -c ":next-search-hit" \
+    ${test_dir}/logfile_glog.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":focus-search nonexistent" \
+    ${test_dir}/logfile_glog.0
+
+# A disabled search cannot be focused, since it is not being highlighted.
+run_cap_test ${lnav_test} -n \
+    -c ":create-named-search arr array" \
+    -c ":disable-named-search arr" \
+    -c ":focus-search arr" \
+    ${test_dir}/logfile_glog.0
+
+run_cap_test ${lnav_test} -n \
+    -c ":next-search-hit nonexistent" \
+    ${test_dir}/logfile_glog.0
+
+# With nothing to focus, the cycle stays where it is.
+run_cap_test ${lnav_test} -n \
+    -c ":focus-next-search" \
+    ${test_dir}/logfile_glog.0

@@ -90,6 +90,8 @@ struct yajl_lexer_t {
     /* shall we validate utf8 inside strings? */
     unsigned int validateUTF8;
 
+    unsigned int needKey;
+
     yajl_alloc_funcs * alloc;
 };
 
@@ -109,6 +111,7 @@ yajl_lex_alloc(yajl_alloc_funcs * alloc,
     lxr->buf = yajl_buf_alloc(alloc);
     lxr->allowComments = allowComments;
     lxr->validateUTF8 = validateUTF8;
+    lxr->needKey = 0;
     lxr->alloc = alloc;
     return lxr;
 }
@@ -134,6 +137,7 @@ yajl_lex_free(yajl_lexer lxr)
 #define VHC 0x04
 #define NFP 0x08
 #define NUC 0x10
+#define PEC 0x20
 
 static const char charLookupTable[256] =
 {
@@ -142,8 +146,8 @@ static const char charLookupTable[256] =
 /*10*/ IJC    , IJC    , IJC    , IJC    , IJC    , IJC    , IJC    , IJC    ,
 /*18*/ IJC    , IJC    , IJC    , IJC    , IJC    , IJC    , IJC    , IJC    ,
 
-/*20*/ 0      , 0      , NFP|VEC|IJC, 0      , 0      , 0      , 0      , 0      ,
-/*28*/ 0      , 0      , 0      , 0      , 0      , 0      , 0      , VEC    ,
+/*20*/ 0      , 0      , NFP|VEC|IJC, PEC, 0      , 0      , 0      , 0      ,
+/*28*/ 0      , 0      , 0      , 0      , 0      , 0      , 0      , VEC|PEC,
 /*30*/ VHC    , VHC    , VHC    , VHC    , VHC    , VHC    , VHC    , VHC    ,
 /*38*/ VHC    , VHC    , 0      , 0      , 0      , 0      , 0      , 0      ,
 
@@ -155,7 +159,7 @@ static const char charLookupTable[256] =
 /*60*/ 0      , VHC    , VEC|VHC, VHC    , VHC    , VHC    , VEC|VHC, 0      ,
 /*68*/ 0      , 0      , 0      , 0      , 0      , 0      , VEC    , 0      ,
 /*70*/ 0      , 0      , VEC    , 0      , VEC    , 0      , 0      , 0      ,
-/*78*/ 0      , 0      , 0      , 0      , 0      , 0      , 0      , 0      ,
+/*78*/ 0      , 0      , 0      , 0      , 0      , 0      , PEC    , 0      ,
 
        NUC    , NUC    , NUC    , NUC    , NUC    , NUC    , NUC    , NUC    ,
        NUC    , NUC    , NUC    , NUC    , NUC    , NUC    , NUC    , NUC    ,
@@ -252,9 +256,9 @@ if (*offset >= jsonTextLen) { \
  *  be skipped.
  * (lth) hi world, any thoughts on how to make this routine faster? */
 static size_t
-yajl_string_scan(const unsigned char * buf, size_t len, int utf8check)
+yajl_string_scan(const unsigned char * buf, size_t len, int utf8check, int ptrCheck)
 {
-    unsigned char mask = IJC|NFP|(utf8check ? NUC : 0);
+    unsigned char mask = IJC|NFP|(utf8check ? NUC : 0)|(ptrCheck ? PEC : 0);
     size_t skip = 0;
     while (skip < len && !(charLookupTable[*buf] & mask))
     {
@@ -266,11 +270,15 @@ yajl_string_scan(const unsigned char * buf, size_t len, int utf8check)
 
 static yajl_tok
 yajl_lex_string(yajl_lexer lexer, const unsigned char * jsonText,
-                size_t jsonTextLen, size_t * offset)
+                size_t jsonTextLen, size_t * offset,
+                yajl_string_props_t* props)
 {
     yajl_tok tok = yajl_tok_error;
     int hasEscapes = 0;
 
+    props->has_ansi = 0;
+    props->line_feeds = 0;
+    props->ptr_escapes = 0;
     for (;;) {
         unsigned char curChar;
 
@@ -286,13 +294,13 @@ yajl_lex_string(yajl_lexer lexer, const unsigned char * jsonText,
                 p = ((const unsigned char *) yajl_buf_data(lexer->buf) +
                      (lexer->bufOff));
                 len = yajl_buf_len(lexer->buf) - lexer->bufOff;
-                lexer->bufOff += yajl_string_scan(p, len, lexer->validateUTF8);
+                lexer->bufOff += yajl_string_scan(p, len, lexer->validateUTF8, lexer->needKey);
             }
             else if (*offset < jsonTextLen)
             {
                 p = jsonText + *offset;
                 len = jsonTextLen - *offset;
-                *offset += yajl_string_scan(p, len, lexer->validateUTF8);
+                *offset += yajl_string_scan(p, len, lexer->validateUTF8, lexer->needKey);
             }
         }
 
@@ -339,6 +347,9 @@ yajl_lex_string(yajl_lexer lexer, const unsigned char * jsonText,
             unreadChar(lexer, offset);
             lexer->error = yajl_lex_string_invalid_json_char;
             goto finish_string_lex;
+        }
+        else if (charLookupTable[curChar] & PEC) {
+            props->ptr_escapes += 1;
         }
         /* when in validate UTF8 mode we need to do some extra work */
         else if (lexer->validateUTF8) {
@@ -495,10 +506,17 @@ yajl_lex_comment(yajl_lexer lexer, const unsigned char * jsonText,
     return tok;
 }
 
+void
+yajl_need_key(yajl_lexer lexer, unsigned int val)
+{
+    lexer->needKey = val;
+}
+
 yajl_tok
 yajl_lex_lex(yajl_lexer lexer, const unsigned char * jsonText,
              size_t jsonTextLen, size_t * offset,
-             const unsigned char ** outBuf, size_t * outLen)
+             const unsigned char ** outBuf, size_t * outLen,
+             yajl_string_props_t* props)
 {
     yajl_tok tok = yajl_tok_error;
     unsigned char c;
@@ -595,7 +613,7 @@ yajl_lex_lex(yajl_lexer lexer, const unsigned char * jsonText,
             }
             case '"': {
                 tok = yajl_lex_string(lexer, (const unsigned char *) jsonText,
-                                      jsonTextLen, offset);
+                                      jsonTextLen, offset, props);
                 goto lexed;
             }
             case '-':
@@ -751,9 +769,10 @@ yajl_tok yajl_lex_peek(yajl_lexer lexer, const unsigned char * jsonText,
     size_t bufOff = lexer->bufOff;
     unsigned int bufInUse = lexer->bufInUse;
     yajl_tok tok;
+    yajl_string_props_t props;
 
     tok = yajl_lex_lex(lexer, jsonText, jsonTextLen, &offset,
-                       &outBuf, &outLen);
+                       &outBuf, &outLen, &props);
 
     lexer->bufOff = bufOff;
     lexer->bufInUse = bufInUse;

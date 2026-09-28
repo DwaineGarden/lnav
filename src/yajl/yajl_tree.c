@@ -143,7 +143,7 @@ static yajl_val context_pop(context_t *ctx)
     ctx->stack = stack->next;
 
     v = stack->value;
-
+    free (stack->key);
     free (stack);
 
     return (v);
@@ -289,6 +289,14 @@ static int handle_string (void *ctx,
     return ((context_add_value (ctx, v) == 0) ? STATUS_CONTINUE : STATUS_ABORT);
 }
 
+
+static int handle_string2 (void *ctx,
+                           const unsigned char *string, size_t string_length,
+                           yajl_string_props_t* props)
+{
+    return handle_string(ctx, string, string_length);
+}
+
 static int handle_number (void *ctx, const char *string, size_t string_length)
 {
     yajl_val v;
@@ -410,9 +418,9 @@ yajl_val yajl_tree_parse (const char *input,
             /* integer     = */ NULL,
             /* double      = */ NULL,
             /* number      = */ handle_number,
-            /* string      = */ handle_string,
+            /* string      = */ handle_string2,
             /* start map   = */ handle_start_map,
-            /* map key     = */ handle_string,
+            /* map key     = */ handle_string2,
             /* end map     = */ handle_end_map,
             /* start array = */ handle_start_array,
             /* end array   = */ handle_end_array
@@ -444,7 +452,14 @@ yajl_val yajl_tree_parse (const char *input,
              snprintf(error_buffer, error_buffer_size, "%s", internal_err_str);
              YA_FREE(&(handle->alloc), internal_err_str);
         }
+        while(ctx.stack != NULL) {
+             yajl_val v = context_pop(&ctx);
+             yajl_tree_free(v);
+        }
         yajl_free (handle);
+        //If the requested memory is not released in time, it will cause memory leakage
+        if(ctx.root)
+            yajl_tree_free(ctx.root);
         return NULL;
     }
 

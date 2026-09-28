@@ -32,13 +32,12 @@
 #ifndef lnav_log_data_table_hh
 #define lnav_log_data_table_hh
 
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "column_namer.hh"
 #include "data_parser.hh"
 #include "log_vtab_impl.hh"
-#include "logfile.hh"
 #include "logfile_sub_source.hh"
 
 class log_data_table : public log_vtab_impl {
@@ -55,7 +54,8 @@ public:
         cols = this->ldt_cols;
     }
 
-    void get_foreign_keys(std::vector<std::string>& keys_inout) const override
+    void get_foreign_keys(
+        std::unordered_set<std::string>& keys_inout) const override
     {
         log_vtab_impl::get_foreign_keys(keys_inout);
     }
@@ -64,12 +64,14 @@ public:
 
     void extract(logfile* lf,
                  uint64_t line_number,
+                 string_attrs_t& sa,
                  logline_value_vector& values) override;
 
 private:
     logfile_sub_source& ldt_log_source;
     const content_line_t ldt_template_line;
     data_parser::schema_id_t ldt_schema_id;
+    uint64_t ldt_bloom_bits{0};
     data_parser::element_list_t ldt_pairs;
     std::shared_ptr<log_vtab_impl> ldt_format_impl;
     std::vector<vtab_column> ldt_cols;

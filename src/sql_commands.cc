@@ -27,18 +27,42 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <atomic>
+#include <chrono>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <stdio.h>
+#include <stdlib.h>
+
 #include "base/auto_mem.hh"
 #include "base/fs_util.hh"
 #include "base/injector.bind.hh"
+#include "base/injector.hh"
+#include "base/itertools.hh"
+#include "base/lnav.console.hh"
 #include "base/lnav_log.hh"
+#include "base/opt_util.hh"
+#include "base/progress.hh"
+#include "base/result.h"
 #include "bound_tags.hh"
 #include "command_executor.hh"
 #include "config.h"
-#include "readline_context.hh"
+#include "fmt/chrono.h"
+#include "lnav.hh"
+#include "lnav_util.hh"
+#include "lnav.commands.hh"
+#include "safe/safe.h"
+#include "service_tags.hh"
 #include "shlex.hh"
+#include "sql_help.hh"
 #include "sqlite-extension-func.hh"
+#include "sqlitepp.client.hh"
 #include "sqlitepp.hh"
 #include "view_helpers.hh"
+
+using namespace std::chrono_literals;
 
 static Result<std::string, lnav::console::user_message>
 sql_cmd_dump(exec_context& ec,
@@ -46,7 +70,7 @@ sql_cmd_dump(exec_context& ec,
              std::vector<std::string>& args)
 {
     static auto& lnav_db = injector::get<auto_sqlite3&>();
-    static auto& lnav_flags = injector::get<unsigned long&, lnav_flags_tag>();
+    static auto& lnflags = injector::get<lnav_flags_storage&>();
 
     std::string retval;
 
@@ -60,7 +84,11 @@ sql_cmd_dump(exec_context& ec,
         return ec.make_error("expecting a file name to write to");
     }
 
-    if (lnav_flags & LNF_SECURE_MODE) {
+    if (args.size() < 3) {
+        return ec.make_error("expecting a table name to dump");
+    }
+
+    if (lnflags.is_set<lnav_flags::secure_mode>()) {
         return ec.make_error("{} -- unavailable in secure mode", args[0]);
     }
 
@@ -71,15 +99,230 @@ sql_cmd_dump(exec_context& ec,
             "unable to open '{}' for writing: {}", args[1], strerror(errno));
     }
 
+    auto prep_res
+        = prepare_stmt(lnav_db, "SELECT name FROM pragma_database_list");
+    if (prep_res.isErr()) {
+        return ec.make_error("unable to prepare database_list: {}",
+                             prep_res.unwrapErr());
+    }
+    auto stmt = prep_res.unwrap();
+    auto all_db_names = std::vector<std::string>();
+    stmt.for_each_row<std::string>([&all_db_names](auto row) {
+        all_db_names.emplace_back(row);
+        return false;
+    });
+
     for (size_t lpc = 2; lpc < args.size(); lpc++) {
-        sqlite3_db_dump(lnav_db.in(),
-                        "main",
-                        args[lpc].c_str(),
-                        (int (*)(const char*, void*)) fputs,
-                        file.in());
+        auto arg = string_fragment::from_str(args[lpc]);
+        auto [schema_name, table_name]
+            = arg.split_when(string_fragment::tag1{'.'});
+        auto db_names = table_name.empty()
+            ? all_db_names
+            : std::vector{schema_name.to_string()};
+
+        for (const auto& db_name : db_names) {
+            sqlite3_db_dump(lnav_db.in(),
+                            db_name.c_str(),
+                            args[lpc].c_str(),
+                            (int (*)(const char*, void*)) fputs,
+                            file.in());
+        }
     }
 
-    retval = "generated";
+    auto table_count = args.size() - 2;
+    retval = fmt::format(
+        FMT_STRING("info: wrote {} table(s) to {}"), table_count, args[1]);
+    return Ok(retval);
+}
+
+struct backup_progress_t {
+    std::atomic<lnav::progress_status_t> bp_status{
+        lnav::progress_status_t::idle};
+    std::atomic_uint32_t bp_instance{0};
+    std::atomic_uint64_t bp_complete{0};
+    std::atomic_uint64_t bp_total{0};
+    safe::Safe<std::vector<lnav::console::user_message>> bp_messages;
+
+    struct backup_guard {
+        ~backup_guard()
+        {
+            if (bg_helper.gh_enabled) {
+                INSTANCE.bp_status.store(lnav::progress_status_t::idle);
+
+                lnav::progress_tracker::instance().notify_completion();
+            }
+        }
+
+        void push_msg(lnav::console::user_message um)
+        {
+            log_info("backup message: %s", um.to_attr_line().al_string.c_str());
+            INSTANCE.bp_messages.writeAccess()->emplace_back(std::move(um));
+        }
+
+        void update(uint64_t complete, uint64_t total)
+        {
+            INSTANCE.bp_complete.store(complete);
+            INSTANCE.bp_total.store(total);
+        }
+
+        lnav::guard_helper bg_helper;
+    };
+
+    static backup_guard begin()
+    {
+        INSTANCE.bp_messages.writeAccess()->clear();
+        INSTANCE.bp_complete.store(0);
+        INSTANCE.bp_total.store(1);
+        INSTANCE.bp_instance.fetch_add(1, std::memory_order_relaxed);
+        INSTANCE.bp_status.store(lnav::progress_status_t::working);
+
+        return {};
+    }
+
+    static backup_progress_t INSTANCE;
+};
+
+backup_progress_t backup_progress_t::INSTANCE;
+
+static lnav::task_progress
+backup_prog_rep()
+{
+    return {
+        ";.save",
+        backup_progress_t::INSTANCE.bp_status.load(),
+        (size_t) backup_progress_t::INSTANCE.bp_instance.load(),
+        "Backing up DB",
+        (size_t) backup_progress_t::INSTANCE.bp_complete.load(),
+        (size_t) backup_progress_t::INSTANCE.bp_total.load(),
+        *backup_progress_t::INSTANCE.bp_messages.readAccess(),
+    };
+}
+
+DIST_SLICE(prog_reps) lnav::progress_reporter_t backup_rep = backup_prog_rep;
+
+static void
+backup_user_db(const std::string& filename)
+{
+    static auto op = lnav_operation{__FUNCTION__};
+    auto op_guard = lnav_opid_guard::internal(op);
+    log_info("starting backup of user DB: %s", filename.c_str());
+    auto bguard = backup_progress_t::begin();
+
+    auto_sqlite3 out_db;
+    if (sqlite3_open(filename.c_str(), out_db.out()) != SQLITE_OK) {
+        auto um = lnav::console::user_message::error(
+                      attr_line_t("unable to open output DB: ")
+                          .append(lnav::roles::file(filename)))
+                      .with_reason(sqlite3_errmsg(out_db.in()));
+        bguard.push_msg(um);
+        return;
+    }
+
+    auto_sqlite3 db;
+    if (sqlite3_open_v2("file:user_db?mode=memory&cache=shared",
+                        db.out(),
+                        SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE,
+                        nullptr)
+        != SQLITE_OK)
+    {
+        auto um = lnav::console::user_message::error(
+                      "unable to open lnav's user DB")
+                      .with_reason(sqlite3_errmsg(db.in()));
+        bguard.push_msg(um);
+        return;
+    }
+
+    {
+        auto stmt = prepare_stmt(db, LNAV_ATTACH_DB).unwrap();
+        auto exec_res = stmt.execute();
+        if (exec_res.isErr()) {
+            auto um
+                = lnav::console::user_message::error("unable to attach lnav_db")
+                      .with_reason(sqlite3_errmsg(db.in()));
+            bguard.push_msg(um);
+            return;
+        }
+    }
+
+    auto* backup = sqlite3_backup_init(out_db.in(), "main", db.in(), "main");
+    if (backup == nullptr) {
+        auto um = lnav::console::user_message::error("unable to backup user DB")
+                      .with_reason(sqlite3_errmsg(db.in()));
+        bguard.push_msg(um);
+        return;
+    }
+
+    auto done = false;
+    auto loop_count = 0;
+    while (!done) {
+        auto rc = sqlite3_backup_step(backup, 1);
+        switch (rc) {
+            case SQLITE_DONE:
+                done = true;
+                break;
+            case SQLITE_OK:
+                if (loop_count % 100 == 0) {
+                    std::this_thread::sleep_for(1ms);
+                }
+                break;
+            case SQLITE_BUSY:
+            case SQLITE_LOCKED:
+                std::this_thread::sleep_for(10ms);
+                break;
+            default: {
+                auto um = lnav::console::user_message::error(
+                              "unable to backup user DB")
+                              .with_reason(sqlite3_errmsg(db.in()));
+                bguard.push_msg(um);
+                sqlite3_backup_finish(backup);
+                return;
+            }
+        }
+
+        if (loop_count % 100 == 0) {
+            auto total = sqlite3_backup_pagecount(backup);
+            auto complete = total - sqlite3_backup_remaining(backup);
+            bguard.update(complete, total);
+        }
+
+        loop_count += 1;
+    }
+
+    {
+        auto total = sqlite3_backup_pagecount(backup);
+        auto complete = total - sqlite3_backup_remaining(backup);
+        bguard.update(complete, total);
+    }
+    sqlite3_backup_finish(backup);
+    log_info("backup complete: complete=%llu; total=%llu",
+             backup_progress_t::INSTANCE.bp_complete.load(),
+             backup_progress_t::INSTANCE.bp_total.load());
+}
+
+static Result<std::string, lnav::console::user_message>
+sql_cmd_save(exec_context& ec,
+             std::string cmdline,
+             std::vector<std::string>& args)
+{
+    static auto& lnflags = injector::get<lnav_flags_storage&>();
+    std::string retval;
+
+    if (args.empty()) {
+        args.emplace_back("filename");
+        return Ok(retval);
+    }
+
+    if (args.size() < 2) {
+        return ec.make_error("expecting a file name to write to");
+    }
+
+    if (lnflags.is_set<lnav_flags::secure_mode>()) {
+        return ec.make_error("{} -- unavailable in secure mode", args[0]);
+    }
+
+    isc::to<bg_looper&, services::background_t>().send(
+        [filename = args[1]](auto& bg_loop) { backup_user_db(filename); });
+
     return Ok(retval);
 }
 
@@ -88,8 +331,9 @@ sql_cmd_read(exec_context& ec,
              std::string cmdline,
              std::vector<std::string>& args)
 {
+    static const intern_string_t SRC = intern_string::lookup("cmdline");
     static auto& lnav_db = injector::get<auto_sqlite3&>();
-    static auto& lnav_flags = injector::get<unsigned long&, lnav_flags_tag>();
+    static auto& lnflags = injector::get<lnav_flags_storage&>();
 
     std::string retval;
 
@@ -98,16 +342,27 @@ sql_cmd_read(exec_context& ec,
         return Ok(retval);
     }
 
-    if (lnav_flags & LNF_SECURE_MODE) {
+    if (lnflags.is_set<lnav_flags::secure_mode>()) {
         return ec.make_error("{} -- unavailable in secure mode", args[0]);
     }
 
-    std::vector<std::string> split_args;
     shlex lexer(cmdline);
 
-    if (!lexer.split(split_args, ec.create_resolver())) {
-        return ec.make_error("unable to parse arguments");
+    auto split_args_res = lexer.split(ec.create_resolver());
+    if (split_args_res.isErr()) {
+        auto split_err = split_args_res.unwrapErr();
+        auto um
+            = lnav::console::user_message::error("unable to parse file name")
+                  .with_reason(split_err.se_error.te_msg)
+                  .with_snippet(lnav::console::snippet::from(
+                      SRC, lexer.to_attr_line(split_err.se_error)))
+                  .move();
+
+        return Err(um);
     }
+
+    auto split_args = split_args_res.unwrap()
+        | lnav::itertools::map([](const auto& elem) { return elem.se_value; });
 
     for (size_t lpc = 1; lpc < split_args.size(); lpc++) {
         auto read_res = lnav::filesystem::read_file(split_args[lpc]);
@@ -157,12 +412,51 @@ sql_cmd_schema(exec_context& ec,
     std::string retval;
 
     if (args.empty()) {
+        args.emplace_back("sql-table");
         return Ok(retval);
     }
 
     ensure_view(LNV_SCHEMA);
+    if (args.size() == 2) {
+        const auto id = text_anchors::to_anchor_string(args[1]);
+        auto* tss = lnav_data.ld_views[LNV_SCHEMA].get_sub_source();
+        if (auto* ta = dynamic_cast<text_anchors*>(tss); ta != nullptr) {
+            ta->row_for_anchor(id) |
+                [](auto row) { lnav_data.ld_views[LNV_SCHEMA].set_top(row); };
+        }
+    }
 
     return Ok(retval);
+}
+
+static Result<std::string, lnav::console::user_message>
+sql_cmd_msgformats(exec_context& ec,
+                   std::string cmdline,
+                   std::vector<std::string>& args)
+{
+    static const std::string MSG_FORMAT_STMT = R"(
+SELECT count(*) AS total,
+       min(log_line) AS log_line,
+       min(log_time) AS log_time,
+       humanize_duration(timediff(max(log_time), min(log_time))) AS duration,
+       group_concat(DISTINCT log_format) AS log_formats,
+       log_msg_format
+    FROM all_logs
+    WHERE log_msg_format != ''
+    GROUP BY log_msg_format
+    HAVING total > 1
+    ORDER BY total DESC, log_line ASC
+)";
+
+    std::string retval;
+
+    if (args.empty()) {
+        return Ok(retval);
+    }
+
+    std::string alt;
+
+    return execute_sql(ec, MSG_FORMAT_STMT, alt);
 }
 
 static Result<std::string, lnav::console::user_message>
@@ -180,28 +474,240 @@ sql_cmd_generic(exec_context& ec,
     return Ok(retval);
 }
 
-static readline_context::command_t sql_commands[] = {
+static Result<std::string, lnav::console::user_message>
+prql_cmd_from(exec_context& ec,
+              std::string cmdline,
+              std::vector<std::string>& args)
+{
+    std::string retval;
+
+    if (args.empty()) {
+        args.emplace_back("prql-table");
+        return Ok(retval);
+    }
+
+    return Ok(retval);
+}
+
+static lnav::commands::prompt_result_t
+prql_cmd_from_prompt(exec_context& ec, const std::string& cmdline)
+{
+    if (!endswith(cmdline, "from ")) {
+        return {};
+    }
+
+    auto* tc = *lnav_data.ld_view_stack.top();
+    auto* lss = dynamic_cast<logfile_sub_source*>(tc->get_sub_source());
+    auto sel = tc->get_selection();
+
+    if (!sel || lss == nullptr || lss->text_line_count() == 0) {
+        return {};
+    }
+
+    auto line_pair = lss->find_line_with_file(lss->at(sel.value()));
+    if (!line_pair) {
+        return {};
+    }
+
+    auto format_name
+        = line_pair->first->get_format_ptr()->get_name().to_string();
+    return {
+        "",
+        lnav::prql::quote_ident(format_name) + " ",
+    };
+}
+
+static Result<std::string, lnav::console::user_message>
+prql_cmd_aggregate(exec_context& ec,
+                   std::string cmdline,
+                   std::vector<std::string>& args)
+{
+    std::string retval;
+
+    if (args.empty()) {
+        args.emplace_back("prql-expr");
+        return Ok(retval);
+    }
+
+    return Ok(retval);
+}
+
+static Result<std::string, lnav::console::user_message>
+prql_cmd_append(exec_context& ec,
+                std::string cmdline,
+                std::vector<std::string>& args)
+{
+    std::string retval;
+
+    if (args.empty()) {
+        args.emplace_back("prql-table");
+        return Ok(retval);
+    }
+
+    return Ok(retval);
+}
+
+static Result<std::string, lnav::console::user_message>
+prql_cmd_derive(exec_context& ec,
+                std::string cmdline,
+                std::vector<std::string>& args)
+{
+    std::string retval;
+
+    if (args.empty()) {
+        args.emplace_back("prql-expr");
+        return Ok(retval);
+    }
+
+    return Ok(retval);
+}
+
+static Result<std::string, lnav::console::user_message>
+prql_cmd_filter(exec_context& ec,
+                std::string cmdline,
+                std::vector<std::string>& args)
+{
+    std::string retval;
+
+    if (args.empty()) {
+        args.emplace_back("prql-expr");
+        return Ok(retval);
+    }
+
+    return Ok(retval);
+}
+
+static Result<std::string, lnav::console::user_message>
+prql_cmd_group(exec_context& ec,
+               std::string cmdline,
+               std::vector<std::string>& args)
+{
+    std::string retval;
+
+    if (args.empty()) {
+        args.emplace_back("prql-expr");
+        args.emplace_back("prql-source");
+        return Ok(retval);
+    }
+
+    return Ok(retval);
+}
+
+static Result<std::string, lnav::console::user_message>
+prql_cmd_join(exec_context& ec,
+              std::string cmdline,
+              std::vector<std::string>& args)
+{
+    std::string retval;
+
+    if (args.empty()) {
+        args.emplace_back("prql-table");
+        args.emplace_back("prql-expr");
+        return Ok(retval);
+    }
+
+    return Ok(retval);
+}
+
+static Result<std::string, lnav::console::user_message>
+prql_cmd_let(exec_context& ec,
+             std::string cmdline,
+             std::vector<std::string>& args)
+{
+    std::string retval;
+
+    return Ok(retval);
+}
+
+static Result<std::string, lnav::console::user_message>
+prql_cmd_select(exec_context& ec,
+                std::string cmdline,
+                std::vector<std::string>& args)
+{
+    std::string retval;
+
+    if (args.empty()) {
+        args.emplace_back("prql-expr");
+        return Ok(retval);
+    }
+
+    return Ok(retval);
+}
+
+static Result<std::string, lnav::console::user_message>
+prql_cmd_sort(exec_context& ec,
+              std::string cmdline,
+              std::vector<std::string>& args)
+{
+    std::string retval;
+
+    if (args.empty()) {
+        args.emplace_back("prql-expr");
+        return Ok(retval);
+    }
+
+    return Ok(retval);
+}
+
+static Result<std::string, lnav::console::user_message>
+prql_cmd_take(exec_context& ec,
+              std::string cmdline,
+              std::vector<std::string>& args)
+{
+    std::string retval;
+
+    if (args.empty()) {
+        return Ok(retval);
+    }
+
+    return Ok(retval);
+}
+
+static lnav::commands::command_t sql_commands[] = {
     {
         ".dump",
         sql_cmd_dump,
-        help_text(".dump", "Dump the contents of the database")
+        help_text(
+            ".dump",
+            "Dump one or more tables to a file as a series of SQL statements")
             .sql_command()
-            .with_parameter({"path", "The path to the file to write"})
+            .with_parameter(
+                help_text{"path", "The path to the file to write"}.with_format(
+                    help_parameter_format_t::HPF_LOCAL_FILENAME))
+            .with_parameter(help_text{"table", "The name of the table to dump"}
+                                .one_or_more())
+            .with_tags({
+                "io",
+            }),
+    },
+    {
+        ".save",
+        sql_cmd_save,
+        help_text(".save", "Save the current database to a SQLite file")
+            .sql_command()
+            .with_parameter(
+                help_text{"path", "The path to the file to write"}.with_format(
+                    help_parameter_format_t::HPF_LOCAL_FILENAME))
             .with_tags({
                 "io",
             }),
     },
     {
         ".msgformats",
-        sql_cmd_schema,
-        help_text(".msgformats", "df").sql_command(),
+        sql_cmd_msgformats,
+        help_text(".msgformats",
+                  "Executes a query that will summarize the different message "
+                  "formats found in the logs")
+            .sql_command(),
     },
     {
         ".read",
         sql_cmd_read,
         help_text(".read", "Execute the SQLite statements in the given file")
             .sql_command()
-            .with_parameter({"path", "The path to the file to write"})
+            .with_parameter(
+                help_text{"path", "The path to the file to write"}.with_format(
+                    help_parameter_format_t::HPF_LOCAL_FILENAME))
             .with_tags({
                 "io",
             }),
@@ -212,7 +718,8 @@ static readline_context::command_t sql_commands[] = {
         help_text(".schema",
                   "Switch to the SCHEMA view that contains a dump of the "
                   "current database schema")
-            .sql_command(),
+            .sql_command()
+            .with_parameter({"name", "The name of a table to jump to"}),
     },
     {
         "ATTACH",
@@ -250,15 +757,352 @@ static readline_context::command_t sql_commands[] = {
         "WITH",
         sql_cmd_generic,
     },
+    {
+        "from",
+        prql_cmd_from,
+        help_text("from")
+            .prql_transform()
+            .with_tags({"prql"})
+            .with_summary("PRQL command to specify a data source")
+            .with_parameter({"table", "The table to use as a source"})
+            .with_example({
+                "To pull data from the 'http_status_codes' database table",
+                "from http_status_codes | take 3",
+                help_example::language::prql,
+            })
+            .with_example({
+                "To use an array literal as a source",
+                "from [{ col1=1, col2='abc' }, { col1=2, col2='def' }]",
+                help_example::language::prql,
+            }),
+        prql_cmd_from_prompt,
+    },
+    {
+        "let",
+        prql_cmd_let,
+        help_text("let")
+            .prql_transform()
+            .with_tags({"prql"})
+            .with_summary("Define a variable")
+            .with_parameter({"name", "The name for the variable"})
+            .with_example({
+                "To set 'x' to 5",
+                "let x = 5",
+                help_example::language::prql,
+            }),
+    },
+    {
+        "aggregate",
+        prql_cmd_aggregate,
+        help_text("aggregate")
+            .prql_transform()
+            .with_tags({"prql"})
+            .with_summary("PRQL transform to summarize many rows into one")
+            .with_parameter(
+                help_text{"expr", "The aggregate expression(s)"}.with_grouping(
+                    "{", "}"))
+            .with_example({
+                "To group values into a JSON array",
+                "from [{a=1}, {a=2}] | aggregate { arr = json.group_array a }",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "append",
+        prql_cmd_append,
+        help_text("append")
+            .prql_transform()
+            .with_tags({"prql"})
+            .with_summary("PRQL transform to concatenate tables together")
+            .with_parameter({"table", "The table to use as a source"}),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "derive",
+        prql_cmd_derive,
+        help_text("derive")
+            .prql_transform()
+            .with_tags({"prql"})
+            .with_summary("PRQL transform to derive one or more columns")
+            .with_parameter(
+                help_text{"column", "The new column"}.with_grouping("{", "}"))
+            .with_example({
+                "To add a column that is a multiplication of another",
+                "from [{a=1}, {a=2}] | derive b = a * 2",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "filter",
+        prql_cmd_filter,
+        help_text("filter")
+            .prql_transform()
+            .with_tags({"prql"})
+            .with_summary("PRQL transform to pick rows based on their values")
+            .with_parameter(
+                {"expr", "The expression to evaluate over each row"})
+            .with_example({
+                "To pick rows where 'a' is greater than one",
+                "from [{a=1}, {a=2}] | filter a > 1",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "group",
+        prql_cmd_group,
+        help_text("group")
+            .prql_transform()
+            .with_tags({"prql"})
+            .with_summary("PRQL transform to partition rows into groups")
+            .with_parameter(
+                help_text{"key_columns", "The columns that define the group"}
+                    .with_grouping("{", "}"))
+            .with_parameter(
+                help_text{"pipeline", "The pipeline to execute over a group"}
+                    .with_grouping("(", ")"))
+            .with_example({
+                "To group by log_level and count the rows in each partition",
+                "from lnav_example_log | group { log_level } (aggregate { "
+                "count this })",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "join",
+        prql_cmd_join,
+        help_text("join")
+            .prql_transform()
+            .with_tags({"prql"})
+            .with_summary("PRQL transform to add columns from another table")
+            .with_parameter(help_text{"side", "Specifies which rows to include"}
+                                .with_enum_values({
+                                    "inner"_frag,
+                                    "left"_frag,
+                                    "right"_frag,
+                                    "full"_frag,
+                                })
+                                .with_default_value("inner")
+                                .optional())
+            .with_parameter(
+                {"table", "The other table to join with the current rows"})
+            .with_parameter(
+                help_text{"condition", "The condition used to join rows"}
+                    .with_grouping("(", ")")),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "select",
+        prql_cmd_select,
+        help_text("select")
+            .prql_transform()
+            .with_tags({"prql"})
+            .with_summary("PRQL transform to pick and compute columns")
+            .with_parameter(
+                help_text{"expr", "The columns to include in the result set"}
+                    .with_grouping("{", "}"))
+            .with_example({
+                "To pick the 'b' column from the rows",
+                "from [{a=1, b='abc'}, {a=2, b='def'}] | select b",
+                help_example::language::prql,
+            })
+            .with_example({
+                "To compute a new column from an input",
+                "from [{a=1}, {a=2}] | select b = a * 2",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "stats.average_of",
+        prql_cmd_sort,
+        help_text("stats.average_of", "Compute the average of col")
+            .prql_function()
+            .with_tags({"prql"})
+            .with_parameter(help_text{"col", "The column to average"})
+            .with_example({
+                "To get the average of a",
+                "from [{a=1}, {a=1}, {a=2}] | stats.average_of a",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "stats.count_by",
+        prql_cmd_sort,
+        help_text(
+            "stats.count_by",
+            "Partition rows and count the number of rows in each partition")
+            .prql_function()
+            .with_tags({"prql"})
+            .with_parameter(help_text{"column", "The columns to group by"}
+                                .one_or_more()
+                                .with_grouping("{", "}"))
+            .with_example({
+                "To count rows for a particular value of column 'a'",
+                "from [{a=1}, {a=1}, {a=2}] | stats.count_by a",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "stats.hist",
+        prql_cmd_sort,
+        help_text("stats.hist", "Count the top values per bucket of time")
+            .prql_function()
+            .with_tags({"prql"})
+            .with_parameter(help_text{"col", "The column to count"})
+            .with_parameter(help_text{"slice", "The time slice"}
+                                .optional()
+                                .with_default_value("$zoom_level"))
+            .with_parameter(
+                help_text{"top", "The limit on the number of values to report"}
+                    .optional()
+                    .with_default_value("10"))
+            .with_example({
+                "To chart the values of ex_procname over time",
+                "from lnav_example_log | stats.hist ex_procname",
+                help_example::language::prql,
+            })
+            .with_example({
+                "To chart the values of ex_procname for every second",
+                "from lnav_example_log | stats.hist ex_procname slice:'1s'",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "stats.sum_of",
+        prql_cmd_sort,
+        help_text("stats.sum_of", "Compute the sum of col")
+            .prql_function()
+            .with_tags({"prql"})
+            .with_parameter(help_text{"col", "The column to sum"})
+            .with_example({
+                "To get the sum of a",
+                "from [{a=1}, {a=1}, {a=2}] | stats.sum_of a",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "stats.timeseries",
+        prql_cmd_sort,
+        help_text("stats.timeseries", "Aggregate values per bucket of time")
+            .prql_function()
+            .with_tags({"prql"})
+            .with_parameter(help_text{"agg", "The aggregation to perform"})
+            .with_grouping("{", "}")
+            .with_parameter(help_text{"slice", "The time slice"}
+                                .optional()
+                                .with_default_value("$zoom_level"))
+            .with_example({
+                "To chart the sum of sc_bytes over time",
+                "from lnav_example_log | stats.timeseries { total_duration = "
+                "humanize.duration (sum ex_duration) }",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "stats.by",
+        prql_cmd_sort,
+        help_text("stats.by", "A shorthand for grouping and aggregating")
+            .prql_function()
+            .with_tags({"prql"})
+            .with_parameter(help_text{"col", "The column to aggregate"})
+            .with_parameter(help_text{"values", "The aggregations to perform"})
+            .with_example({
+                "To partition by a and get the sum of b",
+                "from [{a=1, b=1}, {a=1, b=1}, {a=2, b=1}] | stats.by a "
+                "{sum b}",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "sort",
+        prql_cmd_sort,
+        help_text("sort")
+            .prql_transform()
+            .with_tags({"prql"})
+            .with_summary("PRQL transform to sort rows")
+            .with_parameter(help_text{
+                "expr", "The values to use when ordering the result set"}
+                                .with_grouping("{", "}"))
+            .with_example({
+                "To sort the rows in descending order",
+                "from [{a=1}, {a=2}] | sort {-a}",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "take",
+        prql_cmd_take,
+        help_text("take")
+            .prql_transform()
+            .with_tags({"prql"})
+            .with_summary("PRQL command to pick rows based on their position")
+            .with_parameter({"n_or_range", "The number of rows or range"})
+            .with_example({
+                "To pick the first row",
+                "from [{a=1}, {a=2}, {a=3}] | take 1",
+                help_example::language::prql,
+            })
+            .with_example({
+                "To pick the second and third rows",
+                "from [{a=1}, {a=2}, {a=3}] | take 2..3",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
+    {
+        "utils.distinct",
+        prql_cmd_sort,
+        help_text("utils.distinct",
+                  "A shorthand for getting distinct values of col")
+            .prql_function()
+            .with_tags({"prql"})
+            .with_parameter(help_text{"col", "The column to sum"})
+            .with_example({
+                "To get the distinct values of a",
+                "from [{a=1}, {a=1}, {a=2}] | utils.distinct a",
+                help_example::language::prql,
+            }),
+        nullptr,
+        "prql-source"_frag,
+    },
 };
 
-static readline_context::command_map_t sql_cmd_map;
+static lnav::commands::command_map_t sql_cmd_map;
 
 static auto bound_sql_cmd_map
-    = injector::bind<readline_context::command_map_t,
+    = injector::bind<lnav::commands::command_map_t,
                      sql_cmd_map_tag>::to_instance(+[]() {
           for (auto& cmd : sql_commands) {
               sql_cmd_map[cmd.c_name] = &cmd;
+              if (cmd.c_help.ht_name) {
+                  cmd.c_help.index_tags();
+              }
           }
 
           return &sql_cmd_map;

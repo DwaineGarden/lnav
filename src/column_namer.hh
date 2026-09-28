@@ -32,7 +32,6 @@
 #ifndef lnav_column_namer_hh
 #define lnav_column_namer_hh
 
-#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -46,17 +45,17 @@ public:
         JSON,
     };
 
-    column_namer(language lang);
+    static const string_fragment BUILTIN_COL;
+
+    explicit column_namer(language lang);
 
     bool existing_name(const string_fragment& in_name) const;
 
     string_fragment add_column(const string_fragment& in_name);
 
-    static const char BUILTIN_COL[];
-
-    ArenaAlloc::Alloc<char> cn_alloc;
+    ArenaAlloc::Alloc<char> cn_alloc{1024};
     language cn_language;
-    std::vector<string_fragment> cn_builtin_names{string_fragment(BUILTIN_COL)};
+    std::vector<string_fragment> cn_builtin_names;
     std::vector<string_fragment> cn_names;
     std::unordered_map<
         string_fragment,

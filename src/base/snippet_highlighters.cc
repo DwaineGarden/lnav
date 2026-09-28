@@ -29,12 +29,12 @@
 
 #include "snippet_highlighters.hh"
 
+#include <lnav_log.hh>
+
 #include "attr_line.builder.hh"
 #include "pcrepp/pcre2pp.hh"
-#include "view_curses.hh"
 
-namespace lnav {
-namespace snippets {
+namespace lnav::snippets {
 
 static bool
 is_bracket(const std::string& str, int index, bool is_lit)
@@ -72,7 +72,10 @@ find_matching_bracket(
             } else if (line[lpc] == left && is_bracket(line, lpc, is_lit)) {
                 if (depth == 0) {
                     alb.overlay_attr_for_char(
-                        lpc, VC_STYLE.value(text_attrs{A_BOLD | A_REVERSE}));
+                        lpc,
+                        VC_STYLE.value(text_attrs::with_styles(
+                            text_attrs::style::bold,
+                            text_attrs::style::reverse)));
                     alb.overlay_attr_for_char(lpc,
                                               VC_ROLE.value(role_t::VCR_OK));
                     break;
@@ -89,7 +92,10 @@ find_matching_bracket(
             } else if (line[lpc] == right && is_bracket(line, lpc, is_lit)) {
                 if (depth == 0) {
                     alb.overlay_attr_for_char(
-                        lpc, VC_STYLE.value(text_attrs{A_BOLD | A_REVERSE}));
+                        lpc,
+                        VC_STYLE.value(text_attrs::with_styles(
+                            text_attrs::style::bold,
+                            text_attrs::style::reverse)));
                     alb.overlay_attr_for_char(lpc,
                                               VC_ROLE.value(role_t::VCR_OK));
                     break;
@@ -99,7 +105,7 @@ find_matching_bracket(
         }
     }
 
-    nonstd::optional<int> first_left;
+    std::optional<int> first_left;
 
     depth = 0;
 
@@ -115,7 +121,9 @@ find_matching_bracket(
             } else {
                 auto lr = line_range(is_lit ? lpc - 1 : lpc, lpc + 1);
                 alb.overlay_attr(
-                    lr, VC_STYLE.value(text_attrs{A_BOLD | A_REVERSE}));
+                    lr,
+                    VC_STYLE.value(text_attrs::with_styles(
+                        text_attrs::style::bold, text_attrs::style::reverse)));
                 alb.overlay_attr(lr, VC_ROLE.value(role_t::VCR_ERROR));
             }
         }
@@ -125,7 +133,10 @@ find_matching_bracket(
         auto lr
             = line_range(is_lit ? first_left.value() - 1 : first_left.value(),
                          first_left.value() + 1);
-        alb.overlay_attr(lr, VC_STYLE.value(text_attrs{A_BOLD | A_REVERSE}));
+        alb.overlay_attr(
+            lr,
+            VC_STYLE.value(text_attrs::with_styles(
+                text_attrs::style::bold, text_attrs::style::reverse)));
         alb.overlay_attr(lr, VC_ROLE.value(role_t::VCR_ERROR));
     }
 }
@@ -156,9 +167,9 @@ safe_read(const std::string& str, std::string::size_type index)
 }
 
 void
-regex_highlighter(attr_line_t& al, int x, line_range sub)
+regex_highlighter(attr_line_t& al, std::optional<int> x, line_range sub)
 {
-    static const char* brackets[] = {
+    static constexpr const char* brackets[] = {
         "[]",
         "{}",
         "()",
@@ -170,6 +181,7 @@ regex_highlighter(attr_line_t& al, int x, line_range sub)
     const auto& line = al.get_string();
     attr_line_builder alb(al);
     bool backslash_is_quoted = false;
+    bool in_cap_name = false;
 
     for (auto lpc = sub.lr_start; lpc < sub.lr_end; lpc++) {
         if (lpc == 0 || line[lpc - 1] != '\\') {
@@ -191,12 +203,14 @@ regex_highlighter(attr_line_t& al, int x, line_range sub)
                     }
                     break;
                 case '?': {
-                    struct line_range lr(lpc, lpc + 1);
+                    line_range lr(lpc, lpc + 1);
 
                     if (lpc == sub.lr_start || (lpc - sub.lr_start) == 0) {
                         alb.overlay_attr_for_char(
                             lpc,
-                            VC_STYLE.value(text_attrs{A_BOLD | A_REVERSE}));
+                            VC_STYLE.value(text_attrs::with_styles(
+                                text_attrs::style::bold,
+                                text_attrs::style::reverse)));
                         alb.overlay_attr_for_char(
                             lpc, VC_ROLE.value(role_t::VCR_ERROR));
                     } else if (line[lpc - 1] == '(') {
@@ -212,6 +226,7 @@ regex_highlighter(attr_line_t& al, int x, line_range sub)
                             alb.overlay_attr(
                                 line_range(lpc + 1, lpc + 2),
                                 VC_ROLE.value(role_t::VCR_RE_SPECIAL));
+                            in_cap_name = true;
                         }
                     } else {
                         alb.overlay_attr(lr,
@@ -225,27 +240,35 @@ regex_highlighter(attr_line_t& al, int x, line_range sub)
                     break;
                 }
                 case '>': {
-                    static const auto CAP_RE
-                        = lnav::pcre2pp::code::from_const(R"(\(\?\<\w+$)");
+                    if (in_cap_name) {
+                        static const auto CAP_RE
+                            = lnav::pcre2pp::code::from_const(R"(\?\<\w+$)");
 
-                    auto capture_start
-                        = string_fragment::from_str_range(
-                              line, sub.lr_start, lpc)
-                              .find_left_boundary(lpc - sub.lr_start - 1,
-                                                  string_fragment::tag1{'('});
+                        auto capture_start
+                            = string_fragment::from_str_range(
+                                  line, sub.lr_start, lpc)
+                                  .find_left_boundary(
+                                      lpc - sub.lr_start - 1,
+                                      string_fragment::tag1{'('});
 
-                    auto cap_find_res
-                        = CAP_RE.find_in(capture_start).ignore_error();
+                        auto cap_find_res
+                            = CAP_RE.find_in(capture_start).ignore_error();
 
-                    if (cap_find_res) {
-                        alb.overlay_attr(
-                            line_range(capture_start.sf_begin
-                                           + cap_find_res->f_all.sf_begin + 3,
-                                       capture_start.sf_begin
-                                           + cap_find_res->f_all.sf_end),
-                            VC_ROLE.value(role_t::VCR_IDENTIFIER));
-                        alb.overlay_attr(line_range(lpc, lpc + 1),
-                                         VC_ROLE.value(role_t::VCR_RE_SPECIAL));
+                        if (cap_find_res) {
+                            auto id_lr = line_range{
+                                cap_find_res->f_all.sf_begin + 2,
+                                cap_find_res->f_all.sf_end,
+                            };
+                            if (!x || !id_lr.contains(x.value())) {
+                                alb.overlay_attr(
+                                    id_lr,
+                                    VC_ROLE.value(role_t::VCR_IDENTIFIER));
+                            }
+                            alb.overlay_attr(
+                                line_range(lpc, lpc + 1),
+                                VC_ROLE.value(role_t::VCR_RE_SPECIAL));
+                        }
+                        in_cap_name = false;
                     }
                     break;
                 }
@@ -296,26 +319,42 @@ regex_highlighter(attr_line_t& al, int x, line_range sub)
                                      VC_ROLE.value(role_t::VCR_SYMBOL));
                     break;
                 case ' ':
-                    alb.overlay_attr(
-                        line_range(lpc - 1, lpc + 1),
-                        VC_STYLE.value(text_attrs{A_BOLD | A_REVERSE}));
+                    alb.overlay_attr(line_range(lpc - 1, lpc + 1),
+                                     VC_STYLE.value(text_attrs::with_styles(
+                                         text_attrs::style::bold,
+                                         text_attrs::style::reverse)));
                     alb.overlay_attr(line_range(lpc - 1, lpc + 1),
                                      VC_ROLE.value(role_t::VCR_ERROR));
                     break;
-                case '0':
                 case 'x':
                     if (safe_read(line, lpc + 1) == '{') {
                         alb.overlay_attr(line_range(lpc - 1, lpc + 1),
                                          VC_ROLE.value(role_t::VCR_RE_SPECIAL));
-                    } else if (isdigit(safe_read(line, lpc + 1))
-                               && isdigit(safe_read(line, lpc + 2)))
+                    } else if (isxdigit(safe_read(line, lpc + 1))
+                               && isxdigit(safe_read(line, lpc + 2)))
                     {
                         alb.overlay_attr(line_range(lpc - 1, lpc + 3),
                                          VC_ROLE.value(role_t::VCR_RE_SPECIAL));
                     } else {
-                        alb.overlay_attr(
-                            line_range(lpc - 1, lpc + 1),
-                            VC_STYLE.value(text_attrs{A_BOLD | A_REVERSE}));
+                        alb.overlay_attr(line_range(lpc - 1, lpc + 1),
+                                         VC_STYLE.value(text_attrs::with_styles(
+                                             text_attrs::style::bold,
+                                             text_attrs::style::reverse)));
+                        alb.overlay_attr(line_range(lpc - 1, lpc + 1),
+                                         VC_ROLE.value(role_t::VCR_ERROR));
+                    }
+                    break;
+                case '0':
+                    if (isdigit(safe_read(line, lpc + 1))
+                        && isdigit(safe_read(line, lpc + 2)))
+                    {
+                        alb.overlay_attr(line_range(lpc - 1, lpc + 3),
+                                         VC_ROLE.value(role_t::VCR_RE_SPECIAL));
+                    } else {
+                        alb.overlay_attr(line_range(lpc - 1, lpc + 1),
+                                         VC_STYLE.value(text_attrs::with_styles(
+                                             text_attrs::style::bold,
+                                             text_attrs::style::reverse)));
                         alb.overlay_attr(line_range(lpc - 1, lpc + 1),
                                          VC_ROLE.value(role_t::VCR_ERROR));
                     }
@@ -336,9 +375,9 @@ regex_highlighter(attr_line_t& al, int x, line_range sub)
     }
 
     for (int lpc = 0; brackets[lpc]; lpc++) {
-        find_matching_bracket(al, x, sub, brackets[lpc][0], brackets[lpc][1]);
+        find_matching_bracket(
+            al, x.value_or(0), sub, brackets[lpc][0], brackets[lpc][1]);
     }
 }
 
-}  // namespace snippets
-}  // namespace lnav
+}  // namespace lnav::snippets

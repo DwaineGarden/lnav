@@ -114,24 +114,30 @@ static void Utf32toUtf8(unsigned int codepoint, char * utf8Buf)
 }
 
 void yajl_string_decode(yajl_buf buf, const unsigned char * str,
-                        size_t len)
+                        size_t len, yajl_string_props_t* props)
 {
     size_t beg = 0;
     size_t end = 0;
 
+    props->has_ansi = 0;
+    props->line_feeds = 0;
     while (end < len) {
-        if (str[end] == '\\') {
+        if (str[end] == '/' || str[end] == '#' || str[end] == '~') {
+            props->ptr_escapes += 1;
+            end++;
+        } else if (str[end] == '\\') {
             char utf8Buf[5];
             const char * unescaped = "?";
+            unsigned int unescapedLen = 1;
             yajl_buf_append(buf, str + beg, end - beg);
             switch (str[++end]) {
                 case 'r': unescaped = "\r"; break;
-                case 'n': unescaped = "\n"; break;
+                case 'n': unescaped = "\n"; props->line_feeds += 1; break;
                 case '\\': unescaped = "\\"; break;
                 case '/': unescaped = "/"; break;
                 case '"': unescaped = "\""; break;
                 case 'f': unescaped = "\f"; break;
-                case 'b': unescaped = "\b"; break;
+                case 'b': unescaped = "\b"; props->has_ansi = 1; break;
                 case 't': unescaped = "\t"; break;
                 case 'u': {
                     unsigned int codepoint = 0;
@@ -149,13 +155,20 @@ void yajl_string_decode(yajl_buf buf, const unsigned char * str,
                                    | (surrogate & 0x3FF));
                             end += 5;
                         } else {
-                            unescaped = "?";
                             break;
                         }
+                    } else if (codepoint == 0x1b) {
+                        props->has_ansi = 1;
+                    } else if (codepoint == '\n') {
+                        props->line_feeds += 1;
                     }
-                    
+
                     Utf32toUtf8(codepoint, utf8Buf);
                     unescaped = utf8Buf;
+                    if (codepoint < 0x80) unescapedLen = 1;
+                    else if (codepoint < 0x800) unescapedLen = 2;
+                    else if (codepoint < 0x10000) unescapedLen = 3;
+                    else unescapedLen = 4;
 
                     if (codepoint == 0) {
                         yajl_buf_append(buf, unescaped, 1);
@@ -168,7 +181,7 @@ void yajl_string_decode(yajl_buf buf, const unsigned char * str,
                 default:
                     assert("this should never happen" == NULL);
             }
-            yajl_buf_append(buf, unescaped, (unsigned int)strlen(unescaped));
+            yajl_buf_append(buf, unescaped, unescapedLen);
             beg = ++end;
         } else {
             end++;

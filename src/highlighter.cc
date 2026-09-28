@@ -30,31 +30,18 @@
 #include "highlighter.hh"
 
 #include "config.h"
+#include "pcrepp/pcre2pp.hh"
+#include "view_curses.hh"
 
-highlighter&
-highlighter::operator=(const highlighter& other)
+highlighter::highlighter(const std::shared_ptr<lnav::pcre2pp::code>& regex)
+    : h_regex(regex)
 {
-    if (this == &other) {
-        return *this;
-    }
-
-    this->h_name = other.h_name;
-    this->h_fg = other.h_fg;
-    this->h_bg = other.h_bg;
-    this->h_role = other.h_role;
-    this->h_regex = other.h_regex;
-    this->h_format_name = other.h_format_name;
-    this->h_attrs = other.h_attrs;
-    this->h_text_formats = other.h_text_formats;
-    this->h_nestable = other.h_nestable;
-
-    return *this;
+    this->h_capture_attrs.resize(regex->get_capture_count());
 }
 
 void
-highlighter::annotate_capture(attr_line_t& al, const line_range& lr) const
+highlighter::annotate_capture(attr_line_t& al, line_range lr) const
 {
-    auto& vc = view_colors::singleton();
     auto& sa = al.get_attrs();
 
     if (lr.lr_end <= lr.lr_start) {
@@ -77,18 +64,10 @@ highlighter::annotate_capture(attr_line_t& al, const line_range& lr) const
         }
     }
 
-    if (!this->h_fg.empty()) {
-        sa.emplace_back(lr,
-                        VC_FOREGROUND.value(
-                            vc.match_color(this->h_fg)
-                                .value_or(view_colors::MATCH_COLOR_DEFAULT)));
+    if (this->h_full_line) {
+        lr = line_range::full();
     }
-    if (!this->h_bg.empty()) {
-        sa.emplace_back(lr,
-                        VC_BACKGROUND.value(
-                            vc.match_color(this->h_bg)
-                                .value_or(view_colors::MATCH_COLOR_DEFAULT)));
-    }
+
     if (this->h_role != role_t::VCR_NONE) {
         sa.emplace_back(lr, VC_ROLE.value(this->h_role));
     }
@@ -97,29 +76,45 @@ highlighter::annotate_capture(attr_line_t& al, const line_range& lr) const
     }
 }
 
-void
-highlighter::annotate(attr_line_t& al, int start) const
+bool
+highlighter::annotate(attr_line_t& al, const line_range& lr) const
 {
+    auto retval = false;
+
     if (!this->h_regex) {
-        return;
+        return retval;
     }
 
     auto& vc = view_colors::singleton();
     const auto& str = al.get_string();
     auto& sa = al.get_attrs();
-    auto sf = string_fragment::from_str_range(
-        str, start, std::min(size_t{8192}, str.size()));
+    const auto sf = string_fragment::from_str_range(
+        str,
+        lr.lr_start,
+        std::min(size_t{8192}, std::min((size_t) lr.lr_end, str.size())));
 
     if (!sf.is_valid()) {
-        return;
+        return retval;
     }
 
-    this->h_regex->capture_from(sf).for_each(
+    this->h_regex->capture_from(sf).for_each<PCRE2_NO_UTF_CHECK>(
         [&](lnav::pcre2pp::match_data& md) {
-            if (md.get_count() == 1) {
+            retval = true;
+            if (!this->h_field.empty() || md.get_count() == 1) {
                 this->annotate_capture(al, to_line_range(md[0].value()));
+                if (!this->h_field.empty()) {
+                    for (size_t lpc = 1; lpc < md.get_count(); lpc++) {
+                        if (!md[lpc]
+                            || this->h_capture_attrs[lpc - 1].empty()) {
+                            continue;
+                        }
+                        auto lr = to_line_range(md[lpc].value());
+                        al.al_attrs.emplace_back(
+                            lr, VC_STYLE.value(this->h_capture_attrs[lpc - 1]));
+                    }
+                }
             } else {
-                for (int lpc = 1; lpc < md.get_count(); lpc++) {
+                for (size_t lpc = 1; lpc < md.get_count(); lpc++) {
                     if (!md[lpc]) {
                         continue;
                     }
@@ -143,4 +138,6 @@ highlighter::annotate(attr_line_t& al, int start) const
                 }
             }
         });
+
+    return retval;
 }

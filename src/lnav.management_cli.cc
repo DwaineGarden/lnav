@@ -27,51 +27,347 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <queue>
+#include <functional>
 
 #include "lnav.management_cli.hh"
 
+#include <glob.h>
+#include <pwd.h>
+
+#include "apps.hh"
+#include "base/fs_util.hh"
+#include "base/humanize.hh"
+#include "base/humanize.time.hh"
 #include "base/itertools.hh"
+#include "base/paths.hh"
 #include "base/result.h"
 #include "base/string_util.hh"
+#include "crashd.client.hh"
+#include "file_options.hh"
+#include "file_split.hh"
+#include "fmt/chrono.h"
 #include "fmt/format.h"
-#include "itertools.similar.hh"
+#include "base/itertools.similar.hh"
+#include "lnav.hh"
+#include "lnav_config.hh"
 #include "log_format.hh"
 #include "log_format_ext.hh"
 #include "mapbox/variant.hpp"
+#include "piper.header.hh"
 #include "regex101.import.hh"
 #include "session_data.hh"
+#include "yajlpp/yajlpp_def.hh"
 
+using namespace std::string_view_literals;
 using namespace lnav::roles::literals;
 
-namespace lnav {
-
-namespace management {
+namespace lnav::management {
 
 struct no_subcmd_t {
     CLI::App* ns_root_app{nullptr};
 };
 
+static auto DEFAULT_WRAPPING
+    = text_wrap_settings{}.with_padding_indent(4).with_width(60);
+
 inline attr_line_t&
 symbol_reducer(const std::string& elem, attr_line_t& accum)
 {
-    return accum.append("\n   ").append(lnav::roles::symbol(elem));
+    if (!accum.empty()) {
+        accum.append(", ");
+    }
+    return accum.append(lnav::roles::symbol(elem));
 }
 
 inline attr_line_t&
 subcmd_reducer(const CLI::App* app, attr_line_t& accum)
 {
-    return accum.append("\n \u2022 ")
+    return accum.append("\n ")
+        .append("\u2022"_list_glyph)
+        .append(" ")
         .append(lnav::roles::keyword(app->get_name()))
         .append(": ")
         .append(app->get_description());
 }
+
+static const auto INDEX_MD_TEMPLATE = R"(---
+title: lnav app: {title}
+---
+
+# {title}
+
+The following text was generated dynamically by an lnav code block in this
+Markdown file:
+
+``` {{ .lnav .eval-and-replace }}
+:echo <blockquote>Hello, ${{USER}}!</blockquote>
+```
+
+
+Check out the API test app to learn more about what is possible.  Then,
+edit this file and reload the page to see the results.
+
+)"sv;
+
+struct subcmd_apps_t {
+    using action_t = std::function<perform_result_t(const subcmd_apps_t&)>;
+
+    CLI::App* sa_apps_app{nullptr};
+    action_t sa_action;
+    std::string sa_name;
+
+    static perform_result_t default_action(const subcmd_apps_t& sc)
+    {
+        auto um
+            = console::user_message::error(
+                  "expecting an operation related to lnav apps")
+                  .with_help(sc.sa_apps_app->get_subcommands({})
+                             | lnav::itertools::fold(
+                                 subcmd_reducer,
+                                 attr_line_t{"the available operations are:"}))
+                  .move();
+
+        return {std::move(um)};
+    }
+
+    static perform_result_t create_action(const subcmd_apps_t& sa)
+    {
+        auto configs_dir = lnav::paths::dotlnav() / "configs";
+        std::string publisher;
+
+        auto* user_env = getenv("USER");
+        if (user_env) {
+            publisher = user_env;
+        } else {
+            auto* user_id = getpwuid(getuid());
+            if (user_id) {
+                publisher = user_id->pw_name;
+            }
+        }
+        if (publisher.empty()) {
+            auto um = console::user_message::error(
+                          "Unable to determine the publisher for the app")
+                          .with_help(attr_line_t("Set the ")
+                                         .append("USER"_variable)
+                                         .append(" environment variable"));
+            return {std::move(um)};
+        }
+
+        auto dst_dir = configs_dir / sa.sa_name;
+        if (std::filesystem::exists(dst_dir)) {
+            auto um = console::user_message::error(
+                          attr_line_t("app directory already exists: ")
+                              .append(lnav::roles::file(dst_dir.string())))
+                          .with_help(attr_line_t("Delete the directory or "
+                                                 "choose a different name"));
+            return {std::move(um)};
+        }
+
+        yajlpp_gen gen;
+        {
+            yajlpp_map root_map(gen);
+
+            root_map.gen("$schema");
+            root_map.gen(DEFAULT_CONFIG_SCHEMA);
+
+            root_map.gen("apps");
+            {
+                yajlpp_map apps_map(gen);
+
+                apps_map.gen(publisher);
+                {
+                    yajlpp_map publisher_map(gen);
+
+                    publisher_map.gen(sa.sa_name);
+                    {
+                        yajlpp_map app_map(gen);
+
+                        apps_map.gen("root");
+                        apps_map.gen("app-files");
+
+                        apps_map.gen("description");
+                        apps_map.gen("My fancy new lnav app");
+                    }
+                }
+            }
+        }
+
+        auto app_files_dir = dst_dir / "app-files";
+        std::error_code ec;
+        std::filesystem::create_directories(app_files_dir, ec);
+        if (ec) {
+            auto um = console::user_message::error(
+                          attr_line_t("cannot create app directory: ")
+                              .append(lnav::roles::file(dst_dir.string())))
+                          .with_reason(ec.message());
+
+            return {std::move(um)};
+        }
+
+        auto app_config_path = dst_dir / "app.json";
+        auto config_write_res = lnav::filesystem::write_file(
+            app_config_path, gen.to_string_fragment());
+        if (config_write_res.isErr()) {
+            std::filesystem::remove_all(dst_dir, ec);
+            auto um
+                = console::user_message::error(
+                      attr_line_t("cannot write app config file: ")
+                          .append(lnav::roles::file(app_config_path.string())))
+                      .with_reason(config_write_res.unwrapErr());
+            return {std::move(um)};
+        }
+
+        auto index_md
+            = fmt::format(INDEX_MD_TEMPLATE, fmt::arg("title", sa.sa_name));
+        auto index_write_res = lnav::filesystem::write_file(
+            app_files_dir / "index.md", index_md);
+        if (index_write_res.isErr()) {
+            std::filesystem::remove_all(dst_dir, ec);
+            auto um
+                = console::user_message::error(
+                      attr_line_t("cannot write app config file: ")
+                          .append(lnav::roles::file(app_config_path.string())))
+                      .with_reason(index_write_res.unwrapErr());
+            return {std::move(um)};
+        }
+
+        auto um
+            = lnav::console::user_message::info(
+                  attr_line_t("created app directory: ")
+                      .append(lnav::roles::file(dst_dir.string())))
+                  .with_note(
+                      "edit the app.json file in the directory to configure "
+                      "the app")
+                  .with_note(
+                      "edit the app-files/index.md file to implement the app");
+
+        return {std::move(um)};
+    }
+
+    subcmd_apps_t& set_action(action_t act)
+    {
+        if (!this->sa_action) {
+            this->sa_action = std::move(act);
+        }
+        return *this;
+    }
+};
+
+struct subcmd_config_t {
+    using action_t = std::function<perform_result_t(const subcmd_config_t&)>;
+
+    CLI::App* sc_config_app{nullptr};
+    action_t sc_action;
+    std::string sc_path;
+
+    static perform_result_t default_action(const subcmd_config_t& sc)
+    {
+        auto um
+            = console::user_message::error(
+                  "expecting an operation related to lnav configuration")
+                  .with_help(sc.sc_config_app->get_subcommands({})
+                             | lnav::itertools::fold(
+                                 subcmd_reducer,
+                                 attr_line_t{"the available operations are:"}))
+                  .move();
+
+        return {std::move(um)};
+    }
+
+    static perform_result_t get_action(const subcmd_config_t&)
+    {
+        auto config_str = dump_config();
+        auto um = console::user_message::raw(config_str);
+
+        return {std::move(um)};
+    }
+
+    static perform_result_t blame_action(const subcmd_config_t&)
+    {
+        auto blame = attr_line_t();
+
+        for (const auto& pair : lnav_config_locations) {
+            blame.appendf(FMT_STRING("{} -> {}:{}\n"),
+                          pair.first,
+                          pair.second.sl_source,
+                          pair.second.sl_line_number);
+        }
+
+        auto um = console::user_message::raw(blame.rtrim());
+
+        return {std::move(um)};
+    }
+
+    static perform_result_t file_options_action(const subcmd_config_t& sc)
+    {
+        auto& safe_options_hier
+            = injector::get<lnav::safe_file_options_hier&>();
+
+        if (sc.sc_path.empty()) {
+            auto um = lnav::console::user_message::error(
+                "Expecting a file path to check for options");
+
+            return {std::move(um)};
+        }
+
+        safe::ReadAccess<lnav::safe_file_options_hier> options_hier(
+            safe_options_hier);
+
+        auto realpath_res = lnav::filesystem::realpath(sc.sc_path);
+        if (realpath_res.isErr()) {
+            auto um = lnav::console::user_message::error(
+                          attr_line_t("Unable to get full path for file: ")
+                              .append(lnav::roles::file(sc.sc_path)))
+                          .with_reason(realpath_res.unwrapErr())
+                          .move();
+
+            return {std::move(um)};
+        }
+        auto full_path = realpath_res.unwrap();
+        auto file_opts = options_hier->match(full_path);
+        if (file_opts) {
+            auto content = attr_line_t()
+                               .append(file_opts->second.to_json_string()
+                                           .to_string_fragment())
+                               .move();
+            auto um = lnav::console::user_message::raw(content);
+            perform_result_t retval;
+
+            retval.emplace_back(um);
+
+            return retval;
+        }
+
+        auto um
+            = lnav::console::user_message::info(
+                  attr_line_t("no options found for file: ")
+                      .append(lnav::roles::file(full_path.string())))
+                  .with_help(
+                      attr_line_t("Use the ")
+                          .append(":set-file-timezone"_symbol)
+                          .append(
+                              " command to set the zone for messages in files "
+                              "that do not include a zone in the timestamp"))
+                  .move();
+
+        return {std::move(um)};
+    }
+
+    subcmd_config_t& set_action(action_t act)
+    {
+        if (!this->sc_action) {
+            this->sc_action = std::move(act);
+        }
+        return *this;
+    }
+};
 
 struct subcmd_format_t {
     using action_t = std::function<perform_result_t(const subcmd_format_t&)>;
 
     CLI::App* sf_format_app{nullptr};
     std::string sf_name;
+    std::string sf_path;
     CLI::App* sf_regex_app{nullptr};
     std::string sf_regex_name;
     CLI::App* sf_regex101_app{nullptr};
@@ -89,31 +385,41 @@ struct subcmd_format_t {
         const
     {
         if (this->sf_name.empty()) {
-            auto um = console::user_message::error(
-                "expecting a format name to operate on");
-            um.with_note(
-                (log_format::get_root_formats()
-                 | lnav::itertools::map(&log_format::get_name)
-                 | lnav::itertools::sort_with(intern_string_t::case_lt)
-                 | lnav::itertools::map(&intern_string_t::to_string)
-                 | lnav::itertools::fold(symbol_reducer, attr_line_t{}))
-                    .add_header("the available formats are:"));
+            auto um
+                = console::user_message::error(
+                      "expecting a format name to operate on")
+                      .with_note(
+                          (log_format::get_root_formats()
+                           | lnav::itertools::map(&log_format::get_name)
+                           | lnav::itertools::sort_with(
+                               intern_string_t::case_lt)
+                           | lnav::itertools::map(&intern_string_t::to_string)
+                           | lnav::itertools::fold(symbol_reducer,
+                                                   attr_line_t{}))
+                              .add_header("the available formats are: ")
+                              .wrap_with(&DEFAULT_WRAPPING))
+                      .move();
 
             return Err(um);
         }
 
         auto lformat = log_format::find_root_format(this->sf_name.c_str());
         if (lformat == nullptr) {
-            auto um = console::user_message::error(
-                attr_line_t("unknown format: ")
-                    .append(lnav::roles::symbol(this->sf_name)));
-            um.with_note(
-                (log_format::get_root_formats()
-                 | lnav::itertools::map(&log_format::get_name)
-                 | lnav::itertools::similar_to(this->sf_name)
-                 | lnav::itertools::map(&intern_string_t::to_string)
-                 | lnav::itertools::fold(symbol_reducer, attr_line_t{}))
-                    .add_header("did you mean one of the following?"));
+            auto um
+                = console::user_message::error(
+                      attr_line_t("unknown format: ")
+                          .append(lnav::roles::symbol(this->sf_name)))
+                      .with_note(
+                          (log_format::get_root_formats()
+                           | lnav::itertools::map(&log_format::get_name)
+                           | lnav::itertools::similar_to(this->sf_name)
+                           | lnav::itertools::map(&intern_string_t::to_string)
+                           | lnav::itertools::fold(symbol_reducer,
+                                                   attr_line_t{}))
+                              .add_header(
+                                  "did you mean one of the following?\n")
+                              .wrap_with(&DEFAULT_WRAPPING))
+                      .move();
 
             return Err(um);
         }
@@ -146,14 +452,18 @@ struct subcmd_format_t {
         auto* ext_lformat = TRY(this->validate_external_format());
 
         if (this->sf_regex_name.empty()) {
-            auto um = console::user_message::error(
-                "expecting a regex name to operate on");
-            um.with_note(
-                ext_lformat->elf_pattern_order
-                | lnav::itertools::map(&external_log_format::pattern::p_name)
-                | lnav::itertools::map(&intern_string_t::to_string)
-                | lnav::itertools::fold(
-                    symbol_reducer, attr_line_t{"the available regexes are:"}));
+            auto um
+                = console::user_message::error(
+                      "expecting a regex name to operate on")
+                      .with_note(
+                          ext_lformat->elf_pattern_order
+                          | lnav::itertools::map(
+                              &external_log_format::pattern::p_name)
+                          | lnav::itertools::map(&intern_string_t::to_string)
+                          | lnav::itertools::fold(
+                              symbol_reducer,
+                              attr_line_t{"the available regexes are: "}))
+                      .move();
 
             return Err(um);
         }
@@ -164,16 +474,19 @@ struct subcmd_format_t {
             }
         }
 
-        auto um = console::user_message::error(
-            attr_line_t("unknown regex: ")
-                .append(lnav::roles::symbol(this->sf_regex_name)));
-        um.with_note(
-            (ext_lformat->elf_pattern_order
-             | lnav::itertools::map(&external_log_format::pattern::p_name)
-             | lnav::itertools::map(&intern_string_t::to_string)
-             | lnav::itertools::similar_to(this->sf_regex_name)
-             | lnav::itertools::fold(symbol_reducer, attr_line_t{}))
-                .add_header("did you mean one of the following?"));
+        auto um
+            = console::user_message::error(
+                  attr_line_t("unknown regex: ")
+                      .append(lnav::roles::symbol(this->sf_regex_name)))
+                  .with_note(
+                      (ext_lformat->elf_pattern_order
+                       | lnav::itertools::map(
+                           &external_log_format::pattern::p_name)
+                       | lnav::itertools::map(&intern_string_t::to_string)
+                       | lnav::itertools::similar_to(this->sf_regex_name)
+                       | lnav::itertools::fold(symbol_reducer, attr_line_t{}))
+                          .add_header("did you mean one of the following?\n"))
+                  .move();
 
         return Err(um);
     }
@@ -201,21 +514,23 @@ struct subcmd_format_t {
                       ", ");
         }
 
-        auto um = console::user_message::error(
-            attr_line_t("expecting an operation to perform on the ")
-                .append(lnav::roles::symbol(sf.sf_name))
-                .append(" format"));
-        um.with_note(attr_line_t()
-                         .append(lnav::roles::symbol(sf.sf_name))
-                         .append(": ")
-                         .append(lformat->lf_description)
-                         .append(ext_details));
-        um.with_help(
-            sf.sf_format_app->get_subcommands({})
-            | lnav::itertools::fold(
-                subcmd_reducer, attr_line_t{"the available operations are:"}));
+        auto um
+            = console::user_message::error(
+                  attr_line_t("expecting an operation to perform on the ")
+                      .append(lnav::roles::symbol(sf.sf_name))
+                      .append(" format"))
+                  .with_note(attr_line_t()
+                                 .append(lnav::roles::symbol(sf.sf_name))
+                                 .append(": ")
+                                 .append(lformat->lf_description)
+                                 .append(ext_details))
+                  .with_help(sf.sf_format_app->get_subcommands({})
+                             | lnav::itertools::fold(
+                                 subcmd_reducer,
+                                 attr_line_t{"the available operations are:"}))
+                  .move();
 
-        return {um};
+        return {std::move(um)};
     }
 
     static perform_result_t default_regex_action(const subcmd_format_t& sf)
@@ -227,15 +542,17 @@ struct subcmd_format_t {
         }
 
         auto um = console::user_message::error(
-            attr_line_t("expecting an operation to perform on the ")
-                .append(lnav::roles::symbol(sf.sf_regex_name))
-                .append(" regular expression"));
+                      attr_line_t("expecting an operation to perform on the ")
+                          .append(lnav::roles::symbol(sf.sf_regex_name))
+                          .append(" regular expression"))
+                      .with_help(
+                          attr_line_t{"the available subcommands are:"}.append(
+                              sf.sf_regex_app->get_subcommands({})
+                              | lnav::itertools::fold(subcmd_reducer,
+                                                      attr_line_t{})))
+                      .move();
 
-        um.with_help(attr_line_t{"the available subcommands are:"}.append(
-            sf.sf_regex_app->get_subcommands({})
-            | lnav::itertools::fold(subcmd_reducer, attr_line_t{})));
-
-        return {um};
+        return {std::move(um)};
     }
 
     static perform_result_t get_action(const subcmd_format_t& sf)
@@ -254,7 +571,142 @@ struct subcmd_format_t {
                 .append(": ")
                 .append(on_blank(format->lf_description, "<no description>")));
 
-        return {um};
+        return {std::move(um)};
+    }
+
+    static perform_result_t test_action(const subcmd_format_t& sf)
+    {
+        auto validate_res = sf.validate_external_format();
+        if (validate_res.isErr()) {
+            return {validate_res.unwrapErr()};
+        }
+        auto* format = validate_res.unwrap();
+
+        if (sf.sf_path.empty()) {
+            auto um = lnav::console::user_message::error(
+                "Expecting a file path to test");
+
+            return {std::move(um)};
+        }
+        auto stat_res = lnav::filesystem::stat_file(sf.sf_path);
+        if (stat_res.isErr()) {
+            auto um = lnav::console::user_message::error(
+                          attr_line_t("Unable to stat file: ")
+                              .append(lnav::roles::file(sf.sf_path)))
+                          .with_reason(stat_res.unwrapErr());
+
+            return {std::move(um)};
+        }
+        auto st = stat_res.unwrap();
+        if (!S_ISREG(st.st_mode)) {
+            auto um = lnav::console::user_message::error(
+                          attr_line_t("Unable to test with path: ")
+                              .append(lnav::roles::file(sf.sf_path)))
+                          .with_reason("not a regular file");
+
+            return {std::move(um)};
+        }
+
+        auto open_res = lnav::filesystem::open_file(sf.sf_path, O_RDONLY);
+        if (open_res.isErr()) {
+            auto um = lnav::console::user_message::error(
+                          attr_line_t("Unable to open file")
+                              .append(lnav::roles::file(sf.sf_path)))
+                          .with_reason(open_res.unwrapErr());
+
+            return {std::move(um)};
+        }
+        auto test_file_fd = open_res.unwrap();
+
+        line_buffer lb;
+        lb.set_fd(test_file_fd);
+
+        auto load_res = lb.load_next_line();
+        if (load_res.isErr()) {
+            auto um = lnav::console::user_message::error(
+                          attr_line_t("Unable load line from file")
+                              .append(lnav::roles::file(sf.sf_path)))
+                          .with_reason(load_res.unwrapErr());
+
+            return {std::move(um)};
+        }
+        auto li = load_res.unwrap();
+        auto read_res = lb.read_range(li.li_file_range);
+        if (read_res.isErr()) {
+            auto um = lnav::console::user_message::error(
+                          attr_line_t("Unable read line from file")
+                              .append(lnav::roles::file(sf.sf_path)))
+                          .with_reason(read_res.unwrapErr());
+
+            return {std::move(um)};
+        }
+        auto sbr = read_res.unwrap();
+
+        auto sample = log_format::sample_t{{
+            intern_string::lookup("/"),
+            source_location{
+                intern_string::lookup(sf.sf_path),
+                1,
+            },
+            sbr.to_string_fragment().rtrim("\n").to_string(),
+        }};
+        perform_result_t retval;
+        auto test_res = format->test_line(sample, retval);
+        test_res.match(
+            [&retval, &sample](const log_format::scan_no_match& nope) {
+                if (retval.empty()) {
+                    auto um = lnav::console::user_message::error(
+                        attr_line_t("test file did not match any of this "
+                                    "format's patterns"));
+                    if (nope.snm_reason != nullptr) {
+                        um.with_reason(nope.snm_reason)
+                            .with_snippet(lnav::console::snippet::from(
+                                sample.s_line.pp_location,
+                                sample.s_line.pp_value));
+                    }
+                    retval.emplace_back(um);
+                }
+            },
+            [&retval, &sample](const log_format::scan_error& se) {
+                if (retval.empty()) {
+                    auto um = lnav::console::user_message::error(
+                        attr_line_t("test file did not match due to an error"));
+                    um.with_reason(se.se_message)
+                        .with_snippet(lnav::console::snippet::from(
+                            sample.s_line.pp_location, sample.s_line.pp_value));
+                    retval.emplace_back(um);
+                }
+            },
+            [&retval, &sample](const log_format::scan_match& yep) mutable {
+                auto al = attr_line_t("test file matched format");
+                if (!sample.s_matched_regexes.empty()) {
+                    al.append(" pattern ")
+                        .append(lnav::roles::symbol(
+                            *sample.s_matched_regexes.begin()));
+                }
+
+                auto um = lnav::console::user_message::ok(al).with_snippet(
+                    lnav::console::snippet::from(sample.s_line.pp_location,
+                                                 sample.s_line.pp_value));
+                if (sample.s_matched_regexes.empty()) {
+                    auto note_al = attr_line_t("quality value of ")
+                                       .append(lnav::roles::number(
+                                           fmt::to_string(yep.sm_quality)))
+                                       .append(" and ")
+                                       .append(lnav::roles::number(
+                                           fmt::to_string(yep.sm_strikes)))
+                                       .append(" strikes");
+                    um.with_note(note_al);
+                }
+                retval.emplace_back(um);
+            },
+            [&retval](const log_format::scan_incomplete& inc) {
+                auto um = lnav::console::user_message::error(attr_line_t(
+                    "test file did not have enough data to match against"));
+                retval.emplace_back(um);
+            });
+
+        return retval;
     }
 
     static perform_result_t source_action(const subcmd_format_t& sf)
@@ -277,7 +729,7 @@ struct subcmd_format_t {
         auto um = console::user_message::raw(
             format->elf_format_source_order[0].string());
 
-        return {um};
+        return {std::move(um)};
     }
 
     static perform_result_t sources_action(const subcmd_format_t& sf)
@@ -302,7 +754,7 @@ struct subcmd_format_t {
                                VC_ROLE.value(role_t::VCR_TEXT),
                                "\n"));
 
-        return {um};
+        return {std::move(um)};
     }
 
     static perform_result_t regex101_pull_action(const subcmd_format_t& sf)
@@ -433,7 +885,7 @@ struct subcmd_format_t {
                                             .string())));
                         }
 
-                        return {um};
+                        return {std::move(um)};
                     });
             });
     }
@@ -466,7 +918,7 @@ struct subcmd_format_t {
             sf.sf_regex101_app->get_subcommands({})
             | lnav::itertools::fold(subcmd_reducer, attr_line_t{})));
 
-        return {um};
+        return {std::move(um)};
     }
 
     static perform_result_t regex101_push_action(const subcmd_format_t& sf)
@@ -548,7 +1000,7 @@ struct subcmd_format_t {
                         auto ppath = regex101::patch_path(validate_res.unwrap(),
                                                           en.re_permalink);
 
-                        if (ghc::filesystem::exists(ppath)) {
+                        if (std::filesystem::exists(ppath)) {
                             return {
                                 console::user_message::error(
                                     attr_line_t("cannot delete regex101 entry "
@@ -622,6 +1074,530 @@ struct subcmd_format_t {
     }
 };
 
+struct subcmd_file_t {
+    using action_t = std::function<perform_result_t(const subcmd_file_t&)>;
+
+    CLI::App* sfi_file_app{nullptr};
+    std::string sfi_path;
+    uint64_t sfi_lines{0};
+    std::string sfi_size;
+    std::string sfi_time;
+    std::string sfi_since;
+    std::string sfi_until;
+    std::string sfi_output_dir{"."};
+    action_t sfi_action;
+
+    subcmd_file_t& set_action(action_t act)
+    {
+        if (!this->sfi_action) {
+            this->sfi_action = std::move(act);
+        }
+        return *this;
+    }
+
+    static perform_result_t default_action(const subcmd_file_t& sf)
+    {
+        auto um = console::user_message::error(
+                      "expecting an operation to perform on a file")
+                      .with_help(sf.sfi_file_app->get_subcommands({})
+                                 | lnav::itertools::fold(
+                                     subcmd_reducer,
+                                     attr_line_t{"the available operations are:"}))
+                      .move();
+
+        return {std::move(um)};
+    }
+
+    static std::string format_time(std::chrono::microseconds us)
+    {
+        const auto secs
+            = std::chrono::duration_cast<std::chrono::seconds>(us).count();
+
+        return fmt::format(FMT_STRING("{:%Y-%m-%d %H:%M:%S}"),
+                           fmt::gmtime(static_cast<time_t>(secs)));
+    }
+
+    static perform_result_t split_action(const subcmd_file_t& sf)
+    {
+        if (sf.sfi_path.empty()) {
+            auto um = console::user_message::error(
+                "expecting the path of a file to split");
+
+            return {std::move(um)};
+        }
+
+        file_split::options opts;
+        opts.o_output_dir = sf.sfi_output_dir;
+        if (sf.sfi_lines > 0) {
+            opts.o_limits.l_lines = sf.sfi_lines;
+        }
+        if (!sf.sfi_size.empty()) {
+            auto size_res = humanize::try_from<double>(
+                string_fragment::from_str(sf.sfi_size));
+            if (!size_res
+                || !(size_res->unit_suffix.empty()
+                     || size_res->unit_suffix == "B")
+                || size_res->value < 1)
+            {
+                auto um = console::user_message::error(
+                              attr_line_t("invalid size: ")
+                                  .append_quoted(sf.sfi_size))
+                              .with_help("expecting a size like 512MB or 1GiB")
+                              .move();
+
+                return {std::move(um)};
+            }
+            opts.o_limits.l_bytes = static_cast<uint64_t>(size_res->value);
+        }
+        if (!sf.sfi_time.empty()) {
+            auto rt_res
+                = relative_time::from_str(string_fragment::from_str(sf.sfi_time));
+            if (rt_res.isErr()) {
+                auto um = console::user_message::error(
+                              attr_line_t("invalid time window: ")
+                                  .append_quoted(sf.sfi_time))
+                              .with_reason(rt_res.unwrapErr().pe_msg)
+                              .with_help("expecting a duration like 1h or 1d")
+                              .move();
+
+                return {std::move(um)};
+            }
+            auto rt = rt_res.unwrap();
+            if (rt.is_absolute() || rt.to_microseconds() <= 0) {
+                auto um = console::user_message::error(
+                              attr_line_t("invalid time window: ")
+                                  .append_quoted(sf.sfi_time))
+                              .with_reason("expecting a positive duration")
+                              .with_help("expecting a duration like 1h or 1d")
+                              .move();
+
+                return {std::move(um)};
+            }
+            opts.o_limits.l_duration
+                = std::chrono::microseconds(rt.to_microseconds());
+        }
+        if (!sf.sfi_since.empty() || !sf.sfi_until.empty()) {
+            auto range = time_range::unbounded();
+
+            if (!sf.sfi_since.empty()) {
+                auto from_res = humanize::time::point::from(sf.sfi_since);
+                if (from_res.isErr()) {
+                    auto um = from_res.unwrapErr();
+                    um.um_message = attr_line_t("invalid 'since' time ")
+                                        .append_quoted(sf.sfi_since);
+
+                    return {std::move(um)};
+                }
+                range.tr_begin = to_us(from_res.unwrap().get_point());
+            }
+            if (!sf.sfi_until.empty()) {
+                auto from_res = humanize::time::point::from(sf.sfi_until);
+                if (from_res.isErr()) {
+                    auto um = from_res.unwrapErr();
+                    um.um_message = attr_line_t("invalid 'until' time ")
+                                        .append_quoted(sf.sfi_until);
+
+                    return {std::move(um)};
+                }
+                range.tr_end = to_us(from_res.unwrap().get_point());
+            }
+            if (range.tr_end < range.tr_begin) {
+                auto um = console::user_message::error(
+                              attr_line_t("the 'since' time ")
+                                  .append_quoted(
+                                      lnav::roles::symbol(sf.sfi_since))
+                                  .append(" is not before the 'until' time ")
+                                  .append_quoted(
+                                      lnav::roles::symbol(sf.sfi_until)))
+                              .with_note(attr_line_t("the resolved 'since' "
+                                                     "time is ")
+                                             .append_quoted(lnav::roles::symbol(
+                                                 format_time(range.tr_begin))))
+                              .with_note(attr_line_t("the resolved 'until' "
+                                                     "time is ")
+                                             .append_quoted(lnav::roles::symbol(
+                                                 format_time(range.tr_end))))
+                              .with_help("ensure that the 'since' time is "
+                                         "before the 'until' time")
+                              .move();
+
+                return {std::move(um)};
+            }
+            opts.o_time_range = range;
+        }
+
+        const auto show_progress = isatty(STDERR_FILENO);
+        auto split_res = file_split::split(
+            sf.sfi_path, opts, [show_progress](file_off_t done) {
+                if (show_progress) {
+                    fmt::print(stderr,
+                               FMT_STRING("\rsplitting... {} read\x1b[K"),
+                               humanize::file_size(
+                                   done, humanize::alignment::none));
+                    fflush(stderr);
+                }
+            });
+        if (show_progress) {
+            fmt::print(stderr, FMT_STRING("\r\x1b[K"));
+        }
+        if (split_res.isErr()) {
+            return {split_res.unwrapErr()};
+        }
+
+        const auto sum = split_res.unwrap();
+        if (sum.s_pieces.empty() && opts.o_time_range) {
+            const auto& range = opts.o_time_range.value();
+            auto reason = attr_line_t("looked for messages");
+            if (range.has_lower_bound()) {
+                reason.append(" from ").append(
+                    lnav::roles::symbol(format_time(range.tr_begin)));
+            }
+            if (range.has_upper_bound()) {
+                reason.append(" until ").append(
+                    lnav::roles::symbol(format_time(range.tr_end)));
+            }
+            auto um = console::user_message::ok(
+                          attr_line_t("no messages in the time range in ")
+                              .append(lnav::roles::file(sf.sfi_path)))
+                          .with_reason(reason)
+                          .move();
+
+            return {std::move(um)};
+        }
+        if (sum.s_pieces.empty()) {
+            auto um
+                = console::user_message::ok(
+                      attr_line_t("no split needed for ")
+                          .append(lnav::roles::file(sf.sfi_path)))
+                      .with_reason(
+                          attr_line_t("the file's ")
+                              .append(lnav::roles::number(
+                                  fmt::to_string(sum.s_lines)))
+                              .append(" lines fit in a single piece"))
+                      .move();
+
+            return {std::move(um)};
+        }
+
+        auto um = console::user_message::ok(
+            attr_line_t("split ")
+                .append(lnav::roles::file(sf.sfi_path))
+                .append(" into ")
+                .append(lnav::roles::number(
+                    fmt::to_string(sum.s_pieces.size())))
+                .append(" files"));
+        for (const auto& piece : sum.s_pieces) {
+            auto note = attr_line_t()
+                            .append(lnav::roles::file(piece.ps_path.string()))
+                            .append(": ")
+                            .append(lnav::roles::number(
+                                fmt::to_string(piece.ps_lines)))
+                            .append(" lines, ")
+                            .append(lnav::roles::number(humanize::file_size(
+                                piece.ps_bytes, humanize::alignment::none)));
+            if (piece.ps_first_time && piece.ps_last_time) {
+                note.append(", ")
+                    .append(format_time(piece.ps_first_time.value()))
+                    .append(" to ")
+                    .append(format_time(piece.ps_last_time.value()));
+            }
+            um.with_note(note);
+        }
+        if (sum.s_mtimes_set) {
+            um.with_note(
+                "the timestamps in the file do not include the full date, so "
+                "the modification time of each file was set to the time of its "
+                "last message; preserve the modification times when copying or "
+                "archiving the files so that lnav interprets the timestamps "
+                "correctly");
+        }
+
+        return {std::move(um)};
+    }
+};
+
+struct subcmd_piper_t {
+    using action_t = std::function<perform_result_t(const subcmd_piper_t&)>;
+
+    CLI::App* sp_app{nullptr};
+    action_t sp_action;
+
+    subcmd_piper_t& set_action(action_t act)
+    {
+        if (!this->sp_action) {
+            this->sp_action = std::move(act);
+        }
+        return *this;
+    }
+
+    static perform_result_t default_action(const subcmd_piper_t& sp)
+    {
+        auto um
+            = console::user_message::error(
+                  "expecting an operation related to piper storage")
+                  .with_help(sp.sp_app->get_subcommands({})
+                             | lnav::itertools::fold(
+                                 subcmd_reducer,
+                                 attr_line_t{"the available operations are:"}))
+                  .move();
+
+        return {std::move(um)};
+    }
+
+    static perform_result_t list_action(const subcmd_piper_t&)
+    {
+        static const intern_string_t SRC = intern_string::lookup("piper");
+        static const auto DOT_HEADER = std::filesystem::path(".header");
+
+        struct item {
+            lnav::piper::header i_header;
+            std::string i_url;
+            file_size_t i_total_size{0};
+        };
+
+        file_size_t grand_total{0};
+        std::vector<item> items;
+        std::error_code ec;
+
+        for (const auto& instance_dir : std::filesystem::directory_iterator(
+                 lnav::piper::storage_path(), ec))
+        {
+            if (!instance_dir.is_directory()) {
+                log_warning("piper directory entry is not a directory: %s",
+                            instance_dir.path().c_str());
+                continue;
+            }
+
+            std::optional<lnav::piper::header> hdr_opt;
+            auto url = fmt::format(FMT_STRING("piper://{}"),
+                                   instance_dir.path().filename().string());
+            file_size_t total_size{0};
+            auto hdr_path = instance_dir / DOT_HEADER;
+            if (std::filesystem::exists(hdr_path)) {
+                auto hdr_read_res = lnav::filesystem::read_file(hdr_path);
+                if (hdr_read_res.isOk()) {
+                    auto hdr = hdr_read_res.unwrap();
+                    auto parse_res
+                        = lnav::piper::header_handlers.parser_for(SRC).of(hdr);
+                    if (parse_res.isOk()) {
+                        hdr_opt = parse_res.unwrap();
+                    } else {
+                        log_error("failed to parse header: %s -- %s",
+                                  hdr_path.c_str(),
+                                  parse_res.unwrapErr()[0]
+                                      .to_attr_line()
+                                      .get_string()
+                                      .c_str());
+                    }
+                } else {
+                    log_error("failed to read header file: %s -- %s",
+                              hdr_path.c_str(),
+                              hdr_read_res.unwrapErr().c_str());
+                }
+            }
+
+            for (const auto& entry :
+                 std::filesystem::directory_iterator(instance_dir.path()))
+            {
+                if (entry.path().filename() == DOT_HEADER) {
+                    continue;
+                }
+
+                total_size += entry.file_size();
+                char buffer[lnav::piper::HEADER_SIZE];
+
+                auto entry_open_res
+                    = lnav::filesystem::open_file(entry.path(), O_RDONLY);
+                if (entry_open_res.isErr()) {
+                    log_warning("unable to open piper file: %s -- %s",
+                                entry.path().c_str(),
+                                entry_open_res.unwrapErr().c_str());
+                    continue;
+                }
+
+                auto entry_fd = entry_open_res.unwrap();
+                if (read(entry_fd, buffer, sizeof(buffer)) != sizeof(buffer)) {
+                    log_warning("piper file is too small: %s",
+                                entry.path().c_str());
+                    continue;
+                }
+                auto hdr_bits_opt = lnav::piper::read_header(entry_fd, buffer);
+                if (!hdr_bits_opt) {
+                    log_warning("could not read piper header: %s",
+                                entry.path().c_str());
+                    continue;
+                }
+
+                auto hdr_buf = std::move(hdr_bits_opt.value());
+
+                total_size -= hdr_buf.size();
+                auto hdr_sf
+                    = string_fragment::from_bytes(hdr_buf.in(), hdr_buf.size());
+                auto hdr_parse_res
+                    = lnav::piper::header_handlers.parser_for(SRC).of(hdr_sf);
+                if (hdr_parse_res.isErr()) {
+                    log_error("failed to parse piper header: %s",
+                              hdr_parse_res.unwrapErr()[0]
+                                  .to_attr_line()
+                                  .get_string()
+                                  .c_str());
+                    continue;
+                }
+
+                auto hdr = hdr_parse_res.unwrap();
+
+                if (!hdr_opt || hdr < hdr_opt.value()) {
+                    hdr_opt = hdr;
+                }
+            }
+
+            if (hdr_opt) {
+                items.emplace_back(item{hdr_opt.value(), url, total_size});
+            }
+
+            grand_total += total_size;
+        }
+
+        if (ec && ec.value() != ENOENT) {
+            auto um = lnav::console::user_message::error(
+                          attr_line_t("unable to access piper directory: ")
+                              .append(lnav::roles::file(
+                                  lnav::piper::storage_path().string())))
+                          .with_reason(ec.message())
+                          .move();
+            return {std::move(um)};
+        }
+
+        if (items.empty()) {
+            if (verbosity != verbosity_t::quiet) {
+                auto um
+                    = lnav::console::user_message::info(
+                          attr_line_t("no piper captures were found in:\n\t")
+                              .append(lnav::roles::file(
+                                  lnav::piper::storage_path().string())))
+                          .with_help(
+                              attr_line_t("You can create a capture by "
+                                          "piping data into ")
+                                  .append(lnav::roles::file("lnav"))
+                                  .append(" or using the ")
+                                  .append_quoted(lnav::roles::symbol(":sh"))
+                                  .append(" command"))
+                          .move();
+                return {std::move(um)};
+            }
+
+            return {};
+        }
+
+        auto txt
+            = items
+            | lnav::itertools::sort_with([](const item& lhs, const item& rhs) {
+                  if (lhs.i_header < rhs.i_header) {
+                      return true;
+                  }
+
+                  if (rhs.i_header < lhs.i_header) {
+                      return false;
+                  }
+
+                  return lhs.i_url < rhs.i_url;
+              })
+            | lnav::itertools::map([](const item& it) {
+                  auto ago = humanize::time::point::from_tv(it.i_header.h_ctime)
+                                 .as_time_ago();
+                  auto retval = attr_line_t()
+                                    .append(lnav::roles::list_glyph(
+                                        fmt::format(FMT_STRING("{:>18}"), ago)))
+                                    .append("  ")
+                                    .append(lnav::roles::file(it.i_url))
+                                    .append(" ")
+                                    .append(lnav::roles::number(fmt::format(
+                                        FMT_STRING("{:>8}"),
+                                        humanize::file_size(
+                                            it.i_total_size,
+                                            humanize::alignment::columnar))))
+                                    .append(" ")
+                                    .append_quoted(lnav::roles::comment(
+                                        it.i_header.h_name))
+                                    .append("\n");
+                  if (verbosity == verbosity_t::verbose) {
+                      auto env_al
+                          = it.i_header.h_env
+                          | lnav::itertools::map([](const auto& pair) {
+                                return attr_line_t()
+                                    .append(lnav::roles::identifier(pair.first))
+                                    .append("=")
+                                    .append(pair.second)
+                                    .append("\n");
+                            })
+                          | lnav::itertools::fold(
+                                [](const auto& elem, auto& accum) {
+                                    if (!accum.empty()) {
+                                        accum.append(28, ' ');
+                                    }
+                                    return accum.append(elem);
+                                },
+                                attr_line_t());
+
+                      retval.append(23, ' ')
+                          .append("cwd: ")
+                          .append(lnav::roles::file(it.i_header.h_cwd))
+                          .append("\n")
+                          .append(23, ' ')
+                          .append("env: ")
+                          .append(env_al);
+                  }
+                  return retval;
+              })
+            | lnav::itertools::fold(
+                  [](const auto& elem, auto& accum) {
+                      return accum.append(elem);
+                  },
+                  attr_line_t{});
+        txt.rtrim();
+
+        perform_result_t retval;
+        if (verbosity != verbosity_t::quiet) {
+            auto extra_um
+                = lnav::console::user_message::info(
+                      attr_line_t(
+                          "the following piper captures were found in:\n\t")
+                          .append(lnav::roles::file(
+                              lnav::piper::storage_path().string())))
+                      .with_note(
+                          attr_line_t("The captures currently consume ")
+                              .append(lnav::roles::number(humanize::file_size(
+                                  grand_total, humanize::alignment::none)))
+                              .append(" of disk space.  File sizes include "
+                                      "associated metadata."))
+                      .with_help(
+                          "You can reopen a capture by passing the piper URL "
+                          "to lnav")
+                      .move();
+            retval.emplace_back(extra_um);
+        }
+        retval.emplace_back(lnav::console::user_message::raw(txt));
+
+        return retval;
+    }
+
+    static perform_result_t clean_action(const subcmd_piper_t&)
+    {
+        std::error_code ec;
+
+        std::filesystem::remove_all(lnav::piper::storage_path(), ec);
+        if (ec) {
+            return {
+                lnav::console::user_message::error(
+                    "unable to remove piper storage directory")
+                    .with_reason(ec.message()),
+            };
+        }
+
+        return {};
+    }
+};
+
 struct subcmd_regex101_t {
     using action_t = std::function<perform_result_t(const subcmd_regex101_t&)>;
 
@@ -641,14 +1617,17 @@ struct subcmd_regex101_t {
 
     static perform_result_t default_action(const subcmd_regex101_t& sr)
     {
-        auto um = console::user_message::error(
-            "expecting an operation related to the regex101.com integration");
-        um.with_help(
-            sr.sr_app->get_subcommands({})
-            | lnav::itertools::fold(
-                subcmd_reducer, attr_line_t{"the available operations are:"}));
+        auto um
+            = console::user_message::error(
+                  "expecting an operation related to the regex101.com "
+                  "integration")
+                  .with_help(sr.sr_app->get_subcommands({})
+                             | lnav::itertools::fold(
+                                 subcmd_reducer,
+                                 attr_line_t{"the available operations are:"}))
+                  .move();
 
-        return {um};
+        return {std::move(um)};
     }
 
     static perform_result_t list_action(const subcmd_regex101_t&)
@@ -663,24 +1642,24 @@ struct subcmd_regex101_t {
             };
         }
 
-        auto entries
-            = get_res.unwrap() | lnav::itertools::map([](const auto& elem) {
+        auto entries = get_res.unwrap()
+            | lnav::itertools::map([](const auto& elem) {
                            return fmt::format(
                                FMT_STRING("   format {} regex {} regex101\n"),
                                elem.re_format_name,
                                elem.re_regex_name);
                        })
             | lnav::itertools::fold(
-                  [](const auto& elem, auto& accum) {
-                      return accum.append(elem);
-                  },
-                  attr_line_t{});
+                           [](const auto& elem, auto& accum) {
+                               return accum.append(elem);
+                           },
+                           attr_line_t{});
 
         auto um = console::user_message::ok(
             entries.add_header("the following regex101 entries were found:\n")
                 .with_default("no regex101 entries found"));
 
-        return {um};
+        return {std::move(um)};
     }
 
     static perform_result_t import_action(const subcmd_regex101_t& sr)
@@ -711,8 +1690,104 @@ struct subcmd_regex101_t {
     }
 };
 
-using operations_v
-    = mapbox::util::variant<no_subcmd_t, subcmd_format_t, subcmd_regex101_t>;
+struct subcmd_crash_t {
+    using action_t = std::function<perform_result_t(const subcmd_crash_t&)>;
+
+    CLI::App* sc_app{nullptr};
+    action_t sc_action;
+
+    subcmd_crash_t& set_action(action_t act)
+    {
+        if (!this->sc_action) {
+            this->sc_action = std::move(act);
+        }
+        return *this;
+    }
+
+    static perform_result_t default_action(const subcmd_crash_t& sc)
+    {
+        auto um
+            = console::user_message::error(
+                  "expecting an operation related to crash logs")
+                  .with_help(sc.sc_app->get_subcommands({})
+                             | lnav::itertools::fold(
+                                 subcmd_reducer,
+                                 attr_line_t{"the available operations are:"}))
+                  .move();
+
+        return {std::move(um)};
+    }
+
+    static perform_result_t upload_action(const subcmd_crash_t&)
+    {
+        static constexpr char SPINNER_CHARS[] = "-\\|/";
+        constexpr size_t SPINNER_SIZE = sizeof(SPINNER_CHARS) - 1;
+
+        static_root_mem<glob_t, globfree> gl;
+        const auto path = lnav::paths::dotlnav() / "crash" / "crash-*.log";
+        perform_result_t retval;
+
+        auto glob_rc = glob(path.c_str(), 0, nullptr, gl.inout());
+        if (glob_rc == GLOB_NOMATCH) {
+            auto um = console::user_message::info("no crash logs to upload");
+            return {std::move(um)};
+        }
+        if (glob_rc != 0) {
+            auto um = console::user_message::error("unable to find crash logs");
+            return {std::move(um)};
+        }
+
+        for (size_t lpc = 0; lpc < gl->gl_pathc; lpc++) {
+            auto crash_file = std::filesystem::path(gl->gl_pathv[lpc]);
+            int spinner_index = 0;
+
+            log_info("uploading crash log: %s", crash_file.c_str());
+            printf("~");
+            fflush(stdout);
+            auto upload_res = crashd::client::upload(
+                crash_file,
+                [&spinner_index](double dltotal,
+                                 double dlnow,
+                                 double ultotal,
+                                 double ulnow) {
+                    printf("\b%c", SPINNER_CHARS[spinner_index % SPINNER_SIZE]);
+                    spinner_index += 1;
+                    fflush(stdout);
+                    return crashd::client::progress_result_t::ok;
+                });
+            if (spinner_index > 0) {
+                printf("\b");
+            }
+            printf(".");
+            fflush(stdout);
+            if (upload_res.isErr()) {
+                retval.push_back(upload_res.unwrapErr());
+            } else {
+                std::error_code ec;
+
+                std::filesystem::remove(crash_file, ec);
+            }
+        }
+
+        printf("\n");
+        auto um = console::user_message::ok(
+            attr_line_t("uploaded ")
+                .append(lnav::roles::number(fmt::to_string(gl->gl_pathc)))
+                .append(" crash logs, thank you!"));
+        retval.push_back(um);
+
+        return retval;
+    }
+};
+
+using operations_v = mapbox::util::variant<no_subcmd_t,
+                                           subcmd_apps_t,
+                                           subcmd_config_t,
+                                           subcmd_format_t,
+                                           subcmd_file_t,
+                                           subcmd_piper_t,
+                                           subcmd_regex101_t,
+                                           subcmd_crash_t>;
 
 class operations {
 public:
@@ -730,8 +1805,98 @@ describe_cli(CLI::App& app, int argc, char* argv[])
 
     app.add_flag("-m", "Switch to the management CLI mode.");
 
+    subcmd_apps_t apps_args;
+    subcmd_config_t config_args;
     subcmd_format_t format_args;
+    subcmd_file_t file_args;
+    subcmd_piper_t piper_args;
     subcmd_regex101_t regex101_args;
+    subcmd_crash_t crash_args;
+
+    {
+        auto* subcmd_apps
+            = app.add_subcommand("apps", "manage lnav apps")->callback([&] {
+                  apps_args.set_action(subcmd_apps_t::default_action);
+                  retval->o_ops = apps_args;
+              });
+        apps_args.sa_apps_app = subcmd_apps;
+        auto* sub_create_options
+            = subcmd_apps->add_subcommand("create", "create a new app")
+                  ->callback([&] {
+                      apps_args.set_action(subcmd_apps_t::create_action);
+                  });
+        sub_create_options->add_option(
+            "name", apps_args.sa_name, "name of the app");
+    }
+
+    {
+        auto* subcmd_file
+            = app.add_subcommand("file", "perform operations on log files")
+                  ->callback([&]() {
+                      file_args.set_action(subcmd_file_t::default_action);
+                      retval->o_ops = file_args;
+                  });
+        file_args.sfi_file_app = subcmd_file;
+
+        auto* sub_split = subcmd_file->add_subcommand(
+            "split", "split a file into smaller files that lnav can index");
+        sub_split->add_option(
+            "path", file_args.sfi_path, "the path to the file to split");
+        sub_split->add_option("--lines",
+                              file_args.sfi_lines,
+                              "the maximum number of lines in each file");
+        sub_split->add_option("--size",
+                              file_args.sfi_size,
+                              "the maximum size of each file (e.g. 1GB)");
+        sub_split->add_option(
+            "--time",
+            file_args.sfi_time,
+            "put the messages in each time window in their own file (e.g. 1h)");
+        sub_split->add_option(
+            "-S,--since",
+            file_args.sfi_since,
+            "only write messages at or after this time (e.g. '1h ago')");
+        sub_split->add_option(
+            "-U,--until",
+            file_args.sfi_until,
+            "only write messages at or before this time");
+        sub_split->add_option("-o,--output-dir",
+                              file_args.sfi_output_dir,
+                              "the directory to write the files to");
+        sub_split->callback(
+            [&]() { file_args.set_action(subcmd_file_t::split_action); });
+    }
+
+    {
+        auto* subcmd_config
+            = app.add_subcommand("config",
+                                 "perform operations on the lnav configuration")
+                  ->callback([&]() {
+                      config_args.set_action(subcmd_config_t::default_action);
+                      retval->o_ops = config_args;
+                  });
+        config_args.sc_config_app = subcmd_config;
+
+        subcmd_config->add_subcommand("get", "print the current configuration")
+            ->callback(
+                [&]() { config_args.set_action(subcmd_config_t::get_action); });
+
+        subcmd_config
+            ->add_subcommand("blame",
+                             "print the configuration options and their source")
+            ->callback([&]() {
+                config_args.set_action(subcmd_config_t::blame_action);
+            });
+
+        auto* sub_file_options = subcmd_config->add_subcommand(
+            "file-options", "print the options applied to specific files");
+
+        sub_file_options->add_option(
+            "path", config_args.sc_path, "the path to the file");
+        sub_file_options->callback([&]() {
+            config_args.set_action(subcmd_config_t::file_options_action);
+        });
+    }
 
     {
         auto* subcmd_format
@@ -753,6 +1918,18 @@ describe_cli(CLI::App& app, int argc, char* argv[])
                 ->callback([&]() {
                     format_args.set_action(subcmd_format_t::get_action);
                 });
+        }
+
+        {
+            auto* subcmd_format_test
+                = subcmd_format
+                      ->add_subcommand("test",
+                                       "test this format against a file")
+                      ->callback([&]() {
+                          format_args.set_action(subcmd_format_t::test_action);
+                      });
+            subcmd_format_test->add_option(
+                "path", format_args.sf_path, "the path to the file to test");
         }
 
         {
@@ -837,6 +2014,25 @@ describe_cli(CLI::App& app, int argc, char* argv[])
     }
 
     {
+        auto* subcmd_piper
+            = app.add_subcommand("piper", "perform operations on piper storage")
+                  ->callback([&]() {
+                      piper_args.set_action(subcmd_piper_t::default_action);
+                      retval->o_ops = piper_args;
+                  });
+        piper_args.sp_app = subcmd_piper;
+
+        subcmd_piper
+            ->add_subcommand("list", "print the available piper captures")
+            ->callback(
+                [&]() { piper_args.set_action(subcmd_piper_t::list_action); });
+
+        subcmd_piper->add_subcommand("clean", "remove all piper captures")
+            ->callback(
+                [&]() { piper_args.set_action(subcmd_piper_t::clean_action); });
+    }
+
+    {
         auto* subcmd_regex101
             = app.add_subcommand("regex101",
                                  "create and edit log message regular "
@@ -883,6 +2079,22 @@ describe_cli(CLI::App& app, int argc, char* argv[])
         }
     }
 
+    {
+        auto* subcmd_crash
+            = app.add_subcommand("crash", "manage crash logs")->callback([&]() {
+                  crash_args.set_action(subcmd_crash_t::default_action);
+                  retval->o_ops = crash_args;
+              });
+        crash_args.sc_app = subcmd_crash;
+
+        {
+            subcmd_crash->add_subcommand("upload", "upload crash logs")
+                ->callback([&]() {
+                    crash_args.set_action(subcmd_crash_t::upload_action);
+                });
+        }
+    }
+
     app.parse(argc, argv);
 
     return retval;
@@ -894,17 +2106,23 @@ perform(std::shared_ptr<operations> opts)
     return opts->o_ops.match(
         [](const no_subcmd_t& ns) -> perform_result_t {
             auto um = console::user_message::error(
-                attr_line_t("expecting an operation to perform"));
-            um.with_help(ns.ns_root_app->get_subcommands({})
-                         | lnav::itertools::fold(
-                             subcmd_reducer,
-                             attr_line_t{"the available operations are:"}));
+                          attr_line_t("expecting an operation to perform"))
+                          .with_help(
+                              ns.ns_root_app->get_subcommands({})
+                              | lnav::itertools::fold(
+                                  subcmd_reducer,
+                                  attr_line_t{"the available operations are:"}))
+                          .move();
 
-            return {um};
+            return {std::move(um)};
         },
+        [](const subcmd_apps_t& sa) { return sa.sa_action(sa); },
+        [](const subcmd_config_t& sc) { return sc.sc_action(sc); },
         [](const subcmd_format_t& sf) { return sf.sf_action(sf); },
-        [](const subcmd_regex101_t& sr) { return sr.sr_action(sr); });
+        [](const subcmd_file_t& sf) { return sf.sfi_action(sf); },
+        [](const subcmd_piper_t& sp) { return sp.sp_action(sp); },
+        [](const subcmd_regex101_t& sr) { return sr.sr_action(sr); },
+        [](const subcmd_crash_t& sc) { return sc.sc_action(sc); });
 }
 
-}  // namespace management
-}  // namespace lnav
+}  // namespace lnav::management

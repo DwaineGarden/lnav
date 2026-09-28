@@ -2,6 +2,7 @@ enable_testing()
 
 include_directories(
         . ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/fmtlib
+        ${CMAKE_SOURCE_DIR}/src/third-party/date/include
         ${CMAKE_CURRENT_BINARY_DIR}/../src ${CMAKE_CURRENT_BINARY_DIR})
 
 add_executable(test_abbrev test_abbrev.cc test_stubs.cc)
@@ -30,12 +31,18 @@ target_include_directories(document.sections.tests PUBLIC ../src/third-party/doc
 target_link_libraries(document.sections.tests diag)
 add_test(NAME document.sections.tests COMMAND document.sections.tests)
 
+add_executable(pretty_printer.tests pretty_printer.tests.cc test_stubs.cc)
+target_include_directories(pretty_printer.tests PUBLIC ../src/third-party/doctest-root)
+target_link_libraries(pretty_printer.tests diag)
+add_test(NAME pretty_printer.tests COMMAND pretty_printer.tests)
+
 add_executable(test_bookmarks test_bookmarks.cc test_stubs.cc)
 target_link_libraries(test_bookmarks diag)
 add_test(NAME test_bookmarks COMMAND test_bookmarks)
 
 add_executable(test_date_time_scanner test_date_time_scanner.cc)
-target_link_libraries(test_date_time_scanner base lnavdt)
+target_include_directories(test_date_time_scanner PUBLIC ../src/third-party/doctest-root)
+target_link_libraries(test_date_time_scanner base lnavdt diag)
 add_test(NAME test_date_time_scanner COMMAND test_date_time_scanner)
 
 add_executable(test_grep_proc2 test_grep_proc2.cc)
@@ -72,17 +79,26 @@ add_test(NAME test_text_anonymizer COMMAND test_text_anonymizer)
 add_executable(drive_view_colors drive_view_colors.cc test_stubs.cc)
 target_link_libraries(drive_view_colors diag)
 
-add_executable(drive_vt52_curses drive_vt52_curses.cc test_stubs.cc)
-target_link_libraries(drive_vt52_curses diag)
+add_executable(drive_listview drive_listview.cc test_stubs.cc)
+target_link_libraries(drive_listview diag)
 
 add_executable(drive_logfile drive_logfile.cc test_stubs.cc)
 target_link_libraries(drive_logfile diag)
 
+add_executable(drive_shlexer drive_shlexer.cc test_stubs.cc)
+target_link_libraries(drive_shlexer diag)
+
 add_executable(drive_sql_anno drive_sql_anno.cc test_stubs.cc)
 target_link_libraries(drive_sql_anno diag)
 
+add_executable(drive_textinput drive_textinput.cc test_stubs.cc)
+target_link_libraries(drive_textinput diag)
+
 add_executable(drive_data_scanner drive_data_scanner.cc test_stubs.cc)
 target_link_libraries(drive_data_scanner diag logfmt)
+
+add_executable(drive_doc_discovery drive_doc_discovery.cc test_stubs.cc)
+target_link_libraries(drive_doc_discovery diag logfmt)
 
 add_executable(scripty scripty.cc test_stubs.cc)
 target_link_libraries(scripty diag)
